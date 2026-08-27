@@ -1,0 +1,81 @@
+name: 打包 macOS DMG
+
+# 推送形如 v0.1.0 的标签时触发（tag 号需与 src-tauri/tauri.conf.json 的 version 一致）。
+on:
+  push:
+    tags:
+      - 'v*'
+  # 也可以在 Actions 页面手动触发
+  workflow_dispatch: {}
+
+# 需要读取仓库 + 写 release 附件
+permissions:
+  contents: write
+
+concurrency:
+  group: build-dmg-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-dmg:
+    # 壁纸 sidecar（depot-downloader）只有 aarch64（Apple Silicon）版本，必须在 arm64 宿主机上构建，
+    # 这样 cargo / Tauri 才会把 sidecar 打进 .app。macos-14 是 ARM(M1/M2) 运行器。
+    runs-on: macos-14
+
+    steps:
+      - name: 检出代码（含 Git LFS sidecar）
+        # depot-downloader 走 Git LFS，必须 lfs:true 才能拉到真实二进制（约 85MB）
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+          components: clippy,rustfmt
+
+      - name: Rust 构建缓存
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          # 与本地一致：读取 lockfile v9，且兼容 pnpm-workspace.yaml 的 allowBuilds
+          version: 11
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 构建 Tauri（.app + .dmg）
+        # beforeBuildCommand 会先跑 pnpm --filter @we/desktop build 生成前端 dist/，
+        # 再编译 Rust release 并打包 app/dmg。
+        run: pnpm tauri build
+
+      - name: 上传构建产物（artifact）
+        uses: actions/upload-artifact@v4
+        with:
+          name: WallpaperEM-${{ github.ref_name }}
+          path: |
+            src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/macos/*.app
+          if-no-files-found: error
+
+      - name: 把 DMG 附加到对应 tag 的 Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          # 标题取标签名（如 v0.1.0），自动创建/更新 tag 对应的 release
+          name: ${{ github.ref_name }}
+          files: |
+            src-tauri/target/release/bundle/dmg/*.dmg
+          draft: false
+          prerelease: false
