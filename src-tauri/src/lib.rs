@@ -270,13 +270,12 @@ fn init_logging(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// 托盘：显示主窗口 / 暂停恢复 / 下一张 / 退出
+/// 托盘：显示主窗口 / 暂停恢复 / 退出
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
     let pause = MenuItem::with_id(app, "pause", "暂停 / 恢复壁纸", true, None::<&str>)?;
-    let next = MenuItem::with_id(app, "next", "下一张（轮播）", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &pause, &next, &quit])?;
+    let menu = Menu::with_items(app, &[&show, &pause, &quit])?;
 
     let mut builder = TrayIconBuilder::with_id("main-tray")
         .menu(&menu)
@@ -298,11 +297,6 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                     let _ = wallpaper::resume_all(app.clone());
                 } else {
                     let _ = wallpaper::pause_all(app.clone());
-                }
-            }
-            "next" => {
-                if let Err(e) = wallpaper::next(app.clone()) {
-                    tracing::warn!("next failed: {e}");
                 }
             }
             "quit" => app.exit(0),
