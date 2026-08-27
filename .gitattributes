@@ -1,0 +1,2 @@
+# Track the DepotDownloader sidecar binary with Git LFS (large compiled artifact).
+src-tauri/binaries/depot-downloader-* filter=lfs diff=lfs merge=lfs -text

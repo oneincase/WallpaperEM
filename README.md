@@ -70,8 +70,8 @@
 - **Xcode Command Line Tools**
 
 > **关于 DepotDownloader sidecar / About the DepotDownloader sidecar**
-> 下载工坊内容依赖 `src-tauri/binaries/depot-downloader-aarch64-apple-darwin`（约 85 MB 的编译产物，因体积不入库）。请自行编译该 sidecar 并放到对应路径，或用 Git LFS 托管后拉取；缺少它时其余功能仍可构建运行，仅「下载」不可用。
-> Downloading workshop content needs `src-tauri/binaries/depot-downloader-aarch64-apple-darwin` (~85 MB; not committed due to size). Build it yourself into that path, or track it with Git LFS. Without it the app still builds and runs — only "Download" is unavailable.
+> 下载工坊内容依赖 `src-tauri/binaries/depot-downloader-aarch64-apple-darwin`（约 85 MB 的编译产物）。该二进制已用 **Git LFS** 纳入版本库，拉取仓库即可用；若 LFS 不可用，请自行编译该 sidecar 放到对应路径。缺少它时其余功能仍可构建运行，仅「下载」不可用。
+> Downloading workshop content needs `src-tauri/binaries/depot-downloader-aarch64-apple-darwin` (~85 MB). It is committed via **Git LFS**, so cloning the repo pulls it automatically; if LFS is unavailable, build the sidecar yourself into that path. Without it the app still builds and runs — only "Download" is unavailable.
 
 ### 安装依赖 / Install dependencies
 

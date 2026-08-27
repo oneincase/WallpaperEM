@@ -23,8 +23,7 @@ bundle/
 *.bak
 *~
 
-# --- 依赖下载 sidecar 二进制（体积大，请自行决定是否用 Git LFS 入库）---
-src-tauri/binaries/depot-downloader-*
+# 注：DepotDownloader sidecar 二进制已用 Git LFS 纳入（见 .gitattributes），不再忽略。
 
 # --- 本地运行数据（若误放仓库内）---
 *.db
