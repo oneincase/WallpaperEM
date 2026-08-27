@@ -16,13 +16,38 @@ use crate::db;
 
 use crate::content_server::ContentServerState;
 
-pub const DEFAULT_FIT: &str = "fill";
+pub const DEFAULT_FIT: &str = "cover";
 
 fn default_type() -> String {
     "canvas".into()
 }
 fn default_fit() -> String {
     DEFAULT_FIT.into()
+}
+
+/// 全局壁纸显示模式（覆盖到每次应用/恢复），非法值回退到默认 cover。
+fn global_fit(conn: Option<&Connection>) -> String {
+    let fit = conn.and_then(|c| db::get_setting(c, "wallpaper_fit"));
+    match fit.as_deref() {
+        Some("contain") | Some("stretch") | Some("cover") => fit.unwrap_or_else(|| DEFAULT_FIT.into()),
+        _ => DEFAULT_FIT.into(),
+    }
+}
+
+/// 把全局显示模式写进配置（应用/恢复壁纸时统一以全局为准，实现"全局一个开关"）。
+fn apply_global_fit(app: &AppHandle, cfg: &mut WallpaperConfig) {
+    let fit: String;
+    {
+        let db = app.try_state::<Arc<Mutex<Connection>>>();
+        fit = match db {
+            Some(state) => match state.lock() {
+                Ok(conn) => global_fit(Some(&conn)),
+                Err(_) => DEFAULT_FIT.to_string(),
+            },
+            None => DEFAULT_FIT.to_string(),
+        };
+    }
+    cfg.fit = fit;
 }
 fn default_muted() -> bool {
     true
@@ -40,7 +65,7 @@ pub struct WallpaperConfig {
     pub r#type: String,
     #[serde(default)]
     pub src: Option<String>,
-    /// fill | fit | stretch
+    /// cover（等比铺满裁切，默认）| contain（等比留边）| stretch（拉伸，旧行为）
     #[serde(default = "default_fit")]
     pub fit: String,
     #[serde(default = "default_muted")]
@@ -262,6 +287,7 @@ fn create_desktop_window(
     cfg.media_base = media_base(app);
     // 会话恢复来的 src 可能带上次运行的过期 token，用当前基址重写
     refresh_src(app, &mut cfg);
+    apply_global_fit(app, &mut cfg);
     let query = config_query(&cfg);
     // 渲染器页与媒体同源（内容服务器），消除跨源 fetch 限制
     let port: u16 = match app.try_state::<Arc<Mutex<u16>>>() {
@@ -335,6 +361,7 @@ fn apply_on_main(
 
         let mut cfg2 = cfg.clone();
         cfg2.media_base = media_base(app);
+        apply_global_fit(app, &mut cfg2);
         let js = format!(
             "window.__wp && window.__wp.setWallpaper({})",
             serde_json::to_string(&cfg2).map_err(|e| e.to_string())?
@@ -554,6 +581,15 @@ pub fn set_volume(app: AppHandle, volume: f64) -> Result<(), String> {
 
 #[tauri::command(rename = "wallpaper_set_fit")]
 pub fn set_fit(app: AppHandle, fit: String) -> Result<(), String> {
+    if !matches!(fit.as_str(), "cover" | "contain" | "stretch") {
+        return Err(format!("未知的显示模式: {fit}（可选 cover/contain/stretch）"));
+    }
+    // 持久化为全局显示模式（下次应用/恢复壁纸时统一生效）
+    if let Some(db) = app.try_state::<Arc<Mutex<Connection>>>() {
+        if let Ok(conn) = db.lock() {
+            let _ = db::set_setting(&conn, "wallpaper_fit", &fit);
+        }
+    }
     let js = format!("window.__wp && window.__wp.setFit({:?})", fit);
     eval_all(&app, &js);
     Ok(())

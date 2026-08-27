@@ -1,10 +1,14 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { api } from "../api/steam";
 
 export function SettingsPage() {
   const [autostart, setAutostart] = useState<boolean | null>(null);
   const [interactive, setInteractive] = useState(false);
+  // 全局壁纸显示模式（cover/contain/stretch），默认 cover 等比铺满裁切
+  const [fit, setFit] = useState<"cover" | "contain" | "stretch">("cover");
+  const [fitMsg, setFitMsg] = useState("");
   // 下载账号
   const [cred, setCred] = useState<{ configured: boolean; username?: string } | null>(null);
   const [editingCred, setEditingCred] = useState(false);
@@ -12,6 +16,15 @@ export function SettingsPage() {
   const [dlUser, setDlUser] = useState("");
   const [dlPass, setDlPass] = useState("");
   const [credMsg, setCredMsg] = useState("");
+  // 扫码登录
+  const [qrOpen, setQrOpen] = useState(false);
+  const [qrCode, setQrCode] = useState("");
+  const [qrLog, setQrLog] = useState<string[]>([]);
+  const [qrStatus, setQrStatus] = useState<"idle" | "waiting" | "success" | "fail">("idle");
+  // 扫码登录 2FA 验证码（-no-mobile）
+  const [qrGuardReq, setQrGuardReq] = useState(false);
+  const [qrGuardCode, setQrGuardCode] = useState("");
+  const [qrGuardMsg, setQrGuardMsg] = useState("");
   // 代理
   const [proxy, setProxy] = useState("");
   const [proxyMsg, setProxyMsg] = useState("");
@@ -21,6 +34,9 @@ export function SettingsPage() {
     invoke<boolean>("autostart_status").then(setAutostart).catch(console.warn);
     invoke<string | null>("settings_get", { key: "wallpaper_interactive" })
       .then((v) => setInteractive(v === "true" || v === "1"))
+      .catch(() => {});
+    invoke<string | null>("settings_get", { key: "wallpaper_fit" })
+      .then((v) => setFit((v as "cover" | "contain" | "stretch") || "cover"))
       .catch(() => {});
     api
       .downloadCredentialsStatus()
@@ -54,6 +70,92 @@ export function SettingsPage() {
       setCredMsg(String(e));
     }
   };
+
+  // 扫码登录：启动进程 + 订阅事件
+  const startQrLogin = async () => {
+    setQrOpen(true);
+    setQrCode("");
+    setQrLog([]);
+    setQrStatus("waiting");
+    setQrGuardReq(false);
+    setQrGuardCode("");
+    setQrGuardMsg("");
+    await api.downloadQrLogin().catch((e) => {
+      setQrStatus("fail");
+      setQrLog((p) => [...p, `启动失败: ${e}`]);
+    });
+  };
+
+  const stopQrLogin = async () => {
+    await api.downloadQrCancel().catch(() => {});
+    setQrOpen(false);
+    setQrStatus("idle");
+    setQrGuardReq(false);
+    setQrGuardCode("");
+    setQrGuardMsg("");
+  };
+
+  // 提交扫码登录的 2FA 验证码（-no-mobile）
+  const submitQrGuard = async () => {
+    const code = qrGuardCode.trim();
+    if (!code) {
+      setQrGuardMsg("请输入验证码");
+      return;
+    }
+    const ok = await api.downloadQrSubmitGuard(code).catch(() => false);
+    if (ok) {
+      setQrGuardReq(false);
+      setQrGuardCode("");
+      setQrGuardMsg("");
+    } else {
+      setQrGuardMsg("提交失败，请重试");
+      setQrGuardCode("");
+    }
+  };
+
+  const logout = async () => {
+    await api.downloadCredentialsClear();
+    setCred({ configured: false });
+    setDlUser("");
+    setDlPass("");
+    setCredMsg("已登出，登录令牌已清除");
+  };
+
+  useEffect(() => {
+    const unQrCode = listen<{ qr: string }>("download:qr-code", (e) => {
+      setQrCode(e.payload.qr);
+    });
+    const unQrLine = listen<{ line: string }>("download:qr-line", (e) => {
+      setQrLog((p) => [...p.slice(-8), e.payload.line]);
+    });
+    const unQrGuard = listen("download:qr-guard-required", () => {
+      setQrGuardReq(true);
+      setQrGuardCode("");
+      setQrGuardMsg("");
+    });
+    const unQrSuccess = listen<{ username: string | null }>("download:qr-success", (e) => {
+      setQrStatus("success");
+      setQrGuardReq(false);
+      setQrGuardCode("");
+      setQrGuardMsg("");
+      setCred({ configured: true, username: e.payload.username ?? undefined });
+      setDlUser(e.payload.username ?? "");
+    });
+    const unQrFail = listen<{ error?: string; exitCode?: number }>("download:qr-fail", (e) => {
+      setQrStatus("fail");
+      setQrGuardReq(false);
+      setQrGuardCode("");
+      setQrGuardMsg("");
+      setQrLog((p) => [...p, e.payload.error ?? `退出码 ${e.payload.exitCode}`]);
+    });
+    return () => {
+      unQrCode.then((f) => f());
+      unQrLine.then((f) => f());
+      unQrGuard.then((f) => f());
+      unQrSuccess.then((f) => f());
+      unQrFail.then((f) => f());
+    };
+  }, []);
 
   const saveProxy = async () => {
     setProxyMsg("");
@@ -126,6 +228,16 @@ export function SettingsPage() {
     }
   };
 
+  const changeFit = async (next: "cover" | "contain" | "stretch") => {
+    setFitMsg("");
+    try {
+      await api.wallpaperSetFit(next);
+      setFit(next);
+    } catch (e) {
+      setFitMsg(String(e));
+    }
+  };
+
   return (
     <div className="flex flex-col h-full px-7 py-5">
       {/* 头部区域 - 固定在顶部 */}
@@ -144,16 +256,19 @@ export function SettingsPage() {
           label="下载账号（DepotDownloader）"
           desc={
             cred?.configured
-              ? `已配置：${cred.username}（需拥有 Wallpaper Engine）`
-              : "下载工坊内容需要拥有 WE 的 Steam 账号；密码本地加密存储（不依赖 macOS 钥匙串授权）"
+              ? `已配置：${cred.username}（需拥有 Wallpaper Engine；令牌已记住，下载不再重复验证）`
+              : "下载工坊内容需拥有 WE 的 Steam 账号。可用账号密码，或扫码登录（默认）；登录令牌会记住"
           }
           control={
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <span
                 className={`text-[12px] font-medium ${cred?.configured ? "text-green-500" : "text-[var(--text-2)]"}`}
               >
-                {cred?.configured ? "已配置" : "未配置"}
+                {cred?.configured ? "已登录" : "未登录"}
               </span>
+              <button className="btn !py-1 text-[11.5px]" onClick={startQrLogin}>
+                扫码登录
+              </button>
               {cred?.configured && !editingCred && (
                 <button
                   className="btn !py-1 text-[11.5px]"
@@ -165,6 +280,11 @@ export function SettingsPage() {
                   }}
                 >
                   重新配置
+                </button>
+              )}
+              {cred?.configured && (
+                <button className="btn btn-danger !py-1 text-[11.5px]" onClick={logout}>
+                  登出
                 </button>
               )}
             </div>
@@ -288,6 +408,30 @@ export function SettingsPage() {
           control={<Switch checked={autostart === true} onChange={toggleAutostart} />}
         />
         <Row
+          label="壁纸显示模式"
+          desc={
+            fit === "cover"
+              ? "等比铺满并居中裁切溢出（不变形、无黑边，默认）"
+              : fit === "contain"
+                ? "等比缩放完整显示，边缘留暗边（不变形）"
+                : "忽略宽高比铺满（会拉伸变形，旧行为）"
+          }
+          control={
+            <div className="flex items-center gap-2">
+              <select
+                value={fit}
+                onChange={(e) => changeFit(e.target.value as "cover" | "contain" | "stretch")}
+                className="rounded-lg border border-[var(--separator)] bg-[var(--content)] px-2 py-1 text-[12.5px] outline-none focus:border-[var(--accent)]"
+              >
+                <option value="cover">填充·裁切（默认）</option>
+                <option value="contain">适应·留边</option>
+                <option value="stretch">拉伸（不推荐）</option>
+              </select>
+              {fitMsg && <span className="text-[12px] text-red-500">{fitMsg}</span>}
+            </div>
+          }
+        />
+        <Row
           label="壁纸交互（图标上方）"
           desc="开启后壁纸窗口置于桌面图标之上并可接收鼠标（场景视差/网页互动）；会盖住桌面图标。默认关闭"
           control={<Switch checked={interactive} onChange={toggleInteractive} />}
@@ -303,6 +447,88 @@ export function SettingsPage() {
       </Group>
         </div>
       </div>
+
+      {/* 扫码登录弹窗 */}
+      {qrOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-8">
+          <div className="card flex max-w-lg w-full flex-col overflow-hidden">
+            <div className="flex items-center justify-between border-b border-[var(--separator)] px-4 py-2.5">
+              <div className="text-[14px] font-semibold">扫码登录 Steam</div>
+              <button className="btn !py-1" onClick={stopQrLogin}>
+                关闭
+              </button>
+            </div>
+            <div className="p-5 space-y-3">
+              {qrStatus === "waiting" && !qrCode && (
+                <div className="text-[13px] text-[var(--text-2)] text-center py-6">
+                  正在生成登录二维码…
+                </div>
+              )}
+              {qrCode && (
+                <>
+                  <div className="flex justify-center">
+                    <pre
+                      className="inline-block text-[6px] font-mono select-text bg-white p-3 rounded-lg leading-none"
+                      style={{ lineHeight: "1.05", whiteSpace: "pre" }}
+                    >
+                      {qrCode}
+                    </pre>
+                  </div>
+                  <p className="text-[12.5px] text-center text-[var(--text-2)]">
+                    打开 Steam 手机 App → 扫码登录，确认后自动记住登录令牌
+                  </p>
+                </>
+              )}
+              {qrStatus === "success" && (
+                <div className="text-[13px] text-green-500 text-center">
+                  ✅ 登录成功，令牌已记住，后续下载无需再验证
+                </div>
+              )}
+              {qrStatus === "fail" && (
+                <div className="text-[13px] text-red-500 text-center">登录失败，请重试</div>
+              )}
+              {qrGuardReq && (
+                <div className="rounded-xl border border-[var(--separator)] bg-[var(--content)] p-3 space-y-2">
+                  <div className="text-[13px] font-semibold">输入 Steam Guard 2FA 验证码</div>
+                  <p className="text-[12px] text-[var(--text-2)]">
+                    检测到需要二次验证，请输入 Steam 身份验证器 / 邮箱收到的验证码
+                  </p>
+                  <input
+                    value={qrGuardCode}
+                    onChange={(e) => setQrGuardCode(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && submitQrGuard()}
+                    placeholder="2FA 验证码"
+                    autoFocus
+                    className="w-full rounded-lg border border-[var(--separator)] bg-[var(--content)] px-3 py-1.5 text-[13px] font-mono outline-none focus:border-[var(--accent)]"
+                  />
+                  <div className="flex items-center justify-end gap-2">
+                    {qrGuardMsg && (
+                      <span className="text-[12px] text-red-500">{qrGuardMsg}</span>
+                    )}
+                    <button className="btn btn-primary" onClick={submitQrGuard}>
+                      提交
+                    </button>
+                  </div>
+                </div>
+              )}
+              {qrLog.length > 0 && (
+                <div className="mt-2 max-h-24 overflow-y-auto rounded-lg bg-black/5 dark:bg-white/5 p-2 text-[11px] text-[var(--text-2)] font-mono">
+                  {qrLog.map((l, i) => (
+                    <div key={i} className="truncate">{l}</div>
+                  ))}
+                </div>
+              )}
+              {qrStatus !== "success" && (
+                <div className="flex justify-end gap-2">
+                  <button className="btn" onClick={stopQrLogin}>
+                    取消
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

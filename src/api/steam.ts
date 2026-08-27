@@ -114,6 +114,11 @@ export const api = {
     }),
   downloadCredentialsStatus: () =>
     invoke<{ configured: boolean; username?: string }>("download_credentials_status"),
+  downloadCredentialsClear: () => invoke<void>("download_credentials_clear"),
+  downloadQrLogin: () => invoke<void>("download_qr_login"),
+  downloadQrCancel: () => invoke<void>("download_qr_cancel"),
+  downloadQrSubmitGuard: (code: string) =>
+    invoke<boolean>("download_qr_submit_guard", { code }),
   downloadEnqueue: (itemId: string) => invoke<number>("download_enqueue", { itemId }),
   downloadList: () => invoke<DownloadTask[]>("download_list"),
   downloadCancel: (id: number) => invoke<boolean>("download_cancel", { id }),
@@ -138,6 +143,7 @@ export const api = {
   wallpaperPauseAll: () => invoke<void>("wallpaper_pause_all"),
   wallpaperResumeAll: () => invoke<void>("wallpaper_resume_all"),
   wallpaperInteractiveSet: (enabled: boolean) => invoke<void>("wallpaper_interactive_set", { enabled }),
+  wallpaperSetFit: (fit: string) => invoke<void>("wallpaper_set_fit", { fit }),
   wallpaperNext: () => invoke<{ itemId: string; index: number }>("wallpaper_next"),
   favoritesList: () => invoke<FavoriteItem[]>("favorites_list"),
   favoriteAdd: (itemId: string) => invoke<boolean>("favorite_add", { itemId }),

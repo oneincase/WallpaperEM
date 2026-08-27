@@ -422,7 +422,7 @@ export function createRenderer(canvas, opts = {}) {
   }
 
   // ---------- 渲染入口 ----------
-  async function renderScene(scene, textures, width, height, time) {
+  async function renderScene(scene, textures, width, height, time, fit) {
     gl.viewport(0, 0, width, height)
     const general = scene.general || {}
     if (general.clearenabled !== false) {
@@ -432,7 +432,7 @@ export function createRenderer(canvas, opts = {}) {
       gl.clearColor(0, 0, 0, 1)
     }
     gl.clear(gl.COLOR_BUFFER_BIT)
-    const cam = buildCamera(scene, width, height)
+    const cam = buildCamera(scene, width, height, fit)
     let viewProj = mat4Multiply(cam.projection, cam.view)
 
     // ---- 场景级视差（cameraparallax）----

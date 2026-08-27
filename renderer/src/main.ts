@@ -12,6 +12,7 @@ import * as noiseMod from "../vendor/we-scene/render/noise.js";
 import * as particlesMod from "../vendor/we-scene/render/particles.js";
 import * as mdlMod from "../vendor/we-scene/render/mdl.js";
 import { WE_SHADER_HEADERS } from "../vendor/we-scene/headers";
+import { fitWindow } from "../vendor/we-scene/render/math.js";
 
 const asAny = (m: unknown) => m as unknown as Record<string, any>;
 const pkg = asAny(pkgMod);
@@ -32,15 +33,33 @@ const SKIP_PARTICLES = true; // 暂不渲染粒子（雪 / 雨 / zzz）
 // 逐 pass 渲染会产出灰色遮罩 / 随机颜色多边形。暂改为不应用图层效果，只渲染基础层。
 const SKIP_SCENE_EFFECTS = false;
 
+type WallpaperFit = "cover" | "contain" | "stretch" | "fill" | "fit";
+
 type WallpaperConfig = {
   type: "canvas" | "video" | "gif" | "web" | "scene" | "image";
   src?: string;
-  fit?: "fill" | "fit" | "stretch";
+  fit?: WallpaperFit;
   muted?: boolean;
   loop?: boolean;
   /** 内容服务器媒体基址：http://127.0.0.1:<port>/media/<token>（scene/web 拉取资源） */
   mediaBase?: string;
 };
+
+// 规范化显示模式：兼容旧会话里的 fill（=拉伸）与 fit（=适应）。
+// 旧 fill 是"忽略宽高比铺满"（会被拉伸变形），默认迁移到 cover 修复，不再默认拉伸。
+function normalizeFit(fit?: WallpaperFit): "cover" | "contain" | "stretch" {
+  if (fit === "fit") return "contain"; // 旧"适应"
+  if (fit === "fill") return "cover"; // 旧默认"填充"曾是拉伸 → 修复为等比裁切
+  return fit === "contain" || fit === "stretch" ? fit : "cover";
+}
+
+// 视频/GIF/图片的 object-fit 映射：cover 等比铺满裁切、contain 等比留边、stretch 拉伸。
+function fitObjectFit(fit?: WallpaperFit): { objectFit: string; background: string } {
+  const f = normalizeFit(fit);
+  if (f === "contain") return { objectFit: "contain", background: "rgba(10,12,16,0.85)" };
+  if (f === "stretch") return { objectFit: "fill", background: "transparent" };
+  return { objectFit: "cover", background: "transparent" };
+}
 
 const state: {
   cfg: WallpaperConfig;
@@ -154,7 +173,7 @@ function mountVideo(cfg: WallpaperConfig) {
   v.playsInline = true;
   v.style.cssText =
     "position:absolute;inset:0;width:100%;height:100%;" +
-    (cfg.fit === "fit" ? "object-fit:contain;" : "object-fit:fill;");
+    `object-fit:${fitObjectFit(cfg.fit).objectFit};background:${fitObjectFit(cfg.fit).background};`;
   v.src = cfg.src ?? "";
   v.addEventListener("error", () => {
     console.warn("video error, fallback to default wallpaper", v.error);
@@ -169,9 +188,10 @@ function mountVideo(cfg: WallpaperConfig) {
 function mountGif(cfg: WallpaperConfig) {
   clear();
   const img = document.createElement("img");
+  const fit = fitObjectFit(cfg.fit);
   img.style.cssText =
     "position:absolute;inset:0;width:100%;height:100%;" +
-    (cfg.fit === "fit" ? "object-fit:contain;" : "object-fit:fill;");
+    `object-fit:${fit.objectFit};background:${fit.background};`;
   img.src = cfg.src ?? "";
   img.addEventListener("error", () => mountDefaultWallpaper());
   wrap.appendChild(img);
@@ -703,26 +723,27 @@ function mountScene(cfg: WallpaperConfig) {
       }
       if (disposed) return;
       // 每帧绘制文字
-      // 投影换算：世界坐标 → 屏幕物理像素。场景投影(projW×projH)映射到画布(c.width×c.height)。
+      // 投影换算：世界坐标 → 屏幕物理像素。场景投影(projW×projH)经 fitWindow 裁切/留边后映射到画布。
       const ortho = (scene as any).general?.orthogonalprojection;
       const projW = ortho?.width || c.width;
       const projH = ortho?.height || c.height;
-      const scaleX = c.width / projW;
-      const scaleY = c.height / projH;
       const drawTextFrame = () => {
         if (!textOverlay || !textCtx) return;
         const ctx = textCtx;
         ctx.clearRect(0, 0, textOverlay.width, textOverlay.height);
+        const win = fitWindow(normalizeFit(state.cfg.fit), projW, projH, c.width, c.height);
+        const scaleX = c.width / win.viewW;
+        const scaleY = c.height / win.viewH;
         const nowDate = new Date();
         for (const layer of textLayers) {
           try {
             const txt = resolveText(layer, nowDate);
             if (txt === null || txt === undefined || txt === "") continue;
-            // 世界坐标(y向下) → 画布物理像素：x 直接乘 scaleX；y 翻转后乘 scaleY
+            // 世界坐标(y向下) → 画布物理像素：经可见窗口偏移后映射，裁切/留边时文字位置仍正确
             const wx = layer.origin[0];
             const wy = layer.origin[1];
-            const px = wx * scaleX;
-            const py = (projH - wy) * scaleY;
+            const px = (wx - win.offX) * scaleX;
+            const py = (win.offY + win.viewH - wy) * scaleY;
             const sx = layer.scale[0] || 1;
             const sy = layer.scale[1] || 1;
             const basePts = layer.textPointsize || 24;
@@ -749,7 +770,7 @@ function mountScene(cfg: WallpaperConfig) {
         if (disposed) return;
         const t = (now - start) / 1000;
         void renderer
-          .render(scene, textures, c.width, c.height, t)
+          .render(scene, textures, c.width, c.height, t, normalizeFit(state.cfg.fit))
           .then(() => {
             if (disposed) return;
             try { drawTextFrame(); } catch (e) { /* 文字绘制失败忽略 */ }
@@ -817,8 +838,14 @@ window.__wp = {
     }
   },
   setFit(fit: string) {
+    state.cfg.fit = fit as WallpaperFit;
     const obj = state.video ?? state.img;
-    if (obj) obj.style.objectFit = fit === "fit" ? "contain" : "fill";
+    if (obj) {
+      const f = fitObjectFit(fit as WallpaperFit);
+      obj.style.objectFit = f.objectFit;
+      obj.style.background = f.background;
+    }
+    // 场景壁纸：fit 由渲染循环每帧读取 state.cfg.fit 并传给 fitWindow，无需重挂载即可实时切换
   },
   setVolume(volume: number) {
     if (state.video) {
@@ -836,7 +863,7 @@ const params = new URLSearchParams(location.search);
 const initialCfg: WallpaperConfig = {
   type: (params.get("type") as WallpaperConfig["type"]) ?? "canvas",
   src: params.get("src") ?? undefined,
-  fit: (params.get("fit") as WallpaperConfig["fit"]) ?? "fill",
+  fit: (params.get("fit") as WallpaperConfig["fit"]) ?? "cover",
   muted: params.get("muted") !== "false",
   loop: params.get("loop") !== "false",
   mediaBase: params.get("mediaBase") ?? undefined,

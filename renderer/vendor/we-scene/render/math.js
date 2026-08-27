@@ -63,7 +63,37 @@ export function mat4TransformPoint(m, x, y, z) {
 
 // 场景默认相机（WE 2D 约定：世界坐标 = 像素，y 向下）
 // 注意：2D 正交场景渲染时忽略 scene.json 的 eye/center/up（那是编辑器最后保存的相机状态，运行时不用），使用固定相机
-export function buildCamera(scene, width, height) {
+// 根据显示模式计算「可见窗口」：把场景设计尺寸（projW×projH）映射到屏幕（width×height）时，
+// 用统一的等比缩放，避免 16:9 内容在 16:10 屏幕上被拉伸。
+//   cover():  以较大缩放铺满并居中裁切溢出（无黑边、不变形，桌面壁纸默认）。
+//   contain():以较小缩放完整显示并居中留边（黑边由 clearColor 填充）。
+//   stretch()/其他：保持原行为，忽略宽高比铺满（会拉伸变形）。
+export function fitWindow(fit, projW, projH, width, height) {
+  if (fit === 'cover') {
+    const scale = Math.max(width / projW, height / projH)
+    const viewW = width / scale
+    const viewH = height / scale
+    return { offX: (projW - viewW) / 2, offY: (projH - viewH) / 2, viewW, viewH }
+  }
+  if (fit === 'contain') {
+    const screenAspect = width / height
+    const contentAspect = projW / projH
+    if (contentAspect > screenAspect) {
+      // 内容更宽：宽对齐、加高窗口以完整显示场景（上下留边）
+      const viewW = projW
+      const viewH = projW / screenAspect
+      return { offX: 0, offY: (projH - viewH) / 2, viewW, viewH }
+    }
+    // 内容更高：高对齐、加宽窗口以完整显示场景（左右留边）
+    const viewH = projH
+    const viewW = projH * screenAspect
+    return { offY: 0, offX: (projW - viewW) / 2, viewW, viewH }
+  }
+  // stretch（或未识别模式）：显示整个场景，交给 viewport 拉伸
+  return { offX: 0, offY: 0, viewW: projW, viewH: projH }
+}
+
+export function buildCamera(scene, width, height, fit) {
   const general = scene.general
   const cam = scene.camera
   const eyeV = cam && cam.eye ? parseVec(cam.eye) : [0, 0, 0]
@@ -73,9 +103,10 @@ export function buildCamera(scene, width, height) {
   const view = isOrtho ? mat4Identity() : mat4LookAt(eyeV, centerV, upV)
   const projW = general && general.orthogonalprojection ? general.orthogonalprojection.width || width : width
   const projH = general && general.orthogonalprojection ? general.orthogonalprojection.height || height : height
-  // 世界 y 向下：y=0 → NDC +1（屏幕顶）。ortho(left, right, top=projH, bottom=0)
-  const projection = mat4Ortho(0, projW, projH, 0, -10000, 10000)
-  return { view, projection, eye: eyeV, projW, projH }
+  // 世界 y 向下：y=0 → NDC +1（屏幕顶）。ortho(left, right, top, bottom)
+  const win = fitWindow(fit, projW, projH, width, height)
+  const projection = mat4Ortho(win.offX, win.offX + win.viewW, win.offY + win.viewH, win.offY, -10000, 10000)
+  return { view, projection, eye: eyeV, projW, projH, offX: win.offX, offY: win.offY, viewW: win.viewW, viewH: win.viewH }
 }
 
 function parseVec(s) {

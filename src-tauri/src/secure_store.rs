@@ -100,6 +100,16 @@ pub fn has(username: &str, dir: &Path) -> bool {
     load(username, dir).ok().flatten().is_some()
 }
 
+/// 清除本地凭据文件（登出）
+pub fn clear_all(dir: &Path) -> Result<(), String> {
+    let file = dir.join(FILE);
+    match std::fs::remove_file(&file) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
