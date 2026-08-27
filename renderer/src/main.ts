@@ -39,11 +39,21 @@ type WallpaperConfig = {
   type: "canvas" | "video" | "gif" | "web" | "scene" | "image";
   src?: string;
   fit?: WallpaperFit;
+  /** 渲染分辨率上限（有效 devicePixelRatio 封顶），越低越省内存；默认 1 */
+  renderDpr?: number;
+  /** 场景壁纸帧率上限（30/60/120），越低 GPU 占用越低；默认 60 */
+  sceneFps?: number;
   muted?: boolean;
   loop?: boolean;
   /** 内容服务器媒体基址：http://127.0.0.1:<port>/media/<token>（scene/web 拉取资源） */
   mediaBase?: string;
 };
+
+// 有效渲染 DPR = min(设备 DPR, renderDpr 上限)，用于压缩画布/纹理内存（Retina 上默认降到 1/4）。
+function effectiveDpr(cfg?: WallpaperConfig): number {
+  const cap = cfg?.renderDpr ?? state.cfg?.renderDpr ?? 1;
+  return Math.min(window.devicePixelRatio || 1, cap);
+}
 
 // 规范化显示模式：兼容旧会话里的 fill（=拉伸）与 fit（=适应）。
 // 旧 fill 是"忽略宽高比铺满"（会被拉伸变形），默认迁移到 cover 修复，不再默认拉伸。
@@ -119,8 +129,9 @@ function clear() {
 function mountCanvas() {
   clear();
   const c = document.createElement("canvas");
-  c.width = Math.max(1, Math.round(innerWidth * devicePixelRatio));
-  c.height = Math.max(1, Math.round(innerHeight * devicePixelRatio));
+  const dpr = effectiveDpr();
+  c.width = Math.max(1, Math.round(innerWidth * dpr));
+  c.height = Math.max(1, Math.round(innerHeight * dpr));
   c.style.cssText = "position:absolute;inset:0;width:100%;height:100%;";
   wrap.appendChild(c);
   const ctx = c.getContext("2d");
@@ -317,8 +328,9 @@ function evalTextUpdate(script: string): ((v: string) => string) | null {
 function mountScene(cfg: WallpaperConfig) {
   clear();
   const c = document.createElement("canvas");
-  c.width = Math.max(1, Math.round(innerWidth * devicePixelRatio));
-  c.height = Math.max(1, Math.round(innerHeight * devicePixelRatio));
+  const dpr = effectiveDpr(cfg);
+  c.width = Math.max(1, Math.round(innerWidth * dpr));
+  c.height = Math.max(1, Math.round(innerHeight * dpr));
   c.style.cssText = "position:absolute;inset:0;width:100%;height:100%;";
   wrap.appendChild(c);
   state.canvas = c;
@@ -389,6 +401,8 @@ function mountScene(cfg: WallpaperConfig) {
       const renderer = rnd.createRenderer(c, {
         shaderResolver,
         diag: (msg: string) => reportDiag(cfg, `renderer: ${msg}`),
+        // 效果链 FBO 降采样：降低 GPU 缓冲内存（全质量=0，0.5≈效果分辨率减半→内存约 1/4）
+        fboCapFactor: 0.5,
       });
       if (disposed) return;
 
@@ -766,21 +780,30 @@ function mountScene(cfg: WallpaperConfig) {
       };
       if (disposed) return;
       const start = performance.now();
+      let lastRender = -Infinity;
       const renderLoop = (now: number) => {
         if (disposed) return;
-        const t = (now - start) / 1000;
-        void renderer
-          .render(scene, textures, c.width, c.height, t, normalizeFit(state.cfg.fit))
-          .then(() => {
-            if (disposed) return;
-            try { drawTextFrame(); } catch (e) { /* 文字绘制失败忽略 */ }
-            state.raf = requestAnimationFrame(renderLoop);
-          })
-          .catch((e: Error) => {
-            console.warn("scene render error:", e);
-            reportDiag(cfg, `render: ${String(e.message || e).slice(0, 200)}`);
-            disposed = true;
-          });
+        // 帧率上限：比目标帧更快的帧直接跳过（不渲染、只继续排队），降低 GPU 占用。
+        const fps = state.cfg.sceneFps || 60;
+        const interval = 1000 / fps;
+        if (now - lastRender >= interval) {
+          lastRender = now;
+          const t = (now - start) / 1000;
+          void renderer
+            .render(scene, textures, c.width, c.height, t, normalizeFit(state.cfg.fit))
+            .then(() => {
+              if (disposed) return;
+              try { drawTextFrame(); } catch (e) { /* 文字绘制失败忽略 */ }
+              state.raf = requestAnimationFrame(renderLoop);
+            })
+            .catch((e: Error) => {
+              console.warn("scene render error:", e);
+              reportDiag(cfg, `render: ${String(e.message || e).slice(0, 200)}`);
+              disposed = true;
+            });
+        } else {
+          state.raf = requestAnimationFrame(renderLoop);
+        }
       };
       state.raf = requestAnimationFrame(renderLoop);
       reportDiag(cfg, `renderer started: ${scene.layers.length} layers`);
@@ -810,6 +833,10 @@ declare global {
       resume(): void;
       setFit(fit: string): void;
       setVolume(volume: number): void;
+      release(): void;
+      restore(): void;
+      setRenderDpr(dpr: number): void;
+      setSceneFps(fps: number): void;
     };
   }
 }
@@ -856,6 +883,23 @@ window.__wp = {
       state.sceneAudio.setVolume(volume);
     }
   },
+  // 释放壁纸渲染资源（画布/WebGL/视频/iframe），归还内存；保留 state.cfg 供 restore() 重建
+  release() {
+    clear();
+  },
+  // 重新挂载上次配置（显示器睡眠后唤醒、或 release() 之后恢复）
+  restore() {
+    if (state.cfg) mount(state.cfg);
+  },
+  // 动态调整渲染分辨率上限：需重建画布，重挂当前配置
+  setRenderDpr(dpr: number) {
+    state.cfg.renderDpr = dpr;
+    mount(state.cfg);
+  },
+  // 调整场景帧率：渲染循环每帧读取 state.cfg.sceneFps，无需重挂载即可实时生效
+  setSceneFps(fps: number) {
+    state.cfg.sceneFps = fps;
+  },
 };
 
 // 初始配置优先取自 URL query（壁纸引擎窗口创建时注入，同步无竞态）
@@ -864,6 +908,8 @@ const initialCfg: WallpaperConfig = {
   type: (params.get("type") as WallpaperConfig["type"]) ?? "canvas",
   src: params.get("src") ?? undefined,
   fit: (params.get("fit") as WallpaperConfig["fit"]) ?? "cover",
+  renderDpr: Number(params.get("renderDpr")) || 1,
+  sceneFps: Number(params.get("sceneFps")) || 60,
   muted: params.get("muted") !== "false",
   loop: params.get("loop") !== "false",
   mediaBase: params.get("mediaBase") ?? undefined,

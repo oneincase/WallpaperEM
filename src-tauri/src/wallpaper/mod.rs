@@ -17,12 +17,23 @@ use crate::db;
 use crate::content_server::ContentServerState;
 
 pub const DEFAULT_FIT: &str = "cover";
+/// 渲染分辨率上限（有效 devicePixelRatio 的封顶）：越低越省内存（GPU 画布/纹理）。
+/// 1.0 = 按逻辑分辨率渲染（Retina 上约为原先 1/4 内存）；2.0 = 不封顶（原清晰度）。
+pub const DEFAULT_RENDER_DPR: f32 = 1.0;
+/// 场景壁纸帧率上限（帧/秒）：越低 GPU 占用越低。可选 30 / 60 / 120，默认 60。
+pub const DEFAULT_SCENE_FPS: u32 = 60;
 
 fn default_type() -> String {
     "canvas".into()
 }
 fn default_fit() -> String {
     DEFAULT_FIT.into()
+}
+fn default_render_dpr() -> f32 {
+    DEFAULT_RENDER_DPR
+}
+fn default_scene_fps() -> u32 {
+    DEFAULT_SCENE_FPS
 }
 
 /// 全局壁纸显示模式（覆盖到每次应用/恢复），非法值回退到默认 cover。
@@ -49,6 +60,62 @@ fn apply_global_fit(app: &AppHandle, cfg: &mut WallpaperConfig) {
     }
     cfg.fit = fit;
 }
+
+/// 全局渲染分辨率上限（有效 dpr 封顶），读取设置 `wallpaper_render_dpr`，非法值回退到默认。
+fn global_render_dpr(conn: Option<&Connection>) -> f32 {
+    let raw = conn.and_then(|c| db::get_setting(c, "wallpaper_render_dpr"));
+    let parsed = raw
+        .as_deref()
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .unwrap_or(DEFAULT_RENDER_DPR);
+    parsed.clamp(0.5, 2.0)
+}
+
+/// 把全局渲染分辨率上限写进配置（应用/恢复壁纸时统一以全局为准）。
+fn apply_global_render_dpr(app: &AppHandle, cfg: &mut WallpaperConfig) {
+    let dpr: f32;
+    {
+        let db = app.try_state::<Arc<Mutex<Connection>>>();
+        dpr = match db {
+            Some(state) => match state.lock() {
+                Ok(conn) => global_render_dpr(Some(&conn)),
+                Err(_) => DEFAULT_RENDER_DPR,
+            },
+            None => DEFAULT_RENDER_DPR,
+        };
+    }
+    cfg.render_dpr = dpr;
+}
+
+/// 全局场景帧率上限（读设置 `wallpaper_scene_fps`），只允许 30/60/120，非法值回退 60。
+fn global_scene_fps(conn: Option<&Connection>) -> u32 {
+    let raw = conn.and_then(|c| db::get_setting(c, "wallpaper_scene_fps"));
+    let parsed = raw
+        .as_deref()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_SCENE_FPS);
+    match parsed {
+        30 | 60 | 120 => parsed,
+        _ => DEFAULT_SCENE_FPS,
+    }
+}
+
+/// 把全局场景帧率写进配置（应用/恢复壁纸时统一以全局为准）。
+fn apply_global_scene_fps(app: &AppHandle, cfg: &mut WallpaperConfig) {
+    let fps: u32;
+    {
+        let db = app.try_state::<Arc<Mutex<Connection>>>();
+        fps = match db {
+            Some(state) => match state.lock() {
+                Ok(conn) => global_scene_fps(Some(&conn)),
+                Err(_) => DEFAULT_SCENE_FPS,
+            },
+            None => DEFAULT_SCENE_FPS,
+        };
+    }
+    cfg.scene_fps = fps;
+}
+
 fn default_muted() -> bool {
     true
 }
@@ -68,6 +135,12 @@ pub struct WallpaperConfig {
     /// cover（等比铺满裁切，默认）| contain（等比留边）| stretch（拉伸，旧行为）
     #[serde(default = "default_fit")]
     pub fit: String,
+    /// 渲染分辨率上限（有效 dpr 封顶），越低越省内存
+    #[serde(default = "default_render_dpr")]
+    pub render_dpr: f32,
+    /// 场景壁纸帧率上限（30/60/120），越低 GPU 占用越低
+    #[serde(default = "default_scene_fps")]
+    pub scene_fps: u32,
     #[serde(default = "default_muted")]
     pub muted: bool,
     #[serde(default = "default_loop")]
@@ -83,6 +156,8 @@ impl Default for WallpaperConfig {
             r#type: default_type(),
             src: None,
             fit: default_fit(),
+            render_dpr: default_render_dpr(),
+            scene_fps: default_scene_fps(),
             muted: default_muted(),
             r#loop: default_loop(),
             media_base: None,
@@ -288,6 +363,8 @@ fn create_desktop_window(
     // 会话恢复来的 src 可能带上次运行的过期 token，用当前基址重写
     refresh_src(app, &mut cfg);
     apply_global_fit(app, &mut cfg);
+    apply_global_render_dpr(app, &mut cfg);
+    apply_global_scene_fps(app, &mut cfg);
     let query = config_query(&cfg);
     // 渲染器页与媒体同源（内容服务器），消除跨源 fetch 限制
     let port: u16 = match app.try_state::<Arc<Mutex<u16>>>() {
@@ -362,6 +439,8 @@ fn apply_on_main(
         let mut cfg2 = cfg.clone();
         cfg2.media_base = media_base(app);
         apply_global_fit(app, &mut cfg2);
+        apply_global_render_dpr(app, &mut cfg2);
+        apply_global_scene_fps(app, &mut cfg2);
         let js = format!(
             "window.__wp && window.__wp.setWallpaper({})",
             serde_json::to_string(&cfg2).map_err(|e| e.to_string())?
@@ -435,15 +514,16 @@ fn start_monitor(app: &AppHandle) {
                     if let Some(st) = app2.try_state::<WallpaperEngineState>() {
                         *st.paused.lock().unwrap() = true;
                     }
-                    eval_all(&app2, "window.__wp && window.__wp.pause()");
-                    tracing::info!("display asleep: wallpapers paused");
+                    // 睡眠：释放壁纸窗口的渲染资源（画布/WebGL/视频/iframe），归还内存；醒来后由 restore() 重建
+                    eval_all(&app2, "window.__wp && window.__wp.release()");
+                    tracing::info!("display asleep: wallpapers released");
                 } else if !asleep && was_asleep {
                     was_asleep = false;
                     if let Some(st) = app2.try_state::<WallpaperEngineState>() {
                         *st.paused.lock().unwrap() = false;
                     }
-                    eval_all(&app2, "window.__wp && window.__wp.resume()");
-                    tracing::info!("display woke: wallpapers resumed");
+                    eval_all(&app2, "window.__wp && window.__wp.restore()");
+                    tracing::info!("display woke: wallpapers restored");
                 }
             }
             let _ = now;
@@ -469,6 +549,8 @@ fn config_query(cfg: &WallpaperConfig) -> String {
         parts.push(format!("src={}", url_encode(src)));
     }
     parts.push(format!("fit={}", url_encode(&cfg.fit)));
+    parts.push(format!("renderDpr={}", cfg.render_dpr));
+    parts.push(format!("sceneFps={}", cfg.scene_fps));
     parts.push(format!("muted={}", cfg.muted));
     parts.push(format!("loop={}", cfg.r#loop));
     if let Some(base) = &cfg.media_base {
@@ -592,6 +674,34 @@ pub fn set_fit(app: AppHandle, fit: String) -> Result<(), String> {
     }
     let js = format!("window.__wp && window.__wp.setFit({:?})", fit);
     eval_all(&app, &js);
+    Ok(())
+}
+
+/// 设置全局渲染分辨率上限（有效 dpr 封顶），持久化并对所有壁纸窗口实时生效。
+#[tauri::command(rename = "wallpaper_set_render_dpr")]
+pub fn set_render_dpr(app: AppHandle, dpr: f32) -> Result<(), String> {
+    let dpr = dpr.clamp(0.5, 2.0);
+    if let Some(db) = app.try_state::<Arc<Mutex<Connection>>>() {
+        if let Ok(conn) = db.lock() {
+            let _ = db::set_setting(&conn, "wallpaper_render_dpr", &format!("{dpr}"));
+        }
+    }
+    eval_all(&app, &format!("window.__wp && window.__wp.setRenderDpr({dpr})"));
+    Ok(())
+}
+
+/// 设置全局场景帧率上限（30/60/120），持久化并对所有壁纸窗口实时生效。
+#[tauri::command(rename = "wallpaper_set_scene_fps")]
+pub fn set_scene_fps(app: AppHandle, fps: u32) -> Result<(), String> {
+    if !matches!(fps, 30 | 60 | 120) {
+        return Err(format!("场景帧率仅支持 30/60/120（收到 {fps}）"));
+    }
+    if let Some(db) = app.try_state::<Arc<Mutex<Connection>>>() {
+        if let Ok(conn) = db.lock() {
+            let _ = db::set_setting(&conn, "wallpaper_scene_fps", &fps.to_string());
+        }
+    }
+    eval_all(&app, &format!("window.__wp && window.__wp.setSceneFps({fps})"));
     Ok(())
 }
 

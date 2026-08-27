@@ -9,6 +9,12 @@ export function SettingsPage() {
   // 全局壁纸显示模式（cover/contain/stretch），默认 cover 等比铺满裁切
   const [fit, setFit] = useState<"cover" | "contain" | "stretch">("cover");
   const [fitMsg, setFitMsg] = useState("");
+  // 全局渲染分辨率上限（有效 dpr 封顶，越低越省内存），默认 1
+  const [renderDpr, setRenderDpr] = useState<number>(1);
+  const [renderDprMsg, setRenderDprMsg] = useState("");
+  // 全局场景帧率上限（30/60/120，越低 GPU 占用越低），默认 60
+  const [sceneFps, setSceneFps] = useState<number>(60);
+  const [sceneFpsMsg, setSceneFpsMsg] = useState("");
   // 下载账号
   const [cred, setCred] = useState<{ configured: boolean; username?: string } | null>(null);
   const [editingCred, setEditingCred] = useState(false);
@@ -37,6 +43,12 @@ export function SettingsPage() {
       .catch(() => {});
     invoke<string | null>("settings_get", { key: "wallpaper_fit" })
       .then((v) => setFit((v as "cover" | "contain" | "stretch") || "cover"))
+      .catch(() => {});
+    invoke<string | null>("settings_get", { key: "wallpaper_render_dpr" })
+      .then((v) => setRenderDpr(Number(v) || 1))
+      .catch(() => {});
+    invoke<string | null>("settings_get", { key: "wallpaper_scene_fps" })
+      .then((v) => setSceneFps(Number(v) || 60))
       .catch(() => {});
     api
       .downloadCredentialsStatus()
@@ -238,6 +250,26 @@ export function SettingsPage() {
     }
   };
 
+  const changeRenderDpr = async (next: number) => {
+    setRenderDprMsg("");
+    try {
+      await api.wallpaperSetRenderDpr(next);
+      setRenderDpr(next);
+    } catch (e) {
+      setRenderDprMsg(String(e));
+    }
+  };
+
+  const changeSceneFps = async (next: number) => {
+    setSceneFpsMsg("");
+    try {
+      await api.wallpaperSetSceneFps(next);
+      setSceneFps(next);
+    } catch (e) {
+      setSceneFpsMsg(String(e));
+    }
+  };
+
   return (
     <div className="flex flex-col h-full px-7 py-5">
       {/* 头部区域 - 固定在顶部 */}
@@ -428,6 +460,54 @@ export function SettingsPage() {
                 <option value="stretch">拉伸（不推荐）</option>
               </select>
               {fitMsg && <span className="text-[12px] text-red-500">{fitMsg}</span>}
+            </div>
+          }
+        />
+        <Row
+          label="渲染清晰度（省内存）"
+          desc={
+            renderDpr <= 1
+              ? "流畅：按逻辑分辨率渲染（Retina 上内存约降为原来的 1/4，壁纸稍柔和）"
+              : renderDpr < 2
+                ? "均衡：1.5 倍渲染，画质与内存折中"
+                : "清晰：不封顶（原生分辨率，内存占用最高）"
+          }
+          control={
+            <div className="flex items-center gap-2">
+              <select
+                value={renderDpr}
+                onChange={(e) => changeRenderDpr(Number(e.target.value))}
+                className="rounded-lg border border-[var(--separator)] bg-[var(--content)] px-2 py-1 text-[12.5px] outline-none focus:border-[var(--accent)]"
+              >
+                <option value={1}>流畅 1x（默认）</option>
+                <option value={1.5}>均衡 1.5x</option>
+                <option value={2}>清晰 2x</option>
+              </select>
+              {renderDprMsg && <span className="text-[12px] text-red-500">{renderDprMsg}</span>}
+            </div>
+          }
+        />
+        <Row
+          label="场景帧率（省 GPU）"
+          desc={
+            sceneFps <= 30
+              ? "30 FPS：GPU 占用最低，场景动画/视差略卡"
+              : sceneFps >= 120
+                ? "120 FPS：最流畅，GPU 占用最高（需高刷屏才看得出）"
+                : "60 FPS：默认，画质与 GPU 占用均衡"
+          }
+          control={
+            <div className="flex items-center gap-2">
+              <select
+                value={sceneFps}
+                onChange={(e) => changeSceneFps(Number(e.target.value))}
+                className="rounded-lg border border-[var(--separator)] bg-[var(--content)] px-2 py-1 text-[12.5px] outline-none focus:border-[var(--accent)]"
+              >
+                <option value={30}>30 FPS（省 GPU）</option>
+                <option value={60}>60 FPS（默认）</option>
+                <option value={120}>120 FPS（高刷）</option>
+              </select>
+              {sceneFpsMsg && <span className="text-[12px] text-red-500">{sceneFpsMsg}</span>}
             </div>
           }
         />

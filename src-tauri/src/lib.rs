@@ -147,6 +147,8 @@ pub fn run() {
             wallpaper::resume_all,
             wallpaper::set_volume,
             wallpaper::set_fit,
+            wallpaper::set_render_dpr,
+            wallpaper::set_scene_fps,
             wallpaper::interactive_set,
             wallpaper::next,
             wallpaper::playlist_list,
