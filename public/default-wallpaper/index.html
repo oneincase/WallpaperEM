@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>WallpaperEM</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #0b1020; }
+  body { position: relative; font-family: -apple-system, "SF Pro Display", "PingFang SC", "Segoe UI", sans-serif; }
+
+  /* 动态渐变背景 */
+  .bg {
+    position: absolute; inset: -30%;
+    background: linear-gradient(125deg, #10131f 0%, #1b2439 25%, #20304d 45%, #351b45 70%, #122b3f 90%, #0b1020 100%);
+    filter: blur(60px); opacity: .85;
+    animation: drift 26s ease-in-out infinite alternate;
+  }
+  @keyframes drift {
+    0%   { transform: translate3d(-4%, -3%, 0) scale(1); }
+    50%  { transform: translate3d(4%, 3%, 0) scale(1.06); }
+    100% { transform: translate3d(-2%, 2%, 0) scale(1.02); }
+  }
+
+  /* 漂浮光斑 */
+  .orb {
+    position: absolute; border-radius: 50%;
+    filter: blur(18px); opacity: .5;
+    mix-blend-mode: screen;
+    animation: float var(--d, 14s) ease-in-out infinite;
+  }
+  @keyframes float {
+    0%,100% { transform: translate(0,0) scale(1); }
+    50%     { transform: translate(6vw,-8vh) scale(1.15); }
+  }
+  .o1 { --d: 18s; width: 34vw; height: 34vw; left: -6vw; top: -10vh; background: radial-gradient(circle at 30% 30%, #4dd0ff, transparent 70%); }
+  .o2 { --d: 22s; width: 30vw; height: 30vw; right: -8vw; top: 4vh;  background: radial-gradient(circle at 30% 30%, #b06bff, transparent 70%); }
+  .o3 { --d: 16s; width: 26vw; height: 26vw; left: 24vw; bottom: -14vh; background: radial-gradient(circle at 30% 30%, #69ffc7, transparent 70%); }
+  .o4 { --d: 26s; width: 18vw; height: 18vw; right: 18vw; bottom: 6vh; background: radial-gradient(circle at 30% 30%, #ff8ad2, transparent 70%); }
+
+  /* 细网格点缀 */
+  .grain {
+    position: absolute; inset: 0; opacity: .14;
+    background-image:
+      radial-gradient(circle at 1px 1px, rgba(255,255,255,.6) 1px, transparent 0);
+    background-size: 34px 34px;
+    -webkit-mask-image: radial-gradient(120% 120% at 50% 40%, #000 30%, transparent 90%);
+            mask-image: radial-gradient(120% 120% at 50% 40%, #000 30%, transparent 90%);
+  }
+
+  /* 中央内容 */
+  .center {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 18px; text-align: center; color: #f5f5f7;
+  }
+  .logo {
+    width: 88px; height: 88px; object-fit: contain;
+    filter: drop-shadow(0 14px 34px rgba(90,150,255,.5));
+  }
+  h1 { font-size: 30px; font-weight: 700; letter-spacing: .3px; text-shadow: 0 2px 24px rgba(0,0,0,.4); }
+  .sub { font-size: 14px; color: rgba(255,255,255,.6); letter-spacing: 1px; }
+  .clock {
+    font-size: 92px; font-weight: 200; font-variant-numeric: tabular-nums;
+    letter-spacing: 2px; line-height: 1; color: #fff;
+    text-shadow: 0 4px 40px rgba(70,130,255,.5);
+  }
+  .date { font-size: 16px; color: rgba(255,255,255,.55); letter-spacing: 2px; margin-top: 2px; }
+
+  /* 底部提示 */
+  .hint {
+    position: absolute; left: 0; right: 0; bottom: 6vh; text-align: center;
+    font-size: 12.5px; color: rgba(255,255,255,.4); letter-spacing: .5px;
+  }
+  .hint b { color: rgba(255,255,255,.7); font-weight: 600; }
+</style>
+</head>
+<body>
+  <script>document.addEventListener("contextmenu", e => e.preventDefault());</script>
+  <div class="bg"></div>
+  <div class="orb o1"></div>
+  <div class="orb o2"></div>
+  <div class="orb o3"></div>
+  <div class="orb o4"></div>
+  <div class="grain"></div>
+
+  <div class="center">
+    <img src="icon.png" class="logo" alt="WallpaperEM" />
+    <h1>WallpaperEM</h1>
+    <div class="sub">壁纸引擎 · DESKTOP</div>
+    <div class="clock" id="clock">--:--:--</div>
+    <div class="date" id="date"></div>
+  </div>
+
+  <div class="hint">在应用内 <b>下载壁纸</b> 后即可替换此默认壁纸</div>
+
+  <script>
+    const uk = (n) => String(n).padStart(2, "0");
+    const tick = () => {
+      const d = new Date();
+      document.getElementById("clock").textContent = `${uk(d.getHours())}:${uk(d.getMinutes())}:${uk(d.getSeconds())}`;
+      const wd = ["周日","周一","周二","周三","周四","周五","周六"][d.getDay()];
+      document.getElementById("date").textContent = `${d.getFullYear()}年${uk(d.getMonth()+1)}月${uk(d.getDate())}日 ${wd}`;
+    };
+    tick();
+    setInterval(tick, 1000);
+  </script>
+</body>
+</html>

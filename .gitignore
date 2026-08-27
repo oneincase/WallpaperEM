@@ -1,0 +1,42 @@
+# --- macOS ---
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# --- Node / 前端 ---
+node_modules/
+dist/
+*.local
+*.log
+*.tsbuildinfo
+
+# --- Rust / Cargo / Tauri ---
+src-tauri/target/
+# 本地 cargo 缓存（本仓库曾含 .cargo-home，勿提交）
+.cargo-home/
+# Tauri 打包产物（app / dmg 在 src-tauri/target 内，此处兜底）
+release/
+bundle/
+
+# --- 编辑器/脚本临时备份 ---
+*.bak
+*~
+
+# --- 依赖下载 sidecar 二进制（体积大，请自行决定是否用 Git LFS 入库）---
+src-tauri/binaries/depot-downloader-*
+
+# --- 本地运行数据（若误放仓库内）---
+*.db
+*.db-journal
+*.db-wal
+credentials.dat
+
+# --- IDE / 编辑器 ---
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# --- 依赖下载产生的工坊子目录标记（如需重新分发请自行决定）---
+# src-tauri/binaries/depot-downloader-*（sidecar 二进制；如需入库请自行添加，不默认忽略）

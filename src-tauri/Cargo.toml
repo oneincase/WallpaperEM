@@ -1,0 +1,47 @@
+[package]
+name = "we-wallpaper"
+version = "0.1.0"
+description = "WallpaperEM —— macOS 动态壁纸引擎（Tauri 2.11.2），支持 Steam 工坊视频/场景/网页/图片壁纸"
+license = "MIT"
+edition = "2021"
+
+[lib]
+name = "we_wallpaper_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2.11.2", features = ["macos-private-api", "tray-icon", "image-png"] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-opener = "2"
+window-vibrancy = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
+tracing-appender = "0.2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+dirs = "5"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+regex = "1"
+url = "2"
+rand = "0.8"
+chrono = "0.4"
+sha2 = "0.10"
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs"] }
+keyring = { version = "3", features = ["apple-native"] }
+libc = "0.2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = "0.3"
+objc2-foundation = "0.3"
+objc2-core-graphics = "0.3"
