@@ -7,10 +7,17 @@ import {
 } from "../api/steam";
 import { useWallpaperMeta } from "../hooks/useWallpaperMeta";
 
+// 模块级缓存：首次成功获取后保存随机壁纸列表与选中位置。
+// 切换页面导致组件重新挂载时直接复用缓存、不再发请求；
+// 只有点击「换一批」时才请求新一批并更新缓存。
+let cachedItems: WorkshopItemSummary[] | null = null;
+let cachedIndex = 0;
+
 export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void }) {
-  const [items, setItems] = useState<WorkshopItemSummary[]>([]);
-  const [index, setIndex] = useState(0);
-  const [loading, setLoading] = useState(true);
+  // 初始值取自缓存：有缓存时不显示骨架屏、不重新请求
+  const [items, setItems] = useState<WorkshopItemSummary[]>(cachedItems ?? []);
+  const [index, setIndex] = useState(cachedIndex);
+  const [loading, setLoading] = useState(cachedItems === null);
   const [error, setError] = useState("");
   const [applying, setApplying] = useState(false);
   const [enqueuing, setEnqueuing] = useState(false);
@@ -38,6 +45,9 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
       }
       setItems(list);
       setIndex(0);
+      // 写入模块缓存，切换页面回来时复用
+      cachedItems = list;
+      cachedIndex = 0;
     } catch (e) {
       setError(String(e));
     } finally {
@@ -48,9 +58,15 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
   }, []);
 
   useEffect(() => {
-    load();
+    // 仅首次（无缓存）时请求；切回页面时复用缓存，不触发刷新
+    if (cachedItems === null) load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // 选中位置同步到模块缓存，切换页面后回来时恢复
+  useEffect(() => {
+    cachedIndex = index;
+  }, [index]);
 
   // 收藏状态
   useEffect(() => {
