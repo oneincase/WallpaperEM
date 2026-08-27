@@ -95,7 +95,9 @@ async fn proxy_renderer(
         // dev：代理到 vite dev server（与 tauri.conf devUrl 一致）
         let vite_path = path.trim_start_matches('/');
         let upstream = format!("http://localhost:1420/{vite_path}");
+        // 本地 vite 直连，绝不走系统代理（否则 dev 下渲染器页/媒体加载失败）
         let client = reqwest::Client::builder()
+            .no_proxy()
             .build()
             .map_err(|e| e.to_string())?;
         match client.get(&upstream).send().await {
@@ -164,7 +166,9 @@ async fn proxy_default_wallpaper(
         // dev：代理到 vite dev server（public/default-wallpaper）
         let vite_path = path.trim_start_matches('/');
         let upstream = format!("http://localhost:1420/{vite_path}");
+        // 本地 vite 直连，绝不走系统代理
         let client = reqwest::Client::builder()
+            .no_proxy()
             .build()
             .map_err(|e| e.to_string())?;
         match client.get(&upstream).send().await {
@@ -238,7 +242,9 @@ async fn proxy_static(
     {
         let vite_path = path.trim_start_matches('/');
         let upstream = format!("http://localhost:1420/{vite_path}");
+        // 本地 vite 直连，绝不走系统代理
         let client = reqwest::Client::builder()
+            .no_proxy()
             .build()
             .map_err(|e| e.to_string())?;
         match client.get(&upstream).send().await {

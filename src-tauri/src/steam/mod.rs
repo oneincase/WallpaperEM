@@ -21,7 +21,7 @@ impl SteamClient {
         &self.inner
     }
 
-    pub fn new(proxy: Option<String>) -> Result<Self, String> {
+    pub fn new(proxy: Option<String>, follow_system_proxy: bool) -> Result<Self, String> {
         let mut builder = reqwest::Client::builder()
             .user_agent(UA)
             .timeout(Duration::from_secs(30));
@@ -29,6 +29,11 @@ impl SteamClient {
             builder = builder
                 .proxy(reqwest::Proxy::all(&p).map_err(|e| format!("代理配置无效: {e}"))?);
             tracing::info!("steam client using proxy {p}");
+        } else if !follow_system_proxy {
+            builder = builder.no_proxy();
+            tracing::info!("steam client: system proxy disabled, direct connection");
+        } else {
+            tracing::info!("steam client: following system proxy");
         }
         Ok(Self {
             inner: builder.build().map_err(|e| format!("HTTP 客户端初始化失败: {e}"))?,

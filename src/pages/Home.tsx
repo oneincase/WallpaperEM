@@ -146,11 +146,29 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
 
       {loading && (
         <div className="flex flex-col gap-3 flex-1 min-h-0">
-          <div className="card aspect-video animate-pulse flex-1 min-h-0" />
-          <div className="flex gap-3 shrink-0">
-            {Array.from({ length: 6 }).map((_, i) => (
-              <div key={i} className="h-[76px] w-[136px] shrink-0 rounded-lg animate-pulse" style={{ background: "var(--card)" }} />
-            ))}
+          {/* 上方大屏预览骨架：与加载后布局一致（占满剩余高度 + 底部操作条高度） */}
+          <div className="card overflow-hidden flex flex-col min-h-0 flex-1">
+            <div className="relative flex-1 min-h-0" style={{ background: "var(--card)" }}>
+              <div className="absolute inset-0 animate-pulse" style={{ background: "var(--separator)" }} />
+            </div>
+            <div className="flex items-center gap-2 px-5 py-3 shrink-0">
+              <div className="h-[30px] w-[130px] animate-pulse rounded-lg" style={{ background: "var(--separator)" }} />
+              <div className="h-[30px] w-[90px] animate-pulse rounded-lg" style={{ background: "var(--separator)" }} />
+              <div className="h-[30px] w-[90px] animate-pulse rounded-lg" style={{ background: "var(--separator)" }} />
+            </div>
+          </div>
+          {/* 下方直排列表骨架：与加载后一致（16/10 图 + 标题行） */}
+          <div className="flex items-center gap-2 shrink-0">
+            <div className="h-[30px] w-[30px] shrink-0 animate-pulse rounded-lg" style={{ background: "var(--separator)" }} />
+            <div className="flex flex-1 gap-3 overflow-hidden">
+              {Array.from({ length: 6 }).map((_, i) => (
+                <div key={i} className="w-[136px] shrink-0" style={{ background: "var(--card)" }}>
+                  <div className="aspect-[16/10] animate-pulse" style={{ background: "var(--separator)" }} />
+                  <div className="h-[14px] mt-1 mx-1.5 mb-1.5 animate-pulse rounded" style={{ background: "var(--separator)" }} />
+                </div>
+              ))}
+            </div>
+            <div className="h-[30px] w-[30px] shrink-0 animate-pulse rounded-lg" style={{ background: "var(--separator)" }} />
           </div>
         </div>
       )}

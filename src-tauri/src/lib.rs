@@ -193,12 +193,16 @@ pub fn run() {
 
 /// 初始化 Steam 客户端与工坊服务（代理从设置读取）
 fn init_steam(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
-    let proxy: Option<String> = {
+    let (proxy, follow_system_proxy): (Option<String>, bool) = {
         let db = app.state::<Arc<Mutex<Connection>>>();
         let conn = db.lock().map_err(|e| e.to_string())?;
-        db::get_setting(&conn, "steam_proxy")
+        let proxy = db::get_setting(&conn, "steam_proxy");
+        let follow = db::get_setting(&conn, "follow_system_proxy")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(true);
+        (proxy, follow)
     };
-    let client = steam::SteamClient::new(proxy)?;
+    let client = steam::SteamClient::new(proxy, follow_system_proxy)?;
     app.manage(client.clone());
     let db = app.state::<Arc<Mutex<Connection>>>();
     app.manage(Arc::new(workshop::WorkshopService::new(client, db.inner().clone())));

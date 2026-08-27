@@ -15,6 +15,7 @@ export function SettingsPage() {
   // 代理
   const [proxy, setProxy] = useState("");
   const [proxyMsg, setProxyMsg] = useState("");
+  const [followSystemProxy, setFollowSystemProxy] = useState(true);
 
   useEffect(() => {
     invoke<boolean>("autostart_status").then(setAutostart).catch(console.warn);
@@ -29,6 +30,9 @@ export function SettingsPage() {
       })
       .catch(console.warn);
     api.downloadToolStatus().then(setTool).catch(console.warn);
+    invoke<string | null>("settings_get", { key: "follow_system_proxy" })
+      .then((v) => setFollowSystemProxy(v == null || v === "true" || v === "1"))
+      .catch(() => {});
     invoke<string | null>("settings_get", { key: "download_proxy" })
       .then((p) => setProxy(p ?? ""))
       .catch(() => {});
@@ -54,10 +58,27 @@ export function SettingsPage() {
   const saveProxy = async () => {
     setProxyMsg("");
     try {
+      await invoke("settings_set", {
+        key: "follow_system_proxy",
+        value: followSystemProxy ? "true" : "false",
+      });
       await invoke("settings_set", { key: "download_proxy", value: proxy.trim() });
       setProxyMsg("✅ 已保存（工坊访问重启应用后生效）");
     } catch (e) {
       setProxyMsg(String(e));
+    }
+  };
+
+  const toggleFollowSystemProxy = async () => {
+    const next = !followSystemProxy;
+    try {
+      await invoke("settings_set", {
+        key: "follow_system_proxy",
+        value: next ? "true" : "false",
+      });
+      setFollowSystemProxy(next);
+    } catch {
+      // 失败则不变
     }
   };
 
@@ -199,8 +220,17 @@ export function SettingsPage() {
           }
         />
         <Row
-          label="下载/工坊代理"
-          desc="如 http://127.0.0.1:7890（大陆网络访问 Steam 建议配置）；工坊访问重启应用后生效"
+          label="跟随系统代理"
+          desc={
+            followSystemProxy
+              ? "开启：自动使用 macOS「系统设置 → 网络 → 代理」中的配置访问创意工坊（默认开启）"
+              : "关闭：绕过系统代理，直连网络访问创意工坊"
+          }
+          control={<Switch checked={followSystemProxy} onChange={toggleFollowSystemProxy} />}
+        />
+        <Row
+          label="手动代理"
+          desc="可选，优先级高于系统代理；如 http://127.0.0.1:7890（大陆网络访问 Steam 建议配置）；工坊访问重启应用后生效"
           control={null}
         />
         <div className="mt-1 flex items-center gap-2">
