@@ -1,6 +1,6 @@
 [package]
 name = "WallpaperEM"
-version = "0.3.0"
+version = "0.4.0"
 description = "WallpaperEM —— macOS 动态壁纸引擎（Tauri 2.11.2），支持 Steam 工坊视频/场景/网页/图片壁纸"
 license = "MIT"
 edition = "2021"
