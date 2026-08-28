@@ -81,3 +81,20 @@ export const IconStop = ({ size }: { size?: number }) => (
     <rect x="5.5" y="5.5" width="13" height="13" rx="2" fill="currentColor" stroke="none" />
   </Svg>
 );
+
+// 侧边栏收缩 / 展开（分栏图标）
+export const IconSidebarCollapse = () => (
+  <svg
+    width={17}
+    height={17}
+    viewBox="0 0 24 24"
+    fill="none"
+    xmlns="http://www.w3.org/2000/svg"
+    style={{ flexShrink: 0 }}
+  >
+    <rect x="1.5" y="1.5" width="21" height="21" rx="4" stroke="currentColor" strokeWidth="2" />
+    <line x1="8" y1="2" x2="8" y2="22" stroke="currentColor" strokeWidth="2" />
+  </svg>
+);
+
+export const IconSidebarExpand = IconSidebarCollapse;
