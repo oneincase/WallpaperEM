@@ -119,6 +119,7 @@ pub fn ensure_main_window(app: &AppHandle) {
         .center()
         .title_bar_style(tauri::TitleBarStyle::Overlay)
         .hidden_title(true)
+        .transparent(true)
         .build();
     match built {
         Ok(w) => {
