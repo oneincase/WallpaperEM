@@ -4,6 +4,7 @@
 
 use rusqlite::Connection;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -30,15 +31,29 @@ pub struct WorkshopService {
     client: SteamClient,
     db: Arc<Mutex<Connection>>,
     cache: Mutex<HashMap<String, (Instant, serde_json::Value)>>,
+    /// 工作友好（默认开启）：开启后过滤成人 / NSFW 内容（Arc 内部可变，支持运行时切换）
+    family_friendly: AtomicBool,
 }
 
 impl WorkshopService {
     pub fn new(client: SteamClient, db: Arc<Mutex<Connection>>) -> Self {
+        let family_friendly = db::get_setting(&db.lock().unwrap(), "family_friendly")
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(true);
         Self {
             client,
             db,
             cache: Mutex::new(HashMap::new()),
+            family_friendly: AtomicBool::new(family_friendly),
         }
+    }
+
+    /// 列表摘要是否应被过滤（工作友好开启 + 命中成人特征）
+    fn is_adult_summary(&self, it: &WorkshopItemSummary) -> bool {
+        if !self.family_friendly.load(Ordering::Relaxed) {
+            return false;
+        }
+        crate::sfw::is_adult_text(&it.title) || crate::sfw::is_adult_tags(&it.tags)
     }
 
     fn cache_get(&self, key: &str, ttl: Duration) -> Option<serde_json::Value> {
@@ -91,6 +106,12 @@ impl WorkshopService {
         .await?;
 
         let items = self.enrich(&raw.items).await?;
+
+        // 工作友好（默认开启）：自动过滤成人内容
+        let items = items
+            .into_iter()
+            .filter(|i| !self.is_adult_summary(i))
+            .collect::<Vec<_>>();
 
         // 服务端 requiredtags 可能不完整生效，本地二次过滤兜底
         let items = items
@@ -148,6 +169,10 @@ impl WorkshopService {
         if total == 0 {
             // 未解析到总数：直接返回第 1 页（不缓存）
             let items = self.enrich(&raw1.items).await?;
+            let items: Vec<_> = items
+                .into_iter()
+                .filter(|i| !self.is_adult_summary(i))
+                .collect();
             let page_size = items.len();
             let has_more = page_size > 0;
             return Ok(WorkshopSearchResult {
@@ -172,6 +197,10 @@ impl WorkshopService {
         )
         .await?;
         let items = self.enrich(&raw.items).await?;
+        let items: Vec<_> = items
+            .into_iter()
+            .filter(|i| !self.is_adult_summary(i))
+            .collect();
         let page_size = items.len();
         let has_more = page_size > 0;
         Ok(WorkshopSearchResult {
@@ -190,6 +219,20 @@ impl WorkshopService {
         }
         let details = get_item_details(&self.client, &[id.to_string()]).await?;
         let item = details.into_iter().next();
+        // 工作友好（默认开启）：详情命中成人内容 → 视为不存在（自动过滤）
+        if self.family_friendly.load(Ordering::Relaxed) {
+            let adult = item.as_ref().is_some_and(|it| {
+                crate::sfw::is_adult_full(
+                    &it.title,
+                    &it.description,
+                    it.creator.as_deref(),
+                    &it.tags,
+                )
+            });
+            if adult {
+                return Ok(None);
+            }
+        }
         if let Some(it) = &item {
             let conn = self.db.lock().map_err(|e| e.to_string())?;
             db::upsert_workshop_item(&conn, it)?;
@@ -294,4 +337,22 @@ pub async fn workshop_item(
     id: String,
 ) -> Result<Option<WorkshopItem>, String> {
     svc.detail(&id).await
+}
+
+/// 切换「工作友好」（自动过滤成人内容）。返回当前开关状态（默认开启）。
+#[tauri::command]
+pub async fn workshop_set_family_friendly(
+    svc: tauri::State<'_, Arc<WorkshopService>>,
+    enabled: bool,
+) -> Result<bool, String> {
+    {
+        let conn = svc.db.lock().map_err(|e| e.to_string())?;
+        db::set_setting(&conn, "family_friendly", if enabled { "true" } else { "false" })?;
+    }
+    svc.cache
+        .lock()
+        .unwrap()
+        .retain(|k, _| !k.starts_with("search:"));
+    svc.family_friendly.store(enabled, Ordering::Relaxed);
+    Ok(enabled)
 }

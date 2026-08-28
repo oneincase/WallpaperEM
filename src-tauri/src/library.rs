@@ -32,7 +32,7 @@ pub fn library_list(
     let conn = db.lock().map_err(|e| e.to_string())?;
     let mut sql = String::from(
         "SELECT l.item_id, l.title, l.type, COALESCE(w.preview_url, ''), COALESCE(w.tags,'[]'),
-                l.size_bytes, l.file_count, l.downloaded_at, COALESCE(w.type, '')
+                l.size_bytes, l.file_count, l.downloaded_at, COALESCE(w.type, ''), COALESCE(l.tags,'[]')
          FROM library_items l LEFT JOIN workshop_items w ON w.id = l.item_id",
     );
     if let Some(t) = &r#type {
@@ -47,8 +47,15 @@ pub fn library_list(
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |r| {
-                let tags: Vec<String> =
+                let mut tags: Vec<String> =
                     serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or_default();
+                let ltags: Vec<String> =
+                    serde_json::from_str(&r.get::<_, String>(9)?).unwrap_or_default();
+                for t in ltags {
+                    if !tags.contains(&t) {
+                        tags.push(t);
+                    }
+                }
                 let item_id: String = r.get(0)?;
                 let lt: String = r.get(2)?;
                 let wt: String = r.get(8)?;
@@ -70,7 +77,7 @@ pub fn library_list(
                             } else {
                                 Some(p)
                             }
-                        },
+                            },
                         tags,
                         size_bytes: r.get(5)?,
                         file_count: r.get(6)?,
@@ -94,9 +101,15 @@ pub fn library_list(
             }
         }
     }
+    // 工作友好（默认开启）：本地库同样过滤成人 / Mature 内容
+    let family_friendly = crate::sfw::is_family_friendly(&conn);
     drop(conn);
 
     let mut items = items.into_iter().map(|(it, _)| it).collect::<Vec<_>>();
+
+    if family_friendly {
+        items.retain(|it| !crate::sfw::is_adult_item(&it.title, &it.tags));
+    }
 
     // 无工坊元数据的条目：回退到本地 preview.gif（经内容服务器）
     for it in items.iter_mut() {

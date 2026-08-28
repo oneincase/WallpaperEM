@@ -26,24 +26,37 @@ pub fn favorites_list(app: AppHandle) -> Result<Vec<FavoriteItem>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT f.item_id, COALESCE(w.title, f.item_id), COALESCE(w.preview_url, ''),
-                    COALESCE(w.type, 'unknown'), f.created_at
+                    COALESCE(w.type, 'unknown'), f.created_at, COALESCE(w.tags,'[]')
              FROM favorites f LEFT JOIN workshop_items w ON w.id = f.item_id
              ORDER BY f.created_at DESC",
         )
         .map_err(|e| e.to_string())?;
+    let family_friendly = crate::sfw::is_family_friendly(&conn);
     let rows = stmt
         .query_map([], |r| {
             let preview: String = r.get(2)?;
-            Ok(FavoriteItem {
-                item_id: r.get(0)?,
-                title: r.get(1)?,
-                preview_url: if preview.is_empty() { None } else { Some(preview) },
-                r#type: r.get(3)?,
-                created_at: r.get(4)?,
-            })
+            let tags: Vec<String> =
+                serde_json::from_str(&r.get::<_, String>(5)?).unwrap_or_default();
+            let title: String = r.get(1)?;
+            Ok((
+                FavoriteItem {
+                    item_id: r.get(0)?,
+                    title,
+                    preview_url: if preview.is_empty() { None } else { Some(preview) },
+                    r#type: r.get(3)?,
+                    created_at: r.get(4)?,
+                },
+                tags,
+            ))
         })
-        .map_err(|e| e.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .filter(|(it, tags)| {
+            !(family_friendly && crate::sfw::is_adult_item(&it.title, tags))
+        })
+        .map(|(it, _)| it)
+        .collect::<Vec<_>>();
+    Ok(rows)
 }
 
 #[tauri::command]

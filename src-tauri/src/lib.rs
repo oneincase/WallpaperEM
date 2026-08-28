@@ -10,6 +10,7 @@ mod secure_store;
 mod library;
 mod main_window;
 mod misc;
+mod sfw;
 mod steam;
 mod util;
 mod wallpaper;
@@ -154,6 +155,7 @@ pub fn run() {
             workshop::workshop_search,
             workshop::workshop_random,
             workshop::workshop_item,
+            workshop::workshop_set_family_friendly,
             download::download_tool_status,
             download::download_credentials_set,
             download::download_credentials_status,
