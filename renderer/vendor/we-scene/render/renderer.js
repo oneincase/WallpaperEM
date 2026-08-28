@@ -708,6 +708,13 @@ export function createRenderer(canvas, opts = {}) {
     setParticleRenderer: function (fn) {
       renderParticlesFn = fn
     },
+    // 释放 WebGL 上下文（loseContext → 浏览器回收全部纹理/FBO/program/buffer）
+    dispose: function () {
+      try {
+        const ext = gl.getExtension('WEBGL_lose_context')
+        if (ext) ext.loseContext()
+      } catch (e) { /* 忽略：无法强制释放时交给 GC 兜底 */ }
+    },
   }
 }
 

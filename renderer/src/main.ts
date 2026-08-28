@@ -81,6 +81,12 @@ const state: {
   raf?: number;
   sceneCleanup?: () => void;
   sceneAudio?: { setVolume: (vol: number) => void; audios: HTMLAudioElement[] };
+  /** 当前场景渲染器（含 dispose 释放 WebGL 上下文） */
+  renderer?: { dispose?: () => void };
+  /** 待 revoke 的 blob URL（场景视频纹理 + 音效） */
+  objectUrls?: string[];
+  /** 场景内视频纹理元素（暂停并移除） */
+  videoTextures?: HTMLVideoElement[];
 } = { cfg: { type: "canvas" } };
 
 document.documentElement.style.cssText = "margin:0;height:100%;background:transparent;";
@@ -109,6 +115,28 @@ function clear() {
   state.raf = undefined;
   if (state.sceneCleanup) state.sceneCleanup();
   state.sceneCleanup = undefined;
+  // 释放旧场景渲染器（loseContext → 归还 WebGL 上下文与全部纹理/FBO/program/buffer）
+  if (state.renderer) {
+    state.renderer.dispose?.();
+    state.renderer = undefined;
+  }
+  // 暂停并移除场景内视频纹理元素（避免后台继续解码占用内存）
+  for (const v of state.videoTextures ?? []) {
+    v.pause();
+    v.removeAttribute("src");
+    v.load();
+    v.remove();
+  }
+  state.videoTextures = undefined;
+  // revoke 所有 blob URL（场景视频纹理 + 音效）
+  for (const u of state.objectUrls ?? []) {
+    try {
+      URL.revokeObjectURL(u);
+    } catch {
+      /* 忽略 */
+    }
+  }
+  state.objectUrls = undefined;
   if (state.sceneAudio) {
     for (const au of state.sceneAudio.audios) {
       au.pause();
@@ -337,6 +365,11 @@ function mountScene(cfg: WallpaperConfig) {
   let disposed = false;
   state.sceneCleanup = () => {
     disposed = true;
+    // 兜底：若 clear() 因 disposed 早退未走到 renderer.dispose，这里也释放 WebGL 上下文
+    if (state.renderer) {
+      state.renderer.dispose?.();
+      state.renderer = undefined;
+    }
   };
 
   void (async () => {
@@ -404,6 +437,8 @@ function mountScene(cfg: WallpaperConfig) {
         // 效果链 FBO 降采样：降低 GPU 缓冲内存（全质量=0，0.5≈效果分辨率减半→内存约 1/4）
         fboCapFactor: 0.5,
       });
+      // 立即登记渲染器：即使后续异步加载中途被 clear()，也能正确释放该 WebGL 上下文
+      state.renderer = renderer;
       if (disposed) return;
 
       const textures = new Map<string, any>();
@@ -445,6 +480,9 @@ function mountScene(cfg: WallpaperConfig) {
           videoEl.style.cssText =
             "position:fixed;left:-9999px;top:-9999px;width:2px;height:2px;opacity:0;pointer-events:none";
           document.body.appendChild(videoEl);
+          // 登记以便 clear()/页面卸载时暂停移除元素并 revoke blob URL
+          (state.videoTextures ??= []).push(videoEl);
+          (state.objectUrls ??= []).push(url);
           videoEl.addEventListener("loadedmetadata", () => {
             reportDiag(cfg, `video tex '${name}': ${videoEl.videoWidth}x${videoEl.videoHeight}`);
           });
@@ -591,6 +629,8 @@ function mountScene(cfg: WallpaperConfig) {
               ext === "mp3" ? "audio/mpeg" : ext === "ogg" ? "audio/ogg" : ext === "flac" ? "audio/flac" : "audio/wav";
             const blob = new Blob([entry as BlobPart], { type: mime });
             const url = URL.createObjectURL(blob);
+            // 登记以便 clear()/页面卸载时 revoke blob URL
+            (state.objectUrls ??= []).push(url);
             const au = document.createElement("audio");
             au.src = url;
             au.loop = layer.soundprops?.playbackmode === "loop";
@@ -926,5 +966,10 @@ const diagMouse = (ev: Event, label: string) => {
 };
 window.addEventListener("mousemove", (e) => diagMouse(e, "mousemove"), { once: true, passive: true });
 window.addEventListener("mousedown", (e) => diagMouse(e, "mousedown"), { once: true, passive: true });
+
+// 页面卸载兜底：预览 iframe 关闭 / 壁纸窗口销毁时释放 WebGL 上下文与 blob URL。
+// （clear() 内部用 sceneCleanup 置 disposed + renderer.dispose，对已进入卸载流程的 iframe 安全。）
+window.addEventListener("pagehide", () => clear());
+window.addEventListener("beforeunload", () => clear());
 
 export {};
