@@ -105,15 +105,19 @@ export const api = {
   workshopRandom: (sort?: string) =>
     invoke<WorkshopSearchResult>("workshop_random", { sort }),
   workshopItem: (id: string) => invoke<WorkshopItem | null>("workshop_item", { id }),
+  workshopSetFamilyFriendly: (enabled: boolean) =>
+    invoke<boolean>("workshop_set_family_friendly", { enabled }),
   // 下载
   downloadToolStatus: () => invoke<DownloadToolStatus>("download_tool_status"),
   downloadCredentialsSet: (username: string, password: string) =>
-    invoke<{ ok: boolean; username: string }>("download_credentials_set", {
+    invoke<{ ok: boolean; username: string; mode: "qr" | "password" }>("download_credentials_set", {
       username,
       password,
     }),
   downloadCredentialsStatus: () =>
-    invoke<{ configured: boolean; username?: string }>("download_credentials_status"),
+    invoke<{ configured: boolean; username?: string; mode: "qr" | "password" }>(
+      "download_credentials_status"
+    ),
   downloadCredentialsClear: () => invoke<void>("download_credentials_clear"),
   downloadQrLogin: () => invoke<void>("download_qr_login"),
   downloadQrCancel: () => invoke<void>("download_qr_cancel"),

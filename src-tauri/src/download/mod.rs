@@ -827,6 +827,10 @@ impl DownloadService {
                 let _ = db::set_setting(&conn, "download_username", &u);
                 let _ = db::set_setting(&conn, "download_has_token", "true");
             }
+            // 登录方式单选：扫码成功后清除已保存的账号密码凭据，令牌成为唯一登录方式
+            if let Ok(dir) = self.data_dir() {
+                let _ = secure_store::clear_all(&dir);
+            }
             self.emit("download:qr-success", json!({ "username": u }));
             Ok(())
         } else {
@@ -1161,9 +1165,20 @@ pub fn download_credentials_set(
     secure_store::save(&username, &password, &dir).map_err(|e| format!("凭据写入失败: {e}"))?;
     // 清理旧的 Keychain 凭据，避免残留（删掉失败忽略）
     let _ = crate::keychain::delete_password(&username);
-    let conn = db.lock().map_err(|e| e.to_string())?;
-    db::set_setting(&conn, "download_username", &username)?;
-    Ok(json!({ "ok": true, "username": username }))
+    {
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        db::set_setting(&conn, "download_username", &username)?;
+        // 登录方式单选：切换到账号密码时清除扫码令牌标记，后续下载走账号密码验证
+        let _ = conn.execute("DELETE FROM settings WHERE key = 'download_has_token'", []);
+    }
+    // 同时取消进行中的扫码登录进程，保证任一时刻只有一种登录方式活跃
+    if let Some(svc) = app.try_state::<Arc<DownloadService>>() {
+        let svc = svc.inner().clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = svc.qr_cancel().await;
+        });
+    }
+    Ok(json!({ "ok": true, "username": username, "mode": "password" }))
 }
 
 #[tauri::command]
@@ -1171,12 +1186,22 @@ pub fn download_credentials_status(app: AppHandle) -> Result<serde_json::Value, 
     let db = app.state::<Arc<Mutex<Connection>>>();
     let conn = db.lock().map_err(|e| e.to_string())?;
     let username = db::get_setting(&conn, "download_username");
+    let has_token = db::get_setting(&conn, "download_has_token")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
     let dir = app.path().app_data_dir().ok();
     let has_pw = match (&username, &dir) {
         (Some(u), Some(d)) => secure_store::has(u, d),
         _ => false,
     };
-    Ok(json!({ "configured": username.is_some() && has_pw, "username": username }))
+    // 登录方式（单选，向后兼容旧数据）：保存了密码 = 账号密码；仅令牌 = 扫码
+    let mode = if has_pw { "password" } else { "qr" };
+    // 密码或令牌任一可用即视为已配置（修复：仅扫码登录时重启后误显示「未登录」）
+    Ok(json!({
+        "configured": username.is_some() && (has_pw || has_token),
+        "username": username,
+        "mode": mode,
+    }))
 }
 
 #[tauri::command]
@@ -1289,13 +1314,19 @@ pub async fn download_qr_cancel(app: AppHandle) -> Result<(), String> {
     svc.qr_cancel().await
 }
 
-/// 清除下载账号凭据（本地存储 + DB 账号），实现「登出」
+/// 清除下载账号凭据（本地存储 + DB 账号 + 扫码令牌），实现「登出」
 #[tauri::command]
 pub fn download_credentials_clear(app: AppHandle) -> Result<(), String> {
     let db = app.state::<Arc<Mutex<Connection>>>();
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     // 清本地加密存储的账号密码（逐个已知账号尝试）
     let _ = secure_store::clear_all(&dir);
+    // 清 DepotDownloader 登录令牌（dd-config 下的登录数据），彻底忘记两种登录方式
+    if let Some(svc) = app.try_state::<Arc<DownloadService>>() {
+        if let Ok(configdir) = svc.configdir() {
+            let _ = std::fs::remove_dir_all(configdir);
+        }
+    }
     let conn = db.lock().map_err(|e| e.to_string())?;
     let _ = conn.execute(
         "DELETE FROM settings WHERE key IN ('download_username','download_has_token')",

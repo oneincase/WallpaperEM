@@ -24,9 +24,13 @@ export function SettingsPage() {
   // 全局场景帧率上限（30/60/120，越低 GPU 占用越低），默认 60
   const [sceneFps, setSceneFps] = useState<number>(60);
   const [sceneFpsMsg, setSceneFpsMsg] = useState("");
-  // 下载账号
-  const [cred, setCred] = useState<{ configured: boolean; username?: string } | null>(null);
+  // 工作友好（默认开启）：开启后自动过滤成人内容
+  const [familyFriendly, setFamilyFriendly] = useState(true);
+  // 下载账号（登录方式单选：qr = 扫码令牌；password = 账号密码）
+  const [cred, setCred] = useState<{ configured: boolean; username?: string; mode: "qr" | "password" } | null>(null);
   const [editingCred, setEditingCred] = useState(false);
+  // 配置面板里当前选择的登录方式（单选，二选一）
+  const [loginMode, setLoginMode] = useState<"qr" | "password">("qr");
   const [tool, setTool] = useState<{ installed: boolean; path?: string; version?: string } | null>(null);
   const [dlUser, setDlUser] = useState("");
   const [dlPass, setDlPass] = useState("");
@@ -61,11 +65,15 @@ export function SettingsPage() {
     invoke<string | null>("settings_get", { key: "wallpaper_scene_fps" })
       .then((v) => setSceneFps(Number(v) || 60))
       .catch(() => { });
+    invoke<string | null>("settings_get", { key: "family_friendly" })
+      .then((v) => setFamilyFriendly(v == null || v === "true" || v === "1"))
+      .catch(() => { });
     api
       .downloadCredentialsStatus()
       .then((c) => {
         setCred(c);
         setDlUser(c.username ?? "");
+        setLoginMode(c.mode ?? "qr");
       })
       .catch(console.warn);
     api.downloadToolStatus().then(setTool).catch(console.warn);
@@ -85,13 +93,29 @@ export function SettingsPage() {
     }
     try {
       await api.downloadCredentialsSet(dlUser, dlPass);
-      setCred({ configured: true, username: dlUser });
+      setCred({ configured: true, username: dlUser, mode: "password" });
+      setLoginMode("password");
       setDlPass("");
       setEditingCred(false);
       setCredMsg("✅ 已保存（密码本地加密存储）");
     } catch (e) {
       setCredMsg(String(e));
     }
+  };
+
+  // 登录方式单选切换（账号密码）：若扫码登录正在运行 → 先取消，保证互斥
+  const switchToPassword = async () => {
+    if (qrOpen || qrStatus === "waiting" || qrGuardReq) {
+      await stopQrLogin();
+    }
+    setLoginMode("password");
+    setCredMsg("");
+  };
+
+  // 登录方式单选切换（扫码）：仅切换面板；实际启动由「开始扫码登录」触发
+  const switchToQr = () => {
+    setLoginMode("qr");
+    setCredMsg("");
   };
 
   // 扫码登录：启动进程 + 订阅事件
@@ -138,7 +162,7 @@ export function SettingsPage() {
 
   const logout = async () => {
     await api.downloadCredentialsClear();
-    setCred({ configured: false });
+    setCred({ configured: false, mode: "qr" });
     setDlUser("");
     setDlPass("");
     setCredMsg("已登出，登录令牌已清除");
@@ -161,7 +185,8 @@ export function SettingsPage() {
       setQrGuardReq(false);
       setQrGuardCode("");
       setQrGuardMsg("");
-      setCred({ configured: true, username: e.payload.username ?? undefined });
+      setLoginMode("qr");
+      setCred({ configured: true, username: e.payload.username ?? undefined, mode: "qr" });
       setDlUser(e.payload.username ?? "");
     });
     const unQrFail = listen<{ error?: string; exitCode?: number }>("download:qr-fail", (e) => {
@@ -251,6 +276,17 @@ export function SettingsPage() {
     }
   };
 
+  // 工作友好（默认开启）：开启后自动过滤成人内容
+  const toggleFamilyFriendly = async () => {
+    const next = !familyFriendly;
+    try {
+      await api.workshopSetFamilyFriendly(next);
+      setFamilyFriendly(next);
+    } catch {
+      // 失败则不变
+    }
+  };
+
   const changeFit = async (next: "cover" | "contain" | "stretch") => {
     setFitMsg("");
     try {
@@ -312,27 +348,29 @@ export function SettingsPage() {
           {tab === "download" && (
             <Group title="下载">
               <Row
-                label="下载账号（DepotDownloader）"
+                label="下载账号（有令牌选扫码模式，无令牌选账号模式）"
                 desc={
                   cred?.configured
-                    ? `已配置：${cred.username}（需拥有 Wallpaper Engine；令牌已记住，下载不再重复验证）`
-                    : "下载工坊内容需拥有 WE 的 Steam 账号。可用账号密码，或扫码登录（默认）；登录令牌会记住"
+                    ? `已登录：${cred.username}（${cred.mode === "qr" ? "扫码令牌" : "账号密码"}；需拥有 Wallpaper Engine，下载不再重复验证）`
+                    : "下载工坊内容需拥有 WE 的 Steam 账号。扫码登录（令牌）或账号密码，两种方式互斥，登录后令牌会记住"
                 }
                 control={
                   <div className="flex items-center gap-2 flex-wrap">
                     <span
                       className={`text-[12px] font-medium ${cred?.configured ? "text-green-500" : "text-[var(--text-2)]"}`}
                     >
-                      {cred?.configured ? "已登录" : "未登录"}
+                      {cred?.configured
+                        ? cred.mode === "qr"
+                          ? "已登录 · 扫码令牌"
+                          : "已登录 · 账号密码"
+                        : "未登录"}
                     </span>
-                    <button className="btn !py-1 text-[11.5px]" onClick={startQrLogin}>
-                      扫码登录
-                    </button>
                     {cred?.configured && !editingCred && (
                       <button
                         className="btn !py-1 text-[11.5px]"
                         onClick={() => {
                           setEditingCred(true);
+                          setLoginMode(cred.mode ?? "qr");
                           setDlUser(cred.username ?? "");
                           setDlPass("");
                           setCredMsg("");
@@ -351,38 +389,72 @@ export function SettingsPage() {
               />
               {(!cred?.configured || editingCred) && (
                 <div className="mt-3 rounded-xl border border-[var(--separator)] p-3 space-y-2">
-                  <input
-                    value={dlUser}
-                    onChange={(e) => setDlUser(e.target.value)}
-                    placeholder="Steam 账号（登录名或邮箱）"
-                    className="w-full rounded-lg border border-[var(--separator)] bg-[var(--content)] px-3 py-1.5 text-[13px] outline-none focus:border-[var(--accent)]"
-                  />
-                  <input
-                    type="password"
-                    value={dlPass}
-                    onChange={(e) => setDlPass(e.target.value)}
-                    placeholder="密码"
-                    className="w-full rounded-lg border border-[var(--separator)] bg-[var(--content)] px-3 py-1.5 text-[13px] outline-none focus:border-[var(--accent)]"
-                  />
+                  {/* 登录方式单选：二维码扫码 / 账号密码（二选一，互斥） */}
                   <div className="flex items-center gap-2">
-                    <button className="btn btn-primary" onClick={saveCredentials}>
-                      保存凭据
+                    <button
+                      className={`rounded-lg px-3 py-1.5 text-[12.5px] font-medium transition-colors ${loginMode === "qr"
+                        ? "bg-[var(--accent)] text-white"
+                        : "border border-[var(--separator)] text-[var(--text-2)] hover:bg-black/5 dark:hover:bg-white/8"
+                        }`}
+                      onClick={switchToQr}
+                    >
+                      扫码登录
                     </button>
-                    {editingCred && (
-                      <button
-                        className="btn"
-                        onClick={() => {
-                          setEditingCred(false);
-                          setDlUser(cred?.username ?? "");
-                          setDlPass("");
-                          setCredMsg("");
-                        }}
-                      >
-                        取消
-                      </button>
-                    )}
-                    {credMsg && <span className="text-[12px] text-[var(--text-2)]">{credMsg}</span>}
+                    <button
+                      className={`rounded-lg px-3 py-1.5 text-[12.5px] font-medium transition-colors ${loginMode === "password"
+                        ? "bg-[var(--accent)] text-white"
+                        : "border border-[var(--separator)] text-[var(--text-2)] hover:bg-black/5 dark:hover:bg-white/8"
+                        }`}
+                      onClick={switchToPassword}
+                    >
+                      账号密码登录
+                    </button>
                   </div>
+                  {loginMode === "password" ? (
+                    <div className="space-y-2">
+                      <input
+                        value={dlUser}
+                        onChange={(e) => setDlUser(e.target.value)}
+                        placeholder="Steam 账号（登录名或邮箱）"
+                        className="w-full rounded-lg border border-[var(--separator)] bg-[var(--content)] px-3 py-1.5 text-[13px] outline-none focus:border-[var(--accent)]"
+                      />
+                      <input
+                        type="password"
+                        value={dlPass}
+                        onChange={(e) => setDlPass(e.target.value)}
+                        placeholder="密码"
+                        className="w-full rounded-lg border border-[var(--separator)] bg-[var(--content)] px-3 py-1.5 text-[13px] outline-none focus:border-[var(--accent)]"
+                      />
+                      <div className="flex items-center gap-2">
+                        <button className="btn btn-primary" onClick={saveCredentials}>
+                          保存凭据
+                        </button>
+                        {editingCred && (
+                          <button
+                            className="btn"
+                            onClick={() => {
+                              setEditingCred(false);
+                              setDlUser(cred?.username ?? "");
+                              setDlPass("");
+                              setCredMsg("");
+                            }}
+                          >
+                            取消
+                          </button>
+                        )}
+                        {credMsg && <span className="text-[12px] text-[var(--text-2)]">{credMsg}</span>}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                      <span className="text-[12px] text-[var(--text-2)]">
+                        点击「开始扫码登录」打开二维码，扫码后自动记住登录令牌
+                      </span>
+                      <button className="btn btn-primary" onClick={startQrLogin}>
+                        开始扫码登录
+                      </button>
+                    </div>
+                  )}
                 </div>
               )}
               <Row
@@ -551,6 +623,15 @@ export function SettingsPage() {
                 label="图标穿透"
                 desc="开启后壁纸窗口置于桌面图标之上并可接收鼠标（场景视差/网页互动）；会盖住桌面图标。默认关闭"
                 control={<Switch checked={interactive} onChange={toggleInteractive} />}
+              />
+              <Row
+                label="工作友好"
+                desc={
+                  familyFriendly
+                    ? "开启：过滤工作不友好内容。默认开启"
+                    : "关闭：显示所有内容"
+                }
+                control={<Switch checked={familyFriendly} onChange={toggleFamilyFriendly} />}
               />
             </Group>
           )}

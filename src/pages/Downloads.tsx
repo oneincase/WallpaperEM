@@ -66,7 +66,7 @@ export function DownloadsPage() {
         <div>
           <h1 className="text-[22px] font-bold tracking-tight">下载</h1>
           <p className="text-[13px] text-[var(--text-2)] mt-1">
-            下载需设置里配置正确的steam账号和密码
+            下载需在设置中登录 Steam 账号（扫码登录或账号密码）
           </p>
         </div>
         {tasks.some((t) => t.status === "done" || t.status === "failed") && (
