@@ -57,6 +57,37 @@ export const IconHeart = () => (
   </Svg>
 );
 
+// 本地库卡片操作：预览 / 应用 / 打开文件 / 删除
+export const IconPreview = () => (
+  <Svg>
+    <path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12Z" />
+    <circle cx="12" cy="12" r="3" />
+  </Svg>
+);
+
+export const IconApply = () => (
+  <Svg>
+    <rect x="3" y="4" width="18" height="12" rx="2" />
+    <path d="M9 20h6" />
+    <path d="M12 16v4" />
+  </Svg>
+);
+
+export const IconOpenFile = () => (
+  <Svg>
+    <path d="M3 7a2 2 0 0 1 2-2h4l2 2.5h8a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" />
+  </Svg>
+);
+
+export const IconTrash = () => (
+  <Svg>
+    <path d="M4 7h16" />
+    <path d="M9 7V5a1.5 1.5 0 0 1 1.5-1.5h3A1.5 1.5 0 0 1 15 5v2" />
+    <path d="M6 7l.8 11.2A2 2 0 0 0 8.8 20h6.4a2 2 0 0 0 2-1.8L18 7" />
+    <path d="M10 11v6M14 11v6" />
+  </Svg>
+);
+
 export const IconGear = () => (
   <Svg>
     <circle cx="12" cy="12" r="3.2" />
@@ -98,3 +129,26 @@ export const IconSidebarCollapse = () => (
 );
 
 export const IconSidebarExpand = IconSidebarCollapse;
+
+// 主题：浅色（太阳）
+export const IconSun = () => (
+  <Svg>
+    <circle cx="12" cy="12" r="4.2" />
+    <path d="M12 2.5v2.4M12 19.1v2.4M4.3 4.3l1.7 1.7M18 18l1.7 1.7M2.5 12h2.4M19.1 12h2.4M4.3 19.7 6 18M18 6l1.7-1.7" />
+  </Svg>
+);
+
+// 主题：深色（月亮）
+export const IconMoon = () => (
+  <Svg>
+    <path d="M20 14.2A8 8 0 0 1 9.8 4a8 8 0 1 0 10.2 10.2Z" />
+  </Svg>
+);
+
+// 主题：跟随系统（一半太阳一半月亮）
+export const IconAuto = () => (
+  <Svg>
+    <circle cx="12" cy="12" r="4.2" />
+    <path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M4.8 4.8l1.4 1.4M17.8 17.8l1.4 1.4M4.8 19.2l1.4-1.4M17.8 6.2l1.4-1.4" />
+  </Svg>
+);

@@ -137,6 +137,15 @@ export const api = {
   libraryOpenFolder: (itemId: string) => invoke<boolean>("library_open_folder", { itemId }),
   libraryImportFromWeb: (webDataDir: string) =>
     invoke<{ imported: number; skipped: number }>("library_import_from_web", { webDataDir }),
+  libraryImportCustom: (sourcePath: string) =>
+    invoke<{ imported: number; itemId: string; title: string; type: string }>(
+      "library_import_custom",
+      { sourcePath }
+    ),
+  libraryImportCustomPick: () =>
+    invoke<{ cancelled?: boolean; imported?: number; itemId?: string; title?: string; type?: string }>(
+      "library_import_custom_pick"
+    ),
   wallpaperApplyItem: (itemId: string) => invoke<void>("wallpaper_apply_item", { itemId }),
   libraryPreview: (itemId: string) => invoke<WallpaperConfig>("library_preview", { itemId }),
   wallpaperApply: (config: WallpaperConfig, displayId?: string) =>

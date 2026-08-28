@@ -35,6 +35,7 @@ pub fn run() {
             None,
         ))
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
@@ -174,6 +175,8 @@ pub fn run() {
             library::library_delete,
             library::library_open_folder,
             library::library_import_from_web,
+            library::library_import_custom,
+            library::library_import_custom_pick,
             misc::favorites_list,
             misc::favorite_add,
             misc::favorite_remove,

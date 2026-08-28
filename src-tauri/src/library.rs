@@ -259,6 +259,171 @@ pub fn library_import_from_web(app: AppHandle, web_data_dir: String) -> Result<s
     Ok(json!({ "imported": imported, "skipped": skipped }))
 }
 
+/// 导入自定义壁纸：弹出原生文件/文件夹选择框 → 拷贝到本地库。
+#[tauri::command]
+pub async fn library_import_custom_pick(app: AppHandle) -> Result<serde_json::Value, String> {
+    // blocking 对话框不能阻塞主线程/async 执行器 → 用 spawn_blocking 放到阻塞线程池
+    let app_pick = app.clone();
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        use tauri_plugin_dialog::DialogExt;
+        app_pick
+            .dialog()
+            .file()
+            .add_filter("壁纸", &["mp4", "webm", "mov", "gif", "png", "jpg", "jpeg", "webp", "html"])
+            .blocking_pick_file()
+            .and_then(|f| f.as_path().map(|p| p.to_path_buf()))
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let Some(path) = picked else {
+        return Ok(json!({ "cancelled": true }));
+    };
+    let result = import_custom_impl(&app, &path)?;
+    Ok(result)
+}
+
+/// 导入自定义壁纸：把单个壁纸文件/目录拷贝到本地库，按扩展名推断类型。
+///
+/// 支持：mp4/webm/mov → video；gif → gif；png/jpg/jpeg/webp → image；html → web；
+/// 目录 → 作为完整壁纸目录导入（含 project.json 时优先）。
+#[tauri::command]
+pub fn library_import_custom(app: AppHandle, source_path: String) -> Result<serde_json::Value, String> {
+    import_custom_impl(&app, Path::new(&source_path))
+}
+
+fn import_custom_impl(app: &AppHandle, src: &Path) -> Result<serde_json::Value, String> {
+    if !src.exists() {
+        return Err(format!("路径不存在: {}", src.display()));
+    }
+
+    let db = app.state::<Arc<Mutex<Connection>>>();
+    let dest_root = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("wallpapers");
+    std::fs::create_dir_all(&dest_root).map_err(|e| e.to_string())?;
+
+    // 生成 item_id：以文件名为主、加短随机后缀避免与既有条目冲突
+    let base_name = src
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "custom".into());
+    let mut stem = src
+        .file_stem()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "custom".into());
+    // 目录：用目录名
+    if src.is_dir() {
+        stem = base_name.clone();
+    }
+    // 清理非法字符（item_id 将作为目录名）
+    let clean: String = stem
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    let clean = if clean.is_empty() { "custom".to_string() } else { clean };
+
+    // 确定目标目录（不重复：若同名已存在则加序号）
+    let mut dest = dest_root.join(&clean);
+    let mut n = 2u32;
+    while dest.is_dir() {
+        dest = dest_root.join(format!("{clean}-{n}"));
+        n += 1;
+    }
+    let item_id = dest
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| clean.clone());
+    let dest_clone = dest.clone();
+
+    // 拷贝
+    if src.is_dir() {
+        if dest.exists() {
+            let _ = std::fs::remove_dir_all(&dest);
+        }
+        copy_dir(src, &dest)?;
+    } else {
+        let ext = src
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        let target = dest.join(match ext.as_str() {
+            "html" | "htm" => "index.html".into(),
+            _ => src.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_else(|| ext.clone()),
+        });
+        std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
+        std::fs::copy(src, &target).map_err(|e| format!("拷贝失败: {e}"))?;
+        // 无预览 → 尝试用壁纸文件本身作为预览（视频/图片类可预览）
+        if !dest.join("preview.gif").exists()
+            && !dest.join("preview.png").exists()
+            && !dest.join("preview.jpg").exists()
+        {
+            if ext == "gif" || ext == "png" || ext == "jpg" || ext == "jpeg" {
+                let _ = std::fs::copy(src, dest.join("preview.gif"));
+                let _ = std::fs::copy(src, dest.join("preview.png"));
+            }
+        }
+    }
+
+    // 解析类型 + 标题
+    let (wtype, title) = parse_project(&dest);
+    let wtype = if wtype != "unknown" {
+        wtype
+    } else {
+        infer_type(&dest)
+    };
+
+    {
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO library_items(item_id, title, type, size_bytes, file_count, downloaded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, unixepoch())
+             ON CONFLICT(item_id) DO UPDATE SET title = ?2, type = ?3, size_bytes = ?4, file_count = ?5",
+            rusqlite::params![item_id, title, wtype, dir_size(&dest_clone), dir_count(&dest_clone)],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    Ok(json!({ "imported": 1, "item_id": item_id, "title": title, "type": wtype }))
+}
+
+/// 目录内推断壁纸类型（无 project.json 时）
+fn infer_type(dir: &Path) -> String {
+    if dir.join("index.html").is_file() || dir.join("web/index.html").is_file() {
+        return "web".into();
+    }
+    if dir.join("scenes/scene.pkg").is_file() || dir.join("scene.pkg").is_file() {
+        return "scene".into();
+    }
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_ascii_lowercase();
+            if name.ends_with(".gif") {
+                return "gif".into();
+            }
+            if name.ends_with(".mp4")
+                || name.ends_with(".webm")
+                || name.ends_with(".mov")
+            {
+                return "video".into();
+            }
+            if name.ends_with(".png")
+                || name.ends_with(".jpg")
+                || name.ends_with(".jpeg")
+                || name.ends_with(".webp")
+            {
+                return "image".into();
+            }
+            if name.ends_with(".html") || name.ends_with(".htm") {
+                return "web".into();
+            }
+        }
+    }
+    "image".into()
+}
+
 fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
     std::fs::create_dir_all(to).map_err(|e| e.to_string())?;
     for entry in std::fs::read_dir(from).map_err(|e| e.to_string())? {

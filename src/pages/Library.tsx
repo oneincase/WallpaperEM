@@ -8,6 +8,7 @@ import {
 } from "../api/steam";
 import { PreviewModal } from "../components/PreviewModal";
 import { ConfirmModal } from "../components/ConfirmModal";
+import { IconPreview, IconApply, IconOpenFile, IconTrash } from "../components/icons";
 
 const FILTERS: (WallpaperType | "")[] = ["", "video", "scene", "web"];
 
@@ -19,6 +20,23 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
   const [previewItem, setPreviewItem] = useState<LibraryItem | null>(null);
   const [deleteItem, setDeleteItem] = useState<LibraryItem | null>(null);
   const [appliedItems, setAppliedItems] = useState<Set<string>>(new Set());
+  const [importing, setImporting] = useState(false);
+
+  const importCustom = async () => {
+    setImporting(true);
+    setMsg("");
+    try {
+      const r = await api.libraryImportCustomPick();
+      if (!r.cancelled && r.imported) {
+        setMsg(`✅ 已导入「${r.title ?? ""}」`);
+        refresh();
+      }
+    } catch (e) {
+      setMsg(String(e));
+    } finally {
+      setImporting(false);
+    }
+  };
 
   const refresh = useCallback(async () => {
     try {
@@ -76,20 +94,29 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
             已下载壁纸（可在详情页应用为桌面壁纸）
           </p>
         </div>
-        <div className="flex rounded-lg border border-[var(--separator)] overflow-hidden ml-auto">
-          {FILTERS.map((t) => (
-            <button
-              key={t || "all"}
-              onClick={() => setType(t)}
-              className={`px-3 py-1.5 text-[12.5px] ${
-                type === t
-                  ? "bg-[var(--accent)] text-white"
-                  : "bg-[var(--card)] hover:bg-black/5 dark:hover:bg-white/10"
-              }`}
-            >
-              {t === "" ? "全部" : TYPE_LABELS[t]}
-            </button>
-          ))}
+        <div className="flex items-center gap-3 ml-auto">
+          <button
+            className="rounded-lg border border-[var(--separator)] px-3 py-1.5 text-[12.5px] font-medium hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-60"
+            onClick={importCustom}
+            disabled={importing}
+          >
+            {importing ? "导入中…" : "＋ 导入本地"}
+          </button>
+          <div className="flex rounded-lg border border-[var(--separator)] overflow-hidden">
+            {FILTERS.map((t) => (
+              <button
+                key={t || "all"}
+                onClick={() => setType(t)}
+                className={`px-3 py-1.5 text-[12.5px] ${
+                  type === t
+                    ? "bg-[var(--accent)] text-white"
+                    : "bg-[var(--card)] hover:bg-black/5 dark:hover:bg-white/10"
+                }`}
+              >
+                {t === "" ? "全部" : TYPE_LABELS[t]}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 
@@ -135,38 +162,42 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
                 </div>
                 <div className="mt-2 grid grid-cols-4 gap-2">
                   <button
-                    className="btn !py-1.5 text-[11px] truncate"
+                    className="flex items-center justify-center rounded-lg border border-[var(--separator)] px-1 py-1.5 text-[var(--text-2)] hover:text-[var(--accent)] hover:bg-black/5 dark:hover:bg-white/10"
                     onClick={() => setPreviewItem(item)}
+                    data-tip="预览"
                   >
-                    预览
+                    <IconPreview />
                   </button>
                   {appliedItems.has(item.itemId) ? (
                     <button
-                      className="btn !py-1.5 text-[11px] truncate !bg-green-500/15 !text-green-600 dark:!text-green-400 !border-green-500/30 cursor-default disabled:opacity-75"
+                      className="flex items-center justify-center rounded-lg border border-green-500/30 px-1 py-1.5 !text-green-600 dark:!text-green-400 bg-green-500/10 cursor-default disabled:opacity-75"
                       disabled
-                      title="已应用到桌面"
+                      data-tip="已应用到桌面"
                     >
-                      已应用
+                      <IconApply />
                     </button>
                   ) : (
                     <button
-                      className="btn btn-primary !py-1.5 text-[11px] truncate"
+                      className="flex items-center justify-center rounded-lg border border-[var(--accent)] px-1 py-1.5 text-white bg-[var(--accent)] hover:opacity-90"
                       onClick={() => apply(item.itemId)}
+                      data-tip="应用到桌面"
                     >
-                      应用
+                      <IconApply />
                     </button>
                   )}
                   <button
-                    className="btn !py-1.5 text-[11px] truncate"
+                    className="flex items-center justify-center rounded-lg border border-[var(--separator)] px-1 py-1.5 text-[var(--text-2)] hover:text-[var(--accent)] hover:bg-black/5 dark:hover:bg-white/10"
                     onClick={() => api.libraryOpenFolder(item.itemId)}
+                    data-tip="打开文件所在位置"
                   >
-                    文件
+                    <IconOpenFile />
                   </button>
                   <button
-                    className="btn btn-danger !py-1.5 text-[11px] truncate"
+                    className="flex items-center justify-center rounded-lg border border-[var(--separator)] px-1 py-1.5 text-[var(--text-2)] hover:text-red-500 hover:border-red-500/40 hover:bg-red-500/10"
                     onClick={() => setDeleteItem(item)}
+                    data-tip="删除"
                   >
-                    删除
+                    <IconTrash />
                   </button>
                 </div>
               </div>
