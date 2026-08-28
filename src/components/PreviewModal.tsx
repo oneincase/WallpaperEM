@@ -1,5 +1,6 @@
 // 本地库壁纸预览弹框（按类型渲染：视频/图片/网页/场景）
 import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { api, type LibraryItem, type WallpaperConfig } from "../api/steam";
 
 export function PreviewModal({
@@ -11,6 +12,9 @@ export function PreviewModal({
 }) {
   const [cfg, setCfg] = useState<WallpaperConfig | null>(null);
   const [err, setErr] = useState("");
+  // 场景预览复用渲染器页：读取全局清晰度/帧率设置，与桌面壁纸观感一致
+  const [renderDpr, setRenderDpr] = useState(1);
+  const [sceneFps, setSceneFps] = useState(60);
 
   useEffect(() => {
     setErr("");
@@ -19,6 +23,18 @@ export function PreviewModal({
       .libraryPreview(item.itemId)
       .then(setCfg)
       .catch((e) => setErr(String(e)));
+    invoke<string | null>("settings_get", { key: "wallpaper_render_dpr" })
+      .then((v) => {
+        const n = Number(v);
+        if (Number.isFinite(n) && n > 0) setRenderDpr(n);
+      })
+      .catch(() => {});
+    invoke<string | null>("settings_get", { key: "wallpaper_scene_fps" })
+      .then((v) => {
+        const n = Number(v);
+        if (n === 30 || n === 60 || n === 120) setSceneFps(n);
+      })
+      .catch(() => {});
   }, [item.itemId]);
 
   const renderBody = () => {
@@ -54,13 +70,15 @@ export function PreviewModal({
       );
     }
     if (cfg.type === "scene" && cfg.mediaBase) {
-      // 复用渲染器页（与桌面壁纸同一渲染管线）
+      // 复用渲染器页（与桌面壁纸同一渲染管线），注入全局清晰度/帧率
       const origin = new URL(cfg.mediaBase).origin;
       const q = new URLSearchParams({
         type: "scene",
         src: cfg.src ?? "",
         fit: "fill",
         mediaBase: cfg.mediaBase,
+        renderDpr: String(renderDpr),
+        sceneFps: String(sceneFps),
       });
       return (
         <iframe

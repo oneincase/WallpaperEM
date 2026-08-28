@@ -39,3 +39,6 @@ credentials.dat
 
 # --- 依赖下载产生的工坊子目录标记（如需重新分发请自行决定）---
 # src-tauri/binaries/depot-downloader-*（sidecar 二进制；如需入库请自行添加，不默认忽略）
+
+.v2c/
+.video_agent/

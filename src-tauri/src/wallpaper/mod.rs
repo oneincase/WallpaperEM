@@ -19,7 +19,7 @@ use crate::content_server::ContentServerState;
 pub const DEFAULT_FIT: &str = "cover";
 /// 渲染分辨率上限（有效 devicePixelRatio 的封顶）：越低越省内存（GPU 画布/纹理）。
 /// 1.0 = 按逻辑分辨率渲染（Retina 上约为原先 1/4 内存）；2.0 = 不封顶（原清晰度）。
-pub const DEFAULT_RENDER_DPR: f32 = 1.0;
+pub const DEFAULT_RENDER_DPR: f32 = 2.0;
 /// 场景壁纸帧率上限（帧/秒）：越低 GPU 占用越低。可选 30 / 60 / 120，默认 60。
 pub const DEFAULT_SCENE_FPS: u32 = 60;
 
@@ -253,7 +253,20 @@ fn restore_sessions(app: &AppHandle) {
 
 /// 确保每个活动显示器都有壁纸窗口（创建/缩放/回收）
 fn ensure_windows(app: &AppHandle) {
+    // 显示器睡眠/唤醒切换期间不做任何窗口增删：此时 CGGetActiveDisplayList
+    // 可能返回空列表（显示器从「活动」列表暂时消失），若照常执行下方清理逻辑，
+    // 会把所有壁纸窗口误判为「已断开的显示器」全部销毁 —— 主窗口若也处于闲置
+    // 释放状态，最后一个窗口关闭就会触发 Tauri 默认行为退出整个进程
+    // （表现为「休眠后壁纸软件退出」）。醒来后由下一轮 tick 恢复同步。
+    if macos::display_asleep() {
+        return;
+    }
     let screens = macos::active_screens();
+    // 同理：空列表只说明显示器暂时不可枚举（睡眠/热插拔过渡），绝不能当作
+    // 「用户拔掉了全部显示器」去销毁窗口；仅在确认还有显示器时才做增删。
+    if screens.is_empty() {
+        return;
+    }
     let state = match app.try_state::<WallpaperEngineState>() {
         Some(s) => s,
         None => return,

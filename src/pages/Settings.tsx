@@ -19,7 +19,7 @@ export function SettingsPage() {
   // 全局壁纸显示模式（cover/contain/stretch），默认 cover 等比铺满裁切
   const [fit, setFit] = useState<"cover" | "contain" | "stretch">("cover");
   const [fitMsg, setFitMsg] = useState("");
-  // 全局渲染分辨率上限（有效 dpr 封顶，越低越省内存），默认 2
+  // 全局渲染分辨率上限（有效 dpr 封顶，越低越省内存），默认 2（与 Rust DEFAULT_RENDER_DPR 一致）
   const [renderDpr, setRenderDpr] = useState<number>(2);
   const [renderDprMsg, setRenderDprMsg] = useState("");
   // 全局场景帧率上限（30/60/120，越低 GPU 占用越低），默认 60
@@ -63,7 +63,7 @@ export function SettingsPage() {
       .then((v) => setFit((v as "cover" | "contain" | "stretch") || "cover"))
       .catch(() => { });
     invoke<string | null>("settings_get", { key: "wallpaper_render_dpr" })
-      .then((v) => setRenderDpr(Number(v) || 2))
+      .then((v) => setRenderDpr(Number(v) || 1))
       .catch(() => { });
     invoke<string | null>("settings_get", { key: "wallpaper_scene_fps" })
       .then((v) => setSceneFps(Number(v) || 60))
@@ -582,13 +582,7 @@ export function SettingsPage() {
               />
               <Row
                 label="场景渲染清晰度"
-                desc={
-                  renderDpr <= 1
-                    ? "流畅：按逻辑分辨率渲染（Retina 上内存约降为原来的 1/4，壁纸稍柔和）"
-                    : renderDpr < 2
-                      ? "均衡：1.5 倍渲染，画质与内存折中"
-                      : "清晰：不封顶（原生分辨率，内存占用最高）"
-                }
+                desc="倍数越高越清晰，但占用显存越高。默认 2x（均衡）"
                 control={
                   <div className="flex items-center gap-2">
                     <select
@@ -597,8 +591,10 @@ export function SettingsPage() {
                       className="rounded-lg border border-[var(--separator)] bg-[var(--content)] px-2 py-1 text-[12.5px] outline-none focus:border-[var(--accent)]"
                     >
                       <option value={1}>流畅 1x</option>
-                      <option value={1.5}>均衡 1.5x</option>
-                      <option value={2}>清晰 2x</option>
+                      <option value={2}>均衡 2x</option>
+                      <option value={3}>高清 3x</option>
+                      <option value={4}>超清 4x</option>
+                      <option value={5}>极致 5x</option>
                     </select>
                     {renderDprMsg && <span className="text-[12px] text-red-500">{renderDprMsg}</span>}
                   </div>

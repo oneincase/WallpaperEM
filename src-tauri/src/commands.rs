@@ -71,11 +71,44 @@ pub fn autostart_status(app: AppHandle) -> Result<bool, String> {
     app.autolaunch().is_enabled().map_err(|e| e.to_string())
 }
 
+/// 在自启 LaunchAgent plist 中注入 `KeepAlive`（缺失时）。
+///
+/// `auto-launch` 生成的 plist 只有 `RunAtLoad`，没有 `KeepAlive`：一旦应用在
+/// 睡眠/盒盖期间被 macOS 终结（jetsam/内存压力/watchdog），launchd 不会把它拉起来，
+/// 用户就会看到"壁纸软件整个退出"。补上 `KeepAlive` 后进程被杀会自动重启。
+#[cfg(target_os = "macos")]
+fn ensure_keepalive(app: &AppHandle) {
+    let name = &app.package_info().name;
+    let path = dirs::home_dir()
+        .unwrap_or_default()
+        .join("Library/LaunchAgents")
+        .join(format!("{name}.plist"));
+    let Ok(mut xml) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    // 已含 KeepAlive（或该键已启用）则不重复注入
+    if xml.contains("<key>KeepAlive</key>") {
+        return;
+    }
+    // 插到根 dict 的 </dict> 之前（auto-launch 生成的 plist 只有一个根 dict）
+    if let Some(pos) = xml.rfind("</dict>") {
+        xml.insert_str(pos, "  <key>KeepAlive</key>\n  <true/>\n");
+        if let Err(e) = std::fs::write(&path, xml) {
+            tracing::warn!("inject KeepAlive into {path:?} failed: {e}");
+        } else {
+            tracing::info!("autostart KeepAlive injected: {path:?}");
+        }
+    }
+}
+
 #[tauri::command]
 pub fn autostart_set(app: AppHandle, enabled: bool) -> Result<bool, String> {
     let autolaunch = app.autolaunch();
     if enabled {
         autolaunch.enable().map_err(|e| e.to_string())?;
+        // enable() 会重写 plist，故必须在之后注入 KeepAlive
+        #[cfg(target_os = "macos")]
+        ensure_keepalive(&app);
     } else {
         autolaunch.disable().map_err(|e| e.to_string())?;
     }

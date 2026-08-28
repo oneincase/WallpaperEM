@@ -186,11 +186,19 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app, event| {
+        .run(|app, event| match event {
             // macOS：点击 Dock 图标 / Finder 重开应用 → 显示主窗口
-            if let tauri::RunEvent::Reopen { .. } = event {
-                main_window::ensure_main_window(app);
+            tauri::RunEvent::Reopen { .. } => main_window::ensure_main_window(app),
+            // 最后一个窗口被销毁 ≠ 退出：本应用是常驻托盘的壁纸引擎，主窗口会被
+            // 闲置释放、壁纸窗口可能被 stop() 清空，此前放任默认行为会直接退出进程
+            // （睡眠时显示器列表异常触发的窗口清理即由此整进程退出）。
+            // code = None 表示「窗口全关」而非主动退出；托盘「退出」走 app.exit(0)
+            // （code = Some(0)），不受此拦截影响。
+            tauri::RunEvent::ExitRequested { code: None, api, .. } => {
+                api.prevent_exit();
+                tracing::info!("all windows destroyed; keep running in tray");
             }
+            _ => {}
         });
 }
 

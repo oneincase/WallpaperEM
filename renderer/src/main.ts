@@ -74,6 +74,10 @@ function fitObjectFit(fit?: WallpaperFit): { objectFit: string; background: stri
 const state: {
   cfg: WallpaperConfig;
   video?: HTMLVideoElement;
+  /** 视频壁纸无缝循环对（loop 开启时替代 video） */
+  videoPair?: VideoLoopPair;
+  /** 场景内视频纹理循环对（每纹理一个） */
+  videoPairs?: VideoLoopPair[];
   img?: HTMLImageElement;
   iframe?: HTMLIFrameElement;
   canvas?: HTMLCanvasElement;
@@ -113,6 +117,11 @@ function clear() {
   wrap.innerHTML = "";
   if (state.raf !== undefined) cancelAnimationFrame(state.raf);
   state.raf = undefined;
+  // 停掉视频循环对（取消 rAF 交换驱动 + 暂停解码）
+  state.videoPair?.destroy();
+  state.videoPair = undefined;
+  for (const p of state.videoPairs ?? []) p.destroy();
+  state.videoPairs = undefined;
   if (state.sceneCleanup) state.sceneCleanup();
   state.sceneCleanup = undefined;
   // 释放旧场景渲染器（loseContext → 归还 WebGL 上下文与全部纹理/FBO/program/buffer）
@@ -203,25 +212,256 @@ function startCanvasLoop() {
 
 // ---------- 视频 / GIF / Web ----------
 
+// ---------- 无缝循环视频（A/B 双元素：预热-保温-结尾交接） ----------
+// WebKit 的 <video loop> 在循环点会重置解码管线（ended → seek 0 → 重新起播），
+// 造成 0.1~0.5s 的短暂冻结（缓冲再充分也躲不掉）。方案：主/备两个同源 <video>：
+//   1) 预热：主元素临近结尾时，备用元素起播一两帧后**暂停保温**——解码器已热、
+//      合成器已持有其当前帧（交接零延迟），且不会长时间双路解码；
+//   2) 交接：主元素真正到达结尾的一瞬（≤2~5 帧内）恢复备用播放并交换主备，
+//      切换点即真实循环点，内容不跳跃；
+//   3) 旧主元素暂停归零静音保温，成为下一个备用（保温期静音避免双声）。
+// 备用未及时就绪时退回原生 loop 兜底（只是旧式微卡顿，不会中断）。
+
+/// 预热窗口（秒）：主元素剩多少秒时启动备用预热。
+const LOOP_PREROLL_SEC = 0.5;
+/// 预热起播到多少秒后暂停保温（≈1~2 帧，帧已解码）。
+const LOOP_HOLD_SEC = 0.04;
+/// 主元素离结尾多少秒内执行交接（≈2~5 帧）。
+const LOOP_SWAP_EPS = 0.08;
+
+type VideoLoopPair = {
+  readonly active: HTMLVideoElement;
+  readonly standby: HTMLVideoElement;
+  /** 每次主备交换回调（参数为新主元素），用于同步可见性/纹理引用 */
+  onSwap?: (active: HTMLVideoElement) => void;
+  /** 兜底触发回调：备用未就绪、发生原生循环回绕时调用 */
+  onFallback?: () => void;
+  setVolume(vol: number): void;
+  pause(): void;
+  resume(): void;
+  destroy(): void;
+};
+
+function createLoopingVideo(src: string, opts: { muted: boolean }): VideoLoopPair {
+  const make = (): HTMLVideoElement => {
+    const v = document.createElement("video");
+    v.src = src;
+    v.muted = opts.muted;
+    v.playsInline = true;
+    v.preload = "auto";
+    // 兜底：预热/交接失败时退回原生循环（只是旧式微卡顿，不会中断或黑屏）
+    v.loop = true;
+    return v;
+  };
+
+  let active = make();
+  let standby = make();
+  let userVolume = 1;
+  let userMuted = opts.muted;
+  standby.muted = true; // 备用恒静音，避免交接期出双声
+  let arming = false; // 备用已起播，等第一帧出现后暂停保温
+  let held = false; // 备用已保温（暂停在起点附近、解码器热）
+  let prevTime = -1; // 主元素上一帧时间，用于检测原生循环回绕
+  let raf = 0;
+  let destroyed = false;
+
+  const disarm = () => {
+    arming = false;
+    held = false;
+    if (!standby.paused) {
+      standby.pause();
+      try {
+        standby.currentTime = 0;
+      } catch {
+        /* 忽略 */
+      }
+    }
+  };
+
+  const doSwap = () => {
+    const prev = active;
+    active = standby;
+    standby = prev;
+    arming = false;
+    held = false;
+    // 新主元素从保温点（≈循环点）恢复播放：解码器热、合成器已有帧 → 零延迟
+    void active.play().catch(() => {});
+    active.muted = userMuted;
+    active.volume = userVolume;
+    // 旧主元素暂停归零静音保温，成为下一个备用
+    prev.pause();
+    try {
+      prev.currentTime = 0;
+    } catch {
+      /* 忽略 */
+    }
+    prev.muted = true;
+    prevTime = -1;
+    pair.onSwap?.(active);
+  };
+
+  const tick = () => {
+    if (destroyed) return;
+    raf = requestAnimationFrame(tick);
+    const d = active.duration;
+    if (!isFinite(d) || d <= 0) return;
+    const t = active.currentTime;
+    // 时间回绕 = 交接失败、发生了原生兜底循环：备用已保温则立刻交接（仍近乎无缝），
+    // 否则复位等下一圈（一次性上报 onFallback 便于诊断）
+    if (prevTime >= 0 && t < prevTime - 0.05) {
+      const hadStandby = held;
+      disarm();
+      prevTime = t;
+      if (!hadStandby) pair.onFallback?.();
+      return;
+    }
+    prevTime = t;
+    const remaining = d - t;
+    // 远离结尾：复位预热状态（兜底循环后 / seek 后都会经过这里）
+    if (remaining > LOOP_PREROLL_SEC + 0.5) {
+      if (arming || held) disarm();
+      return;
+    }
+    if (held) {
+      // 备用保温待命：主元素到达结尾即交接
+      if (remaining <= LOOP_SWAP_EPS || t <= LOOP_SWAP_EPS) doSwap();
+      return;
+    }
+    if (arming) {
+      if (!standby.paused) {
+        // 起播出现帧即暂停保温
+        if (standby.currentTime >= LOOP_HOLD_SEC * 0.5) {
+          standby.pause();
+          arming = false;
+          held = true;
+        }
+      } else {
+        // 起播被拒/未开始：重试（远离结尾时由上方复位）
+        void standby.play().catch(() => {});
+      }
+      return;
+    }
+    // 临近结尾：备用解码器就绪才预热，否则交给原生 loop 兜底
+    if (remaining <= LOOP_PREROLL_SEC && standby.readyState >= 2) {
+      try {
+        standby.currentTime = 0;
+      } catch {
+        /* 忽略 */
+      }
+      void standby.play().catch(() => {});
+      arming = true;
+    }
+  };
+  raf = requestAnimationFrame(tick);
+
+  const pair: VideoLoopPair = {
+    get active() {
+      return active;
+    },
+    get standby() {
+      return standby;
+    },
+    onSwap: undefined,
+    onFallback: undefined,
+    setVolume(vol: number) {
+      userVolume = Math.max(0, Math.min(1, vol));
+      userMuted = vol <= 0;
+      active.muted = userMuted;
+      active.volume = userVolume;
+      // 备用保持静音（交接期防双声），但音量同步，交接后立即正确
+      standby.muted = true;
+      standby.volume = userVolume;
+    },
+    pause() {
+      // 放弃未完成的预热：备用停掉归零，恢复时重新走预热流程
+      disarm();
+      active.pause();
+      if (raf) cancelAnimationFrame(raf);
+      raf = 0;
+    },
+    resume() {
+      if (destroyed) return;
+      void active.play().catch(() => {});
+      if (!raf) raf = requestAnimationFrame(tick);
+    },
+    destroy() {
+      destroyed = true;
+      if (raf) cancelAnimationFrame(raf);
+      raf = 0;
+      for (const v of [active, standby]) v.pause();
+    },
+  };
+  return pair;
+}
+
 function mountVideo(cfg: WallpaperConfig) {
   clear();
-  const v = document.createElement("video");
-  v.autoplay = true;
-  v.muted = cfg.muted !== false;
-  v.loop = cfg.loop !== false;
-  v.playsInline = true;
-  v.style.cssText =
-    "position:absolute;inset:0;width:100%;height:100%;" +
-    `object-fit:${fitObjectFit(cfg.fit).objectFit};background:${fitObjectFit(cfg.fit).background};`;
-  v.src = cfg.src ?? "";
-  v.addEventListener("error", () => {
-    console.warn("video error, fallback to default wallpaper", v.error);
+  if (!cfg.src) {
     mountDefaultWallpaper();
+    return;
+  }
+  const fit = fitObjectFit(cfg.fit);
+  const css =
+    "position:absolute;inset:0;width:100%;height:100%;" +
+    `object-fit:${fit.objectFit};background:${fit.background};`;
+  let fellBack = false;
+  const onErr = () => {
+    if (fellBack) return;
+    fellBack = true;
+    console.warn("video error, fallback to default wallpaper");
+    mountDefaultWallpaper();
+  };
+
+  // 关闭循环：保持单元素播完即停
+  if (cfg.loop === false) {
+    const v = document.createElement("video");
+    v.autoplay = true;
+    v.muted = cfg.muted !== false;
+    v.playsInline = true;
+    v.style.cssText = css;
+    v.src = cfg.src;
+    v.addEventListener("error", onErr);
+    wrap.appendChild(v);
+    state.video = v;
+    v.addEventListener("canplay", () => v.play().catch(() => {}), { once: true });
+    return;
+  }
+
+  const pair = createLoopingVideo(cfg.src, { muted: cfg.muted !== false });
+  for (const v of [pair.active, pair.standby]) {
+    v.style.cssText = css;
+    v.addEventListener("error", onErr);
+  }
+  // 备用元素不用 visibility:hidden（WebKit 会挂起隐藏视频的合成层，交接会慢一拍），
+  // 改为主元素覆盖在备用元素之上（zIndex）：备用始终被合成、帧随时可显示，
+  // 交接只是纯 z-index 翻转（合成器原子操作）。备用暂停保温时为静态层，无额外开销。
+  let swapCount = 0;
+  let fallbackReported = false;
+  const applyStack = () => {
+    pair.active.style.zIndex = "2";
+    pair.standby.style.zIndex = "1";
+  };
+  pair.onSwap = () => {
+    applyStack();
+    // 诊断：首次 + 每 10/100 次上报，确认持续无缝交换（频率极低，不刷日志）
+    swapCount++;
+    if (swapCount === 1 || swapCount === 10 || swapCount === 100) {
+      reportDiag(cfg, `video loop swap ok x${swapCount}`);
+    }
+  };
+  pair.onFallback = () => {
+    if (!fallbackReported) {
+      fallbackReported = true;
+      reportDiag(cfg, "video loop fallback (standby not ready, native loop used)");
+    }
+  };
+  applyStack();
+  wrap.appendChild(pair.standby);
+  wrap.appendChild(pair.active);
+  state.videoPair = pair;
+  pair.active.addEventListener("canplay", () => void pair.active.play().catch(() => {}), {
+    once: true,
   });
-  wrap.appendChild(v);
-  state.video = v;
-  const play = () => v.play().catch(() => {});
-  v.addEventListener("canplay", play, { once: true });
 }
 
 function mountGif(cfg: WallpaperConfig) {
@@ -472,32 +712,49 @@ function mountScene(cfg: WallpaperConfig) {
         let entry: any = null;
         if (m.video !== undefined) {
           const url = URL.createObjectURL(new Blob([m.video], { type: "video/mp4" }));
-          const videoEl = document.createElement("video");
-          videoEl.src = url;
-          videoEl.loop = true;
-          videoEl.muted = true;
-          videoEl.playsInline = true;
-          videoEl.style.cssText =
-            "position:fixed;left:-9999px;top:-9999px;width:2px;height:2px;opacity:0;pointer-events:none";
-          document.body.appendChild(videoEl);
-          // 登记以便 clear()/页面卸载时暂停移除元素并 revoke blob URL
-          (state.videoTextures ??= []).push(videoEl);
+          // 无缝循环对：WebKit 原生 loop 在循环点会冻结一瞬，双元素交接可消除
+          const pair = createLoopingVideo(url, { muted: true });
+          for (const v of [pair.active, pair.standby]) {
+            v.style.cssText =
+              "position:fixed;left:-9999px;top:-9999px;width:2px;height:2px;opacity:0;pointer-events:none";
+            document.body.appendChild(v);
+            // 登记以便 clear()/页面卸载时暂停移除元素并 revoke blob URL
+            (state.videoTextures ??= []).push(v);
+          }
           (state.objectUrls ??= []).push(url);
-          videoEl.addEventListener("loadedmetadata", () => {
-            reportDiag(cfg, `video tex '${name}': ${videoEl.videoWidth}x${videoEl.videoHeight}`);
+          (state.videoPairs ??= []).push(pair);
+          pair.active.addEventListener("loadedmetadata", () => {
+            reportDiag(cfg, `video tex '${name}': ${pair.active.videoWidth}x${pair.active.videoHeight}`);
           });
-          videoEl.addEventListener("error", () => {
-            reportDiag(cfg, `video tex '${name}' ERROR: ${videoEl.error?.code}`);
+          pair.active.addEventListener("error", () => {
+            reportDiag(cfg, `video tex '${name}' ERROR: ${pair.active.error?.code}`);
           });
-          void videoEl.play().catch((e) => reportDiag(cfg, `video play fail '${name}': ${String(e).slice(0, 80)}`));
-          entry = {
-            video: videoEl,
+          void pair.active.play().catch((e) => reportDiag(cfg, `video play fail '${name}': ${String(e).slice(0, 80)}`));
+          // entry.video 用 getter 指向当前主元素：交换后渲染器每帧自动采样新元素
+          const entry = {
+            get video() {
+              return pair.active;
+            },
             glTex: rnd.makeTexture(renderer.gl, new Uint8Array([0, 0, 0, 0]), 1, 1),
             width: m.width,
             height: m.height,
             rg88: false,
             lastUploaded: -1,
           };
+          let texSwapCount = 0;
+          pair.onSwap = () => {
+            entry.lastUploaded = -1;
+            // 诊断：首次 + 每 10/100 次上报，确认纹理无缝交换持续生效
+            texSwapCount++;
+            if (texSwapCount === 1 || texSwapCount === 10 || texSwapCount === 100) {
+              reportDiag(cfg, `video tex '${name}' loop swap ok x${texSwapCount}`);
+            }
+          };
+          pair.onFallback = () => {
+            reportDiag(cfg, `video tex '${name}' loop fallback (native loop used)`);
+          };
+          textures.set(name, entry);
+          return entry;
         } else if (m.png !== undefined || (m.image !== undefined && m.fif === tex.FIF.JPEG)) {
           const blob = new Blob([(m.png || m.image) as BlobPart], {
             type: m.png ? "image/png" : "image/jpeg",
@@ -887,14 +1144,16 @@ window.__wp = {
     mount(cfg);
   },
   pause() {
-    state.video?.pause();
+    state.videoPair?.pause();
+    for (const p of state.videoPairs ?? []) p.pause();
     if (state.raf !== undefined) {
       cancelAnimationFrame(state.raf);
       state.raf = undefined;
     }
   },
   resume() {
-    state.video?.play().catch(() => {});
+    state.videoPair?.resume();
+    for (const p of state.videoPairs ?? []) p.resume();
     if (state.cfg.type === "canvas") startCanvasLoop();
     else if (state.cfg.type === "scene") {
       // 场景暂停后重挂 rAF：sceneCleanup 已被 clear() 触发，重新挂载
@@ -906,15 +1165,22 @@ window.__wp = {
   },
   setFit(fit: string) {
     state.cfg.fit = fit as WallpaperFit;
+    const f = fitObjectFit(fit as WallpaperFit);
+    if (state.videoPair) {
+      for (const v of [state.videoPair.active, state.videoPair.standby]) {
+        v.style.objectFit = f.objectFit;
+        v.style.background = f.background;
+      }
+    }
     const obj = state.video ?? state.img;
     if (obj) {
-      const f = fitObjectFit(fit as WallpaperFit);
       obj.style.objectFit = f.objectFit;
       obj.style.background = f.background;
     }
     // 场景壁纸：fit 由渲染循环每帧读取 state.cfg.fit 并传给 fitWindow，无需重挂载即可实时切换
   },
   setVolume(volume: number) {
+    state.videoPair?.setVolume(volume);
     if (state.video) {
       state.video.volume = Math.max(0, Math.min(1, volume));
       state.video.muted = volume <= 0;
