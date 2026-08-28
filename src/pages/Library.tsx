@@ -64,7 +64,14 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
       {/* 头部区域 - 固定在顶部 */}
       <div className="shrink-0 flex items-center gap-3 mb-4">
         <div>
-          <h1 className="text-[22px] font-bold tracking-tight">本地库</h1>
+          <h1 className="text-[22px] font-bold tracking-tight">
+            本地库
+            {!loading && items.length > 0 && (
+              <span className="ml-2 align-middle rounded-full bg-[var(--accent)]/10 px-2 py-0.5 text-[13px] font-semibold text-[var(--accent)]">
+                {items.length} 张
+              </span>
+            )}
+          </h1>
           <p className="text-[13px] text-[var(--text-2)] mt-1">
             已下载壁纸（可在详情页应用为桌面壁纸）
           </p>
