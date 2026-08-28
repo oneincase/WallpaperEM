@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { api } from "../api/steam";
+import { getSidebarAlpha, setSidebarAlpha } from "../lib/sidebar";
 
 // 设置页标签：下载 / 通用 / 网络 / 关于
 type SettingsTab = "download" | "general" | "network" | "about";
@@ -26,6 +27,8 @@ export function SettingsPage() {
   const [sceneFpsMsg, setSceneFpsMsg] = useState("");
   // 工作友好（默认开启）：开启后自动过滤成人内容
   const [familyFriendly, setFamilyFriendly] = useState(true);
+  // 侧边栏透明度（0.2 ~ 1）
+  const [sidebarAlpha, setSidebarAlphaState] = useState<number>(getSidebarAlpha);
   // 下载账号（登录方式单选：qr = 扫码令牌；password = 账号密码）
   const [cred, setCred] = useState<{ configured: boolean; username?: string; mode: "qr" | "password" } | null>(null);
   const [editingCred, setEditingCred] = useState(false);
@@ -285,6 +288,12 @@ export function SettingsPage() {
     } catch {
       // 失败则不变
     }
+  };
+
+  // 侧边栏透明度：设置即生效 + 持久化
+  const changeSidebarAlpha = (v: number) => {
+    const next = setSidebarAlpha(v);
+    setSidebarAlphaState(next);
   };
 
   const changeFit = async (next: "cover" | "contain" | "stretch") => {
@@ -632,6 +641,26 @@ export function SettingsPage() {
                     : "关闭：显示所有内容"
                 }
                 control={<Switch checked={familyFriendly} onChange={toggleFamilyFriendly} />}
+              />
+              <Row
+                label="侧边栏透明度"
+                desc={`调节左侧菜单栏的半透明/磨砂质感（${Math.round(sidebarAlpha * 100)}%）。默认 50%`}
+                control={
+                  <div className="flex items-center gap-2 w-48">
+                    <input
+                      type="range"
+                      min={0.2}
+                      max={1}
+                      step={0.05}
+                      value={sidebarAlpha}
+                      onChange={(e) => changeSidebarAlpha(Number(e.target.value))}
+                      className="flex-1"
+                    />
+                    <span className="w-10 text-right text-[12px] text-[var(--text-2)]">
+                      {Math.round(sidebarAlpha * 100)}%
+                    </span>
+                  </div>
+                }
               />
             </Group>
           )}

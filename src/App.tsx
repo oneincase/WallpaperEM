@@ -19,6 +19,7 @@ import {
   IconMoon,
   IconAuto,
 } from "./components/icons";
+import { applySidebarAlpha, getSidebarAlpha } from "./lib/sidebar";
 
 type PageId = "home" | "workshop" | "downloads" | "library" | "favorites" | "settings";
 type Theme = "system" | "light" | "dark";
@@ -86,6 +87,11 @@ function Shell() {
     }
   }, [theme]);
 
+  // 应用侧边栏透明度
+  useEffect(() => {
+    applySidebarAlpha(getSidebarAlpha());
+  }, []);
+
   const cycleTheme = () => {
     setTheme((t) => (t === "system" ? "light" : t === "light" ? "dark" : "system"));
   };
@@ -111,9 +117,9 @@ function Shell() {
 
   return (
     <div className="flex h-full">
-      {/* 侧边栏 */}
+      {/* 侧边栏（半透明 + 磨砂质感） */}
       <aside
-        className={`${width} shrink-0 flex flex-col bg-[var(--sidebar)] border-r border-[var(--separator)] transition-[width] duration-200 ease-out`}
+        className={`${width} shrink-0 flex flex-col bg-[var(--sidebar)] backdrop-blur-[20px] backdrop-saturate-150 border-r border-[var(--separator)] transition-[width] duration-200 ease-out`}
       >
         <div data-tauri-drag-region className="h-10 shrink-0" />
 

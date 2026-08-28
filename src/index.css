@@ -3,8 +3,9 @@
 /* 默认浅色 */
 :root {
   color-scheme: light;
+  --sidebar-alpha: 0.5;
   --content: rgba(248, 248, 250, 0.82);
-  --sidebar: rgba(238, 238, 242, 0.68);
+  --sidebar: rgba(238, 238, 242, var(--sidebar-alpha));
   --card: rgba(255, 255, 255, 0.72);
   --separator: rgba(0, 0, 0, 0.09);
   --text-1: #1d1d1f;
@@ -18,8 +19,9 @@
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]):not([data-theme="dark"]) {
+    --sidebar-alpha: 0.55;
     --content: rgba(28, 28, 30, 0.85);
-    --sidebar: rgba(40, 40, 42, 0.72);
+    --sidebar: rgba(40, 40, 42, var(--sidebar-alpha));
     --card: rgba(44, 44, 46, 0.72);
     --separator: rgba(255, 255, 255, 0.1);
     --text-1: #f5f5f7;
@@ -31,8 +33,9 @@
 /* 强制深色：不管系统，都用深色 */
 :root[data-theme="dark"] {
   color-scheme: dark;
+  --sidebar-alpha: 0.55;
   --content: rgba(28, 28, 30, 0.85);
-  --sidebar: rgba(40, 40, 42, 0.72);
+  --sidebar: rgba(40, 40, 42, var(--sidebar-alpha));
   --card: rgba(44, 44, 46, 0.72);
   --separator: rgba(255, 255, 255, 0.1);
   --text-1: #f5f5f7;
@@ -50,6 +53,7 @@ body,
 #root {
   height: 100%;
   overflow: hidden;
+  background: transparent;
 }
 
 body {
