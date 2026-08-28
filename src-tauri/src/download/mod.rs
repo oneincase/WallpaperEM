@@ -1095,6 +1095,40 @@ pub fn init(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// 是否有下载相关活动进行中（队列任务 / Steam Guard 等待 / 扫码登录）。
+/// 主窗口闲置释放前查询：活动期间跳过释放，避免打断 Guard 输入与进度展示。
+pub fn is_busy(app: &AppHandle) -> bool {
+    let Some(svc) = app.try_state::<Arc<DownloadService>>() else {
+        return false;
+    };
+    // 内存侧：当前队列任务 / Guard 等待通道 / 扫码登录子进程
+    if svc.current_task.lock().map(|t| t.is_some()).unwrap_or(false) {
+        return true;
+    }
+    if svc.guard_waiters.lock().map(|g| !g.is_empty()).unwrap_or(true) {
+        return true;
+    }
+    if svc.qr_guard_tx.lock().map(|t| t.is_some()).unwrap_or(false) {
+        return true;
+    }
+    if let Ok(child) = svc.qr_child.try_lock() {
+        if child.is_some() {
+            return true;
+        }
+    }
+    // DB 侧（权威）：尚未结束的任务，或等待 Guard 输入（状态集与重启恢复一致）
+    let Ok(conn) = svc.db.lock() else { return false };
+    conn.query_row(
+        "SELECT COUNT(*) FROM downloads
+          WHERE status IN ('queued','authenticating','downloading','installing')
+             OR waiting_guard = 1",
+        [],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| n > 0)
+    .unwrap_or(false)
+}
+
 #[tauri::command]
 pub fn download_tool_status(app: AppHandle) -> serde_json::Value {
     let svc = DownloadService::new(

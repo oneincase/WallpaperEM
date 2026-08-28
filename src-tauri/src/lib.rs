@@ -8,6 +8,7 @@ mod download;
 mod keychain;
 mod secure_store;
 mod library;
+mod main_window;
 mod misc;
 mod steam;
 mod util;
@@ -24,12 +25,9 @@ use tauri::{
 
 pub fn run() {
     tauri::Builder::default()
-        // 单实例：二次启动聚焦主窗口
+        // 单实例：二次启动聚焦主窗口（已被闲置释放则重建）
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(w) = app.get_webview_window("main") {
-                let _ = w.show();
-                let _ = w.set_focus();
-            }
+            main_window::ensure_main_window(app);
         }))
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -118,14 +116,11 @@ pub fn run() {
                 let visible = w.is_visible().unwrap_or(false);
                 tracing::info!("main window visible={visible}");
                 // 关闭主窗口 = 隐藏（壁纸继续运行；点 Dock 图标重新显示）
-                let w2 = w.clone();
-                w.on_window_event(move |event| {
-                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                        api.prevent_close();
-                        let _ = w2.hide();
-                    }
-                });
+                main_window::register_close_to_hide(&w);
             }
+            // 主窗口闲置释放：隐藏/最小化持续 main_window::RELEASE_AFTER 后销毁窗口，
+            // 回收其 WebContent 进程（壁纸窗口不受影响）；唤起时按需重建
+            main_window::start(app.handle());
             tracing::info!("app setup complete");
             Ok(())
         })
@@ -189,10 +184,7 @@ pub fn run() {
         .run(|app, event| {
             // macOS：点击 Dock 图标 / Finder 重开应用 → 显示主窗口
             if let tauri::RunEvent::Reopen { .. } = event {
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.show();
-                    let _ = w.set_focus();
-                }
+                main_window::ensure_main_window(app);
             }
         });
 }
@@ -282,12 +274,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .tooltip("WallpaperEM")
         .show_menu_on_left_click(true)
         .on_menu_event(|app, event| match event.id.as_ref() {
-            "show" => {
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.show();
-                    let _ = w.set_focus();
-                }
-            }
+            "show" => main_window::ensure_main_window(app),
             "pause" => {
                 let paused = app
                     .try_state::<wallpaper::WallpaperEngineState>()
@@ -309,11 +296,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                 ..
             } = event
             {
-                let app = tray.app_handle();
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.show();
-                    let _ = w.set_focus();
-                }
+                main_window::ensure_main_window(tray.app_handle());
             }
         });
     // 菜单栏图标。macOS 上托盘图标必须显式设置，否则状态栏只显示一个「空位」。
@@ -345,8 +328,9 @@ fn register_shortcuts(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-/// macOS 材质：主窗口侧栏 vibrancy（window-vibrancy，基于 NSVisualEffectView）
-fn apply_vibrancy(app: &AppHandle) -> tauri::Result<()> {
+/// macOS 材质：主窗口侧栏 vibrancy（window-vibrancy，基于 NSVisualEffectView）。
+/// pub(crate)：main_window 重建窗口后需再次应用。
+pub(crate) fn apply_vibrancy(app: &AppHandle) -> tauri::Result<()> {
     #[cfg(target_os = "macos")]
     {
         if let Some(w) = app.get_webview_window("main") {
