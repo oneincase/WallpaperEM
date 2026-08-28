@@ -74,8 +74,6 @@ function fitObjectFit(fit?: WallpaperFit): { objectFit: string; background: stri
 const state: {
   cfg: WallpaperConfig;
   video?: HTMLVideoElement;
-  /** 视频壁纸无缝循环对（loop 开启时替代 video） */
-  videoPair?: VideoLoopPair;
   /** 场景内视频纹理循环对（每纹理一个） */
   videoPairs?: VideoLoopPair[];
   img?: HTMLImageElement;
@@ -117,9 +115,8 @@ function clear() {
   wrap.innerHTML = "";
   if (state.raf !== undefined) cancelAnimationFrame(state.raf);
   state.raf = undefined;
-  // 停掉视频循环对（取消 rAF 交换驱动 + 暂停解码）
-  state.videoPair?.destroy();
-  state.videoPair = undefined;
+  // 停掉场景视频纹理循环对（取消 rAF 交换驱动 + 暂停解码）
+  // （视频壁纸本身已是单 video + 原生 loop，无需在此处理）
   for (const p of state.videoPairs ?? []) p.destroy();
   state.videoPairs = undefined;
   if (state.sceneCleanup) state.sceneCleanup();
@@ -259,7 +256,16 @@ function createLoopingVideo(src: string, opts: { muted: boolean }): VideoLoopPai
     v.src = src;
     v.muted = opts.muted;
     v.playsInline = true;
-    v.preload = "auto";
+    // preload=metadata：只拉元数据，避免 WebKit 预下载整个视频文件进内存
+    v.preload = "metadata";
+    // 限制解码分辨率：按「窗口尺寸 × 有效 dpr」解码，而非视频原始分辨率。
+    // WebKit 对超出显示尺寸的 video 会分配等比缩小的解码缓冲（4K 源在 1080p 窗口上
+    // 解码缓冲约为 1/4），显著降低内存。不影响显示清晰度（object-fit 在 CSS 层面缩放）。
+    const dpr = Math.min(window.devicePixelRatio || 1, state.cfg.renderDpr || 1);
+    const maxW = Math.max(1, Math.round(innerWidth * dpr));
+    const maxH = Math.max(1, Math.round(innerHeight * dpr));
+    v.width = maxW;
+    v.height = maxH;
     // 兜底：预热/交接失败时退回原生循环（只是旧式微卡顿，不会中断或黑屏）
     v.loop = true;
     return v;
@@ -433,56 +439,28 @@ function mountVideo(cfg: WallpaperConfig) {
     mountDefaultWallpaper();
   };
 
-  // 关闭循环：保持单元素播完即停
-  if (cfg.loop === false) {
-    const v = document.createElement("video");
-    v.autoplay = true;
-    v.muted = cfg.muted !== false;
-    v.playsInline = true;
-    v.style.cssText = css;
-    v.src = cfg.src;
-    v.addEventListener("error", onErr);
-    wrap.appendChild(v);
-    state.video = v;
-    v.addEventListener("canplay", () => v.play().catch(() => {}), { once: true });
-    return;
-  }
-
-  const pair = createLoopingVideo(cfg.src, { muted: cfg.muted !== false });
-  for (const v of [pair.active, pair.standby]) {
-    v.style.cssText = css;
-    v.addEventListener("error", onErr);
-  }
-  // 备用元素不用 visibility:hidden（WebKit 会挂起隐藏视频的合成层，交接会慢一拍），
-  // 改为主元素覆盖在备用元素之上（zIndex）：备用始终被合成、帧随时可显示，
-  // 交接只是纯 z-index 翻转（合成器原子操作）。备用暂停保温时为静态层，无额外开销。
-  let swapCount = 0;
-  let fallbackReported = false;
-  const applyStack = () => {
-    pair.active.style.zIndex = "2";
-    pair.standby.style.zIndex = "1";
-  };
-  pair.onSwap = () => {
-    applyStack();
-    // 诊断：首次 + 每 10/100 次上报，确认持续无缝交换（频率极低，不刷日志）
-    swapCount++;
-    if (swapCount === 1 || swapCount === 10 || swapCount === 100) {
-      reportDiag(cfg, `video loop swap ok x${swapCount}`);
-    }
-  };
-  pair.onFallback = () => {
-    if (!fallbackReported) {
-      fallbackReported = true;
-      reportDiag(cfg, "video loop fallback (standby not ready, native loop used)");
-    }
-  };
-  applyStack();
-  wrap.appendChild(pair.standby);
-  wrap.appendChild(pair.active);
-  state.videoPair = pair;
-  pair.active.addEventListener("canplay", () => void pair.active.play().catch(() => {}), {
-    once: true,
-  });
+  // 单视频 + 原生 loop（放弃无缝循环双元素方案）。
+  // 内存减半（不再有备用 standby 解码器）；代价是循环点 0.1~0.5s 轻微冻结。
+  const v = document.createElement("video");
+  v.autoplay = true;
+  v.loop = cfg.loop !== false; // 默认循环；loop=false 则播完即停
+  v.muted = cfg.muted !== false;
+  v.playsInline = true;
+  // preload=metadata：只拉元数据，避免 WebKit 预下载整个视频文件进内存
+  v.preload = "metadata";
+  // 限制解码分辨率：按「窗口尺寸 × 有效 dpr」解码，而非视频原始分辨率。
+  // WebKit 对超出显示尺寸的 video 会分配等比缩小的解码缓冲（4K 源在 1080p 窗口上
+  // 解码缓冲约为 1/4），显著降低内存。不影响显示清晰度（object-fit 在 CSS 层面缩放）。
+  const dprV = Math.min(window.devicePixelRatio || 1, state.cfg.renderDpr || 1);
+  v.width = Math.max(1, Math.round(innerWidth * dprV));
+  v.height = Math.max(1, Math.round(innerHeight * dprV));
+  v.style.cssText = css;
+  v.src = cfg.src;
+  v.addEventListener("error", onErr);
+  wrap.appendChild(v);
+  state.video = v;
+  v.addEventListener("canplay", () => v.play().catch(() => {}), { once: true });
+  reportDiag(cfg, "video mounted (single + native loop)");
 }
 
 function mountGif(cfg: WallpaperConfig) {
@@ -508,17 +486,62 @@ function mountWeb(cfg: WallpaperConfig) {
     "position:absolute;inset:0;width:100%;height:100%;border:none;background:transparent;";
   f.src = cfg.src ?? "";
   wrap.appendChild(f);
-  // 同源网页壁纸：加载后注入屏蔽右键菜单（跨源/沙箱不可访问则忽略）
-  const blockIframe = () => {
+  // 同源网页壁纸：加载后注入 GPU 降级脚本 + 屏蔽右键菜单
+  const inject = () => {
     try {
       const doc = f.contentDocument;
-      if (doc) (window as any).__blockContextMenu?.(doc);
+      if (!doc) return;
+      (window as any).__blockContextMenu?.(doc);
+      injectGpuThrottle(f, doc);
     } catch {
-      /* 忽略 */
+      /* 跨源/沙箱不可访问则忽略 */
     }
   };
-  f.addEventListener("load", blockIframe);
+  f.addEventListener("load", inject);
   state.iframe = f;
+}
+
+/// 向网页壁纸 iframe 注入 GPU 降级：requestAnimationFrame 帧率节流 → 限制
+/// WebGL/canvas 动画到 sceneFps（默认 30），显著降低 GPU 占用。
+/// 注意：不做 CSS transform 缩放（会破坏壁纸布局）；仅节流 rAF，安全且有效。
+function injectGpuThrottle(f: HTMLIFrameElement, _doc: Document) {
+  const win = f.contentWindow;
+  if (!win) return;
+  const fps = state.cfg.sceneFps || 30;
+  if (fps >= 60) return; // 60fps 已是目标上限，无需节流
+  const interval = 1000 / fps;
+  try {
+    const origRaf = win.requestAnimationFrame.bind(win);
+    const origCaf = win.cancelAnimationFrame.bind(win);
+    const rafMap = new Map<number, number>();
+    let counter = 0;
+    // 用 setTimeout(≈fps 间隔) 替代原生 60fps rAF，callback 转发回 origRaf（保证仍同步到帧）。
+    // WebKit 会按显示时机光栅化，帧率降半 → WebGL/canvas 动画 GPU 占用约减半。
+    (win as any).requestAnimationFrame = (cb: FrameRequestCallback) => {
+      const id = ++counter;
+      const to = win.setTimeout(() => {
+        rafMap.delete(id);
+        origRaf((now: number) => {
+          try {
+            cb(now);
+          } catch {
+            /* 壁纸内部 rAF callback 抛错忽略 */
+          }
+        });
+      }, interval);
+      rafMap.set(id, to as unknown as number);
+      return id;
+    };
+    (win as any).cancelAnimationFrame = (id: number) => {
+      const to = rafMap.get(id);
+      if (to !== undefined) {
+        win.clearTimeout(to);
+        rafMap.delete(id);
+      }
+    };
+  } catch {
+    /* 忽略 */
+  }
 }
 
 /// 默认壁纸：无壁纸/加载失败时，展示内置的精美 HTML 壁纸（由内容服务器提供，与渲染器同源）
@@ -1165,7 +1188,6 @@ window.__wp = {
     mount(cfg);
   },
   pause() {
-    state.videoPair?.pause();
     for (const p of state.videoPairs ?? []) p.pause();
     if (state.raf !== undefined) {
       cancelAnimationFrame(state.raf);
@@ -1173,7 +1195,6 @@ window.__wp = {
     }
   },
   resume() {
-    state.videoPair?.resume();
     for (const p of state.videoPairs ?? []) p.resume();
     if (state.cfg.type === "canvas") startCanvasLoop();
     else if (state.cfg.type === "scene") {
@@ -1187,12 +1208,6 @@ window.__wp = {
   setFit(fit: string) {
     state.cfg.fit = fit as WallpaperFit;
     const f = fitObjectFit(fit as WallpaperFit);
-    if (state.videoPair) {
-      for (const v of [state.videoPair.active, state.videoPair.standby]) {
-        v.style.objectFit = f.objectFit;
-        v.style.background = f.background;
-      }
-    }
     const obj = state.video ?? state.img;
     if (obj) {
       obj.style.objectFit = f.objectFit;
@@ -1201,7 +1216,6 @@ window.__wp = {
     // 场景壁纸：fit 由渲染循环每帧读取 state.cfg.fit 并传给 fitWindow，无需重挂载即可实时切换
   },
   setVolume(volume: number) {
-    state.videoPair?.setVolume(volume);
     if (state.video) {
       state.video.volume = Math.max(0, Math.min(1, volume));
       state.video.muted = volume <= 0;
