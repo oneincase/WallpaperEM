@@ -154,6 +154,17 @@ function clear() {
     }
     state.sceneAudio = undefined;
   }
+  if (state.video) {
+    // 非循环视频：同样清 src + load() 释放解码器（仅 remove 节点/pause 不足）
+    state.video.pause();
+    state.video.removeAttribute("src");
+    try {
+      state.video.load();
+    } catch {
+      /* 忽略 */
+    }
+    state.video.remove();
+  }
   state.video = undefined;
   state.img = undefined;
   state.iframe = undefined;
@@ -388,7 +399,17 @@ function createLoopingVideo(src: string, opts: { muted: boolean }): VideoLoopPai
       destroyed = true;
       if (raf) cancelAnimationFrame(raf);
       raf = 0;
-      for (const v of [active, standby]) v.pause();
+      for (const v of [active, standby]) {
+        v.pause();
+        // 关键：清掉 src 并 load()，触发 WebKit 释放解码器/解码缓冲区（仅 pause 不会归还内存）
+        v.removeAttribute("src");
+        try {
+          v.load();
+        } catch {
+          /* 忽略 */
+        }
+        v.remove();
+      }
     },
   };
   return pair;
