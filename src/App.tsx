@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { HomePage } from "./pages/Home";
 import { WorkshopPage } from "./pages/Workshop";
 import { DetailPage } from "./pages/Detail";
@@ -15,9 +15,15 @@ import {
   IconGear,
   IconSidebarCollapse,
   IconSidebarExpand,
+  IconSun,
+  IconMoon,
+  IconAuto,
 } from "./components/icons";
 
 type PageId = "home" | "workshop" | "downloads" | "library" | "favorites" | "settings";
+type Theme = "system" | "light" | "dark";
+
+const THEME_STORAGE_KEY = "we.theme";
 
 const NAV: { id: PageId; label: string; icon: ReactNode; group: string }[] = [
   { id: "home", label: "发现", icon: <IconHome />, group: "浏览" },
@@ -38,6 +44,16 @@ function readInitialCollapsed(): boolean {
   }
 }
 
+function readInitialTheme(): Theme {
+  try {
+    const t = localStorage.getItem(THEME_STORAGE_KEY);
+    if (t === "light" || t === "dark" || t === "system") return t;
+  } catch {
+    /* ignore */
+  }
+  return "system";
+}
+
 export default function App() {
   return <Shell />;
 }
@@ -52,6 +68,27 @@ function Shell() {
     group: g,
     items: NAV.filter((n) => n.group === g),
   }));
+
+  // 主题：system / light / dark，默认跟随系统；应用到 <html data-theme>
+  const [theme, setTheme] = useState<Theme>(readInitialTheme);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (theme === "system") {
+      root.removeAttribute("data-theme");
+    } else {
+      root.setAttribute("data-theme", theme);
+    }
+    try {
+      localStorage.setItem(THEME_STORAGE_KEY, theme);
+    } catch {
+      /* ignore */
+    }
+  }, [theme]);
+
+  const cycleTheme = () => {
+    setTheme((t) => (t === "system" ? "light" : t === "light" ? "dark" : "system"));
+  };
 
   const navigate = (p: PageId) => {
     setDetailId(null);
@@ -152,6 +189,33 @@ function Shell() {
             </div>
           ))}
         </nav>
+
+        {/* 底部：主题切换（system → light → dark 循环） */}
+        <div className="shrink-0 border-t border-[var(--separator)] px-3 py-2">
+          <button
+            onClick={cycleTheme}
+            data-tip={
+              theme === "system" ? "主题：跟随系统" : theme === "light" ? "主题：浅色" : "主题：深色"
+            }
+            aria-label="切换主题"
+            className={`${
+              collapsed ? "w-full justify-center" : "w-full justify-start gap-2.5 px-2.5"
+            } flex items-center rounded-[7px] py-[5px] text-[13.5px] transition-colors text-[var(--text-2)] hover:text-[var(--text-1)] hover:bg-black/5 dark:hover:bg-white/8`}
+          >
+            {theme === "system" ? (
+              <IconAuto />
+            ) : theme === "light" ? (
+              <IconSun />
+            ) : (
+              <IconMoon />
+            )}
+            {!collapsed && (
+              <span>
+                {theme === "system" ? "跟随系统" : theme === "light" ? "浅色" : "深色"}
+              </span>
+            )}
+          </button>
+        </div>
       </aside>
 
       {/* 内容区 */}
