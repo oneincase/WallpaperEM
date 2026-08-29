@@ -146,6 +146,14 @@ export const api = {
     invoke<{ cancelled?: boolean; imported?: number; itemId?: string; title?: string; type?: string }>(
       "library_import_custom_pick"
     ),
+  // WE 网页壁纸用户属性
+  libraryItemProps: (itemId: string) => invoke<WebPropDef[]>("library_item_props", { itemId }),
+  librarySetItemProps: (itemId: string, values: WebPropValues) =>
+    invoke<void>("library_set_item_props", { itemId, values }),
+  librarySetItemPropFile: (itemId: string, propName: string) =>
+    invoke<{ cancelled?: boolean; value?: string }>("library_set_item_prop_file", { itemId, propName }),
+  libraryResetItemProps: (itemId: string) =>
+    invoke<void>("library_reset_item_props", { itemId }),
   wallpaperApplyItem: (itemId: string) => invoke<void>("wallpaper_apply_item", { itemId }),
   libraryPreview: (itemId: string) => invoke<WallpaperConfig>("library_preview", { itemId }),
   wallpaperApply: (config: WallpaperConfig, displayId?: string) =>
@@ -219,6 +227,48 @@ export interface Playlist {
   itemIds: string[];
   intervalSec: number;
 }
+
+// ---------- WE 网页壁纸用户属性 ----------
+
+export interface ComboOption {
+  label: string;
+  /** 保留 project.json 声明的类型（同一 combo 内数字/布尔/字符串混用是常态） */
+  value: string | number | boolean;
+  /** 选项级显隐条件 */
+  condition?: string;
+}
+
+/** WE 属性类型。`(string & {})` 兜底未知类型，同时保留字面量的补全与穷尽检查 */
+export type WebPropType =
+  | "color"
+  | "bool"
+  | "slider"
+  | "combo"
+  | "text"
+  | "textinput"
+  | "file"
+  | (string & {});
+
+/** project.json 属性定义 + 当前值（wire 格式：color="r g b" 浮点串，bool=布尔，slider=数值…） */
+export interface WebPropDef {
+  name: string;
+  ptype: WebPropType;
+  /** 已解析的显示文案（localization 表 → WE 内建映射 → 属性名；已剥离 HTML） */
+  text: string;
+  /** 排序键，可为浮点（壁纸用 32.5 这类细分序） */
+  order: number;
+  value: string | number | boolean | null;
+  default: string | number | boolean | null;
+  overridden: boolean;
+  /** WE 显隐条件表达式，由 lib/weCondition 按当前草稿求值（仅影响 UI 显隐） */
+  condition?: string;
+  options: ComboOption[];
+  min?: number;
+  max?: number;
+  step?: number;
+}
+
+export type WebPropValues = Record<string, string | number | boolean>;
 
 /** 系统音频处理（音频可视化）状态 */
 export interface AudioProcessingStatus {

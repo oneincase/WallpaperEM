@@ -14,6 +14,8 @@ mod sfw;
 mod steam;
 mod util;
 mod wallpaper;
+mod we_props;
+mod we_shim;
 mod workshop;
 mod audio_capture;
 
@@ -183,6 +185,10 @@ pub fn run() {
             library::library_import_from_web,
             library::library_import_custom,
             library::library_import_custom_pick,
+            library::item_props,
+            library::set_item_props,
+            library::reset_item_props,
+            library::set_item_prop_file,
             misc::favorites_list,
             misc::favorite_add,
             misc::favorite_remove,

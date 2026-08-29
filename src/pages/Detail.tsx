@@ -2,6 +2,7 @@
 import { useEffect, useState } from "react";
 import { api, TYPE_LABELS, type WorkshopItem } from "../api/steam";
 import { useWallpaperMeta } from "../hooks/useWallpaperMeta";
+import { WebPropsEditor } from "../components/WebPropsEditor";
 
 export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
   const [item, setItem] = useState<WorkshopItem | null>(null);
@@ -172,6 +173,9 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
           )}
         </div>
       </div>
+
+      {/* WE 网页壁纸用户属性（project.json properties，已下载的 web 类型才显示） */}
+      {downloaded && item.type === "web" && <WebPropsEditor itemId={item.id} />}
     </div>
   );
 }

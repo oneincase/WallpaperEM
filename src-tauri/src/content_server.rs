@@ -25,7 +25,7 @@ pub struct ContentServerState {
     /// prod：打包进资源目录的 dist/renderer（dev 由 vite 代理）
     #[allow(dead_code)]
     pub renderer_dir: PathBuf,
-    /// 系统音频捕获共享帧（/audio-stream SSE 端点 + shim 引导标记）
+    /// 系统音频捕获共享帧（二期：/audio-stream SSE 端点 + shim 引导标记）
     pub audio: Arc<crate::audio_capture::AudioShared>,
 }
 
@@ -392,7 +392,7 @@ async fn handle_conn(
         return respond(stream, 200, "OK", "text/plain", b"ok", None).await;
     }
 
-    // 系统音频频谱推送（SSE）：壁纸页内 shim 经 EventSource 订阅
+    // 系统音频频谱推送（SSE，二期）：壁纸页内 shim 经 EventSource 订阅
     if let Some(tok) = path.strip_prefix("/audio-stream/") {
         if tok != state.token {
             return respond(stream, 401, "Unauthorized", "text/plain", b"", None).await;
@@ -438,7 +438,7 @@ async fn handle_conn(
     }
 
     // 路径规范化防穿越
-    let base = state.wallpapers_dir.join(item_id);
+    let base = state.wallpapers_dir.join(&item_id);
     let Some(target) = normalize(&base, &rel_path) else {
         return respond(stream, 403, "Forbidden", "text/plain", b"", None).await;
     };
@@ -474,6 +474,14 @@ async fn handle_conn(
     let data = tokio::fs::read(&file).await.map_err(|e| e.to_string())?;
     let total = data.len() as u64;
     let mime = mime_for(&file);
+
+    // WE 网页壁纸兼容 shim：库内条目的 HTML 响应注入引导数据（属性/fps）+ 脚本，
+    // 拼在 <head> 后先于壁纸自身脚本执行（属性监听、音频 API、rAF 节流均依赖此时机）
+    let data = if mime.starts_with("text/html") {
+        inject_we_shim(state, &item_id, data)
+    } else {
+        data
+    };
 
     if range.starts_with("bytes=") {
         let spec = &range[6..];
@@ -564,6 +572,111 @@ async fn audio_stream_sse(
             }
             Err(e) => return Err(format!("audio sse client disconnected: {e}")),
         }
+    }
+}
+
+/// WE 网页壁纸兼容层：把引导数据（project.json 属性 + fps）与 shim 脚本拼进 HTML。
+/// 位置选 <head> 开标签之后（保证先于壁纸脚本执行）；无 <head> 则前置。
+fn inject_we_shim(state: &ContentServerState, item_id: &str, html: Vec<u8>) -> Vec<u8> {
+    let mut boot = crate::we_props::boot_json(&state.db, &state.wallpapers_dir, item_id);
+    // 系统音频：SSE 端点地址（壁纸页与内容服务器同源，EventSource 直接订阅）
+    boot["token"] = serde_json::json!(state.token);
+    boot["systemAudio"] = serde_json::json!(state.audio.is_running());
+    // 属性文本可能含 script 结束标签：JSON 内把 "<" 转义为 \u003c（合法 JSON 转义，
+    // 解析回原文本），确保注入文本中不出现标签结束序列
+    let boot_str = serde_json::to_string(&boot)
+        .unwrap_or_else(|_| "{}".into())
+        .replace("</", "\\u003c/");
+    let prelude = format!(
+        "<script>window.__WE_BOOT={boot_str};</script><script>{}</script>",
+        crate::we_shim::SRC
+    );
+    let text = String::from_utf8_lossy(&html);
+    let lower = text.to_ascii_lowercase();
+    let insert_at = find_head_open(&lower)
+        .and_then(|pos| lower[pos..].find('>').map(|off| pos + off + 1))
+        .unwrap_or(0);
+    let mut out = String::with_capacity(text.len() + prelude.len());
+    out.push_str(&text[..insert_at]);
+    out.push_str(&prelude);
+    out.push_str(&text[insert_at..]);
+    out.into_bytes()
+}
+
+/// 找真正的 `<head` 开标签（排除 `<header` 等以 head 开头的标签名）
+fn find_head_open(lower: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(rel) = lower[from..].find("<head") {
+        let pos = from + rel;
+        let after = &lower[pos + 5..];
+        let ok = after.starts_with('>')
+            || after.starts_with('/')
+            || after.starts_with(' ')
+            || after.starts_with('\t')
+            || after.starts_with('\n')
+            || after.starts_with('\r');
+        if ok {
+            return Some(pos);
+        }
+        from = pos + 1;
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 找到 <head> 后插入点应在开标签 `>` 之后（即 prelude 位于 </head> 之前、
+    /// 壁纸自身脚本之前）
+    #[test]
+    fn find_head_open_variants() {
+        // 注意：入参约定为已 to_ascii_lowercase 的小写文本（与生产调用一致）
+        assert_eq!(find_head_open("<html><head><title>x"), Some(6));
+        assert_eq!(find_head_open("<html><head lang=\"zh\">"), Some(6));
+        assert_eq!(find_head_open("<html><head\n class=\"a\">"), Some(6));
+        // <header> 不是 <head>
+        assert_eq!(find_head_open("<body><header class=\"h\">x"), None);
+        // <header 在前、真 <head> 在后（"<header>" 8 字符 + "</header>" 9 字符 → 偏移 17）
+        assert_eq!(find_head_open("<header></header><head>"), Some(17));
+        // 无 head：前置到文档开头
+        assert_eq!(find_head_open("<html><body>"), None);
+    }
+
+    #[test]
+    fn inject_splices_after_head_and_escapes_closing_tag() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)", [])
+            .unwrap();
+        let dir = std::env::temp_dir().join("wpem-inject-test-item");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("project.json"),
+            r#"{"type":"web","file":"index.html","general":{"properties":{"t":{"type":"text","value":"a</script>b"}}}}"#,
+        )
+        .unwrap();
+        let state = ContentServerState {
+            port: 0,
+            token: "t".into(),
+            db: Arc::new(Mutex::new(conn)),
+            wallpapers_dir: std::env::temp_dir(),
+            renderer_dir: Default::default(),
+            audio: std::sync::Arc::new(crate::audio_capture::AudioShared::new()),
+        };
+        let html = b"<!DOCTYPE html><html><head><meta charset=utf-8></head><body></body></html>".to_vec();
+        let out = inject_we_shim(&state, "wpem-inject-test-item", html);
+        let s = String::from_utf8(out).unwrap();
+        // prelude 拼在 <head …> 之后、</head> 之前
+        let (before, after) = s.split_once("</head>").unwrap();
+        assert!(before.contains("__WE_BOOT"), "引导数据应在 </head> 之前");
+        assert!(before.contains("__weSetFps"), "shim 控制接口应在 </head> 之前");
+        assert!(after.contains("<body>"));
+        // 属性值里的标签结束序列被 JSON unicode 转义（解析回原文本，且不会提前闭合标签）
+        assert!(s.contains(r"a\u003c/script>b"), "值中的结束标签已转义");
+        assert!(!s.contains("a</script>b"), "原文中的结束标签不应原样出现");
+        // 引导赋值只出现一次（shim 内的读取引用不算；一次注入，不会叠加）
+        assert_eq!(s.matches("window.__WE_BOOT={").count(), 1);
     }
 }
 

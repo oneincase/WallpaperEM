@@ -501,12 +501,24 @@ function mountWeb(cfg: WallpaperConfig) {
   state.iframe = f;
 }
 
+/// 调用库内网页壁纸 iframe 里的 WE 兼容 shim 控制接口（同源；跨源/无 shim 静默忽略）
+function weShimCall(call: (win: any) => void) {
+  try {
+    const win = (state.iframe as HTMLIFrameElement | null)?.contentWindow as any;
+    if (win) call(win);
+  } catch {
+    /* 非同源 iframe 不可访问则忽略 */
+  }
+}
+
 /// 向网页壁纸 iframe 注入 GPU 降级：requestAnimationFrame 帧率节流 → 限制
 /// WebGL/canvas 动画到 sceneFps（默认 30），显著降低 GPU 占用。
 /// 注意：不做 CSS transform 缩放（会破坏壁纸布局）；仅节流 rAF，安全且有效。
 function injectGpuThrottle(f: HTMLIFrameElement, _doc: Document) {
   const win = f.contentWindow;
   if (!win) return;
+  // WE shim 已接管节流（注入时机更早且支持运行时调 fps），避免双层节流把帧率减半
+  if ((win.requestAnimationFrame as any)?.__weThrottled) return;
   const fps = state.cfg.sceneFps || 30;
   if (fps >= 60) return; // 60fps 已是目标上限，无需节流
   const interval = 1000 / fps;
@@ -1178,6 +1190,8 @@ declare global {
       restore(): void;
       setRenderDpr(dpr: number): void;
       setSceneFps(fps: number): void;
+      /** 热更新 WE 网页壁纸用户属性（wire 格式：{name: {value: ...}}） */
+      updateWebProps(props: Record<string, { value: unknown }>): void;
     };
   }
 }
@@ -1189,6 +1203,7 @@ window.__wp = {
   },
   pause() {
     for (const p of state.videoPairs ?? []) p.pause();
+    weShimCall((w) => w.__weSetPaused?.(true));
     if (state.raf !== undefined) {
       cancelAnimationFrame(state.raf);
       state.raf = undefined;
@@ -1196,6 +1211,7 @@ window.__wp = {
   },
   resume() {
     for (const p of state.videoPairs ?? []) p.resume();
+    weShimCall((w) => w.__weSetPaused?.(false));
     if (state.cfg.type === "canvas") startCanvasLoop();
     else if (state.cfg.type === "scene") {
       // 场景暂停后重挂 rAF：sceneCleanup 已被 clear() 触发，重新挂载
@@ -1223,6 +1239,7 @@ window.__wp = {
     if (state.sceneAudio) {
       state.sceneAudio.setVolume(volume);
     }
+    weShimCall((w) => w.__weSetVolume?.(Math.max(0, Math.min(1, volume))));
   },
   // 释放壁纸渲染资源（画布/WebGL/视频/iframe），归还内存；保留 state.cfg 供 restore() 重建
   release() {
@@ -1240,6 +1257,11 @@ window.__wp = {
   // 调整场景帧率：渲染循环每帧读取 state.cfg.sceneFps，无需重挂载即可实时生效
   setSceneFps(fps: number) {
     state.cfg.sceneFps = fps;
+    weShimCall((w) => w.__weSetFps?.(fps));
+  },
+  // 热更新 WE 网页壁纸用户属性（属性编辑保存后由原生侧调用，免刷新生效）
+  updateWebProps(props: Record<string, { value: unknown }>) {
+    weShimCall((w) => w.__weApplyProps?.(props));
   },
 };
 

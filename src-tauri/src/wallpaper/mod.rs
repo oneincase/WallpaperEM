@@ -88,7 +88,7 @@ fn apply_global_render_dpr(app: &AppHandle, cfg: &mut WallpaperConfig) {
 }
 
 /// 全局场景帧率上限（读设置 `wallpaper_scene_fps`），只允许 30/60/120，非法值回退 60。
-fn global_scene_fps(conn: Option<&Connection>) -> u32 {
+pub(crate) fn global_scene_fps(conn: Option<&Connection>) -> u32 {
     let raw = conn.and_then(|c| db::get_setting(c, "wallpaper_scene_fps"));
     let parsed = raw
         .as_deref()
@@ -755,7 +755,7 @@ pub fn interactive_set(app: AppHandle, enabled: bool) -> Result<(), String> {
 
 /// 查找壁纸目录里第一个 HTML 文件，返回相对路径。
 /// 优先 web/ 子目录（WE 常规布局），其次根目录，最后深层子目录；同层按文件名排序保证稳定。
-fn find_first_html(dir: &std::path::Path) -> Option<String> {
+pub(crate) fn find_first_html(dir: &std::path::Path) -> Option<String> {
     fn walk(d: &std::path::Path, base: &std::path::Path, found: &mut Vec<(u8, String)>) {
         let Ok(entries) = std::fs::read_dir(d) else {
             return;

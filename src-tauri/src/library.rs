@@ -1,4 +1,6 @@
 //! 本地库（T4）：列表/删除/打开目录/Web 数据导入 + 应用到桌面
+//!
+//! 另含 WE 网页壁纸用户属性命令（读取/保存/重置，保存后对已应用窗口热更新）。
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -9,6 +11,7 @@ use serde_json::json;
 use tauri::{AppHandle, Manager};
 
 use crate::wallpaper;
+use crate::we_props;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -484,4 +487,143 @@ fn parse_project(dir: &Path) -> (String, String) {
         }
     }
     ("unknown".into(), "未命名".into())
+}
+
+// ---------- WE 网页壁纸用户属性 ----------
+
+fn wallpapers_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|d| d.join("wallpapers"))
+        .map_err(|e| e.to_string())
+}
+
+/// web 壁纸的属性定义列表（project.json 默认值 + 用户覆盖合并后的当前值）。
+/// 非 web 类型/无属性时返回空数组。
+#[tauri::command(rename = "library_item_props")]
+pub fn item_props(app: AppHandle, item_id: String) -> Result<Vec<we_props::WebPropDef>, String> {
+    let db = app.state::<Arc<Mutex<Connection>>>();
+    let conn = db.lock().map_err(|e| e.to_string())?;
+    let dir = wallpapers_dir(&app)?;
+    Ok(we_props::describe(&conn, &dir, &item_id))
+}
+
+/// 保存用户属性覆盖（wire 格式值），并对正在应用该壁纸的窗口热更新（免刷新生效）
+#[tauri::command(rename = "library_set_item_props")]
+pub fn set_item_props(
+    app: AppHandle,
+    item_id: String,
+    values: serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let db = app.state::<Arc<Mutex<Connection>>>();
+    {
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        we_props::set_overrides(&conn, &item_id, &values)?;
+    }
+    apply_live(&app, &item_id)
+}
+
+/// 清除用户属性覆盖（回到 project.json 默认值），并对已应用窗口热更新
+#[tauri::command(rename = "library_reset_item_props")]
+pub fn reset_item_props(app: AppHandle, item_id: String) -> Result<(), String> {
+    let db = app.state::<Arc<Mutex<Connection>>>();
+    {
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        we_props::set_overrides(&conn, &item_id, &serde_json::Map::new())?;
+    }
+    apply_live(&app, &item_id)
+}
+
+/// file 类型属性：弹出文件选择框，拷入壁纸目录（we-props/ 子目录）后写覆盖值。
+/// 返回 {cancelled: true} 或 {value: "we-props/xx.png"}（相对壁纸根的路径）。
+#[tauri::command(rename = "library_set_item_prop_file")]
+pub async fn set_item_prop_file(
+    app: AppHandle,
+    item_id: String,
+    prop_name: String,
+) -> Result<serde_json::Value, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let app_pick = app.clone();
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        app_pick
+            .dialog()
+            .file()
+            .add_filter("图片", &["png", "jpg", "jpeg", "webp", "gif", "bmp"])
+            .blocking_pick_file()
+            .and_then(|f| f.as_path().map(|p| p.to_path_buf()))
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let Some(src) = picked else {
+        return Ok(json!({ "cancelled": true }));
+    };
+
+    // 校验属性存在且为 file 类型
+    let db = app.state::<Arc<Mutex<Connection>>>();
+    let dir = wallpapers_dir(&app)?;
+    {
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        let defs = we_props::describe(&conn, &dir, &item_id);
+        match defs.iter().find(|d| d.name == prop_name) {
+            Some(d) if d.ptype == "file" => {}
+            Some(d) => return Err(format!("属性 {prop_name} 是 {} 类型，非文件", d.ptype)),
+            None => return Err(format!("属性 {prop_name} 不存在")),
+        }
+    }
+
+    // 拷入 we-props/{prop}_{原文件名}（属性名前缀防冲突）
+    let file_name = src
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "image.png".into());
+    let dest_name = format!("{prop_name}_{file_name}");
+    let dest_dir = dir.join(&item_id).join("we-props");
+    std::fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
+    let dest = dest_dir.join(&dest_name);
+    std::fs::copy(&src, &dest).map_err(|e| format!("拷贝文件失败: {e}"))?;
+    let rel = format!("we-props/{dest_name}");
+
+    {
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        we_props::set_single_override(&conn, &item_id, &prop_name, json!(rel))?;
+    }
+    apply_live(&app, &item_id)?;
+    Ok(json!({ "value": rel }))
+}
+
+/// 把该壁纸当前的完整属性表热更新到所有正在应用它的壁纸窗口
+fn apply_live(app: &AppHandle, item_id: &str) -> Result<(), String> {
+    let db = app.state::<Arc<Mutex<Connection>>>();
+    let conn = db.lock().map_err(|e| e.to_string())?;
+    let dir = wallpapers_dir(app)?;
+    let props = we_props::effective_props(&conn, &dir, item_id);
+    let displays: Vec<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT display_id FROM wallpaper_sessions WHERE item_id = ?1 AND item_id != ''",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows: Vec<String> = stmt
+            .query_map([item_id], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        rows
+    };
+    drop(conn);
+    if displays.is_empty() {
+        return Ok(());
+    }
+    let js = format!(
+        "window.__wp && window.__wp.updateWebProps({})",
+        serde_json::to_string(&props).map_err(|e| e.to_string())?
+    );
+    for d in displays {
+        if let Some(w) = app.get_webview_window(&format!("wallpaper-{d}")) {
+            let _ = w.eval(&js);
+        }
+    }
+    Ok(())
 }
