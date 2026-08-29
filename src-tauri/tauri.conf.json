@@ -43,6 +43,9 @@
       "../dist/renderer": "renderer",
       "../dist/assets": "assets",
       "../dist/default-wallpaper": "default-wallpaper"
+    },
+    "macOS": {
+      "entitlements": "entitlements.plist"
     }
   }
 }
