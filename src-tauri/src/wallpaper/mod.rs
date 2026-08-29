@@ -753,6 +753,24 @@ pub fn interactive_set(app: AppHandle, enabled: bool) -> Result<(), String> {
 
 // ---------- 本地库条目应用 + 轮播（T3） ----------
 
+/// project.json 声明的入口 HTML（相对壁纸根）。WE 用 `file` 字段指定入口，
+/// 有些壁纸既无 web/index.html 也无根 index.html，只能靠它定位。
+/// 拒绝绝对路径与 .. 穿越，且要求文件真实存在。
+/// 注意：we_props::entry_dir_prefix 依赖同样的优先级来解析 file 属性的相对前缀，
+/// 两处须保持一致，否则壁纸加载目录与其文件属性的基准目录会不一致。
+fn project_json_entry(dir: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join("project.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let rel = v.get("file")?.as_str()?.trim().replace('\\', "/");
+    if rel.is_empty() || rel.starts_with('/') || rel.split('/').any(|seg| seg == "..") {
+        return None;
+    }
+    if !dir.join(&rel).is_file() {
+        return None;
+    }
+    Some(rel)
+}
+
 /// 查找壁纸目录里第一个 HTML 文件，返回相对路径。
 /// 优先 web/ 子目录（WE 常规布局），其次根目录，最后深层子目录；同层按文件名排序保证稳定。
 pub(crate) fn find_first_html(dir: &std::path::Path) -> Option<String> {
@@ -842,7 +860,11 @@ fn resolve_item_config(app: &AppHandle, item_id: &str) -> Result<WallpaperConfig
         "web" => {
             let web = web_base(app).ok_or("内容服务器未就绪")?;
             let base = format!("{web}/{item_id}");
-            let src = if dir.join("web/index.html").is_file() {
+            // 优先级须与 we_props::entry_dir_prefix 一致
+            let src = if let Some(rel) = project_json_entry(&dir) {
+                // project.json 显式声明的入口（有些壁纸没有任何 index.html）
+                format!("{base}/{rel}")
+            } else if dir.join("web/index.html").is_file() {
                 // WE 常规：主目录下 web/ 子目录
                 format!("{base}/web/")
             } else if dir.join("index.html").is_file() {
@@ -1066,4 +1088,50 @@ pub fn start_playlist_rotation(app: &AppHandle) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("wpem-entry-test-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn project_json_entry_priority_and_safety() {
+        // 声明的入口存在 → 采用（该壁纸没有任何 index.html）
+        let d = fixture("declared");
+        std::fs::write(d.join("bb.html"), "x").unwrap();
+        std::fs::write(d.join("project.json"), r#"{"type":"web","file":"bb.html"}"#).unwrap();
+        assert_eq!(project_json_entry(&d).as_deref(), Some("bb.html"));
+
+        // 反斜杠归一化为正斜杠
+        let d = fixture("backslash");
+        std::fs::create_dir_all(d.join("pages")).unwrap();
+        std::fs::write(d.join("pages/a.html"), "x").unwrap();
+        std::fs::write(d.join("project.json"), r#"{"type":"web","file":"pages\\a.html"}"#).unwrap();
+        assert_eq!(project_json_entry(&d).as_deref(), Some("pages/a.html"));
+
+        // 声明的文件不存在 → None（交给后续常规探测）
+        let d = fixture("missing");
+        std::fs::write(d.join("project.json"), r#"{"type":"web","file":"nope.html"}"#).unwrap();
+        assert_eq!(project_json_entry(&d), None);
+
+        // 路径穿越与绝对路径一律拒绝
+        for bad in [r#"{"file":"../../etc/passwd"}"#, r#"{"file":"/etc/passwd"}"#, r#"{"file":""}"#] {
+            let d = fixture("unsafe");
+            std::fs::write(d.join("project.json"), bad).unwrap();
+            assert_eq!(project_json_entry(&d), None, "应拒绝: {bad}");
+        }
+
+        // 无 project.json / 无 file 字段
+        let d = fixture("nofile");
+        std::fs::write(d.join("project.json"), r#"{"type":"web"}"#).unwrap();
+        assert_eq!(project_json_entry(&d), None);
+        assert_eq!(project_json_entry(&fixture("empty")), None);
+    }
 }
