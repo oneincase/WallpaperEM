@@ -40,9 +40,22 @@ tower-http = { version = "0.6", features = ["fs"] }
 keyring = { version = "3", features = ["apple-native"] }
 libc = "0.2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+rustfft = "6"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-app-kit = "0.3"
-objc2-foundation = "0.3"
+objc2-foundation = { version = "0.3", features = ["NSArray"] }
 objc2-core-graphics = "0.3"
+# 系统全局音频捕获（二期）：ScreenCaptureKit 音频 loopback（macOS 13+）
+objc2-screen-capture-kit = { version = "0.3", features = [
+    "SCStream",
+    "SCShareableContent",
+    "objc2-core-media",
+    "dispatch2",
+    "block2",
+] }
+objc2-core-media = { version = "0.3", features = ["objc2-core-audio-types"] }
+objc2-core-audio-types = "0.3"
+dispatch2 = { version = "0.3", default-features = false, features = ["alloc", "objc2", "block2"] }
+block2 = { version = "0.6", default-features = false, features = ["alloc"] }

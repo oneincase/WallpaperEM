@@ -159,6 +159,10 @@ export const api = {
   wallpaperSetFit: (fit: string) => invoke<void>("wallpaper_set_fit", { fit }),
   wallpaperSetRenderDpr: (dpr: number) => invoke<void>("wallpaper_set_render_dpr", { dpr }),
   wallpaperSetSceneFps: (fps: number) => invoke<void>("wallpaper_set_scene_fps", { fps }),
+  wallpaperAudioProcessingSet: (enabled: boolean) =>
+    invoke<AudioProcessingStatus>("wallpaper_audio_processing_set", { enabled }),
+  wallpaperAudioProcessingStatus: () =>
+    invoke<AudioProcessingStatus>("wallpaper_audio_processing_status"),
   wallpaperNext: () => invoke<{ itemId: string; index: number }>("wallpaper_next"),
   favoritesList: () => invoke<FavoriteItem[]>("favorites_list"),
   favoriteAdd: (itemId: string) => invoke<boolean>("favorite_add", { itemId }),
@@ -214,4 +218,14 @@ export interface Playlist {
   name: string;
   itemIds: string[];
   intervalSec: number;
+}
+
+/** 系统音频处理（音频可视化）状态 */
+export interface AudioProcessingStatus {
+  /** 设置开关（持久化） */
+  enabled: boolean;
+  /** 捕获是否运行中 */
+  running: boolean;
+  /** 屏幕录制权限是否已授予 */
+  granted: boolean;
 }

@@ -25,6 +25,8 @@ pub struct ContentServerState {
     /// prod：打包进资源目录的 dist/renderer（dev 由 vite 代理）
     #[allow(dead_code)]
     pub renderer_dir: PathBuf,
+    /// 系统音频捕获共享帧（/audio-stream SSE 端点 + shim 引导标记）
+    pub audio: Arc<crate::audio_capture::AudioShared>,
 }
 
 pub fn init(app: &AppHandle) -> Result<(), String> {
@@ -40,6 +42,11 @@ pub fn init(app: &AppHandle) -> Result<(), String> {
     let port_state = Arc::new(Mutex::new(0u16));
     app.manage(port_state.clone());
 
+    let audio = app
+        .try_state::<crate::audio_capture::AudioCaptureState>()
+        .map(|s| s.shared.clone())
+        .ok_or("音频捕获状态未就绪（audio_capture::init 须先于 content_server::init）")?;
+
     let state = ContentServerState {
         port: 0,
         token,
@@ -50,6 +57,7 @@ pub fn init(app: &AppHandle) -> Result<(), String> {
             .resource_dir()
             .map(|r| r.join("renderer"))
             .unwrap_or_default(),
+        audio,
     };
     app.manage(state.clone());
 
@@ -384,6 +392,14 @@ async fn handle_conn(
         return respond(stream, 200, "OK", "text/plain", b"ok", None).await;
     }
 
+    // 系统音频频谱推送（SSE）：壁纸页内 shim 经 EventSource 订阅
+    if let Some(tok) = path.strip_prefix("/audio-stream/") {
+        if tok != state.token {
+            return respond(stream, 401, "Unauthorized", "text/plain", b"", None).await;
+        }
+        return audio_stream_sse(stream, state).await;
+    }
+
     // 解析路径 /media/{token}/{item_id}/{path...} 或 /web/{token}/{item_id}/{path...}
     // （/web 为 web 壁纸站点根：绝对路径引用（/js/...）也能正确解析）
     // 注意：浏览器会对非 ASCII 文件名做百分号编码，各段必须先解码再匹配磁盘路径
@@ -500,6 +516,55 @@ async fn handle_conn(
         Some(&format!("Accept-Ranges: bytes\r\nContent-Length: {}", data.len())),
     )
     .await
+}
+
+/// SSE：以 ~30Hz 推送最新 64 段频谱（`data: [f0,...,f63]`）。
+/// 捕获未运行时 503 —— 壁纸页内 EventSource 会自动重试，开关打开后自愈；
+/// 客户端断开表现为写失败，结束本连接。
+async fn audio_stream_sse(
+    stream: &mut tokio::net::TcpStream,
+    state: &ContentServerState,
+) -> Result<(), String> {
+    if !state.audio.is_running() {
+        return respond(
+            stream,
+            503,
+            "Service Unavailable",
+            "text/plain",
+            b"audio capture disabled",
+            None,
+        )
+        .await;
+    }
+    stream
+        .write_all(
+            b"HTTP/1.1 200 OK\r\n\
+              Content-Type: text/event-stream\r\n\
+              Cache-Control: no-cache\r\n\
+              Connection: close\r\n\
+              Access-Control-Allow-Origin: *\r\n\r\n",
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(33)).await;
+        if !state.audio.is_running() {
+            return Ok(()); // 开关被关闭：正常结束，客户端稍后重连
+        }
+        let (seq, bands) = state.audio.snapshot();
+        let data = format!(
+            "data: [{}]\n\n",
+            bands.iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>().join(",")
+        );
+        // seq 仅用于调试判断新鲜度，此处无条件推送（静音时为 0 帧，保持客户端活动）
+        let _ = seq;
+        match stream.write_all(data.as_bytes()).await {
+            Ok(_) => {
+                let _ = stream.flush().await;
+            }
+            Err(e) => return Err(format!("audio sse client disconnected: {e}")),
+        }
+    }
 }
 
 async fn respond(

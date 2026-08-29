@@ -16,6 +16,8 @@ const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
 export function SettingsPage() {
   const [autostart, setAutostart] = useState<boolean | null>(null);
   const [interactive, setInteractive] = useState(false);
+  const [audioProcessing, setAudioProcessing] = useState(false);
+  const [audioMsg, setAudioMsg] = useState("");
   // 全局壁纸显示模式（cover/contain/stretch），默认 cover 等比铺满裁切
   const [fit, setFit] = useState<"cover" | "contain" | "stretch">("cover");
   const [fitMsg, setFitMsg] = useState("");
@@ -70,6 +72,10 @@ export function SettingsPage() {
       .catch(() => { });
     invoke<string | null>("settings_get", { key: "family_friendly" })
       .then((v) => setFamilyFriendly(v == null || v === "true" || v === "1"))
+      .catch(() => { });
+    api
+      .wallpaperAudioProcessingStatus()
+      .then((s) => setAudioProcessing(s.enabled))
       .catch(() => { });
     api
       .downloadCredentialsStatus()
@@ -276,6 +282,27 @@ export function SettingsPage() {
       setInteractive(next);
     } catch {
       // 失败则不变
+    }
+  };
+
+  // 音频可视化（系统音频处理）：开启时触发屏幕录制授权，授权后系统音乐驱动可视化
+  const toggleAudioProcessing = async () => {
+    const next = !audioProcessing;
+    setAudioMsg("");
+    try {
+      const s = await api.wallpaperAudioProcessingSet(next);
+      setAudioProcessing(s.enabled);
+      if (s.enabled && !s.granted) {
+        setAudioMsg(
+          "⚠️ 权限尚未生效：① 系统设置 → 隐私与安全性 → 屏幕录制 → 允许 WallpaperEM；" +
+            "② 完全退出应用（⌘Q）再重新打开（运行中的进程不会自动获得新授权）；" +
+            "③ 若列表里已开启但重启后仍无效，先在列表中选中 WallpaperEM 按「−」移除，再重新添加并允许"
+        );
+      } else if (s.enabled && s.running) {
+        setAudioMsg("✅ 系统音频分析已开启");
+      }
+    } catch (e) {
+      setAudioMsg(String(e));
     }
   };
 
@@ -624,6 +651,14 @@ export function SettingsPage() {
                   </div>
                 }
               />
+              <Row
+                label="音频可视化（系统声音）"
+                desc="开启后壁纸可响应整个系统的声音（如音乐软件），与 WE 桌面端一致；需授予屏幕录制权限。壁纸自带的音乐无需此开关也会可视化"
+                control={<Switch checked={audioProcessing} onChange={toggleAudioProcessing} />}
+              />
+              {audioMsg && (
+                <div className="text-[12px] text-[var(--text-2)]">{audioMsg}</div>
+              )}
               <Row
                 label="图标穿透"
                 desc="开启后壁纸窗口置于桌面图标之上并可接收鼠标（场景视差/网页互动）；会盖住桌面图标。默认关闭"

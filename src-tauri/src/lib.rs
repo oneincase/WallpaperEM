@@ -15,6 +15,7 @@ mod steam;
 mod util;
 mod wallpaper;
 mod workshop;
+mod audio_capture;
 
 use std::sync::{Arc, Mutex};
 use rusqlite::Connection;
@@ -76,9 +77,12 @@ pub fn run() {
             init_steam(app.handle())?;
             build_tray(app.handle())?;
             register_shortcuts(app.handle())?;
+            // 音频捕获状态须先于内容服务器（SSE 端点读取其共享频谱帧）
+            audio_capture::init(app.handle())?;
             content_server::init(app.handle()).map_err(|e| e.to_string())?;
             wallpaper::init(app.handle())?;
             wallpaper::start_playlist_rotation(app.handle());
+            audio_capture::start_if_enabled(app.handle());
             download::init(app.handle()).map_err(|e| e.to_string())?;
             apply_vibrancy(app.handle())?;
             // T1 验证钩子：WE_AUTO_WORKSHOP=1 时启动即搜索第一页并打日志
@@ -152,6 +156,8 @@ pub fn run() {
             wallpaper::playlist_create,
             wallpaper::playlist_delete,
             wallpaper::playlist_apply,
+            audio_capture::audio_processing_set,
+            audio_capture::audio_processing_status,
             content_server::content_server_status,
             workshop::workshop_search,
             workshop::workshop_random,
