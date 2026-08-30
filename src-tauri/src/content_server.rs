@@ -534,16 +534,24 @@ async fn handle_conn(
         .unwrap_or_default();
 
     let data = tokio::fs::read(&file).await.map_err(|e| e.to_string())?;
-    let total = data.len() as u64;
     let mime = mime_for(&file);
 
     // WE 网页壁纸兼容 shim：库内条目的 HTML 响应注入引导数据（属性/fps）+ 脚本，
     // 拼在 <head> 后先于壁纸自身脚本执行（属性监听、音频 API、rAF 节流均依赖此时机）
     let data = if mime.starts_with("text/html") {
         inject_we_shim(state, &item_id, data)
+    } else if rel_path == "project.json" {
+        // 场景壁纸的属性作用在 scene.json 的字段绑定上，渲染器是从 project.json 读属性表
+        // 来解引用那些绑定的，故用户覆盖值必须合并进这份响应（网页壁纸走上面的 shim 下发）
+        match state.db.lock() {
+            Ok(conn) => crate::we_props::merge_overrides_into_project(&conn, &item_id, data),
+            Err(_) => data,
+        }
     } else {
         data
     };
+    // 注意：改写响应体后长度会变，Range 必须按**改写后**的长度算，否则切片越界/错位
+    let total = data.len() as u64;
 
     if range.starts_with("bytes=") {
         let spec = &range[6..];

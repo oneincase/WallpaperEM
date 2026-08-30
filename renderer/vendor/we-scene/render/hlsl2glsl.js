@@ -311,6 +311,31 @@ function matchParen(text, openIdx) {
 }
 
 // 替换 callName(args) 形式（嵌套安全；callName 前必须是词边界，避免误匹配 Desaturate→saturate 之类）
+// [we-scene patch] 跳过**函数声明/定义**：公共头（headers.ts）里就有
+//   `float saturate(float x) { return clamp(x, 0.0, 1.0); }`
+// 这类定义，若把声明处的形参表也当调用改写，会生成
+//   `float clamp(float x, 0.0, 1.0) { ... }`
+// 这种非法 GLSL，导致整个 shader 编译失败、效果被整体跳过
+// （表现：shake/waterwaves/foliagesway 全部失效，如人物不眨眼）。
+const GLSL_TYPES = new Set([
+  'void', 'bool', 'int', 'uint', 'float', 'double',
+  'vec2', 'vec3', 'vec4', 'bvec2', 'bvec3', 'bvec4',
+  'ivec2', 'ivec3', 'ivec4', 'uvec2', 'uvec3', 'uvec4',
+  'mat2', 'mat3', 'mat4', 'mat2x2', 'mat2x3', 'mat2x4',
+  'mat3x2', 'mat3x3', 'mat3x4', 'mat4x2', 'mat4x3', 'mat4x4',
+])
+
+// name 紧前面是否为「类型名 + 空白」→ 说明这是函数声明而非调用
+function isDeclaration(text, idx) {
+  let p = idx - 1
+  while (p >= 0 && /[ \t]/.test(text[p])) p--
+  if (p < 0 || p === idx - 1) return false // 必须有空白分隔
+  let e = p + 1
+  while (p >= 0 && /[A-Za-z0-9_]/.test(text[p])) p--
+  const word = text.slice(p + 1, e)
+  return GLSL_TYPES.has(word)
+}
+
 function rewriteCall(text, callName, fn) {
   let out = ''
   let i = 0
@@ -324,6 +349,19 @@ function rewriteCall(text, callName, fn) {
     if (idx > 0 && /[A-Za-z0-9_]/.test(text[idx - 1])) {
       out += text.slice(i, idx + 1)
       i = idx + 1
+      continue
+    }
+    // 后一个字符也不能是标识符字符（避免 saturateFoo 被当作 saturate）
+    const after = idx + callName.length
+    if (after < text.length && /[A-Za-z0-9_]/.test(text[after])) {
+      out += text.slice(i, after)
+      i = after
+      continue
+    }
+    // 函数声明/定义：原样保留，不改写形参表
+    if (isDeclaration(text, idx)) {
+      out += text.slice(i, after)
+      i = after
       continue
     }
     out += text.slice(i, idx)

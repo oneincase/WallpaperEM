@@ -112,6 +112,65 @@ export function parseTex(buf) {
     images.push(mips)
   }
 
+  // [we-scene patch] TEXS 序列帧表（sprite sheet）。
+  // 原版解析到 TEXB 图像数据就返回，序列帧信息被丢弃 —— 于是粒子只能按
+  // `sequencemultiplier` 猜一个 N×N 方格来切图。实测这个猜测是错的：
+  // 雨滴贴图 `particles 256x1280 blank` 是 1280×256、5 帧**横排**，
+  // 按 3×3 方格采样会取到跨帧的错位图块（雨丝呈碎片而非连续水痕）。
+  //
+  // 实测布局（TEXS0003，2370927443 / 3784370784 的雨滴贴图）：
+  //   "TEXS000x\0" + u32 frameCount
+  //   TEXS0002/0003 额外有 u32 frameWidth + u32 frameHeight（单帧尺寸）
+  //   每帧 32 字节 = 8 个 float32：[imageId, duration秒, x, y, width, 0, 0, height]
+  //   实例：帧 i = { x: i*256, y: 0, w: 256, h: 256 }，duration 0.2s
+  let frames = null
+  if (p + 13 <= buf.length) {
+    const texsMagic = asciiTex(buf, p, 9)
+    if (texsMagic.indexOf('TEXS') === 0) {
+      let q = p + 9
+      const frameCount = u32(buf, q)
+      q += 4
+      let frameW = 0
+      let frameH = 0
+      if (texsMagic === 'TEXS0002\0' || texsMagic === 'TEXS0003\0') {
+        frameW = u32(buf, q)
+        q += 4
+        frameH = u32(buf, q)
+        q += 4
+      }
+      // 每帧字节数由剩余长度反推（版本间字段数不同），只接受能整除且够放下 8 个 float 的布局
+      const stride = frameCount > 0 ? Math.floor((buf.length - q) / frameCount) : 0
+      if (frameCount > 0 && frameCount <= 4096 && stride >= 32) {
+        const list = []
+        for (let i = 0; i < frameCount; i++) {
+          const off = q + i * stride
+          if (off + 32 > buf.length) break
+          list.push({
+            imageId: f32(buf, off) | 0,
+            duration: f32(buf, off + 4),
+            x: f32(buf, off + 8),
+            y: f32(buf, off + 12),
+            width: f32(buf, off + 16) || frameW,
+            height: f32(buf, off + 28) || frameH,
+          })
+        }
+        // 仅在帧矩形合理时采用（宽高为正且不越出贴图），否则宁可退回无序列帧
+        const sane =
+          list.length === frameCount &&
+          list.every(
+            (f) =>
+              f.width > 0 &&
+              f.height > 0 &&
+              f.x >= 0 &&
+              f.y >= 0 &&
+              f.x + f.width <= textureWidth + 1 &&
+              f.y + f.height <= textureHeight + 1,
+          )
+        if (sane) frames = { magic: texsMagic, frameWidth: frameW, frameHeight: frameH, list }
+      }
+    }
+  }
+
   return {
     format,
     formatName: TEXTURE_FORMATS[format] || String(format),
@@ -125,6 +184,8 @@ export function parseTex(buf) {
     containerVersion,
     isVideo,
     images,
+    // 序列帧表；无 TEXS 段时为 null
+    frames,
   }
 }
 
@@ -427,6 +488,16 @@ function u32(buf, p) {
 
 function i32(buf, p) {
   return u32(buf, p) | 0
+}
+
+// [we-scene patch] TEXS 序列帧表的字段是 float32（帧矩形与时长）
+const f32View = new DataView(new ArrayBuffer(4))
+function f32(buf, p) {
+  f32View.setUint8(0, buf[p])
+  f32View.setUint8(1, buf[p + 1])
+  f32View.setUint8(2, buf[p + 2])
+  f32View.setUint8(3, buf[p + 3])
+  return f32View.getFloat32(0, true)
 }
 
 function asciiTex(buf, start, len) {

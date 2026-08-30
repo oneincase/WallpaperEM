@@ -210,6 +210,48 @@ pub fn boot_json(db: &Arc<Mutex<Connection>>, wallpapers_dir: &Path, item_id: &s
     json!({ "props": props, "fps": fps })
 }
 
+/// 把用户覆盖值合并进 project.json 响应体，供**场景壁纸**渲染时读取。
+///
+/// 网页壁纸的属性经 shim 下发（`boot_json` → `applyUserProperties`），但场景壁纸不同：
+/// 它的属性作用在 `scene.json` 的字段绑定上（图层可见性/颜色/透明度…），渲染器是从
+/// `project.json` 读属性表来解引用这些绑定的，所以覆盖值必须出现在该响应里。
+///
+/// 覆盖值写进 `general.properties[name].value`，并给被覆盖的属性加 `userOverridden: true`。
+/// 这个标记是必需的，不能只改 value：`scene.json` 里每个受属性控制的字段都自带
+/// `{user, value}` 快照，而快照与 project.json 默认值并非总是相等（实测 78 个场景的
+/// 2598 处引用里有 372 处不等 —— 作者改过属性默认值却没重存场景，或字段名与属性名撞车）。
+/// 渲染器据此只在用户**显式改过**该属性时才采用属性表的值，其余沿用场景快照；
+/// 否则用户什么都没改，画面就会先变样。
+///
+/// 解析失败（非法 JSON）或无覆盖值时原样返回，渲染器退回场景快照即既有行为。
+pub fn merge_overrides_into_project(conn: &Connection, item_id: &str, raw: Vec<u8>) -> Vec<u8> {
+    let overrides = read_overrides(conn, item_id);
+    if overrides.is_empty() {
+        return raw;
+    }
+    // project.json 可能带 BOM（真实壁纸里常见），serde 不接受，先剥掉
+    let text = String::from_utf8_lossy(&raw);
+    let Ok(mut project) = serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')) else {
+        return raw;
+    };
+    let Some(props) = project
+        .get_mut("general")
+        .and_then(|g| g.get_mut("properties"))
+        .and_then(|p| p.as_object_mut())
+    else {
+        return raw;
+    };
+    for (name, value) in overrides {
+        // 属性已被作者移除（壁纸更新过）：陈旧覆盖值忽略，不凭空造出一个属性
+        let Some(def) = props.get_mut(&name).and_then(|d| d.as_object_mut()) else {
+            continue;
+        };
+        def.insert("value".into(), value);
+        def.insert("userOverridden".into(), Value::Bool(true));
+    }
+    serde_json::to_vec(&project).unwrap_or(raw)
+}
+
 /// 文案解析优先语言，按序逐「键」回退。必须逐键而非逐语言：真实壁纸的
 /// localization 表是残缺的（同一壁纸 en-us 有 152 条、其他语言只有 5 条）
 const TEXT_LANGS: [&str; 3] = ["zh-chs", "zh-cht", "en-us"];
@@ -614,8 +656,61 @@ mod tests {
     }
 
     #[test]
-    fn effective_props_merges_overrides_and_set_overrides_roundtrip() {
+    fn merge_overrides_into_project_marks_only_user_edited_props() {
         let conn = mem_db();
+        let dir = fixture_dir("mergeproj", "x20", SAMPLE);
+        let raw = std::fs::read(dir.join("x20").join("project.json")).unwrap();
+
+        // 无覆盖值：原样返回（渲染器沿用 scene.json 快照，即既有行为）
+        assert_eq!(
+            merge_overrides_into_project(&conn, "x20", raw.clone()),
+            raw,
+            "无覆盖值时不得改写响应体"
+        );
+
+        set_single_override(&conn, "x20", "schemecolor", json!("1 0 0")).unwrap();
+        let out = merge_overrides_into_project(&conn, "x20", raw.clone());
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let props = &v["general"]["properties"];
+        // 被改过的属性：值替换 + 打标记（渲染器只认带标记的，见 parse.js 的 resolveUserValue）
+        assert_eq!(props["schemecolor"]["value"], json!("1 0 0"));
+        assert_eq!(props["schemecolor"]["userOverridden"], json!(true));
+        // 未改过的属性：值不动，且**不能**有标记，否则渲染器会拿默认值覆盖场景快照
+        assert_eq!(props["amount"]["value"], json!(0.5));
+        assert!(
+            props["amount"].get("userOverridden").is_none(),
+            "未被用户改过的属性不得带 userOverridden"
+        );
+        // 纯显示项（无 type）不受影响
+        assert!(props["tip"].get("userOverridden").is_none());
+    }
+
+    #[test]
+    fn merge_overrides_into_project_tolerates_bom_stale_keys_and_bad_json() {
+        let conn = mem_db();
+        let dir = fixture_dir("mergeedge", "x21", SAMPLE);
+        set_single_override(&conn, "x21", "schemecolor", json!("0 1 0")).unwrap();
+        // 已从 project.json 移除的属性（壁纸更新过）：陈旧覆盖值忽略，不得凭空造出属性
+        set_single_override(&conn, "x21", "goneProp", json!(1)).unwrap();
+
+        // 带 BOM 的 project.json（真实壁纸里常见）
+        let mut bom = vec![0xEF, 0xBB, 0xBF];
+        bom.extend_from_slice(&std::fs::read(dir.join("x21").join("project.json")).unwrap());
+        let out = merge_overrides_into_project(&conn, "x21", bom);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["general"]["properties"]["schemecolor"]["value"], json!("0 1 0"));
+        assert!(
+            v["general"]["properties"].get("goneProp").is_none(),
+            "陈旧覆盖值不得凭空生成属性"
+        );
+
+        // 非法 JSON：原样返回，让渲染器自己的容错兜底（绝不能返回半截 JSON）
+        let bad = b"{ not json".to_vec();
+        assert_eq!(merge_overrides_into_project(&conn, "x21", bad.clone()), bad);
+    }
+
+    #[test]
+    fn effective_props_merges_overrides_and_set_overrides_roundtrip() {        let conn = mem_db();
         let dir = fixture_dir("merge", "x2", SAMPLE);
         // 默认：screenFile 无值被跳过（6 个属性 − 1），disableRili=false
         let props = effective_props(&conn, &dir, "x2");

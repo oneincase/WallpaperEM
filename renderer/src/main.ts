@@ -10,6 +10,7 @@ import * as effMod from "../vendor/we-scene/scene/effects-parse.js";
 import * as rndMod from "../vendor/we-scene/render/renderer.js";
 import * as noiseMod from "../vendor/we-scene/render/noise.js";
 import * as particlesMod from "../vendor/we-scene/render/particles.js";
+import * as particleTexMod from "../vendor/we-scene/render/particle-textures.js";
 import * as mdlMod from "../vendor/we-scene/render/mdl.js";
 import { WE_SHADER_HEADERS } from "../vendor/we-scene/headers";
 import { fitWindow } from "../vendor/we-scene/render/math.js";
@@ -22,13 +23,14 @@ const eff = asAny(effMod);
 const rnd = asAny(rndMod);
 const noise = asAny(noiseMod);
 const particles = asAny(particlesMod);
+const ptex = asAny(particleTexMod);
 const mdl = asAny(mdlMod);
 
 // 场景壁纸渲染开关（手动测试用）
-const SKIP_3D_MODELS = false; // 保留 3D 网格渲染
+const SKIP_3D_MODELS = false; // puppet 骨骼网格（人物模型）
 const SKIP_COMPONENTS = true; // 暂不渲染组件（时钟、天气等）
 const SKIP_TEXT = true; // 暂不渲染文字对象
-const SKIP_PARTICLES = true; // 暂不渲染粒子（雪 / 雨 / zzz）
+const SKIP_PARTICLES = false; // 粒子（雪 / 雨 / 火花 / 雾 / 光轴）
 // we-scene 对部分工坊 effect（shake/foliagesway/iris/audio-bars 等）支持不完整，
 // 逐 pass 渲染会产出灰色遮罩 / 随机颜色多边形。暂改为不应用图层效果，只渲染基础层。
 const SKIP_SCENE_EFFECTS = false;
@@ -217,8 +219,6 @@ function startCanvasLoop() {
   };
   state.raf = requestAnimationFrame(draw);
 }
-
-// ---------- 视频 / GIF / Web ----------
 
 // ---------- 无缝循环视频（A/B 双元素：预热-保温-结尾交接） ----------
 // WebKit 的 <video loop> 在循环点会重置解码管线（ended → seek 0 → 重新起播），
@@ -421,7 +421,326 @@ function createLoopingVideo(src: string, opts: { muted: boolean }): VideoLoopPai
   return pair;
 }
 
-function mountVideo(cfg: WallpaperConfig) {
+// ---------- 视频 / 图片 / GIF：走场景引擎渲染 ----------
+//
+// 视频与图片类型壁纸不再各自维护一条 DOM 渲染路径（<video object-fit> / <img object-fit>），
+// 而是合成一个「单图层场景」交给 we-scene 渲染。这样 fit / renderDpr / sceneFps / 效果链
+// 只有一份实现，媒体类壁纸自动获得与场景壁纸一致的行为；后续要给媒体加效果
+// （模糊、色调、粒子叠加）也只是往这个合成场景里加层，不必再碰 DOM 分支。
+//
+// 三种媒体的纹理供给方式不同，但都不需要给 vendor 打新补丁：
+//   video —— 渲染器本身就有视频纹理分支（帧时间戳变化时上传当前帧）；
+//   gif   —— 每帧由本文件把 <img> 重新上传（GIF 动画由浏览器内部推进，
+//            texImage2D 取到的即当前帧）；
+//   image —— 一次性上传位图。
+//
+// WebGL2 不可用时回退原来的 DOM 路径（mountVideoDom / mountGifDom），
+// 保证无 WebGL 环境里媒体壁纸仍可显示。
+
+/** 合成单图层场景：投影尺寸取媒体自身像素，fit 交给 buildCamera/fitWindow（语义同 object-fit） */
+function buildMediaScene(width: number, height: number, textureName: string) {
+  return {
+    camera: null,
+    // contain 模式的留边由 clearcolor 填充（对应 DOM 路径里的深色背景）
+    general: { orthogonalprojection: { width, height }, clearenabled: true, clearcolor: "0 0 0" },
+    layers: [
+      {
+        id: 0,
+        name: "media",
+        visible: true,
+        image: textureName,
+        textureName,
+        particle: null,
+        puppet: null,
+        solid: false,
+        isContainer: false,
+        isPostProcess: false,
+        isText: false,
+        isSound: false,
+        isComponent: false,
+        sound: [],
+        // 铺满整个投影：层中心在投影中心、尺寸等于投影尺寸
+        origin: [width / 2, height / 2, 0],
+        scale: [1, 1, 1],
+        angles: [0, 0, 0],
+        size: [width, height],
+        alignment: "center",
+        color: [1, 1, 1],
+        alpha: 1,
+        brightness: 1,
+        colorBlendMode: 0,
+        copybackground: false,
+        parallaxDepth: null,
+        animationLayers: [],
+        effects: [],
+      },
+    ],
+    properties: {},
+  };
+}
+
+/**
+ * 用 ImageDecoder 把 GIF 解成一组 ImageBitmap（各帧带自己的时长）。
+ *
+ * 为什么不能直接把 `<img src=*.gif>` 当纹理源逐帧上传：GIF 的动画只推进**用于合成显示**
+ * 的那份帧，`drawImage` / `texImage2D` 取到的始终是首帧。实测三种摆放（脱离文档、
+ * 屏幕外、可见 64×64）在 1.5s 内取到的像素**完全无变化**，90 帧的 GIF 渲染成静止画。
+ * ImageDecoder 是显式的逐帧解码接口，能拿到真实帧与 `duration`。
+ *
+ * 代价：整段动画的位图常驻内存（256×256×90 帧 ≈ 23MB）。GIF 壁纸通常是小尺寸预览级
+ * 素材，可接受；解码失败或无 ImageDecoder 时回退静态首帧（画面不动但不黑屏）。
+ */
+async function decodeGifFrames(
+  src: string,
+): Promise<{ width: number; height: number; frames: { bitmap: ImageBitmap; durationMs: number }[] } | null> {
+  const resp = await fetch(src);
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  const dec = new (window as any).ImageDecoder({
+    data: await resp.arrayBuffer(),
+    type: "image/gif",
+  });
+  // tracks.ready 先于 completed：轨道未就绪时 selectedTrack 为 null
+  await dec.tracks.ready;
+  await dec.completed;
+  const track = dec.tracks.selectedTrack;
+  if (!track || !track.frameCount) return null;
+  // 帧数上限：防病态素材（上千帧）把内存吃光；超出部分截断（动画变短，不影响可用）
+  const count = Math.min(track.frameCount, 300);
+  const frames: { bitmap: ImageBitmap; durationMs: number }[] = [];
+  let width = 0;
+  let height = 0;
+  for (let i = 0; i < count; i++) {
+    const { image } = await dec.decode({ frameIndex: i });
+    width = image.displayWidth;
+    height = image.displayHeight;
+    frames.push({
+      bitmap: await createImageBitmap(image),
+      // duration 单位是微秒；缺失/为 0 的帧按 GIF 惯例给 100ms
+      durationMs: image.duration ? image.duration / 1000 : 100,
+    });
+    image.close();
+  }
+  dec.close?.();
+  return { width, height, frames };
+}
+
+function mountMedia(cfg: WallpaperConfig) {
+  clear();
+  if (!cfg.src) {
+    mountDefaultWallpaper();
+    return;
+  }
+  const isVideo = cfg.type === "video";
+  const isGif = cfg.type === "gif";
+
+  const c = document.createElement("canvas");
+  const dpr = effectiveDpr(cfg);
+  c.width = Math.max(1, Math.round(innerWidth * dpr));
+  c.height = Math.max(1, Math.round(innerHeight * dpr));
+  c.style.cssText = "position:absolute;inset:0;width:100%;height:100%;";
+  const gl2 = c.getContext("webgl2", {
+    premultipliedAlpha: false,
+    antialias: false,
+    alpha: false,
+    preserveDrawingBuffer: true,
+  });
+  if (!gl2) {
+    // 无 WebGL2：回退 DOM 路径，媒体壁纸照常显示（只是拿不到场景引擎的能力）
+    reportDiag(cfg, `media ${cfg.type}: WEBGL2_UNAVAILABLE，回退 DOM 渲染`);
+    if (isVideo) mountVideoDom(cfg);
+    else mountGifDom(cfg);
+    return;
+  }
+  wrap.appendChild(c);
+  state.canvas = c;
+  let disposed = false;
+  state.sceneCleanup = () => {
+    disposed = true;
+    if (state.renderer) {
+      state.renderer.dispose?.();
+      state.renderer = undefined;
+    }
+  };
+
+  const fail = (why: string) => {
+    if (disposed) return;
+    disposed = true;
+    reportDiag(cfg, `media ${cfg.type} 失败: ${why}`);
+    mountDefaultWallpaper();
+  };
+
+  void (async () => {
+    try {
+      const renderer = rnd.createRenderer(c, {
+        diag: (msg: string) => reportDiag(cfg, `renderer: ${msg}`),
+        fboCapFactor: 0,
+      });
+      state.renderer = renderer;
+      if (disposed) return;
+
+      const TEX = "__media";
+      const textures = new Map<string, any>();
+      /** 每帧刷新纹理（gif 用；video 由渲染器内部按 currentTime 上传） */
+      let refreshTex: (() => void) | undefined;
+      let mediaW = 0;
+      let mediaH = 0;
+
+      if (isVideo) {
+        const v = document.createElement("video");
+        v.autoplay = true;
+        v.loop = cfg.loop !== false; // 默认循环；loop=false 则播完即停
+        v.muted = cfg.muted !== false;
+        v.playsInline = true;
+        // preload=metadata：只拉元数据，避免 WebKit 预下载整个视频文件进内存
+        v.preload = "metadata";
+        // 限制解码分辨率：按画布尺寸而非视频原始分辨率解码，4K 源在 1080p 窗口上
+        // 解码缓冲约降到 1/4（清晰度由采样阶段的缩放决定）
+        v.width = c.width;
+        v.height = c.height;
+        // 画面走 WebGL 纹理，元素自身不参与显示（但必须在文档内才会持续解码）
+        v.style.cssText =
+          "position:fixed;left:-9999px;top:-9999px;width:2px;height:2px;opacity:0;pointer-events:none";
+        v.src = cfg.src!;
+        document.body.appendChild(v);
+        state.video = v;
+        (state.videoTextures ??= []).push(v);
+        await new Promise<void>((ok, err) => {
+          v.addEventListener("loadedmetadata", () => ok(), { once: true });
+          v.addEventListener("error", () => err(new Error(`video error ${v.error?.code ?? "?"}`)), {
+            once: true,
+          });
+        });
+        if (disposed) return;
+        mediaW = v.videoWidth || c.width;
+        mediaH = v.videoHeight || c.height;
+        // entry.video 交给渲染器的视频纹理分支：帧时间戳变化时自动上传
+        textures.set(TEX, {
+          video: v,
+          glTex: rnd.makeTexture(renderer.gl, new Uint8Array([0, 0, 0, 255]), 1, 1),
+          width: mediaW,
+          height: mediaH,
+          rg88: false,
+          lastUploaded: -1,
+        });
+        void v.play().catch(() => {});
+        reportDiag(cfg, `media video ${mediaW}x${mediaH} → scene 渲染`);
+      } else {
+        // GIF 优先走 ImageDecoder 逐帧解码（见下），失败或非 GIF 才用 <img> 位图。
+        let decoded = false;
+        if (isGif && typeof (window as any).ImageDecoder === "function") {
+          try {
+            const gifFrames = await decodeGifFrames(cfg.src!);
+            if (gifFrames && gifFrames.frames.length > 1) {
+              mediaW = gifFrames.width;
+              mediaH = gifFrames.height;
+              const gl = renderer.gl;
+              const entry = {
+                glTex: rnd.makeTexture(gl, null, 0, 0, gifFrames.frames[0].bitmap),
+                width: mediaW,
+                height: mediaH,
+                rg88: false,
+              };
+              textures.set(TEX, entry);
+              // 按各帧自己的 duration 推进（GIF 每帧时长可不同），到末帧回环
+              let idx = 0;
+              let nextAt = performance.now() + gifFrames.frames[0].durationMs;
+              refreshTex = () => {
+                const now = performance.now();
+                if (now < nextAt) return;
+                idx = (idx + 1) % gifFrames.frames.length;
+                nextAt = now + gifFrames.frames[idx].durationMs;
+                gl.bindTexture(gl.TEXTURE_2D, entry.glTex);
+                try {
+                  gl.texImage2D(
+                    gl.TEXTURE_2D,
+                    0,
+                    gl.RGBA,
+                    gl.RGBA,
+                    gl.UNSIGNED_BYTE,
+                    gifFrames.frames[idx].bitmap,
+                  );
+                } catch {
+                  /* 单帧上传失败：保留上一帧 */
+                }
+              };
+              // 卸载时释放解码出的位图（每帧一张 ImageBitmap，不释放会积压显存）
+              const prev = state.sceneCleanup;
+              state.sceneCleanup = () => {
+                prev?.();
+                for (const f of gifFrames.frames) f.bitmap.close();
+              };
+              decoded = true;
+              reportDiag(
+                cfg,
+                `media gif ${mediaW}x${mediaH} ${gifFrames.frames.length} 帧 → scene 渲染`,
+              );
+            }
+          } catch (e) {
+            reportDiag(cfg, `gif 解码失败，回退静态首帧: ${String((e as Error).message).slice(0, 80)}`);
+          }
+        }
+        if (!decoded) {
+          const img = new Image();
+          // 同源媒体端点；crossOrigin 让将来分端口调试时也能进 WebGL（否则画布被污染）
+          img.crossOrigin = "anonymous";
+          img.src = cfg.src!;
+          await new Promise<void>((ok, err) => {
+            img.addEventListener("load", () => ok(), { once: true });
+            img.addEventListener("error", () => err(new Error("image load error")), { once: true });
+          });
+          if (disposed) return;
+          mediaW = img.naturalWidth || 1;
+          mediaH = img.naturalHeight || 1;
+          state.img = img;
+          textures.set(TEX, {
+            glTex: rnd.makeTexture(renderer.gl, null, 0, 0, img),
+            width: mediaW,
+            height: mediaH,
+            rg88: false,
+          });
+          reportDiag(cfg, `media ${cfg.type} ${mediaW}x${mediaH} → scene 渲染`);
+        }
+      }
+
+      if (disposed) return;
+      const scene = buildMediaScene(mediaW, mediaH, TEX);
+      const start = performance.now();
+      let lastRender = -Infinity;
+      const renderLoop = (now: number) => {
+        if (disposed) return;
+        // 帧率上限：比目标帧更快的帧直接跳过（不渲染、只继续排队），降低 GPU 占用
+        const fps = state.cfg.sceneFps || 60;
+        if (now - lastRender >= 1000 / fps) {
+          lastRender = now;
+          refreshTex?.();
+          void renderer
+            .render(
+              scene,
+              textures,
+              c.width,
+              c.height,
+              (now - start) / 1000,
+              normalizeFit(state.cfg.fit),
+            )
+            .then(() => {
+              if (disposed) return;
+              state.raf = requestAnimationFrame(renderLoop);
+            })
+            .catch((e: Error) => fail(String(e.message || e).slice(0, 200)));
+        } else {
+          state.raf = requestAnimationFrame(renderLoop);
+        }
+      };
+      state.raf = requestAnimationFrame(renderLoop);
+    } catch (e) {
+      fail(String((e as Error).message || e).slice(0, 200));
+    }
+  })();
+}
+
+// ---------- 视频 / 图片：DOM 回退路径（无 WebGL2 时使用）----------
+
+function mountVideoDom(cfg: WallpaperConfig) {
   clear();
   if (!cfg.src) {
     mountDefaultWallpaper();
@@ -463,7 +782,7 @@ function mountVideo(cfg: WallpaperConfig) {
   reportDiag(cfg, "video mounted (single + native loop)");
 }
 
-function mountGif(cfg: WallpaperConfig) {
+function mountGifDom(cfg: WallpaperConfig) {
   clear();
   const img = document.createElement("img");
   const fit = fitObjectFit(cfg.fit);
@@ -659,8 +978,15 @@ function mountScene(cfg: WallpaperConfig) {
   wrap.appendChild(c);
   state.canvas = c;
   let disposed = false;
+  // 粒子系统注册的 mousemove 监听（控制点跟随鼠标）；卸载时必须摘掉，
+  // 否则重挂场景会在 window 上累积监听器，旧回调还持有已释放的 GL 资源。
+  let particleCleanup: (() => void) | undefined;
   state.sceneCleanup = () => {
     disposed = true;
+    if (particleCleanup) {
+      particleCleanup();
+      particleCleanup = undefined;
+    }
     // 兜底：若 clear() 因 disposed 早退未走到 renderer.dispose，这里也释放 WebGL 上下文
     if (state.renderer) {
       state.renderer.dispose?.();
@@ -730,8 +1056,12 @@ function mountScene(cfg: WallpaperConfig) {
       const renderer = rnd.createRenderer(c, {
         shaderResolver,
         diag: (msg: string) => reportDiag(cfg, `renderer: ${msg}`),
-        // 效果链 FBO 降采样：降低 GPU 缓冲内存（全质量=0，0.5≈效果分辨率减半→内存约 1/4）
-        fboCapFactor: 0.5,
+        // 效果链 FBO 降采样：0=全质量，0.5≈效果分辨率减半→内存约 1/4。
+        // 用全质量：降采样会让「层 alpha 再乘一张羽化 mask」的效果（opacity）在
+        // 低分辨率下把过渡带插得更淡，再经后续 waterwaves 的 UV 位移搬移、
+        // 最后放大回屏幕，就在网格交界处（如 3113287126 头发与手臂交汇）看到发虚透明。
+        // 代价：该场景效果链 FBO 由 3.5MB 升到约 100MB。
+        fboCapFactor: 0,
       });
       // 立即登记渲染器：即使后续异步加载中途被 clear()，也能正确释放该 WebGL 上下文
       state.renderer = renderer;
@@ -835,6 +1165,9 @@ function mountScene(cfg: WallpaperConfig) {
           };
         }
         if (!entry) return null;
+        // 序列帧表（.tex 的 TEXS 段）：粒子据此切 sprite sheet。
+        // 没有它就只能按 sequencemultiplier 猜 N×N 方格，对横排/竖排 sheet 会采错图块。
+        if (parsedTex.frames?.list?.length) entry.frames = parsedTex.frames.list;
         textures.set(name, entry);
         return entry;
       };
@@ -896,36 +1229,118 @@ function mountScene(cfg: WallpaperConfig) {
       }
 
       // ---- 粒子系统（particle 图层）----
-      // 加载粒子模型 json + 材质 + 贴图，构造 ParticleSystem，注入 renderer
+      // 加载粒子模型 json + 材质 + 贴图，构造 ParticleSystem，注入 renderer。
+      //
+      // 贴图有两个来源：pkg 内嵌（工坊自制素材）与 WE 内置资源。后者（particle/halo、
+      // particle/fog/fog1 …）不在 pkg 里 —— 全库 33 张被引用的粒子贴图有 24 张属于
+      // 内置资源。没有 WE 安装目录可回退，故用 particle-textures.js 按名字语义
+      // 程序化生成近似素材，否则整个粒子系统无贴图可用、只能整体跳过。
       const particleSystems: any[] = [];
-      for (const layer of scene.layers) {
-        if (!layer.particle || !layer.visible) continue;
-        if (SKIP_PARTICLES) continue; // 暂不渲染粒子（雪/雨/zzz）
-        try {
-          const modelEntry = pkg.getEntry(parsedPkg, layer.particle);
-          if (!modelEntry) continue;
-          const model = JSON.parse(readText(modelEntry));
-          const ps = new particles.ParticleSystem(renderer.gl, model, layer.instanceoverride);
-          // 材质（决定混合模式）
-          if (model.material) {
-            const matEntry = pkg.getEntry(parsedPkg, model.material);
-            if (matEntry) ps.setMaterial(JSON.parse(readText(matEntry)));
-            // 贴图：材质 pass 纹理槽 0
-            const mat = model.material
-              ? JSON.parse(readText(pkg.getEntry(parsedPkg, model.material)))
-              : null;
-            const pass = mat?.passes?.[0];
-            const texName = pass?.textures?.[0];
-            if (texName) {
-              const te = await loadTex(texName);
-              if (te) ps.setTexture({ glTex: te.glTex, width: te.width, height: te.height });
-            }
-          }
-          ps.setVisible(true);
-          particleSystems.push(ps);
-        } catch (e) {
-          console.warn(`粒子图层 ${layer.name} 加载失败: ${(e as Error).message}`);
+      let builtinTexCount = 0;
+
+      // 取粒子贴图：先查 pkg，缺失则程序化生成（生成结果并入 textures 缓存复用）
+      const loadParticleTex = async (name: string): Promise<any | null> => {
+        const inPkg = await loadTex(name);
+        if (inPkg) return inPkg;
+        const gen = ptex.buildBuiltinParticleTexture(name);
+        if (!gen) return null;
+        const entry = {
+          glTex: rnd.makeTextureMip(renderer.gl, [gen], false),
+          width: gen.width,
+          height: gen.height,
+          rg88: false,
+          mips: [gen],
+          generated: true,
+        };
+        textures.set(name, entry);
+        builtinTexCount++;
+        return entry;
+      };
+
+      // 递归构造粒子系统：children 是子发射器（如 ghost1 → 光晕/尾迹/本体三层）。
+      // WE 的 eventfollow 子系统跟随父粒子；这里降级为「与父同图层的独立系统」——
+      // 位置不跟随单个父粒子，但视觉上的分层叠加（本体+光晕+尾迹）得以保留。
+      const buildParticleSystem = async (
+        particlePath: string,
+        layer: any,
+        override: any,
+        depth: number,
+      ): Promise<void> => {
+        if (depth > 3) return; // children 可嵌套，设上限防病态数据造成指数展开
+        const modelEntry = pkg.getEntry(parsedPkg, particlePath);
+        if (!modelEntry) {
+          reportDiag(cfg, `particle '${particlePath}' 不在 pkg，跳过`);
+          return;
         }
+        const model = JSON.parse(readText(modelEntry));
+        // 图层变换（origin/scale/angles）必须传进去：WE 语义里图层 origin 是发射器的
+        // 世界位置、scale 缩放整个系统。不传会让所有粒子堆在世界原点(0,0)。
+        const ps = new particles.ParticleSystem(renderer.gl, model, override, layer);
+        let texName: string | null = null;
+        if (model.material) {
+          const matEntry = pkg.getEntry(parsedPkg, model.material);
+          if (matEntry) {
+            const mat = JSON.parse(readText(matEntry));
+            ps.setMaterial(mat);
+            texName = mat?.passes?.[0]?.textures?.[0] || null;
+          }
+        }
+        // 材质缺失或未声明贴图时，用通用光晕兜底（宁可近似也不整层消失）
+        const te = await loadParticleTex(texName || "particle/halo");
+        if (!te) {
+          reportDiag(cfg, `particle '${particlePath}' 无贴图可用，跳过`);
+          return;
+        }
+        ps.setTexture({ glTex: te.glTex, width: te.width, height: te.height, frames: te.frames });
+        ps.setVisible(true);
+        particleSystems.push(ps);
+
+        for (const ch of model.children || []) {
+          if (!ch || typeof ch.name !== "string") continue;
+          // 子系统继承父图层的世界变换，叠加自身的局部 origin/scale/angles
+          const cOrigin = String(ch.origin ?? "0 0 0").trim().split(/\s+/).map(Number);
+          const cScale = String(ch.scale ?? "1 1 1").trim().split(/\s+/).map(Number);
+          const cAngles = String(ch.angles ?? "0 0 0").trim().split(/\s+/).map(Number);
+          const childLayer = {
+            ...layer,
+            origin: [
+              (layer.origin?.[0] || 0) + (cOrigin[0] || 0),
+              (layer.origin?.[1] || 0) + (cOrigin[1] || 0),
+              (layer.origin?.[2] || 0) + (cOrigin[2] || 0),
+            ],
+            scale: [
+              (layer.scale?.[0] ?? 1) * (cScale[0] || 1),
+              (layer.scale?.[1] ?? 1) * (cScale[1] || 1),
+              (layer.scale?.[2] ?? 1) * (cScale[2] || 1),
+            ],
+            angles: [
+              (layer.angles?.[0] || 0) + (cAngles[0] || 0),
+              (layer.angles?.[1] || 0) + (cAngles[1] || 0),
+              (layer.angles?.[2] || 0) + (cAngles[2] || 0),
+            ],
+          };
+          await buildParticleSystem(ch.name, childLayer, ch.instanceoverride || null, depth + 1);
+        }
+      };
+
+      if (!SKIP_PARTICLES) {
+        for (const layer of scene.layers) {
+          if (!layer.particle || !layer.visible) continue;
+          try {
+            await buildParticleSystem(layer.particle, layer, layer.instanceoverride, 0);
+          } catch (e) {
+            console.warn(`粒子图层 ${layer.name} 加载失败: ${(e as Error).message}`);
+            reportDiag(cfg, `particle '${layer.name}' FAIL: ${(e as Error).message.slice(0, 80)}`);
+          }
+        }
+      }
+      // 场景卸载时释放粒子系统的 GL 资源（每系统一套 program/VAO/VBO）
+      if (particleSystems.length > 0) {
+        const prevCleanup = particleCleanup;
+        particleCleanup = () => {
+          prevCleanup?.();
+          for (const ps of particleSystems) ps.dispose();
+        };
       }
       // ---- 声音图层（sound 对象）----
       // 从 scene.pkg 提取声音文件 → Blob → audio 播放；受 cfg.muted 控制
@@ -970,77 +1385,127 @@ function mountScene(cfg: WallpaperConfig) {
       if (disposed) return;
       // 粒子每帧推进 + 渲染（叠加在场景之上，同投影）
       let lastPt = performance.now();
+      // 鼠标世界位置：locktopointer 的控制点用它做吸引/排斥（controlpointattract）。
+      // 屏幕坐标 → 世界坐标需要相机的可见窗口（cam.offX/viewW），故在回调里换算。
+      const pointerScreen = { x: -1, y: -1, has: false };
+      if (particleSystems.length > 0) {
+        const onMove = (ev: MouseEvent) => {
+          pointerScreen.x = ev.clientX / (window.innerWidth || 1);
+          pointerScreen.y = ev.clientY / (window.innerHeight || 1);
+          pointerScreen.has = true;
+        };
+        window.addEventListener("mousemove", onMove, { passive: true });
+        const prevCleanup = particleCleanup;
+        particleCleanup = () => {
+          prevCleanup?.();
+          window.removeEventListener("mousemove", onMove);
+        };
+      }
+      let particleDiagFrame = 0;
       renderer.setParticleRenderer((cam: any, viewProj: any, w: number, h: number) => {
         const now = performance.now();
+        // dt 封顶 50ms：标签页切回或掉帧时的大 dt 会让粒子瞬移一大段
         const pdt = Math.min(0.05, (now - lastPt) / 1000);
         lastPt = now;
+        if (pointerScreen.has) {
+          const wx = cam.offX + pointerScreen.x * cam.viewW;
+          const wy = cam.offY + pointerScreen.y * cam.viewH;
+          for (const ps of particleSystems) ps.setPointer(wx, wy);
+        }
         for (const ps of particleSystems) ps.advance(pdt);
         for (const ps of particleSystems) ps.render(viewProj, w, h, cam.projW, cam.projH);
-        // 叠加 mdl 网格
-        if (mdlRenderer && mdlItems.length > 0) {
-          try {
-            for (const item of mdlItems) {
-              if (!item.tex) continue;
-              const l = item.layer;
-              // 放置：网格中心对齐 layer origin，缩放匹配 layer scale
-              const b = item.mdl.bounds;
-              const cx = (b.minX + b.maxX) / 2;
-              const cy = (b.minY + b.maxY) / 2;
-              const w0 = b.maxX - b.minX || 1;
-              const h0 = b.maxY - b.minY || 1;
-              const targetW = (l.size?.[0] || w0) * (l.scale?.[0] || 1);
-              const targetH = (l.size?.[1] || h0) * (l.scale?.[1] || 1);
-              const sx = targetW / w0;
-              const sy = targetH / h0;
-              const ox = (l.origin?.[0] || 0) - cx * sx;
-              const oy = (l.origin?.[1] || 0) - cy * sy;
-              mdlRenderer.draw(viewProj, item.mdl, { scaleX: sx, scaleY: sy, offsetX: ox, offsetY: oy }, item.tex.glTex);
-            }
-          } catch (e) {
-            console.warn("mdl 渲染失败:", (e as Error).message);
+        // 首帧后上报一次实际存活粒子数，用于确认系统真的在发射（而非静默空转）
+        if (particleDiagFrame < 2) {
+          particleDiagFrame++;
+          if (particleDiagFrame === 2) {
+            const live = particleSystems.reduce((s, ps) => s + ps.liveCount(), 0);
+            reportDiag(cfg, `particles live: ${live} across ${particleSystems.length} systems`);
           }
         }
       });
-      reportDiag(cfg, `particles: ${particleSystems.length} systems`);
+      reportDiag(
+        cfg,
+        `particles: ${particleSystems.length} systems, ${builtinTexCount} builtin tex generated`,
+      );
+      // 调试出口：测试台/控制台可读粒子系统状态（存活数、世界包围盒、尺寸区间），
+      // 用于确认粒子真的落在可见区域内、尺寸量级合理，而不是堆在原点或大到糊屏。
+      (window as unknown as Record<string, unknown>).__particleStats = () =>
+        particleSystems.map((ps) => {
+          let live = 0;
+          let minX = Infinity;
+          let maxX = -Infinity;
+          let minY = Infinity;
+          let maxY = -Infinity;
+          let minS = Infinity;
+          let maxS = -Infinity;
+          for (const p of ps.pool) {
+            if (!p.alive) continue;
+            live++;
+            const px = ps.originX + p.x * ps.scaleX;
+            const py = ps.originY + p.y * ps.scaleY;
+            if (px < minX) minX = px;
+            if (px > maxX) maxX = px;
+            if (py < minY) minY = py;
+            if (py > maxY) maxY = py;
+            const s = Math.abs(p.size) * ps.sysScale;            if (s < minS) minS = s;
+            if (s > maxS) maxS = s;
+          }
+          return {
+            live,
+            max: ps.maxCount,
+            blend: ps.blend,
+            renderer: ps.renderers.map((r: any) => r.kind).join("+"),
+            origin: [Math.round(ps.originX), Math.round(ps.originY)],
+            bbox: live ? [Math.round(minX), Math.round(minY), Math.round(maxX), Math.round(maxY)] : null,
+            size: live ? [Math.round(minS), Math.round(maxS)] : null,
+          };
+        });
+      // 调试出口：整体开关粒子可见性，用于「开/关两帧对比」量化粒子对画面的实际贡献
+      // （验证是否出现方块边界、是否把画面冲白、是否堆成一团）。
+      // 传索引则只显示该系统，用于逐系统定位过曝来源。
+      (window as unknown as Record<string, unknown>).__particleToggle = (
+        on: boolean,
+        onlyIndex?: number,
+      ) => {
+        for (let i = 0; i < particleSystems.length; i++) {
+          particleSystems[i].setVisible(onlyIndex === undefined ? on : i === onlyIndex);
+        }
+        return particleSystems.length;
+      };
 
-      // ---- 3D 模型图层（puppet mdl）----
-      // model json 有 puppet 字段 → 解析 mdl 网格 + 材质贴图，叠加渲染
-      // 按需求暂不渲染 3D 模型：mdlItems 不变为对象，直接保持空（后续按需开启 SKIP_3D_MODELS）
+      // ---- puppet 骨骼网格图层 ----
+      // model json 有 puppet 字段 → 解析 MDL（网格 + 骨架 + MDLA 动画），挂到图层上。
+      // 渲染由 renderer 的图层循环调用（按 z 序、可走效果链），不再作为叠加层单独绘制。
       const mdlItems: { mdl: any; tex: any; layer: any }[] = [];
       for (const layer of scene.layers) {
         if (!layer.image || !layer.visible) continue;
-        if (SKIP_3D_MODELS) continue; // 忽略 3D 模型图层
+        if (SKIP_3D_MODELS) continue;
         try {
-          // 加载 model json 检查 puppet
-          let model: any;
-          if (eff.BUILTIN_MODELS[layer.image]) continue; // 内置模型非 puppet
+          if (eff.BUILTIN_MODELS[layer.image]) continue; // 内置模型无 puppet
           const modelEntry = pkg.getEntry(parsedPkg, layer.image);
           if (!modelEntry) continue;
-          model = JSON.parse(readText(modelEntry));
-          const puppet = model.puppet;
-          if (!puppet) continue;
-          const mdlEntry = pkg.getEntry(parsedPkg, puppet);
+          const model = JSON.parse(readText(modelEntry));
+          if (!model.puppet) continue;
+          const mdlEntry = pkg.getEntry(parsedPkg, model.puppet);
           if (!mdlEntry) continue;
           const mdlObj = mdl.parseMDL(new Uint8Array(mdlEntry as ArrayBuffer));
-          // 材质贴图
-          const mat = scn.resolveMaterial(model);
-          let texObj: any = null;
-          if (mat) {
-            const matEntry = pkg.getEntry(parsedPkg, mat.materialPath);
-            if (matEntry) {
-              const material = JSON.parse(readText(matEntry));
-              const pass = material.passes?.[0];
-              const texName = pass?.textures?.[0];
-              if (texName) {
-                const te = await loadTex(texName);
-                if (te) texObj = te;
-              }
-            }
+          // 贴图：与普通图层同一条材质链，已在上面的循环里 loadTex 过
+          const texObj = layer.textureName ? textures.get(layer.textureName) : null;
+          if (!texObj) {
+            reportDiag(cfg, `puppet '${layer.name}' 无贴图，跳过`);
+            continue;
           }
+          layer.puppet = mdlObj;
           mdlItems.push({ mdl: mdlObj, tex: texObj, layer });
-          reportDiag(cfg, `mdl '${layer.name}' bounds=(${mdlObj.bounds.minX.toFixed(0)},${mdlObj.bounds.minY.toFixed(0)})-(${mdlObj.bounds.maxX.toFixed(0)},${mdlObj.bounds.maxY.toFixed(0)}) v=${mdlObj.vertexCount}`);
+          const an = mdlObj.animations[0];
+          reportDiag(
+            cfg,
+            `puppet '${layer.name}' v=${mdlObj.vertexCount} bones=${mdlObj.bones.length}` +
+              (an ? ` anim='${an.name}' ${an.fps}fps×${an.frameCount}` : " 无动画"),
+          );
         } catch (e) {
-          console.warn(`3D 图层 ${layer.name} 加载失败: ${(e as Error).message}`);
+          console.warn(`puppet 图层 ${layer.name} 加载失败: ${(e as Error).message}`);
+          reportDiag(cfg, `puppet '${layer.name}' 失败: ${(e as Error).message}`);
         }
       }
       let mdlRenderer: any = null;
@@ -1048,14 +1513,37 @@ function mountScene(cfg: WallpaperConfig) {
         try {
           mdlRenderer = mdl.createMDLRenderer(renderer.gl);
           for (const item of mdlItems) mdlRenderer.upload(item.mdl);
+          // 注入绘制回调：renderer 在图层循环里按 z 序调用
+          const byLayer = new Map<any, { mdl: any; tex: any; layer: any }>();
+          for (const item of mdlItems) byLayer.set(item.layer, item);
+          renderer.setPuppetRenderer((layer: any, mvp: any, o: any) => {
+            const item = byLayer.get(layer);
+            if (!item) return;
+            mdlRenderer.draw(
+              mvp,
+              item.mdl,
+              {
+                time: o.time,
+                animLayers: layer.animationLayers,
+                color: [
+                  layer.color[0] * layer.brightness,
+                  layer.color[1] * layer.brightness,
+                  layer.color[2] * layer.brightness,
+                  layer.alpha,
+                ],
+              },
+              item.tex,
+            );
+          });
         } catch (e) {
-          console.warn(`3D 渲染器初始化失败: ${(e as Error).message}`);
+          console.warn(`puppet 渲染器初始化失败: ${(e as Error).message}`);
+          reportDiag(cfg, `puppet renderer 失败: ${(e as Error).message}`);
           mdlRenderer = null;
+          for (const item of mdlItems) item.layer.puppet = null;
         }
       }
-      // 在 renderScene 后叠加绘制 mdl
       if (disposed) return;
-      reportDiag(cfg, `mdl: ${mdlItems.length} meshes`);
+      reportDiag(cfg, `puppet: ${mdlItems.length} meshes`);
 
       // ---- 文字对象 / 组件（时钟、日期、星期等动态文本）----
       // 用 2D overlay canvas 叠加在 WebGL 之上绘制；字体从 pkg 的 fonts/*.ttf 加载
@@ -1170,9 +1658,10 @@ function mountScene(cfg: WallpaperConfig) {
 }
 
 function mount(cfg: WallpaperConfig) {
-  if (cfg.type === "video" && cfg.src) mountVideo(cfg);
-  else if ((cfg.type === "gif" || cfg.type === "image") && cfg.src) mountGif(cfg);
-  else if (cfg.type === "web" && cfg.src) mountWeb(cfg);
+  // video / gif / image 统一走场景引擎（mountMedia 内部在无 WebGL2 时回退 DOM）
+  if ((cfg.type === "video" || cfg.type === "gif" || cfg.type === "image") && cfg.src) {
+    mountMedia(cfg);
+  } else if (cfg.type === "web" && cfg.src) mountWeb(cfg);
   else if (cfg.type === "scene" && cfg.src) mountScene(cfg);
   else mountDefaultWallpaper(); // 无壁纸/默认配置 → 精美 HTML 默认壁纸
 }
@@ -1204,6 +1693,9 @@ window.__wp = {
   pause() {
     for (const p of state.videoPairs ?? []) p.pause();
     weShimCall((w) => w.__weSetPaused?.(true));
+    // 媒体壁纸的画面由 rAF 渲染循环驱动，但解码器是独立的：只停 rAF 会让视频
+    // 在后台继续解码（白耗 CPU），故一并暂停元素
+    state.video?.pause();
     if (state.raf !== undefined) {
       cancelAnimationFrame(state.raf);
       state.raf = undefined;
@@ -1213,23 +1705,27 @@ window.__wp = {
     for (const p of state.videoPairs ?? []) p.resume();
     weShimCall((w) => w.__weSetPaused?.(false));
     if (state.cfg.type === "canvas") startCanvasLoop();
-    else if (state.cfg.type === "scene") {
-      // 场景暂停后重挂 rAF：sceneCleanup 已被 clear() 触发，重新挂载
-      if (!state.sceneCleanup && state.canvas) {
-        // 简单恢复：重新挂载
-        mount(state.cfg);
-      }
+    else if (
+      state.cfg.type === "scene" ||
+      state.cfg.type === "video" ||
+      state.cfg.type === "gif" ||
+      state.cfg.type === "image"
+    ) {
+      // scene / 媒体壁纸的渲染循环持有各自闭包内的 disposed 标志，无法从外部重启，
+      // 故按当前配置重新挂载（sceneCleanup 已被 pause 前的 clear() 或此处的 mount 处理）
+      mount(state.cfg);
     }
   },
   setFit(fit: string) {
     state.cfg.fit = fit as WallpaperFit;
-    const f = fitObjectFit(fit as WallpaperFit);
+    // DOM 回退路径（无 WebGL2）才需要改 object-fit；走场景引擎时 fit 由渲染循环
+    // 每帧读 state.cfg.fit 传给 fitWindow，无需重挂载即可实时切换
     const obj = state.video ?? state.img;
-    if (obj) {
+    if (obj && obj.isConnected && obj.parentElement === wrap) {
+      const f = fitObjectFit(fit as WallpaperFit);
       obj.style.objectFit = f.objectFit;
       obj.style.background = f.background;
     }
-    // 场景壁纸：fit 由渲染循环每帧读取 state.cfg.fit 并传给 fitWindow，无需重挂载即可实时切换
   },
   setVolume(volume: number) {
     if (state.video) {
@@ -1262,6 +1758,10 @@ window.__wp = {
   // 热更新 WE 网页壁纸用户属性（属性编辑保存后由原生侧调用，免刷新生效）
   updateWebProps(props: Record<string, { value: unknown }>) {
     weShimCall((w) => w.__weApplyProps?.(props));
+    // 场景壁纸的属性作用在 scene.json 的字段绑定上（图层可见性/颜色/位置…），
+    // 这些值在 parseScene 时已烘进图层对象，无法逐字段热改 → 重挂载重新解析。
+    // 覆盖值由宿主合并进 project.json 响应，重挂载即读到新值。
+    if (state.cfg.type === "scene") mount(state.cfg);
   },
 };
 

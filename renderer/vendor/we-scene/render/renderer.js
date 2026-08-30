@@ -137,6 +137,10 @@ export function createRenderer(canvas, opts = {}) {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo)
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0)
+    // 新建附件内容未定义。效果的中间 target FBO（_rt_*）可能因其写入 pass 编译失败而
+    // 始终没被写过，后续 pass 采样到未定义内容会得到整屏白/花屏，故先清零。
+    gl.clearColor(0, 0, 0, 0)
+    gl.clear(gl.COLOR_BUFFER_BIT)
     gl.bindFramebuffer(gl.FRAMEBUFFER, null)
     const entry = { fbo, tex, width: w, height: h }
     fboCache.set(key, entry)
@@ -379,6 +383,37 @@ export function createRenderer(canvas, opts = {}) {
       gl.disable(gl.BLEND)
     }
   }
+
+  // 图层的 colorBlendMode（scene.json 的 colorBlendMode，语义同 common_blending.h 的
+  // blend mode 编号）→ 合成到画布时的 GL 混合模式。
+  // 只映射能用固定管线表达的几种；其余（Overlay/SoftLight 等需要读回目标色）
+  // 退回 translucent，与此前行为一致。
+  //
+  // 这一步不做的后果：像 3299228616 的 ripple1440p 水面层，贴图是一张几乎全黑、
+  // 靠 Add 混合只贡献亮部高光的图（colorBlendMode=9），若按 translucent 合成，
+  // 黑色像素会被当成不透明色直接糊住背景，看起来就是"一层黑色蒙版盖住了壁纸"。
+  const COLOR_BLEND_GL = {
+    2: 'multiply', // Multiply
+    6: 'additive', // Lighten（近似）
+    7: 'screen', // Screen
+    9: 'additive', // Add
+    31: 'additive', // Add(带 opacity 权重)
+  }
+  function setColorBlend(colorBlendMode) {
+    const mode = COLOR_BLEND_GL[colorBlendMode]
+    if (mode === 'additive') {
+      gl.enable(gl.BLEND)
+      gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE, gl.ONE, gl.ONE)
+    } else if (mode === 'multiply') {
+      gl.enable(gl.BLEND)
+      gl.blendFuncSeparate(gl.DST_COLOR, gl.ZERO, gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
+    } else if (mode === 'screen') {
+      gl.enable(gl.BLEND)
+      gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_COLOR, gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
+    } else {
+      setBlend('translucent')
+    }
+  }
   function drawQuad(prog, fbo, w, h, verts, mvp, blending) {
     gl.useProgram(prog)
     setBlend(blending)
@@ -391,24 +426,76 @@ export function createRenderer(canvas, opts = {}) {
     gl.drawArrays(gl.TRIANGLES, 0, 6)
   }
 
+  // ---------- 视锥裁剪 ----------
+  // 图层的世界空间 AABB 与可见窗口是否完全不相交。
+  // 世界坐标同 layerModelMatrix：y 已翻成 cam.projH - origin.y，可见窗口是
+  // [offX, offX+viewW] × [offY, offY+viewH]（见 buildCamera 的 fitWindow）。
+  function isLayerOffscreen(layer, cam) {
+    const sw = layer.size[0] * layer.scale[0]
+    const sh = layer.size[1] * layer.scale[1]
+    // 尺寸未知（0）的层不裁：文字/声音/纯效果层的 size 常为 0，但仍可能有内容
+    if (sw === 0 || sh === 0) return false
+    // 负缩放（镜像）会让宽高为负，取绝对值才是真实包围盒
+    let halfW = Math.abs(sw) / 2
+    let halfH = Math.abs(sh) / 2
+    // 旋转后的 AABB：用旋转矩阵作用于半宽半高向量，取绝对值之和
+    const ang = layer.angles[2]
+    if (ang !== 0) {
+      const c = Math.abs(Math.cos(ang))
+      const s = Math.abs(Math.sin(ang))
+      const rw = halfW * c + halfH * s
+      const rh = halfW * s + halfH * c
+      halfW = rw
+      halfH = rh
+    }
+    const cx = layer.origin[0]
+    const cy = cam.projH - layer.origin[1]
+    // 视差与相机抖动会让层在几十像素内浮动；留一档余量避免边缘层被误裁。
+    // 对象级视差最大位移 = |parallaxDepth| × layerParallaxScale（已封顶到 60px）。
+    let margin = 64
+    if (layer.parallaxDepth) {
+      margin += Math.abs(layer.parallaxDepth[0] * layerParallaxScaleX)
+      margin += Math.abs(layer.parallaxDepth[1] * layerParallaxScaleY)
+    }
+    return (
+      cx + halfW + margin < cam.offX ||
+      cx - halfW - margin > cam.offX + cam.viewW ||
+      cy + halfH + margin < cam.offY ||
+      cy - halfH - margin > cam.offY + cam.viewH
+    )
+  }
+
   // ---------- 合成（层 → 画布） ----------
-  function compositeLayer(prog, inputTex, color4, layer, cam, viewProj, width, height) {
-    const a = ALIGN[layer.alignment] || [0.5, 0.5]
+  // 图层局部变换（不含投影）：把 [-0.5,0.5] 的 local quad 映射到世界空间
+  function layerModelMatrix(layer, cam) {
     const w = layer.size[0] * layer.scale[0]
     const h = layer.size[1] * layer.scale[1]
     let m = mat4Identity()
     m = mat4Translate(m, layer.origin[0], cam.projH - layer.origin[1], layer.origin[2])
+    // 对象级视差（parallaxDepth）：近景 depth 正值随鼠标位移放大、远景负值反向。
+    // 放在旋转之前 = 沿世界轴平移（视差是相机效果，不应被图层自身旋转带偏）。
+    if (layer.parallaxDepth && (layerParallaxScaleX !== 0 || layerParallaxScaleY !== 0)) {
+      m = mat4Translate(
+        m,
+        layer.parallaxDepth[0] * layerParallaxScaleX,
+        layer.parallaxDepth[1] * layerParallaxScaleY,
+        0,
+      )
+    }
     // 旋转：参考实现 y-up 空间 rotate(-angle)，等效 y-down 屏幕 rotate(-angle)（正角度=屏幕逆时针）
     m = mat4RotateZ(m, -layer.angles[2])
-    m = mat4Scale(m, w, h, 1)
-    // 对象级视差（parallaxDepth）：近景 depth 正值随鼠标位移放大、远景负值反向
-    if (layer.parallaxDepth && (layerParallaxScaleX !== 0 || layerParallaxScaleY !== 0)) {
-      m = mat4Translate(m, layer.parallaxDepth[0] * layerParallaxScaleX, layer.parallaxDepth[1] * layerParallaxScaleY, 0)
-    }
+    return { m, w, h }
+  }
+
+  function compositeLayer(prog, inputTex, color4, layer, cam, viewProj, width, height) {
+    const a = ALIGN[layer.alignment] || [0.5, 0.5]
+    const base = layerModelMatrix(layer, cam)
+    const m = mat4Scale(base.m, base.w, base.h, 1)
+    void a
     const mvp = mat4Multiply(viewProj, m)
     const uni = prog === compProg ? compUni : copyUni
     gl.useProgram(prog)
-    setBlend('translucent')
+    setColorBlend(layer.colorBlendMode)
     gl.bindFramebuffer(gl.FRAMEBUFFER, null)
     gl.viewport(0, 0, width, height)
     gl.bindVertexArray(vao)
@@ -421,7 +508,45 @@ export function createRenderer(canvas, opts = {}) {
     gl.drawArrays(gl.TRIANGLES, 0, 6)
   }
 
-  // ---------- 渲染入口 ----------
+  // [we-scene patch] puppet 骨骼网格图层：由外部注入的 MDL 渲染器绘制（见 setPuppetRenderer）
+  // 网格坐标 = 图层局部像素、y 轴朝上，故 model 矩阵在层变换后翻转 y。
+  let puppetDrawFn = null
+  function puppetModelMatrix(layer, cam) {
+    const base = layerModelMatrix(layer, cam)
+    // scale(sx, -sy)：网格 y-up → 场景 y-down；网格坐标已是像素，不再乘 size
+    return mat4Scale(base.m, layer.scale[0], -layer.scale[1], 1)
+  }
+
+  // 直接绘制到画布（无效果链）
+  function drawPuppetDirect(layer, cam, viewProj, width, height, time) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    gl.viewport(0, 0, width, height)
+    const mvp = mat4Multiply(viewProj, puppetModelMatrix(layer, cam))
+    puppetDrawFn(layer, mvp, { time })
+    currentQuadKey = null // MDL 渲染器换过 VAO/buffer，失效 quad 缓存
+  }
+
+  // 绘制到层 FBO（供效果链使用）：内容朝向必须与 copy pass 完全一致。
+  // copy pass 的 quad 约定（layerQuadVerts）令「FBO 的 NDC 顶 ← 纹理 v=1 ← 图像底行」，
+  // 即层 FBO 里的画面是上下倒置的。网格 y-up 且 v=(H/2-y)/H，
+  // 故网格顶（v=0，图像顶行）必须落到 FBO 的 NDC 底 ⇒ 用 y-down 的正交投影
+  // （mat4Ortho 的 top/bottom 传成 h/0）。注意只能翻几何、不能翻 UV：
+  // 翻 UV 会把贴图镜像贴到未翻转的网格上，得到上下颠倒的人物。
+  function drawPuppetToFBO(layer, fbo, fboW, fboH, time) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo.fbo)
+    gl.viewport(0, 0, fboW, fboH)
+    gl.clearColor(0, 0, 0, 0)
+    gl.clear(gl.COLOR_BUFFER_BIT)
+    const w = layer.size[0]
+    const h = layer.size[1]
+    let m = mat4Ortho(0, w, h, 0, -10000, 10000)
+    m = mat4Translate(m, w / 2, h / 2, 0)
+    puppetDrawFn(layer, m, { time })
+    currentQuadKey = null
+    gl.bindVertexArray(vao)
+  }
+
+
   async function renderScene(scene, textures, width, height, time, fit) {
     gl.viewport(0, 0, width, height)
     const general = scene.general || {}
@@ -451,23 +576,48 @@ export function createRenderer(canvas, opts = {}) {
       parallaxState.sx += (parallaxState.x - parallaxState.sx) * parAlpha
       parallaxState.sy += (parallaxState.y - parallaxState.sy) * parAlpha
       const strength = amount * influence
-      const parOffX = parallaxState.sx * strength * cam.projW * 0.12
-      const parOffY = parallaxState.sy * strength * cam.projH * 0.12
+      // WE 语义：amount 是「相机偏移占可见画面的比例」（鼠标居中 0、到边缘 ±1）。
+      // 但 amount 只按比例换算会让「作者没动过的默认值」把画面整体推走：
+      // 全库实测 amount=0.5 / mouseinfluence=0.5 就是编辑器默认值（13/21 个场景原样保留），
+      // 真正调过视差的作者会显式改到 0.01~0.08。按纯比例算，默认值在 3840 宽的场景上
+      // 得到 ±960px（约 1/4 屏）的相机位移 —— 表现为鼠标一动整个画面主体过度飘移。
+      // WE 的实际观感是几十像素级的轻微浮动，故这里对相机位移取绝对上限封顶：
+      // 既保留作者显式调小时的比例关系，也让默认值退化为可接受的轻微浮动。
+      const PARALLAX_MAX_PX = 60
+      const rawOffX = parallaxState.sx * strength * cam.viewW
+      const rawOffY = parallaxState.sy * strength * cam.viewH
+      // 按 x/y 里更大的超出比例统一缩放，避免单轴截断改变位移方向
+      const over = Math.max(Math.abs(rawOffX), Math.abs(rawOffY)) / PARALLAX_MAX_PX
+      const damp = over > 1 ? 1 / over : 1
+      const parOffX = rawOffX * damp
+      const parOffY = rawOffY * damp
       if (parOffX !== 0 || parOffY !== 0) {
-        viewProj = mat4Multiply(mat4Translate(mat4Identity(), parOffX, parOffY, 0), viewProj)
+        // 必须右乘：viewProj · translate = 在**世界空间**平移。
+        // 若写成 translate · viewProj，平移会落在投影之后的 NDC 空间（全宽仅 2.0），
+        // 几十像素的偏移被当成十几个屏幕宽 → 鼠标一动整个画面就跑飞。
+        viewProj = mat4Multiply(viewProj, mat4Translate(mat4Identity(), parOffX, parOffY, 0))
       }
       // 对象级视差基准：depth 1.0 的层位移约等于场景级位移
-      layerParallaxScaleX = parallaxState.sx * strength * cam.projW * 0.12
-      layerParallaxScaleY = parallaxState.sy * strength * cam.projH * 0.12
+      layerParallaxScaleX = parOffX
+      layerParallaxScaleY = parOffY
     }
 
     for (const layer of scene.layers) {
       if (!layer.visible) continue
       if (layer.isContainer) continue
+      // [we-scene patch] 全屏后期处理层（projectlayer / fullscreenlayer）：
+      // 其内容应是「已渲染画面的副本」，尚未实现回读，先整层跳过。
+      // 当普通空层渲染会被效果末尾的 compositecolor 铺成纯白，糊掉整个画面。
+      if (layer.isPostProcess) continue
       if (layer.particle) {
         // [we-scene patch] 粒子图层：由外部 ParticleSystem 模拟+渲染（见 renderer.renderParticles）
         continue
       }
+      // [we-scene patch] 视锥裁剪：完全落在可见窗口外的图层不必渲染。
+      // 作者常放超出屏幕的大图供视差平移（3113287126 的背景层 quad 达 8289×1554，
+      // 而屏幕只有 3840 宽），这些层的效果链 FBO 会按整层尺寸分配 —— 跳过屏外层
+      // 既省显存与逐 pass 开销，也不会改变画面（屏外内容本就被裁掉）。
+      if (isLayerOffscreen(layer, cam)) continue
       await renderLayer(layer, textures, cam, viewProj, width, height, time)
     }
     // [we-scene patch] 渲染叠加粒子系统（在图层之后，与场景同投影）
@@ -479,6 +629,8 @@ export function createRenderer(canvas, opts = {}) {
   }
 
   async function renderLayer(layer, textures, cam, viewProj, width, height, time) {
+    // [we-scene patch] puppet 图层：几何由 MDL 网格提供，而非层 quad
+    const isPuppet = !!(layer.puppet && puppetDrawFn)
     const texObj = !layer.solid && layer.textureName ? textures.get(layer.textureName) : null
     // 视频纹理层：把当前视频帧上传到 WebGL（帧时间戳变化才上传）
     if (texObj && texObj.video) {
@@ -538,17 +690,25 @@ export function createRenderer(canvas, opts = {}) {
       }
     }
     const srcTex = texObj && texObj.glTex ? texObj.glTex : (layer.solid ? whiteTex : transparentTex)
-    const w = Math.max(1, texObj ? texObj.width : 1)
-    const h = Math.max(1, texObj ? texObj.height : 1)
+    // puppet 层的层内容尺寸由 size 决定（网格坐标即层局部像素），而非贴图尺寸
+    const w = Math.max(1, isPuppet ? Math.round(layer.size[0]) : texObj ? texObj.width : 1)
+    const h = Math.max(1, isPuppet ? Math.round(layer.size[1]) : texObj ? texObj.height : 1)
     const color4 = [layer.color[0] * layer.brightness, layer.color[1] * layer.brightness, layer.color[2] * layer.brightness, layer.alpha]
     const effects = (layer.effects || []).filter((e) => e.visible)
 
-    // 效果降采样（性能档位）：fboCapFactor > 0 时效果链 FBO 上限 = 屏幕占比 × 系数（0=全质量）
+    // 效果降采样（性能档位）：fboCapFactor > 0 时效果链 FBO 上限 = 屏幕占比 × 系数（0=全质量）。
+    // 注意 copy pass 会把**整张贴图**铺满 fboW×fboH，所以任何缩小 FBO 的做法都是降质，
+    // 不能以「屏外部分反正看不见」为理由单独裁小 —— 屏外内容同样占着贴图 UV 空间。
+    // 巨型层（如 3113287126 的背景层 8289×1554）在全质量档确实按整层分配，
+    // 这是全质量的既定代价；要省显存请调 fboCapFactor，而不是在这里做隐式缩减。
     let fboW = w
     let fboH = h
     if (fboCapFactor > 0 && cam.projW > 0 && cam.projH > 0) {
-      const screenW = layer.size[0] * layer.scale[0] * (width / cam.projW)
-      const screenH = layer.size[1] * layer.scale[1] * (height / cam.projH)
+      // 层在屏幕上的实际占用；超出可见窗口的部分不必参与分辨率预算
+      const visW = Math.min(Math.abs(layer.size[0] * layer.scale[0]), cam.viewW)
+      const visH = Math.min(Math.abs(layer.size[1] * layer.scale[1]), cam.viewH)
+      const screenW = visW * (width / cam.projW)
+      const screenH = visH * (height / cam.projH)
       if (screenW > 0 && screenH > 0) {
         const capW = Math.max(64, Math.round(screenW * fboCapFactor))
         const capH = Math.max(64, Math.round(screenH * fboCapFactor))
@@ -559,7 +719,8 @@ export function createRenderer(canvas, opts = {}) {
 
     // 无效果：直接合成
     if (effects.length === 0) {
-      compositeLayer(copyProg, srcTex, color4, layer, cam, viewProj, width, height)
+      if (isPuppet) drawPuppetDirect(layer, cam, viewProj, width, height, time)
+      else compositeLayer(copyProg, srcTex, color4, layer, cam, viewProj, width, height)
       return
     }
 
@@ -567,18 +728,29 @@ export function createRenderer(canvas, opts = {}) {
     const fboA = getFBO(fboW, fboH, 'ping')
     const fboB = getFBO(fboW, fboH, 'pong')
     const layerOrtho = mat4Ortho(0, fboW, 0, fboH, -10000, 10000)
-    gl.useProgram(copyProg)
-    setBlend('normal')
-    gl.bindFramebuffer(gl.FRAMEBUFFER, fboA.fbo)
-    gl.viewport(0, 0, fboW, fboH)
-    gl.bindVertexArray(vao)
-    uploadQuad('layer' + fboW + 'x' + fboH, layerQuad(fboW, fboH))
-    gl.activeTexture(gl.TEXTURE0)
-    gl.bindTexture(gl.TEXTURE_2D, srcTex)
-    gl.uniform1i(copyUni.tex, 0)
-    gl.uniform4f(copyUni.color, color4[0], color4[1], color4[2], color4[3])
-    gl.uniformMatrix4fv(copyUni.mvp, false, layerOrtho)
-    gl.drawArrays(gl.TRIANGLES, 0, 6)
+    if (isPuppet) {
+      // puppet 图层的「层内容」= 蒙皮网格，先渲进 FBO A 再走效果链
+      drawPuppetToFBO(layer, fboA, fboW, fboH, time)
+    } else {
+      gl.useProgram(copyProg)
+      setBlend('normal')
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fboA.fbo)
+      gl.viewport(0, 0, fboW, fboH)
+      // 先清成透明：fboA/fboB 按尺寸缓存、被所有图层共享，上一层的内容会残留。
+      // waterwaves 这类效果做 UV 位移时会采样到 quad 之外，层 FBO 是 CLAMP_TO_EDGE，
+      // 于是把残留像素（solid 层缺贴图时回退的 whiteTex 尤为明显）沿边缘拉出来 ——
+      // 表现就是水面倾斜幅度稍大就在边上漏出白色底色。
+      gl.clearColor(0, 0, 0, 0)
+      gl.clear(gl.COLOR_BUFFER_BIT)
+      gl.bindVertexArray(vao)
+      uploadQuad('layer' + fboW + 'x' + fboH, layerQuad(fboW, fboH))
+      gl.activeTexture(gl.TEXTURE0)
+      gl.bindTexture(gl.TEXTURE_2D, srcTex)
+      gl.uniform1i(copyUni.tex, 0)
+      gl.uniform4f(copyUni.color, color4[0], color4[1], color4[2], color4[3])
+      gl.uniformMatrix4fv(copyUni.mvp, false, layerOrtho)
+      gl.drawArrays(gl.TRIANGLES, 0, 6)
+    }
 
     // 效果链
     let curInput = fboA // 当前主 FBO（asInput）
@@ -587,6 +759,7 @@ export function createRenderer(canvas, opts = {}) {
     let inTargetSeq = false
     let seqInput = fboA
     const flatPasses = []
+    const failedEffects = new Set()
     for (const eff of effects) {
       for (const f of eff.fbos || []) {
         if (!effectFBOs.has(f.name)) {
@@ -601,6 +774,7 @@ export function createRenderer(canvas, opts = {}) {
     }
     for (let fi = 0; fi < flatPasses.length; fi++) {
       const { eff, mp, ov } = flatPasses[fi]
+      if (failedEffects.has(eff)) continue
       const combos = { ...(mp.combos || {}), ...((ov && ov.combos) || {}) }
       // 本 pass 提供的纹理（material + scene override 合并，用于纹理关联 combo）
       const mpT = mp.textures || []
@@ -610,13 +784,16 @@ export function createRenderer(canvas, opts = {}) {
         if (ovT[i] !== undefined && ovT[i] !== null) mergedTex[i] = ovT[i]
         else mergedTex[i] = mpT[i] !== undefined ? mpT[i] : null
       }
-      // [we-scene patch] 单个效果 pass 编译失败（如缺失公共头/不支持的组合）时跳过该 pass，
-      // 而不是让整帧渲染崩溃——主体画面仍可渲染，仅该效果缺失。
+      // [we-scene patch] pass 编译失败（缺失公共头/不支持的组合）时跳过**整个效果**，
+      // 而不是只跳过这一个 pass。多 pass 效果的后续 pass 依赖前置 pass 写入的中间
+      // target FBO（如 cursorripple 的 _rt_EightBuffer2）；只跳过失败的那个会让 combine
+      // 之类的 pass 拿着没写过的 FBO 继续跑，把整层刷成纯白/花屏蒙版。
       let progEntry
       try {
         progEntry = await getEffectProgram(mp.shader, combos, mergedTex)
       } catch (e) {
-        console.warn('[we-scene] 跳过效果 pass:', mp.shader, (e && e.message) || e)
+        console.warn('[we-scene] 跳过效果（pass 编译失败）:', mp.shader, (e && e.message) || e)
+        failedEffects.add(eff)
         continue
       }
       const prog = progEntry.prog
@@ -650,8 +827,11 @@ export function createRenderer(canvas, opts = {}) {
       for (let ti = 0; ti < maxTex; ti++) {
         let name = ti < texNames.length ? texNames[ti] : null
         if (ov && ov.textures && ov.textures[ti] !== undefined && ov.textures[ti] !== null) name = ov.textures[ti]
-        // binds 覆盖
-        for (const b of eff.binds || []) {
+        // bind 覆盖：定义在**每个 pass** 上（effect.json 的 passes[i].bind），
+        // 由 effects-parse 存进 mp.binds。此前误读效果级的 eff.binds（恒为 undefined），
+        // 使 cursorripple 这类多 pass 效果的 bind 全部失效：combine pass 的槽 1
+        // 本该绑 previous（真实画面），落空后取到白纹理 → 整层被刷成纯白蒙版。
+        for (const b of mp.binds || []) {
           if (b.index === ti) name = b.name
         }
         // WE 语义：槽 0 为空 = 当前输入 FBO（asInput）；'previous' 同义
@@ -707,6 +887,11 @@ export function createRenderer(canvas, opts = {}) {
     // [we-scene patch] 注入粒子渲染回调：fn(cam, viewProj, width, height, time)
     setParticleRenderer: function (fn) {
       renderParticlesFn = fn
+    },
+    // [we-scene patch] 注入 puppet 网格绘制回调：fn(layer, mvp, { time })
+    // 由宿主用 MDL 渲染器实现；puppet 图层按自身 z 序参与图层循环与效果链。
+    setPuppetRenderer: function (fn) {
+      puppetDrawFn = fn
     },
     // 释放 WebGL 上下文（loseContext → 浏览器回收全部纹理/FBO/program/buffer）
     dispose: function () {
@@ -784,7 +969,13 @@ export function makeTextureMip(gl, levels, rg88 = false) {
       rg[p * 2] = lv.rgba[p * 4 + 3]
       rg[p * 2 + 1] = lv.rgba[p * 4]
     }
+    // [we-scene patch] RG8 每像素 2 字节，宽度为奇数时行长不是 4 的倍数；
+    // 默认 UNPACK_ALIGNMENT=4 会让 GL 按 4 字节对齐算行距而读越界 →
+    // INVALID_OPERATION、纹理留空（该遮罩采样恒黑，效果失真）。改为按字节对齐上传。
+    const prevAlign = gl.getParameter(gl.UNPACK_ALIGNMENT)
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1)
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG8, lv.width, lv.height, 0, gl.RG, gl.UNSIGNED_BYTE, rg)
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, prevAlign)
   } else {
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, lv.width, lv.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, lv.rgba)
   }
