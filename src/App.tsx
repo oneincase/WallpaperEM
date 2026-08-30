@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { HomePage } from "./pages/Home";
 import { WorkshopPage } from "./pages/Workshop";
 import { DetailPage } from "./pages/Detail";
@@ -61,7 +61,11 @@ export default function App() {
 
 function Shell() {
   const [page, setPage] = useState<PageId>("home");
+  // 详情抽屉：detailId 非 null 时抽屉挂载；shown 控制滑入/滑出（关闭时先滑出、
+  // 动画结束再卸载，保证「向右滑动隐藏」可见）
   const [detailId, setDetailId] = useState<string | null>(null);
+  const [detailShown, setDetailShown] = useState(false);
+  const detailCloseTimer = useRef<number | null>(null);
   // 侧边栏是否收缩成图标栏；由用户手动切换，并持久化
   const [collapsed, setCollapsed] = useState<boolean>(readInitialCollapsed);
 
@@ -113,9 +117,51 @@ function Shell() {
   };
 
   const navigate = (p: PageId) => {
+    if (detailCloseTimer.current) {
+      clearTimeout(detailCloseTimer.current);
+      detailCloseTimer.current = null;
+    }
     setDetailId(null);
+    setDetailShown(false);
     setPage(p);
   };
+
+  // 打开详情抽屉：从右侧滑入（面板先以滑出位挂载，下一帧再过渡到滑入位）
+  const openDetail = (id: string) => {
+    if (detailCloseTimer.current) {
+      clearTimeout(detailCloseTimer.current);
+      detailCloseTimer.current = null;
+    }
+    if (detailId === null) {
+      setDetailId(id);
+      setDetailShown(false);
+      requestAnimationFrame(() => requestAnimationFrame(() => setDetailShown(true)));
+    } else {
+      // 已打开时切换条目：面板保持滑入位，仅换内容
+      setDetailShown(true);
+      setDetailId(id);
+    }
+  };
+
+  // 关闭详情抽屉：先向右滑出，动画结束后再卸载
+  const closeDetail = () => {
+    setDetailShown(false);
+    if (detailCloseTimer.current) clearTimeout(detailCloseTimer.current);
+    detailCloseTimer.current = window.setTimeout(() => {
+      detailCloseTimer.current = null;
+      setDetailId(null);
+    }, 320);
+  };
+
+  // Esc 关闭详情抽屉
+  useEffect(() => {
+    if (detailId === null) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") closeDetail();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [detailId]);
 
   const toggleCollapsed = () => {
     setCollapsed((c) => {
@@ -247,24 +293,37 @@ function Shell() {
         </header>
         <div className="flex-1 flex flex-col min-h-0 relative">
           {page === "home" ? (
-            <HomePage onOpenDetail={setDetailId} />
+            <HomePage onOpenDetail={openDetail} />
           ) : page === "workshop" ? (
-            <WorkshopPage onOpenDetail={setDetailId} />
+            <WorkshopPage onOpenDetail={openDetail} />
           ) : page === "downloads" ? (
             <DownloadsPage />
           ) : page === "library" ? (
-            <LibraryPage onOpenDetail={setDetailId} />
+            <LibraryPage onOpenDetail={openDetail} />
           ) : page === "favorites" ? (
-            <FavoritesPage onOpenDetail={setDetailId} />
+            <FavoritesPage onOpenDetail={openDetail} />
           ) : (
             <SettingsPage />
           )}
 
-          {/* 详情页以覆盖层展示，底下列表保持挂载，返回时不刷新/不重置 */}
+          {/* 详情页以右侧抽屉展示：遮罩淡入 + 面板向左滑入覆盖，关闭时向右滑回隐藏。
+              底下列表保持挂载，关闭抽屉后滚动位置/数据不重置 */}
           {detailId && (
-            <div className="absolute inset-0 z-20 overflow-y-auto bg-[var(--content)]">
-              <DetailPage id={detailId} onBack={() => setDetailId(null)} />
-            </div>
+            <>
+              <div
+                onClick={closeDetail}
+                className={`absolute inset-0 z-20 bg-black/25 transition-opacity duration-300 ${
+                  detailShown ? "opacity-100" : "opacity-0"
+                }`}
+              />
+              <div
+                className={`absolute inset-y-0 right-0 z-30 w-[420px] max-w-[88%] border-l border-[var(--separator)] bg-[var(--content)] shadow-2xl transition-transform duration-300 ease-out ${
+                  detailShown ? "translate-x-0" : "translate-x-full"
+                }`}
+              >
+                <DetailPage id={detailId} onBack={closeDetail} />
+              </div>
+            </>
           )}
         </div>
       </main>
