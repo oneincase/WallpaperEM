@@ -75,6 +75,20 @@ pub fn run() {
         )
         .setup(|app| {
             init_logging(app.handle())?;
+            // panic 钩子：tokio 任务与主线程回调里的 panic 会被各自的
+            // catch_unwind 吞掉或仅在 stderr 打印（dev 终端不可见），统一落盘
+            // 到滚动日志，保证「软件无响应」类问题可追溯
+            {
+                let hook = std::panic::take_hook();
+                std::panic::set_hook(Box::new(move |info| {
+                    let loc = info
+                        .location()
+                        .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                        .unwrap_or_default();
+                    tracing::error!("PANIC {loc}: {info}");
+                    hook(info);
+                }));
+            }
             db::init(app.handle())?;
             init_steam(app.handle())?;
             build_tray(app.handle())?;
@@ -82,9 +96,11 @@ pub fn run() {
             // 音频捕获状态须先于内容服务器（SSE 端点读取其共享频谱帧）
             audio_capture::init(app.handle())?;
             content_server::init(app.handle()).map_err(|e| e.to_string())?;
+            // 开启音频可视化时先启动系统音频捕获，壁纸引擎（wallpaper::init）会
+            // 有界等待其就绪后再创建壁纸窗口：保证壁纸页加载时注入服务已可用
+            audio_capture::start_if_enabled(app.handle());
             wallpaper::init(app.handle())?;
             wallpaper::start_playlist_rotation(app.handle());
-            audio_capture::start_if_enabled(app.handle());
             download::init(app.handle()).map_err(|e| e.to_string())?;
             apply_vibrancy(app.handle())?;
             // T1 验证钩子：WE_AUTO_WORKSHOP=1 时启动即搜索第一页并打日志

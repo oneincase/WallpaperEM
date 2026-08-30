@@ -35,19 +35,21 @@
 
   // ---------- 属性 listener 捕获 ----------
   function dispatchTo(l, includeGeneral) {
-    if (!l || typeof l !== "object") return;
+    if (!l || typeof l !== "object") return true;
+    var ok = true;
     if (includeGeneral !== false) {
       try {
         if (typeof l.applyGeneralProperties === "function") {
           l.applyGeneralProperties({ fps: fps });
         }
-      } catch (e) {}
+      } catch (e) { ok = false; }
     }
     try {
       if (typeof l.applyUserProperties === "function") {
         l.applyUserProperties(userProps);
       }
-    } catch (e) {}
+    } catch (e) { ok = false; }
+    return ok;
   }
 
   try {
@@ -73,6 +75,30 @@
       dispatchTo(window.wallpaperPropertyListener, true);
     });
   }
+
+  // WE 桌面端在壁纸就绪后才下发属性，且属性变更会多次下发。部分壁纸的初始化
+  // 横跨多个阶段——有的在构造函数末尾复位「已收到配置」标志（VU Meter 的
+  // gotSettings），有的在 window.onload 里才初始化画布等全局量（Circular
+  // Visualizer），过早回调会抛异常或被覆盖，整段属性处理中断（表现为黑屏/缺元素）。
+  // 因此除赋值即发外，再在宏任务与 load 之后各补发一次；补发若仍抛错（壁纸尚未
+  // 就绪）则以 100ms 周期重试（上限 ~5s），全部成功即停——等价 WE 的多次下发契约。
+  var redispatchTries = 0;
+  function dispatchToPropsOnce() {
+    var ok = true;
+    for (var i = 0; i < propListeners.length; i++) {
+      if (!dispatchTo(propListeners[i], true)) ok = false;
+    }
+    return ok;
+  }
+  function redispatchWhenReady() {
+    if (dispatchToPropsOnce()) return;
+    if (++redispatchTries > 50) return;
+    setTimeout(redispatchWhenReady, 100);
+  }
+  setTimeout(redispatchWhenReady, 0);
+  window.addEventListener("load", function () {
+    setTimeout(redispatchWhenReady, 0);
+  });
 
   // ---------- 音频 ----------
   // 优先用原生 AudioContext（在包装前保存引用），自身分析不经过 tap，避免自环
@@ -171,7 +197,14 @@
   } catch (e) {}
 
   window.wallpaperRegisterAudioListener = function (cb) {
-    if (typeof cb === "function") audioCbs.push(cb);
+    // WE 桌面端语义：单监听槽位，重复注册为替换（部分壁纸在每次属性回调里
+    // 重新注册；若累积，同一帧音频会被重复消费，数据被逐次稀释直至不可见）
+    if (typeof cb === "function") {
+      audioCbs[0] = cb;
+      audioCbs.length = 1;
+    } else {
+      audioCbs.length = 0;
+    }
   };
 
   // 系统音频外部帧写入（SSE onmessage / 调试注入用），250ms 内参与融合
@@ -187,7 +220,9 @@
 
   // ---------- 系统音频（SSE 外部帧）：Rust ScreenCaptureKit → /audio-stream ----------
   // 与本地分析（壁纸自身音频）取最大值融合：系统音乐驱动 extSpec，壁纸自播驱动 spec
-  if (boot.systemAudio && boot.token && /^http:\/\/127\.0\.0\.1:\d+$/.test(location.origin)) {
+  // 不以注入时刻的 systemAudio 快照作门：捕获可能在页面加载后才就绪（冷启动竞态、
+  // 开关稍后打开、休眠唤醒后重启）。未就绪时端点 503，EventSource 自动重试自愈。
+  if (boot.token && /^http:\/\/127\.0\.0\.1:\d+$/.test(location.origin)) {
     try {
       var es = new EventSource(location.origin + "/audio-stream/" + boot.token);
       es.onmessage = function (ev) {

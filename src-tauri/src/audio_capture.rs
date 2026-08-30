@@ -11,7 +11,7 @@
 use std::alloc::{alloc, dealloc, Layout};
 use std::ffi::c_void;
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -36,9 +36,19 @@ const WINDOW: usize = 2048;
 const SAMPLE_RATE: f32 = 48_000.0;
 const PUBLISH_INTERVAL: Duration = Duration::from_millis(33);
 
+/// 捕获生命周期相位（AudioShared.phase）
+pub const PHASE_IDLE: u8 = 0; // 未启动（开关关闭或已停止）
+pub const PHASE_STARTING: u8 = 1; // 启动中（SCShareableContent/SCStream 建立期间）
+pub const PHASE_RUNNING: u8 = 2; // 运行中（样本持续到达）
+pub const PHASE_FAILED: u8 = 3; // 本次启动失败（权限缺失/超时等）
+
 /// 最新频谱帧（内容服务器 SSE 读取；音频回调线程写入）
 pub struct AudioShared {
-    pub running: std::sync::atomic::AtomicBool,
+    /// 捕获生命周期相位（PHASE_*）
+    phase: AtomicU8,
+    /// 是否收到过至少一个音频样本（看门狗只对「曾正常工作后卡死」的会话重启，
+    /// 避免对从未投递样本的环境做无意义的反复重启）
+    pub ever_received: AtomicBool,
     pub seq: AtomicU64,
     pub bands: Mutex<[f32; BANDS]>,
 }
@@ -46,14 +56,23 @@ pub struct AudioShared {
 impl AudioShared {
     pub(crate) fn new() -> Self {
         Self {
-            running: AtomicBool::new(false),
+            phase: AtomicU8::new(PHASE_IDLE),
+            ever_received: AtomicBool::new(false),
             seq: AtomicU64::new(0),
             bands: Mutex::new([0.0; BANDS]),
         }
     }
 
     pub fn is_running(&self) -> bool {
-        self.running.load(Ordering::Relaxed)
+        self.phase() == PHASE_RUNNING
+    }
+
+    pub fn phase(&self) -> u8 {
+        self.phase.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_phase(&self, phase: u8) {
+        self.phase.store(phase, Ordering::Relaxed);
     }
 
     /// 读取最新频谱快照（seq 用于 SSE 判断变化）
@@ -166,6 +185,7 @@ fn handle_audio_sample(sample_buffer: &objc2_core_media::CMSampleBuffer) {
     if !shared.is_running() {
         return;
     }
+    shared.ever_received.store(true, Ordering::Relaxed);
     if FIRST_CB.swap(false, Ordering::Relaxed) {
         tracing::info!("audio sample callback: first sample received");
     }
@@ -409,92 +429,103 @@ fn start_blocking(
 ) -> Result<(), String> {
     let mut session = session_slot.lock().map_err(|e| e.to_string())?;
     if session.is_some() {
+        shared.set_phase(PHASE_RUNNING); // 已在运行（幂等启动）
         return Ok(());
     }
+    shared.set_phase(PHASE_STARTING);
     // tokio 阻塞线程没有 ObjC autorelease pool：所有 ObjC 调用须包在 pool 内
-    objc2::rc::autoreleasepool(|_| unsafe {
-        if !CGPreflightScreenCaptureAccess() {
-            // 触发系统授权对话框（用户可能需到系统设置手动开启）
-            CGRequestScreenCaptureAccess();
+    let result = objc2::rc::autoreleasepool(|_| unsafe { start_inner(shared, &mut session) });
+    if result.is_err() {
+        shared.set_phase(PHASE_FAILED);
+    }
+    result
+}
+
+unsafe fn start_inner(
+    shared: &Arc<AudioShared>,
+    session: &mut Option<SendPtr<CaptureSession>>,
+) -> Result<(), String> {
+    if !CGPreflightScreenCaptureAccess() {
+        // 触发系统授权对话框（用户可能需到系统设置手动开启）
+        CGRequestScreenCaptureAccess();
+    }
+    // 拉取可捕获内容（completion handler → channel + 超时等待）
+    let (tx, rx) = std::sync::mpsc::channel::<Option<Retained<SCShareableContent>>>();
+    let block = block2::RcBlock::new(move |content: *mut SCShareableContent, err: *mut NSError| {
+        // completion 传入的是 +0 autoreleased 引用：必须主动 retain 持有。
+        // 若按 +1 消费（from_raw），block 返回后 pool drain 即释放对象 → use-after-free
+        let c = Retained::retain(content);
+        if !err.is_null() {
+            let e = Retained::retain(err);
+            if let Some(e) = e {
+                tracing::warn!("SCShareableContent error: {}", e.localizedDescription());
+            }
         }
-        // 拉取可捕获内容（completion handler → channel + 超时等待）
-        let (tx, rx) = std::sync::mpsc::channel::<Option<Retained<SCShareableContent>>>();
-        let block = block2::RcBlock::new(move |content: *mut SCShareableContent, err: *mut NSError| {
-            // completion 传入的是 +0 autoreleased 引用：必须主动 retain 持有。
-            // 若按 +1 消费（from_raw），block 返回后 pool drain 即释放对象 → use-after-free
-            let c = Retained::retain(content);
-            if !err.is_null() {
-                let e = Retained::retain(err);
-                if let Some(e) = e {
-                    tracing::warn!("SCShareableContent error: {}", e.localizedDescription());
-                }
+        let _ = tx.send(c);
+    });
+    SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
+        false, false, &block,
+    );
+    let content = rx
+        .recv_timeout(Duration::from_secs(10))
+        .map_err(|_| "获取可捕获内容超时".to_string())?
+        .ok_or("获取可捕获内容失败（可能未授权屏幕录制）")?;
+
+    let displays = content.displays();
+    let display = displays
+        .iter()
+        .next()
+        .ok_or("屏幕录制权限未生效：① 系统设置 → 隐私与安全性 → 屏幕录制 允许 WallpaperEM；② 完全退出（⌘Q）重开应用；③ 仍无效则在列表中移除 WallpaperEM 后重新添加")?;
+
+    let filter = SCContentFilter::initWithDisplay_excludingWindows(
+        SCContentFilter::alloc(),
+        &display,
+        &NSArray::new(),
+    );
+    let config = SCStreamConfiguration::new();
+    config.setWidth(2);
+    config.setHeight(2); // 只要音频：2×2 @默认帧率的开销可忽略
+    config.setCapturesAudio(true);
+    config.setExcludesCurrentProcessAudio(true); // 排除自身进程：壁纸自播音乐由 shim 本地分析覆盖
+
+    let delegate: Retained<AudioDelegate> = msg_send![AudioDelegate::alloc(), init];
+    let stream = SCStream::initWithFilter_configuration_delegate(
+        SCStream::alloc(),
+        &filter,
+        &config,
+        // init 的 delegate 是 SCStreamDelegate（生命周期事件，可选）；
+        // 帧输出经 addStreamOutput 注册 SCStreamOutput，此处传 None
+        None,
+    );
+    // 属性为 None 即串行队列（SERIAL 是默认值）
+    let queue = dispatch2::DispatchQueue::new("wpem-audio", None);
+    stream
+        .addStreamOutput_type_sampleHandlerQueue_error(
+            ProtocolObject::from_ref(&*delegate),
+            SCStreamOutputType::Audio,
+            Some(&queue),
+        )
+        .map_err(|e| format!("注册音频输出失败: {}", e.localizedDescription()))?;
+
+    // 启动捕获（completion → 等待完成）
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let start_block = block2::RcBlock::new(move |err: *mut NSError| {
+        if !err.is_null() {
+            let e = Retained::retain(err);
+            if let Some(e) = e {
+                tracing::error!("SCStream start error: {}", e.localizedDescription());
             }
-            let _ = tx.send(c);
-        });
-        SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
-            false, false, &block,
-        );
-        let content = rx
-            .recv_timeout(Duration::from_secs(10))
-            .map_err(|_| "获取可捕获内容超时".to_string())?
-            .ok_or("获取可捕获内容失败（可能未授权屏幕录制）")?;
+        }
+        let _ = tx.send(());
+    });
+    stream.startCaptureWithCompletionHandler(Some(&start_block));
+    rx.recv_timeout(Duration::from_secs(5))
+        .map_err(|_| "启动音频捕获超时".to_string())?;
 
-        let displays = content.displays();
-        let display = displays
-            .iter()
-            .next()
-            .ok_or("屏幕录制权限未生效：① 系统设置 → 隐私与安全性 → 屏幕录制 允许 WallpaperEM；② 完全退出（⌘Q）重开应用；③ 仍无效则在列表中移除 WallpaperEM 后重新添加")?;
-
-        let filter = SCContentFilter::initWithDisplay_excludingWindows(
-            SCContentFilter::alloc(),
-            &display,
-            &NSArray::new(),
-        );
-        let config = SCStreamConfiguration::new();
-        config.setWidth(2);
-        config.setHeight(2); // 只要音频：2×2 @默认帧率的开销可忽略
-        config.setCapturesAudio(true);
-        config.setExcludesCurrentProcessAudio(true); // 排除自身进程：壁纸自播音乐由 shim 本地分析覆盖
-
-        let delegate: Retained<AudioDelegate> = msg_send![AudioDelegate::alloc(), init];
-        let stream = SCStream::initWithFilter_configuration_delegate(
-            SCStream::alloc(),
-            &filter,
-            &config,
-            // init 的 delegate 是 SCStreamDelegate（生命周期事件，可选）；
-            // 帧输出经 addStreamOutput 注册 SCStreamOutput，此处传 None
-            None,
-        );
-        // 属性为 None 即串行队列（SERIAL 是默认值）
-        let queue = dispatch2::DispatchQueue::new("wpem-audio", None);
-        stream
-            .addStreamOutput_type_sampleHandlerQueue_error(
-                ProtocolObject::from_ref(&*delegate),
-                SCStreamOutputType::Audio,
-                Some(&queue),
-            )
-            .map_err(|e| format!("注册音频输出失败: {}", e.localizedDescription()))?;
-
-        // 启动捕获（completion → 等待完成）
-        let (tx, rx) = std::sync::mpsc::channel::<()>();
-        let start_block = block2::RcBlock::new(move |err: *mut NSError| {
-            if !err.is_null() {
-                let e = Retained::retain(err);
-                if let Some(e) = e {
-                    tracing::error!("SCStream start error: {}", e.localizedDescription());
-                }
-            }
-            let _ = tx.send(());
-        });
-        stream.startCaptureWithCompletionHandler(Some(&start_block));
-        rx.recv_timeout(Duration::from_secs(5))
-            .map_err(|_| "启动音频捕获超时")?;
-
-        shared.running.store(true, Ordering::Relaxed);
-        tracing::info!("system audio capture started (ScreenCaptureKit loopback)");
-        *session = Some(SendPtr(CaptureSession { stream, delegate, queue }));
-        Ok(())
-    })
+    shared.set_phase(PHASE_RUNNING);
+    tracing::info!("system audio capture started (ScreenCaptureKit loopback)");
+    *session = Some(SendPtr(CaptureSession { stream, delegate, queue }));
+    Ok(())
 }
 
 pub async fn stop(app: tauri::AppHandle) -> Result<(), String> {
@@ -509,7 +540,7 @@ fn stop_blocking(
     session_slot: &Arc<Mutex<Option<SendPtr<CaptureSession>>>>,
 ) -> Result<(), String> {
     let mut session = session_slot.lock().map_err(|e| e.to_string())?;
-    shared.running.store(false, Ordering::Relaxed);
+    shared.set_phase(PHASE_IDLE);
     if let Some(s) = session.take() {
         let s = s.0;
         // 同 start：阻塞线程无 pool，包一层 autorelease
@@ -589,15 +620,42 @@ pub fn audio_processing_status(app: tauri::AppHandle) -> AudioStatus {
     status(&app)
 }
 
-/// 启动时按设置自启（延迟数秒，避开启动风暴；失败仅记日志）
+/// 同步等待捕获进入运行态（壁纸引擎启动排序用：壁纸窗口须等注入服务就绪后再创建）。
+/// 失败/超时/未启用返回 false（调用方照常继续，页面内 shim 会经 SSE 重连自愈）。
+pub fn wait_until_ready(app: &tauri::AppHandle, timeout: Duration) -> bool {
+    let Some(state) = app.try_state::<AudioCaptureState>() else {
+        return false;
+    };
+    let shared = state.shared.clone();
+    let deadline = Instant::now() + timeout;
+    loop {
+        match shared.phase() {
+            PHASE_RUNNING => return true,
+            PHASE_FAILED | PHASE_IDLE => return false,
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// 启动时按设置自启。必须在 wallpaper::init 之前调用：壁纸引擎会等捕获就绪
+/// （wait_until_ready 有界等待）再创建壁纸窗口，避免壁纸页先于注入服务加载、
+/// 拿到过期的 systemAudio 快照后整段会话无可视化。失败仅记日志。
 pub fn start_if_enabled(app: &tauri::AppHandle) {
     let enabled = status(app).enabled;
     if !enabled {
         return;
     }
+    // 同步标记「启动中」：壁纸引擎的等待依赖相位，不能因 spawn 的任务尚未被
+    // 调度而把 STARTING 误判成 IDLE（未启用）而跳过等待
+    if let Some(state) = app.try_state::<AudioCaptureState>() {
+        state.shared.set_phase(PHASE_STARTING);
+    }
     let app2 = app.clone();
     tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(3)).await;
         if let Err(e) = start(app2.clone()).await {
             tracing::warn!("audio capture autostart failed: {e}");
         }

@@ -27,6 +27,16 @@ pub struct ContentServerState {
     pub renderer_dir: PathBuf,
     /// 系统音频捕获共享帧（二期：/audio-stream SSE 端点 + shim 引导标记）
     pub audio: Arc<crate::audio_capture::AudioShared>,
+    /// 当前存活的 /audio-stream SSE 客户端数（壁纸页存活信号：新 shim 下每个
+    /// web 壁纸页加载后必然持有 1 条连接；睡眠唤醒后若为 0 说明页面已僵死）
+    pub sse_clients: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ContentServerState {
+    /// 当前存活的 SSE 客户端数（壁纸引擎唤醒后检测页面僵死用）
+    pub fn sse_client_count(&self) -> usize {
+        self.sse_clients.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 pub fn init(app: &AppHandle) -> Result<(), String> {
@@ -58,6 +68,7 @@ pub fn init(app: &AppHandle) -> Result<(), String> {
             .map(|r| r.join("renderer"))
             .unwrap_or_default(),
         audio,
+        sse_clients: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
     app.manage(state.clone());
 
@@ -554,6 +565,19 @@ async fn audio_stream_sse(
         )
         .await
         .map_err(|e| e.to_string())?;
+    state.sse_clients.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let result = stream_loop_sse(stream, state).await;
+    state
+        .sse_clients
+        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    result
+}
+
+/// SSE 推送主循环（连接计数由 audio_stream_sse 管理）
+async fn stream_loop_sse(
+    stream: &mut tokio::net::TcpStream,
+    state: &ContentServerState,
+) -> Result<(), String> {
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(33)).await;
         if !state.audio.is_running() {
@@ -663,6 +687,7 @@ mod tests {
             wallpapers_dir: std::env::temp_dir(),
             renderer_dir: Default::default(),
             audio: std::sync::Arc::new(crate::audio_capture::AudioShared::new()),
+            sse_clients: Default::default(),
         };
         let html = b"<!DOCTYPE html><html><head><meta charset=utf-8></head><body></body></html>".to_vec();
         let out = inject_we_shim(&state, "wpem-inject-test-item", html);

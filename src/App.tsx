@@ -92,6 +92,22 @@ function Shell() {
     applySidebarAlpha(getSidebarAlpha());
   }, []);
 
+  // 冻结自检：系统睡眠/合盖后 WebKit 可能恢复出一个「卡死」的页面（定时器全部
+  // 停摆）。定时器恢复触发时若发现实际流逝时间远超定时周期，说明页面曾被长时间
+  // 挂起——强制刷新自身，回到干净状态。
+  useEffect(() => {
+    let last = Date.now();
+    const t = window.setInterval(() => {
+      const now = Date.now();
+      if (now - last > 30_000) {
+        window.location.reload();
+        return;
+      }
+      last = now;
+    }, 5_000);
+    return () => window.clearInterval(t);
+  }, []);
+
   const cycleTheme = () => {
     setTheme((t) => (t === "system" ? "light" : t === "light" ? "dark" : "system"));
   };

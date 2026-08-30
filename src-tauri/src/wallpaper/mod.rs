@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use rusqlite::Connection;
+use crate::audio_capture;
 use crate::db;
 
 use crate::content_server::ContentServerState;
@@ -198,6 +199,14 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    // 音频可视化开启时，等系统音频捕获就绪再创建壁纸窗口（壁纸页在服务时刻
+    // 读取 systemAudio 快照决定是否订阅频谱流）。有界等待：失败/超时照常渲染，
+    // 页面内 shim 对 SSE 的重连订阅可自愈。
+    if audio_capture::wait_until_ready(app, std::time::Duration::from_secs(6)) {
+        tracing::info!("audio capture ready; creating wallpaper windows");
+    } else {
+        tracing::info!("audio capture not ready (disabled/failed/slow); relying on shim SSE reconnect");
+    }
     ensure_windows(app);
     start_monitor(app);
     tracing::info!("wallpaper engine ready");
@@ -253,12 +262,19 @@ fn restore_sessions(app: &AppHandle) {
 
 /// 确保每个活动显示器都有壁纸窗口（创建/缩放/回收）
 fn ensure_windows(app: &AppHandle) {
+    ensure_windows_inner(app, macos::display_asleep());
+}
+
+/// `display_asleep` 由调用方传入：monitor 用「CG 报告 && 音频样本停止流动」的
+/// 复合判定（CGDisplayIsAsleep 的进程内状态在合盖唤醒后可能卡死在 true，
+/// 样本恢复流动即证明系统实际已唤醒）。
+fn ensure_windows_inner(app: &AppHandle, display_asleep: bool) {
     // 显示器睡眠/唤醒切换期间不做任何窗口增删：此时 CGGetActiveDisplayList
     // 可能返回空列表（显示器从「活动」列表暂时消失），若照常执行下方清理逻辑，
     // 会把所有壁纸窗口误判为「已断开的显示器」全部销毁 —— 主窗口若也处于闲置
     // 释放状态，最后一个窗口关闭就会触发 Tauri 默认行为退出整个进程
     // （表现为「休眠后壁纸软件退出」）。醒来后由下一轮 tick 恢复同步。
-    if macos::display_asleep() {
+    if display_asleep {
         return;
     }
     let screens = macos::active_screens();
@@ -507,39 +523,244 @@ fn current_interactive(app: &AppHandle) -> bool {
         .unwrap_or(false)
 }
 
+/// 监控 tick 的自愈动作
+#[derive(Default, Clone, Copy)]
+struct TickActions {
+    /// 音频捕获停滞（RUNNING 相位序号冻结）或 FAILED 相位到重试间隔：重启捕获
+    restart_audio: bool,
+    /// web 壁纸页僵死（SSE 客户端数为 0）：用当前配置强制重载壁纸页
+    reload_wallpapers: bool,
+}
+
 fn start_monitor(app: &AppHandle) {
     let app2 = app.clone();
     tauri::async_runtime::spawn(async move {
         let mut was_asleep = false;
+        let mut last_audio_seq: u64 = 0;
+        let mut audio_stale_ticks: u32 = 0;
+        let mut failed_retry_ticks: u32 = 0;
+        let mut web_stall_ticks: u32 = 0;
+        let mut ticks: u64 = 0;
+        tracing::debug!("wallpaper monitor started");
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
-            // AppKit 窗口操作必须在主线程
-            let app3 = app2.clone();
-            let _ = app2.run_on_main_thread(move || {
-                ensure_windows(&app3);
-            });
-            // 睡眠检测（轮询）
-            let now = chrono::Utc::now().timestamp();
-            {
-                let asleep = macos::display_asleep();
-                if asleep && !was_asleep {
-                    was_asleep = true;
-                    if let Some(st) = app2.try_state::<WallpaperEngineState>() {
-                        *st.paused.lock().unwrap() = true;
+            ticks += 1;
+            // 单个 tick 的 panic 绝不能杀死监控任务：任务一旦死亡，睡眠唤醒恢复、
+            // 窗口同步、壁纸页僵死检测全部静默失效（tokio 任务 panic 无任何日志）。
+            let tick = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                monitor_tick(
+                    &app2,
+                    &mut was_asleep,
+                    &mut last_audio_seq,
+                    &mut audio_stale_ticks,
+                    &mut failed_retry_ticks,
+                    &mut web_stall_ticks,
+                )
+            }));
+            match tick {
+                Ok(action) => {
+                    if action.restart_audio {
+                        // stop/start 含 ObjC 调用与最长数秒的等待，放在同步捕获
+                        // 范围外的异步段执行
+                        tracing::info!("restarting system audio capture");
+                        let a = app2.clone();
+                        let _ = audio_capture::stop(a.clone()).await;
+                        let _ = audio_capture::start(a).await;
+                        last_audio_seq = 0;
                     }
-                    // 睡眠：释放壁纸窗口的渲染资源（画布/WebGL/视频/iframe），归还内存；醒来后由 restore() 重建
-                    eval_all(&app2, "window.__wp && window.__wp.release()");
-                    tracing::info!("display asleep: wallpapers released");
-                } else if !asleep && was_asleep {
-                    was_asleep = false;
-                    if let Some(st) = app2.try_state::<WallpaperEngineState>() {
-                        *st.paused.lock().unwrap() = false;
+                    if action.reload_wallpapers {
+                        tracing::warn!(
+                            "web wallpaper page stalled (no sse clients); force reloading"
+                        );
+                        spawn_force_reload(app2.clone());
                     }
-                    eval_all(&app2, "window.__wp && window.__wp.restore()");
-                    tracing::info!("display woke: wallpapers restored");
+                }
+                Err(p) => {
+                    let msg = p
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| p.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".into());
+                    tracing::error!("wallpaper monitor tick panicked: {msg}");
                 }
             }
-            let _ = now;
+            if ticks % 30 == 0 {
+                tracing::debug!(
+                    "wallpaper monitor alive (ticks={ticks}, display_asleep={})",
+                    macos::display_asleep()
+                );
+            }
+        }
+    });
+}
+
+/// 单次监控 tick（窗口同步 + 睡眠唤醒 + 音频看门狗 + web 壁纸活性检测）。
+fn monitor_tick(
+    app: &AppHandle,
+    was_asleep: &mut bool,
+    last_audio_seq: &mut u64,
+    audio_stale_ticks: &mut u32,
+    failed_retry_ticks: &mut u32,
+    web_stall_ticks: &mut u32,
+) -> TickActions {
+    let mut action = TickActions::default();
+    // 睡眠判定（复合信号，两道保险）：
+    // ① CG 状态查询放在主线程（display 状态更新依赖运行循环，后台线程轮询
+    //    会拿到卡死的陈旧值——实测合盖重开后进程内恒报 asleep=true）；
+    // ② 音频样本恢复流动即证明系统实际已唤醒，覆盖 CG 谎报的情形。
+    //    故有效睡眠 = 「主线程 CG 报告 && 样本未流动」。
+    let fresh = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let app3 = app.clone();
+        let (fresh_flag, done_flag) = (fresh.clone(), done.clone());
+        let _ = app.run_on_main_thread(move || {
+            let a = macos::display_asleep();
+            ensure_windows_inner(&app3, a);
+            fresh_flag.store(a, std::sync::atomic::Ordering::Relaxed);
+            done_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        // 等主线程完成（通常 <10ms）；超时则退回用上一 tick 的状态。
+        // 长时间不完成 = 主线程事件循环被卡死（软件无响应的直接信号），告警留痕。
+        for _ in 0..50 {
+            if done.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        if !done.load(std::sync::atomic::Ordering::Relaxed) {
+            tracing::error!(
+                "main thread did not process monitor dispatch within 100ms (UI event loop wedged?)"
+            );
+        }
+    }
+    let asleep_reported = fresh.load(std::sync::atomic::Ordering::Relaxed);
+    let samples_flow = {
+        let seq = app
+            .try_state::<audio_capture::AudioCaptureState>()
+            .map(|st| st.shared.snapshot().0)
+            .unwrap_or(0);
+        seq != *last_audio_seq
+    };
+    let asleep = asleep_reported && !samples_flow;
+    if asleep && !*was_asleep {
+        *was_asleep = true;
+        if let Some(st) = app.try_state::<WallpaperEngineState>() {
+            *st.paused.lock().unwrap() = true;
+        }
+        // 睡眠：释放壁纸窗口的渲染资源（画布/WebGL/视频/iframe），归还内存；醒来后由 restore() 重建
+        eval_all(app, "window.__wp && window.__wp.release()");
+        tracing::info!("display asleep: wallpapers released");
+    } else if !asleep && *was_asleep {
+        *was_asleep = false;
+        if let Some(st) = app.try_state::<WallpaperEngineState>() {
+            *st.paused.lock().unwrap() = false;
+        }
+        eval_all(app, "window.__wp && window.__wp.restore()");
+        tracing::info!("display woke: wallpapers restored");
+    }
+    // 音频捕获健康看门狗（仅 RUNNING 相位参与）。
+    let has_web = has_web_wallpaper(app);
+    if let Some(st) = app.try_state::<audio_capture::AudioCaptureState>() {
+        let shared = st.shared.clone();
+        if shared.is_running() {
+            let seq = shared.snapshot().0;
+            if seq != *last_audio_seq {
+                *last_audio_seq = seq;
+                *audio_stale_ticks = 0;
+            } else {
+                *audio_stale_ticks += 1;
+            }
+            if *audio_stale_ticks >= 5 {
+                *audio_stale_ticks = 0;
+                if shared.ever_received.load(std::sync::atomic::Ordering::Relaxed) {
+                    *last_audio_seq = 0;
+                    action.restart_audio = true;
+                }
+            }
+        } else if shared.phase() == crate::audio_capture::PHASE_FAILED {
+            // FAILED：本次启动失败（如合盖期间 SCStream 以「流播放无法启动音频」
+            // 拒绝）。若此前曾成功工作过（权限必然已授予），每 ~30s 自动重试，
+            // 开盖后自行恢复；从未成功过（无权限等永久性问题）不重试。
+            *audio_stale_ticks = 0;
+            if shared.ever_received.load(std::sync::atomic::Ordering::Relaxed) {
+                *failed_retry_ticks += 1;
+                if *failed_retry_ticks >= 15 {
+                    *failed_retry_ticks = 0;
+                    action.restart_audio = true;
+                }
+            }
+        } else {
+            *audio_stale_ticks = 0;
+            *failed_retry_ticks = 0;
+        }
+    }
+    // web 壁纸页活性检测（与睡眠转换事件解耦）：休眠/合盖场景下 WebKit 页面可能
+    // 被系统挂起后不再恢复（rAF/网络全停）。新 shim 下每个 web 壁纸页加载后必然
+    // 持有 1 条 /audio-stream SSE 连接——capture 运行中若连续 3 个 tick（~6s）
+    // 连接数为 0，判定页面僵死，用当前会话配置强制重载自愈。
+    if has_web && action.restart_audio {
+        // 本 tick 已要求重启音频：SSE 即将断开重连，跳过本轮活性判断
+        *web_stall_ticks = 0;
+    } else if has_web {
+        let running = app
+            .try_state::<audio_capture::AudioCaptureState>()
+            .map(|s| s.shared.is_running())
+            .unwrap_or(false);
+        let sse = app
+            .try_state::<ContentServerState>()
+            .map(|st| st.sse_client_count())
+            .unwrap_or(0);
+        if running && sse == 0 {
+            *web_stall_ticks += 1;
+            if *web_stall_ticks >= 3 {
+                *web_stall_ticks = 0;
+                action.reload_wallpapers = true;
+            }
+        } else {
+            *web_stall_ticks = 0;
+        }
+    } else {
+        *web_stall_ticks = 0;
+    }
+    action
+}
+
+fn has_web_wallpaper(app: &AppHandle) -> bool {
+    app.try_state::<WallpaperEngineState>()
+        .map(|st| st.windows.lock().unwrap().values().any(|c| c.r#type == "web"))
+        .unwrap_or(false)
+}
+
+/// 用当前会话配置强制重载所有 web 壁纸页（页面僵死自愈）。
+fn spawn_force_reload(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let configs: Vec<(String, WallpaperConfig)> = app
+            .try_state::<WallpaperEngineState>()
+            .map(|st| st.windows.lock().unwrap().clone().into_iter().collect())
+            .unwrap_or_default();
+        for (label, mut cfg) in configs {
+            if cfg.r#type != "web" {
+                continue;
+            }
+            if let Some(w) = app.get_webview_window(&label) {
+                cfg.media_base = media_base(&app);
+                refresh_src(&app, &mut cfg);
+                apply_global_fit(&app, &mut cfg);
+                apply_global_render_dpr(&app, &mut cfg);
+                apply_global_scene_fps(&app, &mut cfg);
+                let query = config_query(&cfg);
+                if let Some(port) = app
+                    .try_state::<Arc<Mutex<u16>>>()
+                    .and_then(|p| p.lock().ok().map(|g| *g))
+                    .filter(|p| *p > 0)
+                {
+                    let js = format!(
+                        "window.location.replace('http://127.0.0.1:{port}/renderer/index.html{query}')"
+                    );
+                    let _ = w.eval(&js);
+                }
+            }
         }
     });
 }
