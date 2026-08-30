@@ -2,9 +2,10 @@
  * Wallpaper Engine 网页壁纸兼容 shim（注入到库内壁纸 HTML 的 <head> 开头，
  * 先于壁纸自身脚本执行）。对齐 WE 桌面端行为：
  *
- * 1. window.wallpaperPropertyListener —— 用 defineProperty 捕获壁纸的赋值，
- *    赋值后立即回调 applyGeneralProperties({fps}) 与 applyUserProperties(props)；
- *    属性热更新时（__weApplyProps）对所有已注册 listener 再次回调。
+ * 1. window.wallpaperPropertyListener —— 用 defineProperty 捕获壁纸的赋值（WE 语义：
+ *    赋值只存引用，属性一律异步下发），在宏任务/load 后回调
+ *    applyGeneralProperties({fps}) 与 applyUserProperties(props)；属性热更新时
+ *    （__weApplyProps）对所有已注册 listener 再次回调。
  * 2. window.wallpaperRegisterAudioListener(cb) —— 64 段对数频谱，每帧推送
  *    128 长度数组（前 64 段低→高，后 64 段镜像，与 WE 数据格式一致）。
  *    双数据源取最大值融合：
@@ -32,6 +33,7 @@
   var propListeners = [];
   var audioCbs = [];
   var curListener = null;
+  var pendingDispatch = false;
 
   // ---------- 属性 listener 捕获 ----------
   function dispatchTo(l, includeGeneral) {
@@ -59,13 +61,26 @@
         return curListener;
       },
       set: function (v) {
-        // 重复赋值视为替换（避免同一段脚本被热载时 listener 越积越多）
+        // WE 语义：赋值只保存引用，属性由桌面端「异步」下发（页面加载后与每次变更时）。
+        // 绝不能在 setter 里同步回调：React 类壁纸会在 render 期间赋值 listener，
+        // 同步回调 → render 阶段 setState → 触发再 render → 再赋值 → 无限循环
+        // （实测 Bocchi the Rock 壁纸白屏，React #301 "Too many re-renders"）。
+        // 补发时机：宏任务/load + 抛错时有界重试（见 redispatchWhenReady）；
+        // 另对「首个 listener 注册」补排一次宏任务派发，覆盖 load 之后才异步注册
+        // 的壁纸（替换赋值不派发，否则同样成环）。
+        var first = propListeners.length === 0;
         var i = propListeners.indexOf(curListener);
         if (i >= 0) propListeners.splice(i, 1);
         curListener = v;
         if (v && typeof v === "object") {
           propListeners.push(v);
-          dispatchTo(v, true);
+          if (first && !pendingDispatch) {
+            pendingDispatch = true;
+            setTimeout(function () {
+              pendingDispatch = false;
+              redispatchWhenReady();
+            }, 0);
+          }
         }
       },
     });
@@ -80,8 +95,9 @@
   // 横跨多个阶段——有的在构造函数末尾复位「已收到配置」标志（VU Meter 的
   // gotSettings），有的在 window.onload 里才初始化画布等全局量（Circular
   // Visualizer），过早回调会抛异常或被覆盖，整段属性处理中断（表现为黑屏/缺元素）。
-  // 因此除赋值即发外，再在宏任务与 load 之后各补发一次；补发若仍抛错（壁纸尚未
-  // 就绪）则以 100ms 周期重试（上限 ~5s），全部成功即停——等价 WE 的多次下发契约。
+  // 因此在宏任务与 load 之后各补发一次；补发若仍抛错（壁纸尚未就绪）则以 100ms
+  // 周期重试（上限 ~5s），全部成功即停——等价 WE 的多次下发契约。首次注册的
+  // 额外补发见上方 setter。
   var redispatchTries = 0;
   function dispatchToPropsOnce() {
     var ok = true;
@@ -205,6 +221,66 @@
     } else {
       audioCbs.length = 0;
     }
+  };
+
+  // ---------- 媒体集成 API（WE「媒体集成」：系统正在播放的歌曲元数据/进度） ----------
+  // 库内实测调用方：CWAV Engine（裸调用，缺函数会 TypeError 中断其媒体模块初始化）
+  // 与音域回响（守卫调用）。本端暂无系统媒体数据源，先复刻「API 面」：
+  // 注册函数存在且语义为单槽替换，回调保存待将来接入媒体捕获后驱动；
+  // 常量表按 CWAV 的硬编码语义（state == 1 视为播放中）对齐。
+  var mediaCbs = {};
+  function mediaRegister(name) {
+    mediaCbs[name] = null;
+    return function (cb) {
+      mediaCbs[name] = typeof cb === "function" ? cb : null;
+    };
+  }
+  window.wallpaperRegisterMediaPropertiesListener = mediaRegister("properties");
+  window.wallpaperRegisterMediaThumbnailListener = mediaRegister("thumbnail");
+  window.wallpaperRegisterMediaPlaybackListener = mediaRegister("playback");
+  window.wallpaperRegisterMediaTimelineListener = mediaRegister("timeline");
+  window.wallpaperMediaIntegration = {
+    PLAYBACK_STOPPED: 0,
+    PLAYBACK_PLAYING: 1,
+    PLAYBACK_PAUSED: 2,
+  };
+
+  // ---------- 随机文件请求（WE 目录属性幻灯片契约） ----------
+  // wallpaperRequestRandomFileForProperty(propertyName, callback)：WE 对 directory
+  // 属性返回该目录内随机一个文件的路径，回调 (propertyName, filePath)。
+  // 内容服务器只能提供壁纸包内目录（/random-file 端点），返回可加载的 http URL；
+  // 属性缺失/为空/指向包外（用户系统目录）时按 WE 语义不回调。
+  // 实测调用方：VU Meter 家族为守卫调用（拼 file:/// 前缀，http 下该路径不可用，
+  // 维持其既有降级）；Audio Visualizer 等直接把回调值用于 CSS url —— http URL 可用。
+  window.wallpaperRequestRandomFileForProperty = function (propName, cb) {
+    if (typeof cb !== "function") return;
+    var def = userProps[propName];
+    var val = def ? def.value : null;
+    if (typeof val !== "string" || val === "") return;
+    if (val.charAt(0) === "/" || val.indexOf("..") >= 0) return;
+    // 站点根形如 /web/{token}/{item}/...（非本服务器派发的页面不提供此能力）
+    var segs = location.pathname.split("/");
+    if (segs[1] !== "web" || !segs[3] || !boot.token) return;
+    var itemBase = location.origin + "/web/" + boot.token + "/" + segs[3];
+    var url =
+      location.origin +
+      "/random-file/" +
+      boot.token +
+      "/" +
+      segs[3] +
+      "/" +
+      val.split("/").map(encodeURIComponent).join("/");
+    fetch(url)
+      .then(function (r) {
+        return r.ok ? r.json() : null;
+      })
+      .then(function (j) {
+        if (j && j.file) {
+          var rel = j.file.split("/").map(encodeURIComponent).join("/");
+          cb(propName, itemBase + "/" + rel);
+        }
+      })
+      .catch(function () {});
   };
 
   // 系统音频外部帧写入（SSE onmessage / 调试注入用），250ms 内参与融合

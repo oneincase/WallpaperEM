@@ -979,7 +979,7 @@ pub fn interactive_set(app: AppHandle, enabled: bool) -> Result<(), String> {
 /// 拒绝绝对路径与 .. 穿越，且要求文件真实存在。
 /// 注意：we_props::entry_dir_prefix 依赖同样的优先级来解析 file 属性的相对前缀，
 /// 两处须保持一致，否则壁纸加载目录与其文件属性的基准目录会不一致。
-fn project_json_entry(dir: &std::path::Path) -> Option<String> {
+pub(crate) fn project_json_entry(dir: &std::path::Path) -> Option<String> {
     let text = std::fs::read_to_string(dir.join("project.json")).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
     let rel = v.get("file")?.as_str()?.trim().replace('\\', "/");

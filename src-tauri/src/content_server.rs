@@ -411,6 +411,57 @@ async fn handle_conn(
         return audio_stream_sse(stream, state).await;
     }
 
+    // 目录属性随机文件（WE wallpaperRequestRandomFileForProperty 契约）：
+    // /random-file/{token}/{item_id}/{相对目录} → {"file": "目录内随机文件相对路径"}
+    // 仅限壁纸包内目录；目录不存在/为空返回 file=null（shim 据此不回调）
+    if let Some(rest) = path.strip_prefix("/random-file/") {
+        let segs: Vec<String> = rest.split('/').map(percent_decode).collect();
+        if segs.len() < 3 {
+            return respond(stream, 404, "Not Found", "text/plain", b"", None).await;
+        }
+        let (token, item_id) = (segs[0].clone(), segs[1].clone());
+        let rel_dir = segs[2..].join("/");
+        if token != state.token {
+            return respond(stream, 401, "Unauthorized", "text/plain", b"", None).await;
+        }
+        let ok = state
+            .db
+            .lock()
+            .map(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM library_items WHERE item_id = ?1",
+                    [item_id.as_str()],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map(|n| n > 0)
+                .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if !ok {
+            return respond(stream, 404, "Not Found", "text/plain", b"", None).await;
+        }
+        let base = state.wallpapers_dir.join(&item_id);
+        let Some(dir) = normalize(&base, &rel_dir) else {
+            return respond(stream, 403, "Forbidden", "text/plain", b"", None).await;
+        };
+        if !dir.starts_with(&base) || !dir.is_dir() {
+            return respond(stream, 404, "Not Found", "text/plain", b"", None).await;
+        }
+        let body = match random_file_in_dir(&dir, &rel_dir) {
+            Some(file) => json!({ "file": file }),
+            None => json!({ "file": null }),
+        };
+        return respond(
+            stream,
+            200,
+            "OK",
+            "application/json",
+            body.to_string().as_bytes(),
+            None,
+        )
+        .await;
+    }
+
     // 解析路径 /media/{token}/{item_id}/{path...} 或 /web/{token}/{item_id}/{path...}
     // （/web 为 web 壁纸站点根：绝对路径引用（/js/...）也能正确解析）
     // 注意：浏览器会对非 ASCII 文件名做百分号编码，各段必须先解码再匹配磁盘路径
@@ -651,6 +702,160 @@ fn find_head_open(lower: &str) -> Option<usize> {
 mod tests {
     use super::*;
 
+    /// 离线体检：对真实壁纸库（web 类型）里所有 HTML 文件跑生产注入，
+    /// 产物写到 WPEM_DUMP_DIR（相对镜像路径，供无头浏览器渲染验证服务使用），
+    /// 并断言注入点/次数不变式。设 WPEM_DUMP_DIR 才生效（CI/常规测试无库可跳过）。
+    #[test]
+    fn dump_injected_html_for_local_library() {
+        let Ok(dump_root) = std::env::var("WPEM_DUMP_DIR") else {
+            return;
+        };
+        let wallpapers_dir = std::path::PathBuf::from(
+            std::env::var("WPEM_WALLPAPERS_DIR").unwrap_or_else(|_| {
+                dirs_shim().join("wallpapers").to_string_lossy().into_owned()
+            }),
+        );
+        // 直接只读打开真实库 DB 副本：取 web 条目清单 + 用户属性覆盖 + fps，
+        // 与生产 boot_json 完全同源（effective_props 只依赖 settings 表）
+        let db_path = std::env::var("WPEM_DB_COPY").unwrap_or_default();
+        let conn = if db_path.is_empty() {
+            Connection::open_in_memory().unwrap()
+        } else {
+            Connection::open_with_flags(
+                &db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap()
+        };
+        let db = Arc::new(Mutex::new(conn));
+        let state = ContentServerState {
+            port: 0,
+            token: "dump".into(),
+            db: db.clone(),
+            wallpapers_dir: wallpapers_dir.clone(),
+            renderer_dir: Default::default(),
+            audio: std::sync::Arc::new(crate::audio_capture::AudioShared::new()),
+            sse_clients: Default::default(),
+        };
+
+        let items: Vec<String> = {
+            let conn = db.lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT item_id FROM library_items WHERE lower(type)='web'")
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect()
+        };
+        let mut dumped = 0usize;
+        let mut problems: Vec<String> = Vec::new();
+        println!("library web items: {}", items.len());
+        for item in &items {
+            let dir = wallpapers_dir.join(item);
+            // 入口优先级与 wallpaper::resolve_item_config 的 web 分支一致
+            let entry = crate::wallpaper::project_json_entry(&dir)
+                .or_else(|| {
+                    (dir.join("web/index.html").is_file()).then(|| "web/index.html".to_string())
+                })
+                .or_else(|| (dir.join("index.html").is_file()).then(|| "index.html".to_string()))
+                .or_else(|| crate::wallpaper::find_first_html(&dir));
+            if entry.is_none() {
+                problems.push(format!("{item}: 无任何 HTML 入口（无法应用）"));
+                continue;
+            }
+            std::fs::create_dir_all(std::path::Path::new(&dump_root).join(item)).unwrap();
+            // 库内所有 HTML 响应在生产都会被注入（不止入口页），逐个镜像
+            let mut htmls: Vec<std::path::PathBuf> = Vec::new();
+            collect_htmls(&dir, &mut htmls);
+            for path in htmls {
+                let Ok(raw) = std::fs::read(&path) else { continue };
+                let rel = path.strip_prefix(&dir).unwrap().to_string_lossy().into_owned();
+                let out = inject_we_shim(&state, item, raw);
+                let text = String::from_utf8_lossy(&out).into_owned();
+                let lower = text.to_ascii_lowercase();
+                // 不变式 1：prelude 恰好一次
+                let boot_n = lower.matches("window.__we_boot={").count();
+                if boot_n != 1 {
+                    problems.push(format!("{item}/{rel}: __WE_BOOT 出现 {boot_n} 次"));
+                }
+                // 不变式 2：有 <head> 时注入点必须在 <head 开标签之内（'</head' 之前）
+                if lower.contains("<head") {
+                    let head_ins = find_head_open(&lower).unwrap();
+                    assert!(
+                        lower[head_ins..].contains("__we_boot"),
+                        "{item}/{rel}: 注入点不在 <head> 内"
+                    );
+                    let head_end = lower.find("</head").unwrap();
+                    assert!(
+                        head_ins < head_end,
+                        "{item}/{rel}: 注入点落在 </head> 之后"
+                    );
+                }
+                let dest = std::path::Path::new(&dump_root).join(item).join(&rel);
+                std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+                std::fs::write(&dest, out).unwrap();
+                dumped += 1;
+            }
+        }
+        std::fs::write(
+            std::path::Path::new(&dump_root).join("_problems.json"),
+            serde_json::to_string_pretty(&problems).unwrap(),
+        )
+        .unwrap();
+        println!("dumped {dumped} injected html files, {} problems", problems.len());
+        for p in &problems {
+            println!("  ⚠ {p}");
+        }
+    }
+
+    fn collect_htmls(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                collect_htmls(&p, out);
+            } else if p.extension().and_then(|x| x.to_str()).map(|x| {
+                x.eq_ignore_ascii_case("html") || x.eq_ignore_ascii_case("htm")
+            }) == Some(true)
+            {
+                out.push(p);
+            }
+        }
+    }
+
+    /// 无 dirs crate 时的 home 目录兜底（仅测试用）
+    fn dirs_shim() -> std::path::PathBuf {
+        std::env::var("HOME").map(std::path::PathBuf::from).unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+    }
+
+    /// 随机文件端点的目录挑选逻辑：只挑普通文件、路径相对壁纸根、空目录 None
+    #[test]
+    fn random_file_in_dir_picks_files_relative_to_root() {
+        let root = std::env::temp_dir().join("wpem-random-file-test");
+        let _ = std::fs::remove_dir_all(&root);
+        let album = root.join("directories/album");
+        std::fs::create_dir_all(&album).unwrap();
+        std::fs::write(album.join("a.png"), b"x").unwrap();
+        std::fs::write(album.join("b.jpg"), b"y").unwrap();
+        std::fs::create_dir_all(album.join("nested")).unwrap();
+        // 多次取样都落在普通文件集合内（嵌套目录不参与；路径相对壁纸根）
+        for _ in 0..8 {
+            let pick = random_file_in_dir(&album, "directories/album").unwrap();
+            assert!(
+                pick == "directories/album/a.png" || pick == "directories/album/b.jpg",
+                "unexpected pick: {pick}"
+            );
+        }
+        // 空目录 → None
+        let empty = root.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(random_file_in_dir(&empty, "empty"), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// 找到 <head> 后插入点应在开标签 `>` 之后（即 prelude 位于 </head> 之前、
     /// 壁纸自身脚本之前）
     #[test]
@@ -735,6 +940,36 @@ fn normalize(base: &Path, rel: &str) -> Option<PathBuf> {
         return None;
     }
     Some(base.join(rel))
+}
+
+/// 目录内（非递归）随机挑一个普通文件，返回「相对壁纸根」的路径（URL 时按段再编码）。
+/// 目录为空或没有普通文件返回 None。
+fn random_file_in_dir(dir: &Path, rel_prefix: &str) -> Option<String> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let files: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            // 提前拒绝 HTML？WE 目录属性会返回任意文件（幻灯片场景以图片为主），
+            // 不做类型过滤，交由壁纸自身处理
+            Some(if rel_prefix.is_empty() {
+                name
+            } else {
+                format!("{}/{}", rel_prefix.trim_end_matches('/'), name)
+            })
+        })
+        .collect();
+    if files.is_empty() {
+        return None;
+    }
+    // 轻量随机：时间熵 + 洗牌取首（避免引入 rand 依赖）
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as usize ^ (d.as_secs() as usize))
+        .unwrap_or(0);
+    let idx = now % files.len();
+    Some(files.into_iter().nth(idx).unwrap())
 }
 
 fn percent_decode(s: &str) -> String {
