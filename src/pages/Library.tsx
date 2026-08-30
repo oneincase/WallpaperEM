@@ -10,6 +10,7 @@ import { PreviewModal } from "../components/PreviewModal";
 import { ConfirmModal } from "../components/ConfirmModal";
 import { WallpaperPropsModal } from "../components/WallpaperPropsModal";
 import { fetchItemPropsCached } from "../hooks/useItemProps";
+import { WallpaperCard, TypeChip } from "../components/WallpaperCard";
 import { IconPreview, IconApply, IconOpenFile, IconTrash, IconSliders } from "../components/icons";
 
 const FILTERS: (WallpaperType | "")[] = ["", "video", "scene", "web"];
@@ -151,34 +152,22 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
       <div className="flex-1 overflow-y-auto">
         <div className="grid grid-cols-4 gap-4">
           {items.map((item) => (
-            <div key={item.itemId} className="card group overflow-hidden">
-              <button onClick={() => onOpenDetail(item.itemId)} className="block w-full">
-                <div className="aspect-[16/10] overflow-hidden bg-black/10">
-                  {item.previewUrl ? (
-                    <img src={item.previewUrl} alt={item.title} loading="lazy" className="h-full w-full object-cover" />
-                  ) : (
-                    <div className="flex h-full items-center justify-center text-[var(--text-2)]">
-                      无预览
-                    </div>
-                  )}
-                </div>
-              </button>
-              <div className="p-2.5">
-                <button
-                  onClick={() => onOpenDetail(item.itemId)}
-                  className="block w-full truncate text-left text-[12.5px] font-medium hover:text-[var(--accent)]"
-                >
-                  {item.title}
-                </button>
-                <div className="mt-1.5 flex items-center justify-between">
-                  <span className="rounded-full bg-[var(--accent)]/10 px-2 py-0.5 text-[10.5px] font-medium text-[var(--accent)]">
-                    {TYPE_LABELS[item.type]}
+            <WallpaperCard
+              key={item.itemId}
+              imageUrl={item.previewUrl ?? undefined}
+              title={item.title}
+              onOpen={() => onOpenDetail(item.itemId)}
+              badges={
+                appliedItems.has(item.itemId) ? (
+                  <span className="rounded bg-green-500/90 px-1.5 py-0.5 text-[9px] font-semibold text-white">
+                    已应用
                   </span>
-                  <span className="text-[11px] text-[var(--text-2)]">
-                    {(item.sizeBytes / 1024 / 1024).toFixed(1)} MB
-                  </span>
-                </div>
-                <div className="mt-2 grid grid-cols-5 gap-2">
+                ) : undefined
+              }
+              metaLeft={<TypeChip label={TYPE_LABELS[item.type]} />}
+              metaRight={`${(item.sizeBytes / 1024 / 1024).toFixed(1)} MB`}
+              actions={
+                <div className="grid grid-cols-5 gap-2">
                   <button
                     className="flex items-center justify-center rounded-lg border border-[var(--separator)] px-1 py-1.5 text-[var(--text-2)] hover:text-[var(--accent)] hover:bg-black/5 dark:hover:bg-white/10"
                     onClick={() => setPreviewItem(item)}
@@ -232,8 +221,8 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
                     <IconTrash />
                   </button>
                 </div>
-              </div>
-            </div>
+              }
+            />
           ))}
         </div>
       </div>

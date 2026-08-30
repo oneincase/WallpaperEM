@@ -1,6 +1,7 @@
 // 收藏页（T4）
 import { useCallback, useEffect, useState } from "react";
 import { api, TYPE_LABELS, type FavoriteItem } from "../api/steam";
+import { WallpaperCard, TypeChip } from "../components/WallpaperCard";
 
 export function FavoritesPage({ onOpenDetail }: { onOpenDetail: (id: string) => void }) {
   const [items, setItems] = useState<FavoriteItem[]>([]);
@@ -39,36 +40,23 @@ export function FavoritesPage({ onOpenDetail }: { onOpenDetail: (id: string) => 
       <div className="flex-1 overflow-y-auto">
         <div className="grid grid-cols-4 gap-4">
           {items.map((item) => (
-            <button
+            <WallpaperCard
               key={item.itemId}
-              onClick={() => onOpenDetail(item.itemId)}
-              className="card group overflow-hidden text-left transition-transform hover:-translate-y-0.5"
-            >
-              <div className="aspect-[16/10] overflow-hidden bg-black/10">
-                {item.previewUrl ? (
-                  <img src={item.previewUrl} alt={item.title} loading="lazy" className="h-full w-full object-cover" />
-                ) : (
-                  <div className="flex h-full items-center justify-center text-[var(--text-2)]">无预览</div>
-                )}
-              </div>
-              <div className="p-2.5">
-                <div className="truncate text-[12.5px] font-medium">{item.title}</div>
-                <div className="mt-1.5 flex items-center justify-between">
-                  <span className="rounded-full bg-[var(--accent)]/10 px-2 py-0.5 text-[10.5px] font-medium text-[var(--accent)]">
-                    {TYPE_LABELS[item.type]}
-                  </span>
-                  <button
-                    className="text-[11px] text-[var(--text-2)] hover:text-red-500"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      api.favoriteRemove(item.itemId).then(refresh);
-                    }}
-                  >
-                    取消收藏
-                  </button>
-                </div>
-              </div>
-            </button>
+              imageUrl={item.previewUrl ?? undefined}
+              title={item.title}
+              onOpen={() => onOpenDetail(item.itemId)}
+              metaLeft={<TypeChip label={TYPE_LABELS[item.type]} />}
+              metaRight={
+                <button
+                  className="text-[11px] text-[var(--text-2)] hover:text-red-500"
+                  onClick={() => {
+                    api.favoriteRemove(item.itemId).then(refresh);
+                  }}
+                >
+                  取消收藏
+                </button>
+              }
+            />
           ))}
         </div>
       </div>

@@ -8,6 +8,7 @@ import {
   type WorkshopSearchResult,
 } from "../api/steam";
 import { useWallpaperMeta } from "../hooks/useWallpaperMeta";
+import { WallpaperCard, TypeChip } from "../components/WallpaperCard";
 
 const TYPE_FILTERS: (WallpaperType | "")[] = [
   "",
@@ -125,7 +126,7 @@ export function WorkshopPage({ onOpenDetail }: { onOpenDetail: (id: string) => v
           {Array.from({ length: 8 }).map((_, i) => (
             <div
               key={i}
-              className="card aspect-[16/10] animate-pulse"
+              className="card aspect-square animate-pulse"
               style={{ background: "var(--card)" }}
             />
           ))}
@@ -137,51 +138,28 @@ export function WorkshopPage({ onOpenDetail }: { onOpenDetail: (id: string) => v
         {!loading && data && (
           <div className="grid grid-cols-4 gap-4">
             {data.items.map((item) => (
-              <button
+              <WallpaperCard
                 key={item.id}
-                onClick={() => onOpenDetail(item.id)}
-                className="card group overflow-hidden text-left transition-transform hover:-translate-y-0.5"
-              >
-                <div className="relative aspect-[16/10] overflow-hidden bg-black/10">
-                  {item.previewUrl ? (
-                    <img
-                      src={item.previewUrl}
-                      alt={item.title}
-                      loading="lazy"
-                      className="h-full w-full object-cover"
-                    />
-                  ) : (
-                    <div className="flex h-full items-center justify-center text-[var(--text-2)]">
-                      无预览
-                    </div>
-                  )}
-                  {(appliedItems.has(item.id) || downloadedItems.has(item.id)) && (
-                    <div className="absolute left-1.5 top-1.5 z-10 flex flex-col gap-1">
-                      {appliedItems.has(item.id) && (
-                        <span className="rounded bg-green-500/90 px-1.5 py-0.5 text-[9px] font-semibold text-white">
-                          已应用
-                        </span>
-                      )}
-                      {downloadedItems.has(item.id) && (
-                        <span className="rounded bg-sky-500/90 px-1.5 py-0.5 text-[9px] font-semibold text-white">
-                          已下载
-                        </span>
-                      )}
-                    </div>
-                  )}
-                </div>
-                <div className="p-2.5">
-                  <div className="truncate text-[12.5px] font-medium">{item.title}</div>
-                  <div className="mt-1.5 flex items-center justify-between">
-                    <span className="rounded-full bg-[var(--accent)]/10 px-2 py-0.5 text-[10.5px] font-medium text-[var(--accent)]">
-                      {TYPE_LABELS[item.type]}
-                    </span>
-                    <span className="text-[11px] text-[var(--text-2)]">
-                      {item.subscriptions ? `⬇ ${item.subscriptions.toLocaleString()}` : ""}
-                    </span>
-                  </div>
-                </div>
-              </button>
+                imageUrl={item.previewUrl ?? undefined}
+                title={item.title}
+                onOpen={() => onOpenDetail(item.id)}
+                badges={
+                  <>
+                    {appliedItems.has(item.id) && (
+                      <span className="rounded bg-green-500/90 px-1.5 py-0.5 text-[9px] font-semibold text-white">
+                        已应用
+                      </span>
+                    )}
+                    {downloadedItems.has(item.id) && (
+                      <span className="rounded bg-sky-500/90 px-1.5 py-0.5 text-[9px] font-semibold text-white">
+                        已下载
+                      </span>
+                    )}
+                  </>
+                }
+                metaLeft={<TypeChip label={TYPE_LABELS[item.type]} />}
+                metaRight={item.subscriptions ? `⬇ ${item.subscriptions.toLocaleString()}` : ""}
+              />
             ))}
           </div>
         )}
