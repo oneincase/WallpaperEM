@@ -6,6 +6,9 @@ import {
   type WorkshopItemSummary,
 } from "../api/steam";
 import { useWallpaperMeta } from "../hooks/useWallpaperMeta";
+import { useItemProps } from "../hooks/useItemProps";
+import { WallpaperPropsModal } from "../components/WallpaperPropsModal";
+import { IconSliders } from "../components/icons";
 
 // 模块级缓存：首次成功获取后保存随机壁纸列表与选中位置。
 // 切换页面导致组件重新挂载时直接复用缓存、不再发请求；
@@ -24,12 +27,16 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
   const [msg, setMsg] = useState("");
   const [faved, setFaved] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [propsItemId, setPropsItemId] = useState<string | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const { appliedItems, downloadedItems, refreshApplied } = useWallpaperMeta();
 
   const current = items[index];
   const currentApplied = current ? appliedItems.has(current.id) : false;
   const currentDownloaded = current ? downloadedItems.has(current.id) : false;
+  // 已下载壁纸的 project.json 若声明了可自定义属性，操作条提供快捷入口
+  const currentPropDefs = useItemProps(currentDownloaded ? current?.id : null);
+  const currentCustomizable = (currentPropDefs?.length ?? 0) > 0;
 
   // 加载随机推荐壁纸
   const load = useCallback(async (fresh = false) => {
@@ -269,6 +276,16 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
                 {enqueuing ? "…" : "⬇ 下载"}
               </button>
             )}
+            {currentDownloaded && currentCustomizable && (
+              <button
+                className="btn"
+                onClick={() => current && setPropsItemId(current.id)}
+                title="编辑壁纸自定义属性"
+              >
+                <IconSliders size={14} />
+                自定义属性
+              </button>
+            )}
             <button className={`btn ${faved ? "btn-danger" : ""}`} onClick={toggleFav}>
               {faved ? "★ 已收藏" : "☆ 收藏"}
             </button>
@@ -278,6 +295,15 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
             {msg && <span className="text-[12.5px] text-[var(--text-2)]">{msg}</span>}
           </div>
         </div>
+      )}
+
+      {/* 自定义属性弹窗（已下载且 project.json 声明了可配置项时从操作条打开） */}
+      {propsItemId && (
+        <WallpaperPropsModal
+          itemId={propsItemId}
+          title={items.find((i) => i.id === propsItemId)?.title ?? propsItemId}
+          onClose={() => setPropsItemId(null)}
+        />
       )}
 
       {/* 下方直排壁纸列表 */}

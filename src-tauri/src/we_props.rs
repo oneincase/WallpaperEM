@@ -53,6 +53,13 @@ pub struct WebPropDef {
     pub max: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub step: Option<f64>,
+    /// slider 显示精度（小数位数，project.json `precision`；真实数据 51 处）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub precision: Option<i64>,
+    /// file 属性的期望文件类别（project.json `fileType`：image/video/audio），
+    /// 决定选择器过滤器；directory 属性无此字段
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_type: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -143,9 +150,10 @@ pub fn effective_props(conn: &Connection, wallpapers_dir: &Path, item_id: &str) 
         let ptype = def.get("type").and_then(|t| t.as_str()).unwrap_or("");
         if let Some(v) = overrides.get(&name).cloned().or_else(|| wire_value(ptype, &def)) {
             // file 属性：值相对壁纸根存储，下发给壁纸时按入口 HTML 所在目录补相对前缀
-            // （WE 语义：文件属性相对路径以入口页面为基准解析）
+            // （WE 语义：文件属性相对路径以入口页面为基准解析）；空值不补（空串 + 前缀会凭空指向目录）
             let v = if ptype == "file" {
                 v.as_str()
+                    .filter(|s| !s.is_empty())
                     .map(|s| json!(format!("{file_prefix}{s}")))
                     .unwrap_or(v)
             } else {
@@ -378,6 +386,8 @@ pub fn describe(conn: &Connection, wallpapers_dir: &Path, item_id: &str) -> Vec<
                 min: def.get("min").and_then(|m| m.as_f64()),
                 max: def.get("max").and_then(|m| m.as_f64()),
                 step: def.get("step").and_then(|m| m.as_f64()),
+                precision: def.get("precision").and_then(|m| m.as_i64()),
+                file_type: str_field(&def, "fileType"),
             }
         })
         .collect()
@@ -688,5 +698,50 @@ mod tests {
         // 无 properties 段
         let dir2 = fixture_dir("noprops", "x", r#"{"type":"web","file":"a.html"}"#);
         assert!(describe(&conn, &dir2, "x").is_empty());
+    }
+
+    /// 真实数据形态：fileType/precision 透传；directory 不补入口前缀；file 空值不补前缀
+    #[test]
+    fn file_type_precision_passthrough_and_prefix_edge_cases() {
+        let conn = mem_db();
+        let dir = fixture_dir(
+            "extra",
+            "x9",
+            r#"{"type":"web","file":"web/index.html","general":{"properties":{
+                "music": {"order":1, "type":"file", "fileType":"video", "value":""},
+                "slide": {"order":2, "type":"directory", "value":""},
+                "gain":  {"order":3, "type":"slider", "value":1, "min":0, "max":2, "step":0.1, "precision":1}
+            }}}"#,
+        );
+        let defs = describe(&conn, &dir, "x9");
+        let music = defs.iter().find(|d| d.name == "music").unwrap();
+        assert_eq!(music.file_type.as_deref(), Some("video"), "fileType 透传");
+        let gain = defs.iter().find(|d| d.name == "gain").unwrap();
+        assert_eq!(gain.precision, Some(1), "precision 透传");
+
+        let props = effective_props(&conn, &dir, "x9");
+        assert_eq!(
+            props.get("music").unwrap(),
+            &json!({ "value": "" }),
+            "file 空默认值不加前缀"
+        );
+        assert_eq!(
+            props.get("slide").unwrap(),
+            &json!({ "value": "" }),
+            "directory 不加前缀"
+        );
+
+        // directory 覆盖值为绝对路径（WE 语义）：同样不加前缀
+        we_props_set_dir(&conn, "x9", "slide", "/Users/me/Pictures/album");
+        let props = effective_props(&conn, &dir, "x9");
+        assert_eq!(
+            props.get("slide").unwrap(),
+            &json!({ "value": "/Users/me/Pictures/album" })
+        );
+    }
+
+    /// 复用 set_single_override（测试里经pub接口写覆盖）
+    fn we_props_set_dir(conn: &Connection, item: &str, name: &str, path: &str) {
+        crate::we_props::set_single_override(conn, item, name, json!(path)).unwrap();
     }
 }

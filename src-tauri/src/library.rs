@@ -534,8 +534,11 @@ pub fn reset_item_props(app: AppHandle, item_id: String) -> Result<(), String> {
     apply_live(&app, &item_id)
 }
 
-/// file 类型属性：弹出文件选择框，拷入壁纸目录（we-props/ 子目录）后写覆盖值。
-/// 返回 {cancelled: true} 或 {value: "we-props/xx.png"}（相对壁纸根的路径）。
+/// file/directory 类型属性：弹出系统选择框后写覆盖值并对已应用窗口热更新。
+/// - file：拷入壁纸目录（we-props/ 子目录），存相对壁纸根的路径（下发时按入口目录补前缀）；
+///   选择器过滤器按 project.json `fileType`（image/video/audio，缺省 image）
+/// - directory：不拷贝，存所选目录的绝对路径（与 WE 的目录属性存储语义一致）
+/// 返回 {cancelled: true} 或 {value: "<路径>"}。
 #[tauri::command(rename = "library_set_item_prop_file")]
 pub async fn set_item_prop_file(
     app: AppHandle,
@@ -544,14 +547,31 @@ pub async fn set_item_prop_file(
 ) -> Result<serde_json::Value, String> {
     use tauri_plugin_dialog::DialogExt;
 
+    // 校验属性存在且类型受支持，同时取 fileType 决定选择器过滤器
+    let db = app.state::<Arc<Mutex<Connection>>>();
+    let dir = wallpapers_dir(&app)?;
+    let (is_dir, file_type) = {
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        let defs = we_props::describe(&conn, &dir, &item_id);
+        match defs.iter().find(|d| d.name == prop_name) {
+            Some(d) if d.ptype == "file" => (false, d.file_type.clone()),
+            Some(d) if d.ptype == "directory" => (true, None),
+            Some(d) => return Err(format!("属性 {prop_name} 是 {} 类型，非文件/目录", d.ptype)),
+            None => return Err(format!("属性 {prop_name} 不存在")),
+        }
+    };
+
     let app_pick = app.clone();
     let picked = tauri::async_runtime::spawn_blocking(move || {
-        app_pick
-            .dialog()
-            .file()
-            .add_filter("图片", &["png", "jpg", "jpeg", "webp", "gif", "bmp"])
-            .blocking_pick_file()
-            .and_then(|f| f.as_path().map(|p| p.to_path_buf()))
+        let dialog = app_pick.dialog().file();
+        let picked = if is_dir {
+            dialog.blocking_pick_folder()
+        } else {
+            dialog
+                .add_filter("文件", file_filter(file_type.as_deref()))
+                .blocking_pick_file()
+        };
+        picked.and_then(|f| f.as_path().map(|p| p.to_path_buf()))
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -560,17 +580,16 @@ pub async fn set_item_prop_file(
         return Ok(json!({ "cancelled": true }));
     };
 
-    // 校验属性存在且为 file 类型
-    let db = app.state::<Arc<Mutex<Connection>>>();
-    let dir = wallpapers_dir(&app)?;
-    {
-        let conn = db.lock().map_err(|e| e.to_string())?;
-        let defs = we_props::describe(&conn, &dir, &item_id);
-        match defs.iter().find(|d| d.name == prop_name) {
-            Some(d) if d.ptype == "file" => {}
-            Some(d) => return Err(format!("属性 {prop_name} 是 {} 类型，非文件", d.ptype)),
-            None => return Err(format!("属性 {prop_name} 不存在")),
+    // directory：绝对路径直接作为覆盖值（页面经内容服务器取不到本地目录，
+    // 该值主要供壁纸读取路径文本/上层能力使用，与 WE 存储语义一致）
+    if is_dir {
+        let abs = src.to_string_lossy().to_string();
+        {
+            let conn = db.lock().map_err(|e| e.to_string())?;
+            we_props::set_single_override(&conn, &item_id, &prop_name, json!(abs))?;
         }
+        apply_live(&app, &item_id)?;
+        return Ok(json!({ "value": abs }));
     }
 
     // 拷入 we-props/{prop}_{原文件名}（属性名前缀防冲突）
@@ -591,6 +610,15 @@ pub async fn set_item_prop_file(
     }
     apply_live(&app, &item_id)?;
     Ok(json!({ "value": rel }))
+}
+
+/// fileType → 文件选择器扩展名过滤器（缺省按图片；壁纸最常见的是贴图）
+fn file_filter(file_type: Option<&str>) -> &'static [&'static str] {
+    match file_type {
+        Some("video") => &["mp4", "webm", "mov", "m4v"],
+        Some("audio") => &["mp3", "ogg", "wav", "flac", "m4a"],
+        _ => &["png", "jpg", "jpeg", "webp", "gif", "bmp"],
+    }
 }
 
 /// 把该壁纸当前的完整属性表热更新到所有正在应用它的壁纸窗口

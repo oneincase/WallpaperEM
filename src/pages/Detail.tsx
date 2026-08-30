@@ -2,7 +2,9 @@
 import { useEffect, useState } from "react";
 import { api, TYPE_LABELS, type WorkshopItem } from "../api/steam";
 import { useWallpaperMeta } from "../hooks/useWallpaperMeta";
-import { WebPropsEditor } from "../components/WebPropsEditor";
+import { useItemProps } from "../hooks/useItemProps";
+import { WallpaperPropsModal } from "../components/WallpaperPropsModal";
+import { IconSliders } from "../components/icons";
 
 export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
   const [item, setItem] = useState<WorkshopItem | null>(null);
@@ -12,10 +14,14 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
   const [msg, setMsg] = useState("");
   const [faved, setFaved] = useState(false);
   const [applying, setApplying] = useState(false);
+  const [showProps, setShowProps] = useState(false);
   const { appliedItems, downloadedItems, refreshApplied } = useWallpaperMeta();
 
   const downloaded = item ? downloadedItems.has(item.id) : false;
   const applied = item ? appliedItems.has(item.id) : false;
+  // 是否可自定义由 project.json 决定（general.properties 有无声明），与壁纸类型无关
+  const propDefs = useItemProps(downloaded && item ? item.id : null);
+  const customizable = (propDefs?.length ?? 0) > 0;
 
   useEffect(() => {
     setLoading(true);
@@ -146,6 +152,15 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
               {applying ? "…" : "🖥 应用到桌面"}
             </button>
           )}
+            {downloaded && customizable && (
+              <button className="btn" onClick={() => setShowProps(true)} title="编辑壁纸自定义属性">
+                <IconSliders size={14} />
+                自定义属性
+                {propDefs!.some((d) => d.overridden) && (
+                  <span className="text-[11px] text-[var(--accent)]">•</span>
+                )}
+              </button>
+            )}
             <button
               className={`btn ${faved ? "btn-danger" : ""}`}
               onClick={async () => {
@@ -174,8 +189,14 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
         </div>
       </div>
 
-      {/* WE 网页壁纸用户属性（project.json properties，已下载的 web 类型才显示） */}
-      {downloaded && item.type === "web" && <WebPropsEditor itemId={item.id} />}
+      {/* 自定义属性弹窗（project.json general.properties，是否可自定义与壁纸类型无关） */}
+      {showProps && item && (
+        <WallpaperPropsModal
+          itemId={item.id}
+          title={item.title}
+          onClose={() => setShowProps(false)}
+        />
+      )}
     </div>
   );
 }

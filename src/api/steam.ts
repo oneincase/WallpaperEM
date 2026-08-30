@@ -247,6 +247,8 @@ export type WebPropType =
   | "text"
   | "textinput"
   | "file"
+  | "directory"
+  | "group"
   | (string & {});
 
 /** project.json 属性定义 + 当前值（wire 格式：color="r g b" 浮点串，bool=布尔，slider=数值…） */
@@ -266,6 +268,10 @@ export interface WebPropDef {
   min?: number;
   max?: number;
   step?: number;
+  /** slider 显示精度（小数位数）；无 step 时拖动粒度也按它取 */
+  precision?: number;
+  /** file 属性的期望类别（image/video/audio），决定文件选择器过滤器 */
+  fileType?: string;
 }
 
 export type WebPropValues = Record<string, string | number | boolean>;

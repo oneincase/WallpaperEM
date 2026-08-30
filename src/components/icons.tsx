@@ -95,6 +95,18 @@ export const IconGear = () => (
   </Svg>
 );
 
+// 壁纸自定义属性入口（WE「编辑壁纸属性」的双滑杆图标）
+export const IconSliders = ({ size }: { size?: number }) => (
+  <Svg size={size}>
+    <path d="M4 7h8" />
+    <circle cx="14.5" cy="7" r="2.5" />
+    <path d="M17 7h3" />
+    <path d="M4 17h3" />
+    <circle cx="9.5" cy="17" r="2.5" />
+    <path d="M12 17h8" />
+  </Svg>
+);
+
 export const IconPlay = ({ size }: { size?: number }) => (
   <Svg size={size}>
     <path d="M7 4.5v15l12-7.5-12-7.5Z" fill="currentColor" stroke="none" />

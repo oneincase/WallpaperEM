@@ -8,7 +8,9 @@ import {
 } from "../api/steam";
 import { PreviewModal } from "../components/PreviewModal";
 import { ConfirmModal } from "../components/ConfirmModal";
-import { IconPreview, IconApply, IconOpenFile, IconTrash } from "../components/icons";
+import { WallpaperPropsModal } from "../components/WallpaperPropsModal";
+import { fetchItemPropsCached } from "../hooks/useItemProps";
+import { IconPreview, IconApply, IconOpenFile, IconTrash, IconSliders } from "../components/icons";
 
 const FILTERS: (WallpaperType | "")[] = ["", "video", "scene", "web"];
 
@@ -19,6 +21,9 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
   const [msg, setMsg] = useState("");
   const [previewItem, setPreviewItem] = useState<LibraryItem | null>(null);
   const [deleteItem, setDeleteItem] = useState<LibraryItem | null>(null);
+  // 自定义属性：project.json 是否声明了可配置项（决定卡片「属性」按钮可用性）+ 当前编辑条目
+  const [customizable, setCustomizable] = useState<Record<string, boolean>>({});
+  const [propsItem, setPropsItem] = useState<LibraryItem | null>(null);
   const [appliedItems, setAppliedItems] = useState<Set<string>>(new Set());
   const [importing, setImporting] = useState(false);
 
@@ -64,6 +69,19 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
   useEffect(() => {
     loadApplied();
   }, [loadApplied]);
+
+  // 逐条读 project.json（带会话级缓存）判断哪些壁纸可自定义属性
+  useEffect(() => {
+    let alive = true;
+    Promise.all(
+      items.map(async (it) => [it.itemId, (await fetchItemPropsCached(it.itemId)).length > 0] as const)
+    ).then((pairs) => {
+      if (alive) setCustomizable(Object.fromEntries(pairs));
+    });
+    return () => {
+      alive = false;
+    };
+  }, [items]);
 
   const apply = async (itemId: string) => {
     setMsg("");
@@ -160,13 +178,27 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
                     {(item.sizeBytes / 1024 / 1024).toFixed(1)} MB
                   </span>
                 </div>
-                <div className="mt-2 grid grid-cols-4 gap-2">
+                <div className="mt-2 grid grid-cols-5 gap-2">
                   <button
                     className="flex items-center justify-center rounded-lg border border-[var(--separator)] px-1 py-1.5 text-[var(--text-2)] hover:text-[var(--accent)] hover:bg-black/5 dark:hover:bg-white/10"
                     onClick={() => setPreviewItem(item)}
                     data-tip="预览"
                   >
                     <IconPreview />
+                  </button>
+                  <button
+                    className={`flex items-center justify-center rounded-lg border px-1 py-1.5 ${
+                      customizable[item.itemId]
+                        ? "border-[var(--separator)] text-[var(--text-2)] hover:text-[var(--accent)] hover:bg-black/5 dark:hover:bg-white/10"
+                        : "border-[var(--separator)] text-[var(--text-2)]/40 cursor-not-allowed"
+                    }`}
+                    disabled={customizable[item.itemId] === false}
+                    onClick={() => setPropsItem(item)}
+                    data-tip={
+                      customizable[item.itemId] === false ? "该壁纸无可自定义配置" : "自定义属性"
+                    }
+                  >
+                    <IconSliders />
                   </button>
                   {appliedItems.has(item.itemId) ? (
                     <button
@@ -207,6 +239,14 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
       </div>
 
       {previewItem && <PreviewModal item={previewItem} onClose={() => setPreviewItem(null)} />}
+
+      {propsItem && (
+        <WallpaperPropsModal
+          itemId={propsItem.itemId}
+          title={propsItem.title}
+          onClose={() => setPropsItem(null)}
+        />
+      )}
 
       {deleteItem && (
         <ConfirmModal
