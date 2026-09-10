@@ -4,9 +4,9 @@ pub mod browse;
 pub mod details;
 pub mod types;
 
+use reqwest::{Response, StatusCode};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use reqwest::{Response, StatusCode};
 
 pub const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
 const MAX_ATTEMPTS: u32 = 3;
@@ -19,11 +19,19 @@ const SESSION_URL: &str = "https://steamcommunity.com/";
 fn browser_headers() -> reqwest::header::HeaderMap {
     use reqwest::header::*;
     let mut h = HeaderMap::new();
-    h.insert(ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8".parse().unwrap());
+    h.insert(
+        ACCEPT,
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+            .parse()
+            .unwrap(),
+    );
     h.insert(ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8".parse().unwrap());
     h.insert(CACHE_CONTROL, "no-cache".parse().unwrap());
     // Referer 指向工坊浏览页，配合 UA 伪装浏览器会话
-    h.insert(REFERER, "https://steamcommunity.com/workshop/".parse().unwrap());
+    h.insert(
+        REFERER,
+        "https://steamcommunity.com/workshop/".parse().unwrap(),
+    );
     h.insert("sec-fetch-dest", "document".parse().unwrap());
     h.insert("sec-fetch-mode", "navigate".parse().unwrap());
     h.insert("sec-fetch-site", "same-origin".parse().unwrap());
@@ -50,8 +58,8 @@ impl SteamClient {
             .user_agent(UA)
             .timeout(Duration::from_secs(30));
         if let Some(p) = proxy.filter(|p| !p.is_empty()) {
-            builder = builder
-                .proxy(reqwest::Proxy::all(&p).map_err(|e| format!("代理配置无效: {e}"))?);
+            builder =
+                builder.proxy(reqwest::Proxy::all(&p).map_err(|e| format!("代理配置无效: {e}"))?);
             tracing::info!("steam client using proxy {p}");
         } else if !follow_system_proxy {
             builder = builder.no_proxy();
@@ -60,7 +68,9 @@ impl SteamClient {
             tracing::info!("steam client: following system proxy");
         }
         Ok(Self {
-            inner: builder.build().map_err(|e| format!("HTTP 客户端初始化失败: {e}"))?,
+            inner: builder
+                .build()
+                .map_err(|e| format!("HTTP 客户端初始化失败: {e}"))?,
             session: Arc::new(Mutex::new(None)),
         })
     }
@@ -74,10 +84,7 @@ impl SteamClient {
             }
         }
         // 先发一次 GET，读 Set-Cookie 里的 sessionid；reqwest cookie_store 也会自动保存
-        let req = self
-            .inner
-            .get(SESSION_URL)
-            .headers(browser_headers());
+        let req = self.inner.get(SESSION_URL).headers(browser_headers());
         if let Ok(resp) = req.send().await {
             let cookies: Vec<String> = resp
                 .headers()
@@ -121,11 +128,7 @@ impl SteamClient {
         url: &str,
         fields: &[(&str, &str)],
     ) -> Result<Response, String> {
-        let mut req = self
-            .inner
-            .post(url)
-            .headers(browser_headers())
-            .form(fields);
+        let mut req = self.inner.post(url).headers(browser_headers()).form(fields);
         if let Ok(guard) = self.session.lock() {
             if let Some(sid) = guard.as_ref() {
                 req = req.header(reqwest::header::COOKIE, format!("sessionid={sid}"));
@@ -154,10 +157,14 @@ impl SteamClient {
                     if attempt < MAX_ATTEMPTS {
                         self.reset_session();
                         self.ensure_session().await;
-                        tracing::info!("steam client: HTTP 403, re-acquired sessionid (attempt {attempt})");
+                        tracing::info!(
+                            "steam client: HTTP 403, re-acquired sessionid (attempt {attempt})"
+                        );
                         backoff(attempt).await;
                     } else {
-                        return Err(format!("Steam 接口返回 HTTP 403（可能被 Steam 限制访问，请检查代理/令牌）"));
+                        return Err(format!(
+                            "Steam 接口返回 HTTP 403（可能被 Steam 限制访问，请检查代理/令牌）"
+                        ));
                     }
                 }
                 Ok(r) => return Err(format!("Steam 接口返回 HTTP {}", r.status())),
@@ -185,10 +192,14 @@ impl SteamClient {
                     if attempt < MAX_ATTEMPTS {
                         self.reset_session();
                         self.ensure_session().await;
-                        tracing::info!("steam client: HTTP 403, re-acquired sessionid (attempt {attempt})");
+                        tracing::info!(
+                            "steam client: HTTP 403, re-acquired sessionid (attempt {attempt})"
+                        );
                         backoff(attempt).await;
                     } else {
-                        return Err(format!("Steam 接口返回 HTTP 403（可能被 Steam 限制访问，请检查代理/令牌）"));
+                        return Err(format!(
+                            "Steam 接口返回 HTTP 403（可能被 Steam 限制访问，请检查代理/令牌）"
+                        ));
                     }
                 }
                 Ok(r) => return Err(format!("Steam 接口返回 HTTP {}", r.status())),

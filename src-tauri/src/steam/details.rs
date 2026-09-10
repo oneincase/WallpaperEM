@@ -3,8 +3,8 @@
 //! POST ISteamRemoteStorage/GetPublishedFileDetails/v1（表单，一次 ≤30 个 id）
 //! 返回条目完整元数据；类型从标签推断。
 
-use super::SteamClient;
 use super::types::WorkshopItem;
+use super::SteamClient;
 use serde::{Deserialize, Deserializer};
 
 pub const DETAILS_URL: &str =
@@ -77,12 +77,14 @@ pub fn infer_type_from_tags(tags: &[String]) -> String {
 }
 
 /// 批量获取条目完整元数据（一次 ≤30 个；结果仅含 result==1 的有效条目）
-pub async fn get_item_details(client: &SteamClient, ids: &[String]) -> Result<Vec<WorkshopItem>, String> {
+pub async fn get_item_details(
+    client: &SteamClient,
+    ids: &[String],
+) -> Result<Vec<WorkshopItem>, String> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let mut fields: Vec<(String, String)> =
-        vec![("itemcount".into(), ids.len().to_string())];
+    let mut fields: Vec<(String, String)> = vec![("itemcount".into(), ids.len().to_string())];
     for (i, id) in ids.iter().enumerate() {
         fields.push((format!("publishedfileids[{i}]"), id.clone()));
     }
@@ -91,14 +93,23 @@ pub async fn get_item_details(client: &SteamClient, ids: &[String]) -> Result<Ve
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
     let resp = client.post_form(DETAILS_URL, &refs).await?;
-    let data: DetailsResp = resp.json().await.map_err(|e| format!("详情接口解析失败: {e}"))?;
+    let data: DetailsResp = resp
+        .json()
+        .await
+        .map_err(|e| format!("详情接口解析失败: {e}"))?;
 
     let mut out = Vec::new();
-    for d in data.response.and_then(|r| r.publishedfiledetails).unwrap_or_default() {
+    for d in data
+        .response
+        .and_then(|r| r.publishedfiledetails)
+        .unwrap_or_default()
+    {
         if d.result != Some(1) {
             continue;
         }
-        let Some(id) = d.publishedfileid else { continue };
+        let Some(id) = d.publishedfileid else {
+            continue;
+        };
         let tags: Vec<String> = d
             .tags
             .unwrap_or_default()

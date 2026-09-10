@@ -18,16 +18,12 @@ concurrency:
 
 jobs:
   build-dmg:
-    # 壁纸 sidecar（depot-downloader）只有 aarch64（Apple Silicon）版本，必须在 arm64 宿主机上构建，
-    # 这样 cargo / Tauri 才会把 sidecar 打进 .app。macos-14 是 ARM(M1/M2) 运行器。
+    # 构建目标是 aarch64-apple-darwin，需在 arm64 宿主机上构建。macos-14 是 ARM(M1/M2) 运行器。
     runs-on: macos-14
 
     steps:
-      - name: 检出代码（含 Git LFS sidecar）
-        # depot-downloader 走 Git LFS，必须 lfs:true 才能拉到真实二进制（约 85MB）
+      - name: 检出代码
         uses: actions/checkout@v4
-        with:
-          lfs: true
 
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable

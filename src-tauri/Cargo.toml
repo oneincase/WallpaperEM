@@ -1,7 +1,7 @@
 [package]
 name = "WallpaperEM"
 version = "0.4.0"
-description = "WallpaperEM —— macOS 动态壁纸引擎（Tauri 2.11.2），支持 Steam 工坊视频/场景/网页/图片壁纸"
+description = "WallpaperEM —— 跨平台动态壁纸引擎（Tauri 2.11.2），支持 Steam 工坊视频/场景/网页/图片壁纸"
 license = "MIT"
 edition = "2021"
 
@@ -13,12 +13,16 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+# macos-private-api 在非 macOS 目标上是惰性 cfg（wry 内部仅 macOS 使用），
+# 且 tauri-build 会校验它与 tauri.conf.json 的 macOSPrivateApi 一致，故保持开启
 tauri = { version = "2.11.2", features = ["macos-private-api", "tray-icon", "image-png"] }
 tauri-plugin-single-instance = "2"
 tauri-plugin-autostart = "2"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
+tauri-plugin-desktop-underlay = "0.2"
+# window-vibrancy 仅在 macOS/Windows 有实际实现，Linux 下为空 crate（编译安全）
 window-vibrancy = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -27,6 +31,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 tracing-appender = "0.2"
 rusqlite = { version = "0.32", features = ["bundled"] }
+fs2 = "0.4"
 dirs = "5"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "system-proxy"] }
 regex = "1"
@@ -37,12 +42,13 @@ sha2 = "0.10"
 axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["fs"] }
-keyring = { version = "3", features = ["apple-native"] }
 libc = "0.2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 rustfft = "6"
+base64 = "0.22"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
 objc2 = "0.6"
 objc2-app-kit = "0.3"
 objc2-foundation = { version = "0.3", features = ["NSArray"] }
@@ -59,3 +65,22 @@ objc2-core-media = { version = "0.3", features = ["objc2-core-audio-types"] }
 objc2-core-audio-types = "0.3"
 dispatch2 = { version = "0.3", default-features = false, features = ["alloc", "objc2", "block2"] }
 block2 = { version = "0.6", default-features = false, features = ["alloc"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Linux 凭据存储：内核 keyutils（keyring 的 linux-native；无 D-Bus 依赖，免 DE 配合）。
+# 注：主凭据走 secure_store 本地加密文件，keychain.rs 仅为旧版回退/迁移来源，
+# keyutils 非持久化的限制不影响主流程。
+keyring = { version = "3", features = ["linux-native"] }
+# 「正在播放」：MPRIS D-Bus 客户端（Linux 桌面媒体控制标准接口）
+mpris = "2"
+# gtk 直依赖：与 tao/desktop-underlay 同一大版本（0.18），用于壁纸窗口 realize 状态检测
+gtk = "0.18"
+# 主窗口模糊（KDE KWin，见 blur.rs）：X11 设 _KDE_NET_WM_BLUR_BEHIND_REGION；
+# Wayland 走 org_kde_kwin_blur。client_system = 复用 GDK 的系统 wl_display 连接
+x11rb = "0.13"
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-protocols-plasma = { version = "0.3", features = ["client"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }

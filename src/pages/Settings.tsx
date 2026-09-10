@@ -1,13 +1,20 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { api } from "../api/steam";
+import {
+  api,
+  type DownloadToolStatus,
+  type SteamcmdInstallProgress,
+} from "../api/steam";
 import { getSidebarAlpha, setSidebarAlpha } from "../lib/sidebar";
+import { ConfirmModal } from "../components/ConfirmModal";
+import { useMessage } from "../components/Message";
 
-// 设置页标签：下载 / 通用 / 网络 / 关于
+// 设置页标签：账号 / 通用 / 网络 / 关于
+// （id 沿用 "download"：该页内容是下载工具安装 + 下载账号登录，改 id 无收益）
 type SettingsTab = "download" | "general" | "network" | "about";
 const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
-  { id: "download", label: "下载" },
+  { id: "download", label: "账号" },
   { id: "general", label: "通用" },
   { id: "network", label: "网络" },
   { id: "about", label: "关于" },
@@ -16,50 +23,65 @@ const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
 export function SettingsPage() {
   const [autostart, setAutostart] = useState<boolean | null>(null);
   const [interactive, setInteractive] = useState(false);
+  const [autoSystemStatic, setAutoSystemStatic] = useState(true);
+  const [autoPause, setAutoPause] = useState(false);
   const [audioProcessing, setAudioProcessing] = useState(false);
   const [audioMsg, setAudioMsg] = useState("");
   // 全局壁纸显示模式（cover/contain/stretch），默认 cover 等比铺满裁切
   const [fit, setFit] = useState<"cover" | "contain" | "stretch">("cover");
   const [fitMsg, setFitMsg] = useState("");
-  // 全局渲染分辨率上限（有效 dpr 封顶，越低越省内存），默认 2（与 Rust DEFAULT_RENDER_DPR 一致）
-  const [renderDpr, setRenderDpr] = useState<number>(2);
+  // 全局清晰度（有效 dpr 封顶，越低越省内存）。三档 0.8 / 1 / 2，
+  // 默认 1 标准（与 Rust DEFAULT_RENDER_DPR 一致）
+  const [renderDpr, setRenderDpr] = useState<number>(1);
   const [renderDprMsg, setRenderDprMsg] = useState("");
   // 全局场景帧率上限（30/60/120，越低 GPU 占用越低），默认 60
   const [sceneFps, setSceneFps] = useState<number>(60);
   const [sceneFpsMsg, setSceneFpsMsg] = useState("");
-  // 工作友好（默认开启）：开启后自动过滤成人内容
-  const [familyFriendly, setFamilyFriendly] = useState(true);
-  // 侧边栏透明度（0.2 ~ 1）
+  // 壁纸语言（只影响壁纸的 language 属性，不是软件本体语言）。默认简体中文
+  const [language, setLanguage] = useState<string>("simplifiedchinese");
   const [sidebarAlpha, setSidebarAlphaState] = useState<number>(getSidebarAlpha);
-  // 下载账号（登录方式单选：qr = 扫码令牌；password = 账号密码）
-  const [cred, setCred] = useState<{ configured: boolean; username?: string; mode: "qr" | "password" } | null>(null);
+  // 下载账号（steamcmd 只支持账号密码登录）
+  const [cred, setCred] = useState<{ configured: boolean; username?: string } | null>(null);
   const [editingCred, setEditingCred] = useState(false);
-  // 配置面板里当前选择的登录方式（单选，二选一）
-  const [loginMode, setLoginMode] = useState<"qr" | "password">("qr");
-  const [tool, setTool] = useState<{ installed: boolean; path?: string; version?: string } | null>(null);
+  const [tool, setTool] = useState<DownloadToolStatus | null>(null);
+  // steamcmd 安装
+  const [installing, setInstalling] = useState(false);
+  const [confirmLogout, setConfirmLogout] = useState(false);
+  const msg = useMessage();
+  const [installMsg, setInstallMsg] = useState("");
   const [dlUser, setDlUser] = useState("");
   const [dlPass, setDlPass] = useState("");
   const [credMsg, setCredMsg] = useState("");
-  // 扫码登录
-  const [qrOpen, setQrOpen] = useState(false);
-  const [qrCode, setQrCode] = useState("");
-  const [qrLog, setQrLog] = useState<string[]>([]);
-  const [qrStatus, setQrStatus] = useState<"idle" | "waiting" | "success" | "fail">("idle");
-  // 扫码登录 2FA 验证码（-no-mobile）
-  const [qrGuardReq, setQrGuardReq] = useState(false);
-  const [qrGuardCode, setQrGuardCode] = useState("");
-  const [qrGuardMsg, setQrGuardMsg] = useState("");
   // 代理
   const [proxy, setProxy] = useState("");
   const [proxyMsg, setProxyMsg] = useState("");
   const [followSystemProxy, setFollowSystemProxy] = useState(true);
   // 当前激活的设置标签页（状态都在本组件顶层，切换标签不丢失）
   const [tab, setTab] = useState<SettingsTab>("download");
+  // 运行平台（macos/linux/...）：平台相关文案与不可用功能的提示
+  const [os, setOs] = useState<string>("macos");
+  // 系统音频捕获平台支持性（Linux 暂未支持，开关给出明确提示而不是报权限错误）
+  const [audioSupported, setAudioSupported] = useState(true);
 
   useEffect(() => {
     invoke<boolean>("autostart_status").then(setAutostart).catch(console.warn);
+    invoke<{ os: string }>("app_info")
+      .then((i) => setOs(i.os))
+      .catch(console.warn);
+    api
+      .wallpaperAudioProcessingStatus()
+      .then((s) => setAudioSupported(s.supported))
+      .catch(console.warn);
     invoke<string | null>("settings_get", { key: "wallpaper_interactive" })
       .then((v) => setInteractive(v === "true" || v === "1"))
+      .catch(() => { });
+    // 默认关闭：键未写入过视为 false
+    invoke<string | null>("settings_get", { key: "wallpaper_auto_pause" })
+      .then((v) => setAutoPause(v === "true" || v === "1"))
+      .catch(() => { });
+    // 默认开启：键未写入过视为 true
+    invoke<string | null>("settings_get", { key: "wallpaper_auto_system_static" })
+      .then((v) => setAutoSystemStatic(v == null || v === "true" || v === "1"))
       .catch(() => { });
     invoke<string | null>("settings_get", { key: "wallpaper_fit" })
       .then((v) => setFit((v as "cover" | "contain" | "stretch") || "cover"))
@@ -70,8 +92,8 @@ export function SettingsPage() {
     invoke<string | null>("settings_get", { key: "wallpaper_scene_fps" })
       .then((v) => setSceneFps(Number(v) || 60))
       .catch(() => { });
-    invoke<string | null>("settings_get", { key: "family_friendly" })
-      .then((v) => setFamilyFriendly(v == null || v === "true" || v === "1"))
+    invoke<string | null>("settings_get", { key: "language" })
+      .then((v) => v && setLanguage(v))
       .catch(() => { });
     api
       .wallpaperAudioProcessingStatus()
@@ -82,7 +104,6 @@ export function SettingsPage() {
       .then((c) => {
         setCred(c);
         setDlUser(c.username ?? "");
-        setLoginMode(c.mode ?? "qr");
       })
       .catch(console.warn);
     api.downloadToolStatus().then(setTool).catch(console.warn);
@@ -102,8 +123,7 @@ export function SettingsPage() {
     }
     try {
       await api.downloadCredentialsSet(dlUser, dlPass);
-      setCred({ configured: true, username: dlUser, mode: "password" });
-      setLoginMode("password");
+      setCred({ configured: true, username: dlUser });
       setDlPass("");
       setEditingCred(false);
       setCredMsg("✅ 已保存（密码本地加密存储）");
@@ -112,105 +132,45 @@ export function SettingsPage() {
     }
   };
 
-  // 登录方式单选切换（账号密码）：若扫码登录正在运行 → 先取消，保证互斥
-  const switchToPassword = async () => {
-    if (qrOpen || qrStatus === "waiting" || qrGuardReq) {
-      await stopQrLogin();
-    }
-    setLoginMode("password");
-    setCredMsg("");
-  };
-
-  // 登录方式单选切换（扫码）：仅切换面板；实际启动由「开始扫码登录」触发
-  const switchToQr = () => {
-    setLoginMode("qr");
-    setCredMsg("");
-  };
-
-  // 扫码登录：启动进程 + 订阅事件
-  const startQrLogin = async () => {
-    setQrOpen(true);
-    setQrCode("");
-    setQrLog([]);
-    setQrStatus("waiting");
-    setQrGuardReq(false);
-    setQrGuardCode("");
-    setQrGuardMsg("");
-    await api.downloadQrLogin().catch((e) => {
-      setQrStatus("fail");
-      setQrLog((p) => [...p, `启动失败: ${e}`]);
-    });
-  };
-
-  const stopQrLogin = async () => {
-    await api.downloadQrCancel().catch(() => { });
-    setQrOpen(false);
-    setQrStatus("idle");
-    setQrGuardReq(false);
-    setQrGuardCode("");
-    setQrGuardMsg("");
-  };
-
-  // 提交扫码登录的 2FA 验证码（-no-mobile）
-  const submitQrGuard = async () => {
-    const code = qrGuardCode.trim();
-    if (!code) {
-      setQrGuardMsg("请输入验证码");
-      return;
-    }
-    const ok = await api.downloadQrSubmitGuard(code).catch(() => false);
-    if (ok) {
-      setQrGuardReq(false);
-      setQrGuardCode("");
-      setQrGuardMsg("");
-    } else {
-      setQrGuardMsg("提交失败，请重试");
-      setQrGuardCode("");
-    }
-  };
-
   const logout = async () => {
-    await api.downloadCredentialsClear();
-    setCred({ configured: false, mode: "qr" });
-    setDlUser("");
-    setDlPass("");
-    setCredMsg("已登出，登录令牌已清除");
+    try {
+      await api.downloadCredentialsClear();
+      setCred({ configured: false });
+      setDlUser("");
+      setDlPass("");
+      setCredMsg("");
+      msg.success("已登出，账号与登录态已清除");
+    } catch (e) {
+      msg.error(String(e));
+    }
+  };
+
+  // 安装 / 修复 steamcmd
+  const installSteamcmd = async (force = false) => {
+    setInstalling(true);
+    setInstallMsg("准备安装…");
+    try {
+      await api.steamcmdInstall(force);
+      setTool(await api.downloadToolStatus());
+      setInstallMsg("✅ steamcmd 已就绪");
+    } catch (e) {
+      const raw = String(e);
+      // 后端用 "CODE|中文说明" 传递可识别的失败原因
+      setInstallMsg(raw.includes("|") ? raw.slice(raw.indexOf("|") + 1) : raw);
+    } finally {
+      setInstalling(false);
+    }
   };
 
   useEffect(() => {
-    const unQrCode = listen<{ qr: string }>("download:qr-code", (e) => {
-      setQrCode(e.payload.qr);
-    });
-    const unQrLine = listen<{ line: string }>("download:qr-line", (e) => {
-      setQrLog((p) => [...p.slice(-8), e.payload.line]);
-    });
-    const unQrGuard = listen("download:qr-guard-required", () => {
-      setQrGuardReq(true);
-      setQrGuardCode("");
-      setQrGuardMsg("");
-    });
-    const unQrSuccess = listen<{ username: string | null }>("download:qr-success", (e) => {
-      setQrStatus("success");
-      setQrGuardReq(false);
-      setQrGuardCode("");
-      setQrGuardMsg("");
-      setLoginMode("qr");
-      setCred({ configured: true, username: e.payload.username ?? undefined, mode: "qr" });
-      setDlUser(e.payload.username ?? "");
-    });
-    const unQrFail = listen<{ error?: string; exitCode?: number }>("download:qr-fail", (e) => {
-      setQrStatus("fail");
-      setQrGuardReq(false);
-      setQrGuardCode("");
-      setQrGuardMsg("");
-      setQrLog((p) => [...p, e.payload.error ?? `退出码 ${e.payload.exitCode}`]);
+    const unInstall = listen<SteamcmdInstallProgress>("steamcmd:install-progress", (e) => {
+      const { phase, message } = e.payload;
+      const label =
+        phase === "download" ? "下载中" : phase === "extract" ? "解压中" : "初始化中";
+      setInstallMsg(`${label}：${message}`);
     });
     return () => {
-      unQrCode.then((f) => f());
-      unQrLine.then((f) => f());
-      unQrGuard.then((f) => f());
-      unQrSuccess.then((f) => f());
-      unQrFail.then((f) => f());
+      unInstall.then((f) => f());
     };
   }, []);
 
@@ -275,6 +235,34 @@ export function SettingsPage() {
     if (ok !== null) setAutostart(ok);
   };
 
+  // 自动设置系统壁纸：应用动态壁纸后抽首帧/代表帧设为系统静态壁纸
+  const toggleAutoSystemStatic = async () => {
+    const next = !autoSystemStatic;
+    try {
+      await invoke("settings_set", {
+        key: "wallpaper_auto_system_static",
+        value: next ? "true" : "false",
+      });
+      setAutoSystemStatic(next);
+    } catch {
+      // 失败则不变
+    }
+  };
+
+  // 自动暂停：切到非桌面应用自动暂停壁纸，切回桌面自动播放（默认关）
+  const toggleAutoPause = async () => {
+    const next = !autoPause;
+    try {
+      await invoke("settings_set", {
+        key: "wallpaper_auto_pause",
+        value: next ? "true" : "false",
+      });
+      setAutoPause(next);
+    } catch {
+      // 失败则不变
+    }
+  };
+
   const toggleInteractive = async () => {
     const next = !interactive;
     try {
@@ -289,6 +277,10 @@ export function SettingsPage() {
   const toggleAudioProcessing = async () => {
     const next = !audioProcessing;
     setAudioMsg("");
+    if (next && !audioSupported) {
+      setAudioMsg("当前平台暂不支持系统音频捕获（macOS 已支持；Linux 待后续版本接入 PipeWire）");
+      return;
+    }
     try {
       const s = await api.wallpaperAudioProcessingSet(next);
       setAudioProcessing(s.enabled);
@@ -306,16 +298,6 @@ export function SettingsPage() {
     }
   };
 
-  // 工作友好（默认开启）：开启后自动过滤成人内容
-  const toggleFamilyFriendly = async () => {
-    const next = !familyFriendly;
-    try {
-      await api.workshopSetFamilyFriendly(next);
-      setFamilyFriendly(next);
-    } catch {
-      // 失败则不变
-    }
-  };
 
   // 侧边栏透明度：设置即生效 + 持久化
   const changeSidebarAlpha = (v: number) => {
@@ -353,6 +335,19 @@ export function SettingsPage() {
     }
   };
 
+  // 语言在挂载时才注入（壁纸 project.json 没有自带 language 属性时生效），
+  // 改完需要重新应用壁纸；不像清晰度/帧率能实时热切
+  const changeLanguage = async (next: string) => {
+    const prev = language;
+    setLanguage(next); // 乐观更新
+    try {
+      await api.wallpaperSetLanguage(next);
+    } catch (e) {
+      setLanguage(prev);
+      msg.error(`语言设置失败：${String(e)}`);
+    }
+  };
+
   return (
     <div className="flex flex-col h-full px-7 py-5">
       {/* 头部 + 标签栏：与内容列同宽、整体居中 */}
@@ -382,31 +377,58 @@ export function SettingsPage() {
       <div className="min-h-0 overflow-y-auto flex flex-col">
         <div className="w-full p-5  mx-auto my-auto space-y-5">
           {tab === "download" && (
-            <Group title="下载">
+            <Group title="下载账号">
               <Row
-                label="下载账号（有令牌选扫码模式，无令牌选账号模式）"
+                label="下载工具"
+                desc={
+                  tool?.rosettaMissing
+                    ? "缺少 Rosetta 2：steamcmd 的官方引导程序是 x86_64，首次启动需要它。请在终端执行 softwareupdate --install-rosetta --agree-to-license 后重试（首次自更新后 steamcmd 即以原生 arm64 运行）"
+                    : tool?.installed
+                      ? `steamcmd 已就绪${tool.version ? ` · 版本 ${tool.version}` : ""}${tool.path ? ` · ${tool.path}` : ""}`
+                      : tool?.downloaded
+                        ? "已下载但未完成初始化，请点击「修复」重试"
+                        : "Valve 官方 steamcmd。尚未安装，点击「安装」从官方源下载（约 2.5 MB 引导包，初始化后约 85 MB）"
+                }
+                control={
+                  <div className="flex items-center gap-2">
+                    <span
+                      className={`text-[12px] font-medium ${tool?.installed ? "text-green-500" : "text-red-500"}`}
+                    >
+                      {tool?.installed ? "就绪" : "未就绪"}
+                    </span>
+                    <button
+                      className="btn !py-1 text-[11.5px]"
+                      disabled={installing || tool?.rosettaMissing}
+                      onClick={() => installSteamcmd(!!tool?.installed)}
+                    >
+                      {installing ? "安装中…" : tool?.installed ? "修复" : "安装"}
+                    </button>
+                  </div>
+                }
+              />
+              {installMsg && (
+                <div className="mt-1.5 break-all text-[12px] text-[var(--text-2)]">{installMsg}</div>
+              )}
+
+              <Row
+                label="下载账号"
                 desc={
                   cred?.configured
-                    ? `已登录：${cred.username}（${cred.mode === "qr" ? "扫码令牌" : "账号密码"}；需拥有 Wallpaper Engine，下载不再重复验证）`
-                    : "下载工坊内容需拥有 WE 的 Steam 账号。扫码登录（令牌）或账号密码，两种方式互斥，登录后令牌会记住"
+                    ? `已登录：${cred.username}（需拥有 Wallpaper Engine，下载不再重复验证）`
+                    : "下载工坊内容需拥有 WE 的 Steam 账号。首次下载会要求输入 Steam Guard 验证码，之后记住登录态。注意：steamcmd 登录会挤掉你正在运行的 Steam 客户端（同账号同时只能登录一处）"
                 }
                 control={
                   <div className="flex items-center gap-2 flex-wrap">
                     <span
                       className={`text-[12px] font-medium ${cred?.configured ? "text-green-500" : "text-[var(--text-2)]"}`}
                     >
-                      {cred?.configured
-                        ? cred.mode === "qr"
-                          ? "已登录 · 扫码令牌"
-                          : "已登录 · 账号密码"
-                        : "未登录"}
+                      {cred?.configured ? "已登录" : "未登录"}
                     </span>
                     {cred?.configured && !editingCred && (
                       <button
                         className="btn !py-1 text-[11.5px]"
                         onClick={() => {
                           setEditingCred(true);
-                          setLoginMode(cred.mode ?? "qr");
                           setDlUser(cred.username ?? "");
                           setDlPass("");
                           setCredMsg("");
@@ -416,7 +438,10 @@ export function SettingsPage() {
                       </button>
                     )}
                     {cred?.configured && (
-                      <button className="btn btn-danger !py-1 text-[11.5px]" onClick={logout}>
+                      <button
+                        className="btn btn-danger !py-1 text-[11.5px]"
+                        onClick={() => setConfirmLogout(true)}
+                      >
                         登出
                       </button>
                     )}
@@ -425,87 +450,43 @@ export function SettingsPage() {
               />
               {(!cred?.configured || editingCred) && (
                 <div className="mt-3 rounded-xl border border-[var(--separator)] p-3 space-y-2">
-                  {/* 登录方式单选：二维码扫码 / 账号密码（二选一，互斥） */}
+                  <input
+                    value={dlUser}
+                    onChange={(e) => setDlUser(e.target.value)}
+                    placeholder="Steam 账号（登录名或邮箱）"
+                    className="w-full rounded-lg border border-[var(--separator)] bg-[var(--content)] px-3 py-1.5 text-[13px] outline-none focus:border-[var(--accent)]"
+                  />
+                  <input
+                    type="password"
+                    value={dlPass}
+                    onChange={(e) => setDlPass(e.target.value)}
+                    placeholder="密码"
+                    className="w-full rounded-lg border border-[var(--separator)] bg-[var(--content)] px-3 py-1.5 text-[13px] outline-none focus:border-[var(--accent)]"
+                  />
                   <div className="flex items-center gap-2">
-                    <button
-                      className={`rounded-lg px-3 py-1.5 text-[12.5px] font-medium transition-colors ${loginMode === "qr"
-                        ? "bg-[var(--accent)] text-white"
-                        : "border border-[var(--separator)] text-[var(--text-2)] hover:bg-black/5 dark:hover:bg-white/8"
-                        }`}
-                      onClick={switchToQr}
-                    >
-                      扫码登录
+                    <button className="btn btn-primary" onClick={saveCredentials}>
+                      保存凭据
                     </button>
-                    <button
-                      className={`rounded-lg px-3 py-1.5 text-[12.5px] font-medium transition-colors ${loginMode === "password"
-                        ? "bg-[var(--accent)] text-white"
-                        : "border border-[var(--separator)] text-[var(--text-2)] hover:bg-black/5 dark:hover:bg-white/8"
-                        }`}
-                      onClick={switchToPassword}
-                    >
-                      账号密码登录
-                    </button>
-                  </div>
-                  {loginMode === "password" ? (
-                    <div className="space-y-2">
-                      <input
-                        value={dlUser}
-                        onChange={(e) => setDlUser(e.target.value)}
-                        placeholder="Steam 账号（登录名或邮箱）"
-                        className="w-full rounded-lg border border-[var(--separator)] bg-[var(--content)] px-3 py-1.5 text-[13px] outline-none focus:border-[var(--accent)]"
-                      />
-                      <input
-                        type="password"
-                        value={dlPass}
-                        onChange={(e) => setDlPass(e.target.value)}
-                        placeholder="密码"
-                        className="w-full rounded-lg border border-[var(--separator)] bg-[var(--content)] px-3 py-1.5 text-[13px] outline-none focus:border-[var(--accent)]"
-                      />
-                      <div className="flex items-center gap-2">
-                        <button className="btn btn-primary" onClick={saveCredentials}>
-                          保存凭据
-                        </button>
-                        {editingCred && (
-                          <button
-                            className="btn"
-                            onClick={() => {
-                              setEditingCred(false);
-                              setDlUser(cred?.username ?? "");
-                              setDlPass("");
-                              setCredMsg("");
-                            }}
-                          >
-                            取消
-                          </button>
-                        )}
-                        {credMsg && <span className="text-[12px] text-[var(--text-2)]">{credMsg}</span>}
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="flex items-center justify-between gap-2 flex-wrap">
-                      <span className="text-[12px] text-[var(--text-2)]">
-                        点击「开始扫码登录」打开二维码，扫码后自动记住登录令牌
-                      </span>
-                      <button className="btn btn-primary" onClick={startQrLogin}>
-                        开始扫码登录
+                    {editingCred && (
+                      <button
+                        className="btn"
+                        onClick={() => {
+                          setEditingCred(false);
+                          setDlUser(cred?.username ?? "");
+                          setDlPass("");
+                          setCredMsg("");
+                        }}
+                      >
+                        取消
                       </button>
-                    </div>
-                  )}
+                    )}
+                    {credMsg && <span className="text-[12px] text-[var(--text-2)]">{credMsg}</span>}
+                  </div>
+                  <p className="text-[11.5px] text-[var(--text-2)]">
+                    密码本地加密存储。首次下载时若需要 Steam Guard 验证码，会在下载页弹窗提示输入。
+                  </p>
                 </div>
               )}
-              <Row
-                label="下载工具"
-                desc={
-                  tool?.installed
-                    ? `DepotDownloader ${tool.version ?? ""}（已打包 sidecar）`
-                    : "DepotDownloader 未就绪"
-                }
-                control={
-                  <span className={`text-[12px] font-medium ${tool?.installed ? "text-green-500" : "text-red-500"}`}>
-                    {tool?.installed ? "就绪" : "缺失"}
-                  </span>
-                }
-              />
             </Group>
           )}
 
@@ -516,7 +497,9 @@ export function SettingsPage() {
                   label="跟随系统代理"
                   desc={
                     followSystemProxy
-                      ? "开启：自动使用 macOS「系统设置 → 网络 → 代理」中的配置访问创意工坊（默认开启）"
+                      ? os === "macos"
+                        ? "开启：自动使用 macOS「系统设置 → 网络 → 代理」中的配置访问创意工坊（默认开启）"
+                        : "开启：自动使用系统代理环境变量中的配置访问创意工坊（默认开启）"
                       : "关闭：绕过系统代理，直连网络访问创意工坊"
                   }
                   control={<Switch checked={followSystemProxy} onChange={toggleFollowSystemProxy} />}
@@ -580,11 +563,11 @@ export function SettingsPage() {
             <Group title="通用">
               <Row
                 label="开机自启"
-                desc="登录 macOS 时自动启动本应用"
+                desc={os === "macos" ? "登录 macOS 时自动启动本应用" : "登录系统时自动启动本应用"}
                 control={<Switch checked={autostart === true} onChange={toggleAutostart} />}
               />
               <Row
-                label="壁纸显示模式"
+                label="显示模式"
                 desc={
                   fit === "cover"
                     ? "等比铺满并居中裁切溢出（不变形、无黑边，默认）"
@@ -599,8 +582,8 @@ export function SettingsPage() {
                       onChange={(e) => changeFit(e.target.value as "cover" | "contain" | "stretch")}
                       className="rounded-lg border border-[var(--separator)] bg-[var(--content)] px-2 py-1 text-[12.5px] outline-none focus:border-[var(--accent)]"
                     >
-                      <option value="cover">填充</option>
-                      <option value="contain">适应</option>
+                      <option value="cover">裁剪</option>
+                      <option value="contain">缩放</option>
                       <option value="stretch">拉伸</option>
                     </select>
                     {fitMsg && <span className="text-[12px] text-red-500">{fitMsg}</span>}
@@ -608,8 +591,8 @@ export function SettingsPage() {
                 }
               />
               <Row
-                label="场景渲染清晰度"
-                desc="倍数越高越清晰，但占用显存越高。默认 2x（均衡）"
+                label="清晰度"
+                desc="越高越清晰，显存占用也越高。实际生效值不超过屏幕像素比。默认标准"
                 control={
                   <div className="flex items-center gap-2">
                     <select
@@ -617,18 +600,16 @@ export function SettingsPage() {
                       onChange={(e) => changeRenderDpr(Number(e.target.value))}
                       className="rounded-lg border border-[var(--separator)] bg-[var(--content)] px-2 py-1 text-[12.5px] outline-none focus:border-[var(--accent)]"
                     >
-                      <option value={1}>流畅 1x</option>
-                      <option value={2}>均衡 2x</option>
-                      <option value={3}>高清 3x</option>
-                      <option value={4}>超清 4x</option>
-                      <option value={5}>极致 5x</option>
+                      <option value={0.8}>省电</option>
+                      <option value={1}>标准</option>
+                      <option value={2}>高清</option>
                     </select>
                     {renderDprMsg && <span className="text-[12px] text-red-500">{renderDprMsg}</span>}
                   </div>
                 }
               />
               <Row
-                label="场景帧率"
+                label="帧率限制"
                 desc={
                   sceneFps <= 30
                     ? "30 FPS：GPU 占用最低，场景动画/视差略卡"
@@ -652,30 +633,59 @@ export function SettingsPage() {
                 }
               />
               <Row
+                label="语言"
+                desc="壁纸的语言偏好。壁纸自带语言设置时以壁纸为准；仅对没有该设置的壁纸生效。改动需重新应用壁纸，暂不影响软件界面"
+                control={
+                  <select
+                    value={language}
+                    onChange={(e) => void changeLanguage(e.target.value)}
+                    className="rounded-lg border border-[var(--separator)] bg-[var(--content)] px-2 py-1 text-[12.5px] outline-none focus:border-[var(--accent)]"
+                  >
+                    <option value="simplifiedchinese">简体中文</option>
+                    <option value="traditionalchinese">繁體中文</option>
+                    <option value="english">English</option>
+                    <option value="japanese">日本語</option>
+                    <option value="korean">한국어</option>
+                    <option value="german">Deutsch</option>
+                  </select>
+                }
+              />
+              <Row
                 label="音频可视化（系统声音）"
-                desc="开启后壁纸可响应整个系统的声音（如音乐软件），与 WE 桌面端一致；需授予屏幕录制权限。壁纸自带的音乐无需此开关也会可视化"
+                desc={
+                  audioSupported
+                    ? "开启后壁纸可响应整个系统的声音（如音乐软件），与 WE 桌面端一致；需授予屏幕录制权限。壁纸自带的音乐无需此开关也会可视化"
+                    : "当前平台暂不支持系统音频捕获（Linux 待接入 PipeWire）；壁纸自带的音乐无需此开关也会可视化"
+                }
                 control={<Switch checked={audioProcessing} onChange={toggleAudioProcessing} />}
               />
               {audioMsg && (
                 <div className="text-[12px] text-[var(--text-2)]">{audioMsg}</div>
               )}
               <Row
-                label="图标穿透"
-                desc="开启后壁纸窗口置于桌面图标之上并可接收鼠标（场景视差/网页互动）；会盖住桌面图标。默认关闭"
+                label="自动设置系统壁纸"
+                desc={os === "macos" ? "应用动态壁纸后，自动抽首帧（scene/web 用工坊预览图）设为 macOS 静态壁纸：锁屏、登录窗口与壁纸引擎未运行时保持视觉一致" : "应用动态壁纸后，自动抽首帧设为系统静态壁纸（依赖 ffmpeg 与桌面环境的壁纸接口）：壁纸引擎未运行时保持视觉一致"}
+                control={<Switch checked={autoSystemStatic} onChange={toggleAutoSystemStatic} />}
+              />
+              <Row
+                label="自动暂停"
+                desc="切到非桌面应用时自动暂停壁纸，切回桌面时自动播放（手动暂停不受影响）"
+                control={<Switch checked={autoPause} onChange={toggleAutoPause} />}
+              />
+              <Row
+                label="隐藏图标"
+                desc={
+                  interactive
+                    ? "开启：壁纸窗口位于桌面图标之上（会盖住桌面图标，用于场景视差/网页互动）"
+                    : "关闭：壁纸窗口位于桌面图标下方、壁纸上方，桌面图标正常显示（默认）"
+                }
                 control={<Switch checked={interactive} onChange={toggleInteractive} />}
               />
-              <Row
-                label="工作友好"
-                desc={
-                  familyFriendly
-                    ? "开启：过滤工作不友好内容。默认开启"
-                    : "关闭：显示所有内容"
-                }
-                control={<Switch checked={familyFriendly} onChange={toggleFamilyFriendly} />}
-              />
+              {/* 侧边栏透明度：入口暂时隐藏（默认固定 55%，见 lib/sidebar.ts）。
+                  代码保留，需要恢复时去掉这层注释即可（changeSidebarAlpha 也在）。
               <Row
                 label="侧边栏透明度"
-                desc={`调节左侧菜单栏的半透明/磨砂质感（${Math.round(sidebarAlpha * 100)}%）。默认 50%`}
+                desc={`调节左侧菜单栏的半透明/磨砂质感（${Math.round(sidebarAlpha * 100)}%）。默认 55%`}
                 control={
                   <div className="flex items-center gap-2 w-48">
                     <input
@@ -693,6 +703,7 @@ export function SettingsPage() {
                   </div>
                 }
               />
+              */}
             </Group>
           )}
 
@@ -700,7 +711,7 @@ export function SettingsPage() {
             <Group title="关于">
               <Row
                 label="WallpaperEM"
-                desc="macOS 动态壁纸引擎 · 浏览/下载并应用 Steam 创意工坊壁纸（视频 / 场景 / 网页 / 图片）"
+                desc={os === "macos" ? "macOS 动态壁纸引擎 · 浏览/下载并应用 Steam 创意工坊壁纸（视频 / 场景 / 网页 / 图片）" : "跨平台动态壁纸引擎 · 浏览/下载并应用 Steam 创意工坊壁纸（视频 / 场景 / 网页 / 图片）"}
                 control={null}
               />
             </Group>
@@ -708,86 +719,18 @@ export function SettingsPage() {
         </div>
       </div>
 
-      {/* 扫码登录弹窗 */}
-      {qrOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-8">
-          <div className="card flex max-w-lg w-full flex-col overflow-hidden">
-            <div className="flex items-center justify-between border-b border-[var(--separator)] px-4 py-2.5">
-              <div className="text-[14px] font-semibold">扫码登录 Steam</div>
-              <button className="btn !py-1" onClick={stopQrLogin}>
-                关闭
-              </button>
-            </div>
-            <div className="p-5 space-y-3">
-              {qrStatus === "waiting" && !qrCode && (
-                <div className="text-[13px] text-[var(--text-2)] text-center py-6">
-                  正在生成登录二维码…
-                </div>
-              )}
-              {qrCode && (
-                <>
-                  <div className="flex justify-center">
-                    <pre
-                      className="inline-block text-[6px] font-mono select-text bg-white p-3 rounded-lg leading-none"
-                      style={{ lineHeight: "1.05", whiteSpace: "pre" }}
-                    >
-                      {qrCode}
-                    </pre>
-                  </div>
-                  <p className="text-[12.5px] text-center text-[var(--text-2)]">
-                    打开 Steam 手机 App → 扫码登录，确认后自动记住登录令牌
-                  </p>
-                </>
-              )}
-              {qrStatus === "success" && (
-                <div className="text-[13px] text-green-500 text-center">
-                  ✅ 登录成功，令牌已记住，后续下载无需再验证
-                </div>
-              )}
-              {qrStatus === "fail" && (
-                <div className="text-[13px] text-red-500 text-center">登录失败，请重试</div>
-              )}
-              {qrGuardReq && (
-                <div className="rounded-xl border border-[var(--separator)] bg-[var(--content)] p-3 space-y-2">
-                  <div className="text-[13px] font-semibold">输入 Steam Guard 2FA 验证码</div>
-                  <p className="text-[12px] text-[var(--text-2)]">
-                    检测到需要二次验证，请输入 Steam 身份验证器 / 邮箱收到的验证码
-                  </p>
-                  <input
-                    value={qrGuardCode}
-                    onChange={(e) => setQrGuardCode(e.target.value)}
-                    onKeyDown={(e) => e.key === "Enter" && submitQrGuard()}
-                    placeholder="2FA 验证码"
-                    autoFocus
-                    className="w-full rounded-lg border border-[var(--separator)] bg-[var(--content)] px-3 py-1.5 text-[13px] font-mono outline-none focus:border-[var(--accent)]"
-                  />
-                  <div className="flex items-center justify-end gap-2">
-                    {qrGuardMsg && (
-                      <span className="text-[12px] text-red-500">{qrGuardMsg}</span>
-                    )}
-                    <button className="btn btn-primary" onClick={submitQrGuard}>
-                      提交
-                    </button>
-                  </div>
-                </div>
-              )}
-              {qrLog.length > 0 && (
-                <div className="mt-2 max-h-24 overflow-y-auto rounded-lg bg-black/5 dark:bg-white/5 p-2 text-[11px] text-[var(--text-2)] font-mono">
-                  {qrLog.map((l, i) => (
-                    <div key={i} className="truncate">{l}</div>
-                  ))}
-                </div>
-              )}
-              {qrStatus !== "success" && (
-                <div className="flex justify-end gap-2">
-                  <button className="btn" onClick={stopQrLogin}>
-                    取消
-                  </button>
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
+      {confirmLogout && (
+        <ConfirmModal
+          title="登出下载账号"
+          message="将清除本地保存的账号密码与 steamcmd 登录态，下次下载需要重新登录并再过一次 Steam Guard 验证。"
+          confirmText="登出"
+          danger
+          onCancel={() => setConfirmLogout(false)}
+          onConfirm={() => {
+            setConfirmLogout(false);
+            logout();
+          }}
+        />
       )}
     </div>
   );

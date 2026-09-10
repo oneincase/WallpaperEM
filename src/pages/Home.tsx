@@ -9,22 +9,45 @@ import { useWallpaperMeta } from "../hooks/useWallpaperMeta";
 import { useItemProps } from "../hooks/useItemProps";
 import { WallpaperPropsModal } from "../components/WallpaperPropsModal";
 import { IconSliders } from "../components/icons";
+import { useMessage } from "../components/Message";
+import { useWorkshopFilter } from "../hooks/useWorkshopFilter";
+import { readSnapshot, writeSnapshot, SNAPSHOT_KEYS } from "../lib/cache-snapshots";
 
-// 模块级缓存：首次成功获取后保存随机壁纸列表与选中位置。
-// 切换页面导致组件重新挂载时直接复用缓存、不再发请求；
-// 只有点击「换一批」时才请求新一批并更新缓存。
-let cachedItems: WorkshopItemSummary[] | null = null;
-let cachedIndex = 0;
+// 会话快照：首次成功获取后把随机壁纸列表与选中位置落到 localStorage。
+//
+// 之前这里用的是模块级变量，只能扛住「切页导致组件卸载」；窗口被释放后重建
+// （main_window.rs 的 RELEASE_AFTER）是全新 JS 上下文，模块级变量归零，
+// 于是每次重开都要等三次串行网络请求（拉总数 → 拉随机页 → enrich 元数据）。
+//
+// 刻意不做 TTL、也不后台静默刷新：重开窗口直接显示上次那一批，只有点
+// 「换一批」才真正重随机。代价是内容不再「每次打开都新鲜」，换来的是秒开。
+type HomeSnapshot = {
+  items: WorkshopItemSummary[];
+  index: number;
+  /** 拍快照时的筛选条件指纹；与当前不一致说明用户在工坊页改过条件 */
+  filterKey: string;
+};
 
 export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void }) {
-  // 初始值取自缓存：有缓存时不显示骨架屏、不重新请求
-  const [items, setItems] = useState<WorkshopItemSummary[]>(cachedItems ?? []);
-  const [index, setIndex] = useState(cachedIndex);
-  const [loading, setLoading] = useState(cachedItems === null);
+  // 与工坊页共用的筛选条件。放在最前面：下面的初始 state 要用它算条件指纹
+  const { sort, days, tags, excludedTags } = useWorkshopFilter();
+  // 筛选条件的指纹：变了就说明用户在工坊页调过条件，快照里的推荐已不符合预期
+  const filterKey = JSON.stringify([sort, days, tags, excludedTags]);
+
+  // useState 的惰性初始化：readSnapshot 只在首次渲染跑一次。
+  // 直接写在函数体里会每次渲染都读一遍 localStorage 并 JSON.parse 整个列表。
+  const [restored] = useState(() => readSnapshot<HomeSnapshot>(SNAPSHOT_KEYS.home));
+  const usable = restored !== null && restored.filterKey === filterKey;
+
+  // 初始值取自快照：可用时不显示骨架屏、不重新请求。
+  // 指纹不匹配时当作无缓存处理 —— 内容确实是错的，显示骨架比显示旧结果诚实
+  const [items, setItems] = useState<WorkshopItemSummary[]>(usable ? restored.items : []);
+  const [index, setIndex] = useState(usable ? restored.index : 0);
+  const [loading, setLoading] = useState(!usable);
   const [error, setError] = useState("");
   const [applying, setApplying] = useState(false);
   const [enqueuing, setEnqueuing] = useState(false);
-  const [msg, setMsg] = useState("");
+  const msg = useMessage();
   const [faved, setFaved] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [propsItemId, setPropsItemId] = useState<string | null>(null);
@@ -34,7 +57,7 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
   const current = items[index];
   const currentApplied = current ? appliedItems.has(current.id) : false;
   const currentDownloaded = current ? downloadedItems.has(current.id) : false;
-  // 已下载壁纸的 project.json 若声明了可自定义属性，操作条提供快捷入口
+  // 已下载壁纸的操作条提供「壁纸配置」快捷入口
   const currentPropDefs = useItemProps(currentDownloaded ? current?.id : null);
   const currentCustomizable = (currentPropDefs?.length ?? 0) > 0;
 
@@ -44,7 +67,13 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
     setRefreshing(fresh);
     setError("");
     try {
-      const res = await api.workshopRandom("trend");
+      // 复用工坊页的筛选条件：用户在那边排除了成人内容，这里也不该再推
+      const res = await api.workshopRandom({
+        sort,
+        days: sort === "trend" && days > 0 ? days : undefined,
+        tags,
+        excludedTags,
+      });
       const list = res.items;
       if (list.length === 0) {
         setError("没有获取到壁纸，请重试");
@@ -52,9 +81,7 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
       }
       setItems(list);
       setIndex(0);
-      // 写入模块缓存，切换页面回来时复用
-      cachedItems = list;
-      cachedIndex = 0;
+      writeSnapshot<HomeSnapshot>(SNAPSHOT_KEYS.home, { items: list, index: 0, filterKey });
     } catch (e) {
       setError(String(e));
     } finally {
@@ -62,17 +89,31 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
       setRefreshing(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [sort, days, tags, excludedTags, filterKey]);
 
+  // 快照可用时首帧已经渲染了正确内容 —— 跳过挂载时这次请求
+  const skipFirstFetch = useRef(usable);
   useEffect(() => {
-    // 仅首次（无缓存）时请求；切回页面时复用缓存，不触发刷新
-    if (cachedItems === null) load();
+    if (skipFirstFetch.current) {
+      skipFirstFetch.current = false;
+      return;
+    }
+    load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [filterKey]);
 
-  // 选中位置同步到模块缓存，切换页面后回来时恢复
+  // 选中位置同步到快照，切页或重开窗口后恢复到同一张。
+  // items 走 ref 读取：这个 effect 只该被 index 触发，不想因 items 变化多写一次
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
   useEffect(() => {
-    cachedIndex = index;
+    if (itemsRef.current.length === 0) return;
+    writeSnapshot<HomeSnapshot>(SNAPSHOT_KEYS.home, {
+      items: itemsRef.current,
+      index,
+      filterKey,
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [index]);
 
   // 收藏状态
@@ -94,12 +135,10 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
     if (!items.length) return;
     const next = (index + dir + items.length) % items.length;
     setIndex(next);
-    setMsg("");
   };
 
   const select = (i: number) => {
     setIndex(i);
-    setMsg("");
   };
 
   const scrollRow = (dir: 1 | -1) => {
@@ -111,12 +150,11 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
   const apply = async () => {
     if (!current) return;
     setApplying(true);
-    setMsg("");
     try {
       await api.wallpaperApplyItem(current.id);
       await refreshApplied();
     } catch (e) {
-      setMsg(String(e));
+      msg.error(String(e));
     } finally {
       setApplying(false);
     }
@@ -125,12 +163,11 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
   const enqueue = async () => {
     if (!current) return;
     setEnqueuing(true);
-    setMsg("");
     try {
       await api.downloadEnqueue(current.id);
-      setMsg("✅ 已加入下载队列");
+      msg.success("已加入下载队列");
     } catch (e) {
-      setMsg(String(e));
+      msg.error(String(e));
     } finally {
       setEnqueuing(false);
     }
@@ -163,7 +200,7 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
 
       {error && (
         <div className="rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-[13px] text-red-500 shrink-0">
-          {error} —— 请检查网络/代理（设置 → 下载 → 代理）
+          {error} —— 请检查网络/代理（设置 → 网络 → 代理）
         </div>
       )}
 
@@ -280,10 +317,10 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
               <button
                 className="btn"
                 onClick={() => current && setPropsItemId(current.id)}
-                title="编辑壁纸自定义属性"
+                title="壁纸配置"
               >
                 <IconSliders size={14} />
-                自定义属性
+                壁纸配置
               </button>
             )}
             <button className={`btn ${faved ? "btn-danger" : ""}`} onClick={toggleFav}>
@@ -292,12 +329,11 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
             <button className="btn" onClick={() => onOpenDetail(current.id)}>
               查看详情 ↗
             </button>
-            {msg && <span className="text-[12.5px] text-[var(--text-2)]">{msg}</span>}
           </div>
         </div>
       )}
 
-      {/* 自定义属性弹窗（已下载且 project.json 声明了可配置项时从操作条打开） */}
+      {/* 壁纸配置弹窗（从操作条打开） */}
       {propsItemId && (
         <WallpaperPropsModal
           itemId={propsItemId}

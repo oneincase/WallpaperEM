@@ -1,6 +1,10 @@
-// 本地库壁纸预览弹框（按类型渲染：视频/图片/网页/场景）
-import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+// 本地库壁纸预览弹框
+//
+// 所有类型（scene / web / video / gif / image）统一复用渲染器页 ——
+// 与桌面壁纸走完全同一条渲染管线（webwallgl 库），所以预览里看到的效果
+// 就是应用后的效果。之前各类型分头用 <video>/<img>/<iframe> 直接渲染，
+// 预览与实际观感会有差异（缺 fit 归一化、缺 WE shim 的属性与音频注入）。
+import { useEffect, useRef, useState } from "react";
 import { api, type LibraryItem, type WallpaperConfig } from "../api/steam";
 
 export function PreviewModal({
@@ -12,9 +16,6 @@ export function PreviewModal({
 }) {
   const [cfg, setCfg] = useState<WallpaperConfig | null>(null);
   const [err, setErr] = useState("");
-  // 场景预览复用渲染器页：读取全局清晰度/帧率设置，与桌面壁纸观感一致
-  const [renderDpr, setRenderDpr] = useState(1);
-  const [sceneFps, setSceneFps] = useState(60);
 
   useEffect(() => {
     setErr("");
@@ -23,73 +24,57 @@ export function PreviewModal({
       .libraryPreview(item.itemId)
       .then(setCfg)
       .catch((e) => setErr(String(e)));
-    invoke<string | null>("settings_get", { key: "wallpaper_render_dpr" })
-      .then((v) => {
-        const n = Number(v);
-        if (Number.isFinite(n) && n > 0) setRenderDpr(n);
-      })
-      .catch(() => {});
-    invoke<string | null>("settings_get", { key: "wallpaper_scene_fps" })
-      .then((v) => {
-        const n = Number(v);
-        if (n === 30 || n === 60 || n === 120) setSceneFps(n);
-      })
-      .catch(() => {});
   }, [item.itemId]);
+
+  // 关闭前先把 iframe 导航到 about:blank：WKWebView 对带活动文档的 iframe 回收
+  // 迟缓（库的 web 卸载路径同样处理），仅从 DOM 移除会让整个预览渲染器 ——
+  // WebGL 上下文、scene.pkg 解析缓存（几百 MB）、解码器 —— 在后台多活很久，
+  // 表现为"关了预览内存不降"。导航触发文档立即拆毁，资源随之释放。
+  const frameRef = useRef<HTMLIFrameElement | null>(null);
+  useEffect(() => {
+    return () => {
+      const f = frameRef.current;
+      if (f) {
+        try {
+          f.contentWindow?.location.replace("about:blank");
+        } catch {
+          /* 跨源时用 src 导航兜底（设置 src 属性跨源也允许） */
+        }
+        f.removeAttribute("src");
+        f.src = "about:blank";
+      }
+    };
+  }, []);
 
   const renderBody = () => {
     if (err) return <div className="text-[13px] text-red-500 px-4">{err}</div>;
     if (!cfg) return <div className="text-[13px] text-[var(--text-2)]">加载中…</div>;
+    // mediaBase 由 Rust 的 resolve_item_config 对所有类型统一下发；
+    // 缺它说明内容服务器没起来，渲染器页也拉不到资源
+    if (!cfg.mediaBase) {
+      return <div className="text-[13px] text-[var(--text-2)]">内容服务器未就绪，无法预览</div>;
+    }
 
-    if (cfg.type === "video") {
-      return (
-        <video
-          key={cfg.src}
-          src={cfg.src}
-          autoPlay
-          loop
-          muted
-          controls
-          playsInline
-          className="max-h-full max-w-full"
-        />
-      );
-    }
-    if (cfg.type === "gif" || cfg.type === "image") {
-      return <img src={cfg.src} alt={item.title} className="max-h-full max-w-full object-contain" />;
-    }
-    if (cfg.type === "web") {
-      return (
-        <iframe
-          key={cfg.src}
-          src={cfg.src}
-          sandbox="allow-scripts allow-same-origin"
-          title={item.title}
-          className="h-full w-full"
-        />
-      );
-    }
-    if (cfg.type === "scene" && cfg.mediaBase) {
-      // 复用渲染器页（与桌面壁纸同一渲染管线），注入全局清晰度/帧率
-      const origin = new URL(cfg.mediaBase).origin;
-      const q = new URLSearchParams({
-        type: "scene",
-        src: cfg.src ?? "",
-        fit: "fill",
-        mediaBase: cfg.mediaBase,
-        renderDpr: String(renderDpr),
-        sceneFps: String(sceneFps),
-      });
-      return (
-        <iframe
-          key={cfg.src}
-          src={`${origin}/renderer/index.html?${q}`}
-          title={item.title}
-          className="h-full w-full"
-        />
-      );
-    }
-    return <div className="text-[13px] text-[var(--text-2)]">该类型暂不支持预览</div>;
+    const origin = new URL(cfg.mediaBase).origin;
+    const q = new URLSearchParams({
+      type: cfg.type,
+      src: cfg.src ?? "",
+      // 预览固定写死低开销参数，不跟随全局设置：裁剪 + 省电清晰度 + 30fps。
+      // 预览只为确认内容/试调属性，压低开销才能让主窗口与桌面壁纸保持流畅
+      fit: "cover",
+      mediaBase: cfg.mediaBase,
+      renderDpr: "0.8",
+      sceneFps: "30",
+    });
+    return (
+      <iframe
+        ref={frameRef}
+        key={`${cfg.type}:${cfg.src}`}
+        src={`${origin}/renderer/index.html?${q}`}
+        title={item.title}
+        className="h-full w-full"
+      />
+    );
   };
 
   return (

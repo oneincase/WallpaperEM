@@ -14,7 +14,7 @@ export function DownloadsPage() {
   return (
     <PlaceholderPage
       title="下载"
-      desc="下载队列、进度与 Steam Guard 验证码交互（DepotDownloader 内部集成，T2）"
+      desc="下载队列、进度与 Steam Guard 验证码交互（steamcmd 内部集成，T2）"
       hint="T2 · 下载引擎"
     />
   );

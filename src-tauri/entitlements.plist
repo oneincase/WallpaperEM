@@ -2,13 +2,13 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
   <dict>
-    <!-- DepotDownloader 为 .NET 应用：CoreCLR 需要 JIT（W+X 内存）。
-         hardened runtime 缺少此 entitlement 时 CoreCLR 初始化失败：
-         "Failed to create CoreCLR, HRESULT: 0x80070008" -->
-    <key>com.apple.security.cs.allow-jit</key>
-    <true/>
-    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
-    <true/>
+    <!-- steamcmd 在运行时自更新，会下载并 dlopen 自己的 steamclient.dylib 等组件。
+         那些 dylib 由 Valve 签名，不在本应用的签名团队下；hardened runtime 默认的
+         library validation 会拒绝加载。
+         注：steamcmd 是独立子进程，理论上有自己的签名评估、不受本进程 entitlement
+         约束，但公证后的实际行为难以离线验证，保留此项以免线上出现难以诊断的加载失败。
+         （原先还有 allow-jit / allow-unsigned-executable-memory 两项，是 DepotDownloader
+         的 .NET CoreCLR 所需；该后端已移除，两项一并删除。） -->
     <key>com.apple.security.cs.disable-library-validation</key>
     <true/>
   </dict>

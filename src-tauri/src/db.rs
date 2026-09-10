@@ -36,6 +36,88 @@ fn migrate(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
         conn.pragma_update(None, "user_version", 2)?;
         tracing::info!("db migrated to version 2");
     }
+    if v < 3 {
+        // v3：移除 DepotDownloader 后端，下载工具只剩 steamcmd。
+        // 清掉旧的后端选择键，避免残留一个再也不会被读的设置。
+        conn.execute_batch("DELETE FROM settings WHERE key = 'download_backend';")?;
+        conn.pragma_update(None, "user_version", 3)?;
+        tracing::info!("db migrated to version 3");
+    }
+    if v < 4 {
+        // v4：本地库筛选需要标签，但 library_items.tags 从未被写入过（历史遗漏，
+        // 实测 244 行全为空）。从工坊元数据缓存回填一次；缓存里没有的条目保持空数组，
+        // 筛选时仍可经 LEFT JOIN workshop_items 兜底。
+        let n = conn.execute(
+            "UPDATE library_items
+                SET tags = COALESCE(
+                    (SELECT w.tags FROM workshop_items w WHERE w.id = library_items.item_id),
+                    '[]')
+              WHERE tags IS NULL OR tags = '' OR tags = '[]'",
+            [],
+        )?;
+        // 这两列是筛选与排序的主力，之前全库无索引
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_library_type ON library_items(type);
+             CREATE INDEX IF NOT EXISTS idx_library_downloaded ON library_items(downloaded_at);",
+        )?;
+        conn.pragma_update(None, "user_version", 4)?;
+        tracing::info!("db migrated to version 4（回填 {n} 条本地库标签 + 建索引）");
+    }
+    if v < 5 {
+        // v5：清晰度档位从 5 档（0.5~5x）收敛到 3 档（0.8 省电 / 1 标准 / 2 高清）。
+        // 旧值就近映射，3/4/5 一律归到 2 —— 实际生效值受 min(devicePixelRatio, cap)
+        // 约束，2x 屏上 3x 以上本来就等于 2x，映射过去不改变任何观感；留着 5 反而
+        // 让下拉框找不到对应项（显示成空档或错档，用户看不出当前生效的是哪个）。
+        if let Some(raw) = get_setting(conn, "wallpaper_render_dpr")
+            .as_deref()
+            .and_then(|s| s.trim().parse::<f32>().ok())
+        {
+            let mapped = if raw <= 0.9 {
+                "0.8"
+            } else if raw <= 1.5 {
+                "1"
+            } else {
+                "2"
+            };
+            set_setting(conn, "wallpaper_render_dpr", mapped)?;
+            tracing::info!("db v5：全局清晰度 {raw} → {mapped}");
+        }
+        // 每壁纸覆盖里也可能存着旧档位（play_cfg:* 的 renderDpr）
+        let mut fixed = 0usize;
+        {
+            let rows: Vec<(String, String)> = conn
+                .prepare("SELECT key, value FROM settings WHERE key LIKE 'play_cfg:%'")?
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect();
+            for (k, val) in rows {
+                let Ok(mut j) = serde_json::from_str::<serde_json::Value>(&val) else {
+                    continue;
+                };
+                let Some(d) = j.get("renderDpr").and_then(|x| x.as_f64()) else {
+                    continue;
+                };
+                let mapped: f64 = if d <= 0.9 {
+                    0.8
+                } else if d <= 1.5 {
+                    1.0
+                } else {
+                    2.0
+                };
+                if (d - mapped).abs() < 1e-9 {
+                    continue;
+                }
+                j["renderDpr"] = serde_json::json!(mapped);
+                conn.execute(
+                    "UPDATE settings SET value = ?2 WHERE key = ?1",
+                    rusqlite::params![k, j.to_string()],
+                )?;
+                fixed += 1;
+            }
+        }
+        conn.pragma_update(None, "user_version", 5)?;
+        tracing::info!("db migrated to version 5（清晰度档位收敛，修正 {fixed} 条壁纸覆盖）");
+    }
     Ok(())
 }
 
@@ -54,10 +136,12 @@ fn column_exists(conn: &Connection, table: &str, col: &str) -> rusqlite::Result<
 // ---------- 设置 ----------
 
 pub fn get_setting(conn: &Connection, key: &str) -> Option<String> {
-    conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0))
-        .optional()
-        .ok()
-        .flatten()
+    conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
+        r.get(0)
+    })
+    .optional()
+    .ok()
+    .flatten()
 }
 
 #[allow(dead_code)]
@@ -119,7 +203,11 @@ pub fn find_workshop_items(
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map(rusqlite::params_from_iter(ids.iter()), |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
         })
         .map_err(|e| e.to_string())?;
     let now = chrono::Utc::now().timestamp_millis();
@@ -145,12 +233,91 @@ pub fn find_workshop_item(
         let mut stmt = conn
             .prepare("SELECT metadata_json FROM workshop_items WHERE id = ?1")
             .map_err(|e| e.to_string())?;
-        let mut rows = stmt.query_map([id], |r| r.get::<_, String>(0)).map_err(|e| e.to_string())?;
+        let mut rows = stmt
+            .query_map([id], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
         rows.next().transpose().map_err(|e| e.to_string())?
     };
     drop(conn);
     match meta {
-        Some(m) => serde_json::from_str(&m).map(Some).map_err(|e| e.to_string()),
+        Some(m) => serde_json::from_str(&m)
+            .map(Some)
+            .map_err(|e| e.to_string()),
         None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v4_db() -> Connection {
+        // 复刻 v4 状态：跑 schema(v1) 后直接把 user_version 钉到 4，
+        // 并灌入旧档位值 —— 这样 migrate() 只会执行 v5 这一段
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(include_str!("schema.sql")).unwrap();
+        c.execute(
+            "INSERT OR REPLACE INTO settings(key,value) VALUES('wallpaper_render_dpr','5')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",
+            rusqlite::params!["play_cfg:999", r#"{"renderDpr":3}"#],
+        )
+        .unwrap();
+        c.pragma_update(None, "user_version", 4).unwrap();
+        c
+    }
+
+    #[test]
+    fn v5_maps_old_dpr_tiers_to_three_levels() {
+        let c = v4_db();
+        migrate(&c).unwrap();
+
+        let v: String = c
+            .query_row(
+                "SELECT value FROM settings WHERE key='wallpaper_render_dpr'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // 旧 5（高清档 3/4/5 之一）就近归到 2，不能留着让下拉框找不到对应项
+        assert_eq!(v, "2");
+
+        // 每壁纸覆盖里的 renderDpr 也要一起迁移
+        let cfg: String = c
+            .query_row(
+                "SELECT value FROM settings WHERE key='play_cfg:999'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(cfg.contains("\"renderDpr\":2"), "cfg 未迁移: {cfg}");
+
+        let ver: i64 = c
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, 5);
+    }
+
+    #[test]
+    fn v5_mapping_table_boundaries() {
+        // 逐档验证映射边界（与迁移代码同一规则）
+        let map = |raw: f32| {
+            if raw <= 0.9 {
+                "0.8"
+            } else if raw <= 1.5 {
+                "1"
+            } else {
+                "2"
+            }
+        };
+        assert_eq!(map(0.5), "0.8");
+        assert_eq!(map(0.8), "0.8");
+        assert_eq!(map(1.0), "1");
+        assert_eq!(map(1.5), "1");
+        assert_eq!(map(2.0), "2");
+        assert_eq!(map(5.0), "2");
     }
 }

@@ -22,6 +22,35 @@ use serde_json::{json, Map, Value};
 /// 用户覆盖值存放的 settings 键前缀
 const OVERRIDES_KEY_PREFIX: &str = "web_props:";
 
+/// 全局语言设置键（设置 → 通用 → 语言）。
+/// 只影响壁纸内的 `language` 属性，不做软件本体 i18n。
+pub const LANGUAGE_SETTING_KEY: &str = "language";
+/// WE 全局语言码 → 壁纸 `language` 属性值。
+///
+/// 注意壁纸作者并不统一用 WE 的语言码：有的用 WE 全码（"english"），有的用
+/// 自定义数字（language.value == 3）。全局语言只能注入"WE 语义"的值 ——
+/// 壁纸自己声明了 language 属性时一律以壁纸为准（见 effective_props），
+/// 只有壁纸没声明时才补这个全局默认，所以数字枚举类壁纸不会被错误覆盖。
+pub const LANGUAGE_DEFAULT: &str = "simplifiedchinese";
+pub const LANGUAGE_CHOICES: [&str; 6] = [
+    "simplifiedchinese",
+    "traditionalchinese",
+    "english",
+    "japanese",
+    "korean",
+    "german",
+];
+
+/// 读全局语言，非法/缺失回退简体中文。
+pub fn global_language(conn: &Connection) -> String {
+    let raw = crate::db::get_setting(conn, LANGUAGE_SETTING_KEY).unwrap_or_default();
+    if LANGUAGE_CHOICES.contains(&raw.as_str()) {
+        raw
+    } else {
+        LANGUAGE_DEFAULT.to_string()
+    }
+}
+
 /// UI 编辑用的属性定义
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -75,8 +104,95 @@ pub struct ComboOption {
 
 /// 读取并解析壁纸目录下的 project.json
 fn load_project(dir: &Path) -> Option<Value> {
+    let mut project = load_project_raw(dir)?;
+    merge_preset(dir, &mut project);
+    Some(project)
+}
+
+/// 不做预设合成的原始读取（供 merge_preset 读依赖用，避免递归）
+fn load_project_raw(dir: &Path) -> Option<Value> {
     let text = std::fs::read_to_string(dir.join("project.json")).ok()?;
     serde_json::from_str::<Value>(&text).ok()
+}
+
+/// 预设物品（WE "另存为预设"）：project.json 只有扁平的 `preset`（属性名 → 值），
+/// 没有 `general.properties` —— 类型/文案/order 全在 `dependency` 指向的基础壁纸里。
+/// 不合成的话 raw_props 返回空表，壁纸一个属性都收不到，表现为整页黑屏。
+///
+/// 合成规则：以基础壁纸的 properties 为骨架（type/order/condition/text 等元信息），
+/// 把 preset 的值覆盖进每项的 `value`。preset 独有、基础壁纸没定义的键（本体自加的
+/// 属性）按无 type 补一条，走 wire_value 的字符串兜底透传。
+///
+/// 依赖内容已由下载器 merge_missing 合并进本体目录，所以文件路径基准仍是本体目录，
+/// 无需重写 file 属性的值。
+fn merge_preset(dir: &Path, project: &mut Value) {
+    // 已有 properties 的正常壁纸不动
+    if project
+        .get("general")
+        .and_then(|g| g.get("properties"))
+        .and_then(|p| p.as_object())
+        .is_some_and(|p| !p.is_empty())
+    {
+        return;
+    }
+    let Some(preset) = project.get("preset").and_then(|p| p.as_object()).cloned() else {
+        return;
+    };
+    if preset.is_empty() {
+        return;
+    }
+
+    // 基础壁纸（dependency 指向）与本体同级，其内容已合并进本体目录
+    let base_props = base_wallpaper_props(dir, project);
+
+    let mut merged = Map::new();
+    for (name, value) in &preset {
+        match base_props.get(name).and_then(|d| d.as_object()) {
+            // 有定义：保留元信息，只换 value
+            Some(def) => {
+                let mut def = def.clone();
+                def.insert("value".into(), value.clone());
+                merged.insert(name.clone(), Value::Object(def));
+            }
+            // preset 独有：基础壁纸没定义类型。标成 text 让它通过 raw_props 的
+            // 「有 type 才是真属性」过滤（否则会被当成 tip/ui_* 纯显示项丢掉），
+            // 值走 wire_value 的字符串兜底，壁纸 JS 自行转型
+            None => {
+                merged.insert(name.clone(), json!({ "type": "text", "value": value }));
+            }
+        }
+    }
+
+    let general = project
+        .as_object_mut()
+        .map(|o| o.entry("general").or_insert_with(|| json!({})));
+    if let Some(g) = general.and_then(|g| g.as_object_mut()) {
+        g.insert("properties".into(), Value::Object(merged));
+    }
+}
+
+/// 读取 `dependency` 指向的基础壁纸的 general.properties（同一 wallpapers 目录下的兄弟目录）
+fn base_wallpaper_props(dir: &Path, project: &Value) -> Map<String, Value> {
+    let self_id = dir
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let Some(parent) = dir.parent() else {
+        return Map::new();
+    };
+    let ids = crate::download::parse_dependency_ids(project, &self_id);
+    for id in ids {
+        let props = load_project_raw(&parent.join(&id))
+            .as_ref()
+            .and_then(|p| p.get("general"))
+            .and_then(|g| g.get("properties"))
+            .and_then(|p| p.as_object())
+            .cloned();
+        if let Some(props) = props.filter(|p| !p.is_empty()) {
+            return props;
+        }
+    }
+    Map::new()
 }
 
 /// general.properties 原始条目（仅保留有 "type" 的真属性，跳过 tip/ui_* 纯显示项）
@@ -137,8 +253,17 @@ fn read_overrides(conn: &Connection, item_id: &str) -> Map<String, Value> {
         .unwrap_or_default()
 }
 
-/// 当前生效的完整属性表（默认值 + 用户覆盖），wire 格式；无 project.json 时为空表
-pub fn effective_props(conn: &Connection, wallpapers_dir: &Path, item_id: &str) -> Map<String, Value> {
+/// 当前生效的完整属性表（默认值 + 用户覆盖），wire 格式；无 project.json 时为空表。
+///
+/// 全局语言合并（需求：壁纸没有自带语言设置时用全局语言）：
+/// 遍历完 project.json 的属性后，若其中**没有**名为 `language` 的属性，
+/// 补一条全局语言。壁纸自己声明了 language（无论是 WE 全码还是自定义数字枚举）
+/// 都以壁纸为准 —— 否则会把数字枚举类壁纸的 language=3 错误改写成字符串。
+pub fn effective_props(
+    conn: &Connection,
+    wallpapers_dir: &Path,
+    item_id: &str,
+) -> Map<String, Value> {
     let item_dir = wallpapers_dir.join(item_id);
     let Some(project) = load_project(&item_dir) else {
         return Map::new();
@@ -146,9 +271,17 @@ pub fn effective_props(conn: &Connection, wallpapers_dir: &Path, item_id: &str) 
     let overrides = read_overrides(conn, item_id);
     let file_prefix = entry_dir_prefix(&item_dir);
     let mut out = Map::new();
+    let mut wallpaper_has_language = false;
     for (name, def) in raw_props(&project) {
+        if name == "language" {
+            wallpaper_has_language = true;
+        }
         let ptype = def.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        if let Some(v) = overrides.get(&name).cloned().or_else(|| wire_value(ptype, &def)) {
+        if let Some(v) = overrides
+            .get(&name)
+            .cloned()
+            .or_else(|| wire_value(ptype, &def))
+        {
             // file 属性：值相对壁纸根存储，下发给壁纸时按入口 HTML 所在目录补相对前缀
             // （WE 语义：文件属性相对路径以入口页面为基准解析）；空值不补（空串 + 前缀会凭空指向目录）
             let v = if ptype == "file" {
@@ -161,6 +294,12 @@ pub fn effective_props(conn: &Connection, wallpapers_dir: &Path, item_id: &str) 
             };
             out.insert(name, json!({ "value": v }));
         }
+    }
+    if !wallpaper_has_language {
+        // 用户对 language 的显式覆盖也走 overrides，但壁纸没声明该属性时 overrides
+        // 里也不会有 —— 全局语言是唯一来源。直接补 WE 全码字符串。
+        out.entry("language")
+            .or_insert_with(|| json!({ "value": global_language(conn) }));
     }
     out
 }
@@ -208,6 +347,73 @@ pub fn boot_json(db: &Arc<Mutex<Connection>>, wallpapers_dir: &Path, item_id: &s
         Err(_) => (Map::new(), crate::wallpaper::DEFAULT_SCENE_FPS),
     };
     json!({ "props": props, "fps": fps })
+}
+
+/// 目录属性（`type: "directory"`）对应的文件清单：属性名 → 该目录内文件的相对 URL 路径。
+///
+/// WE 的 `wallpaperRequestRandomFileForProperty(prop, cb)` 语义是「从该目录随机取一个文件」。
+/// 官方 CEF 直接读文件系统；webwallgl 的 shim 改成从父页预推的清单里挑（`__wePushDirectoryFiles`），
+/// 所以这份清单必须由内容服务器在注入时一起下发 —— 不下发的话幻灯片类壁纸拿到空串，
+/// 表现为「背景图一直不换」。
+///
+/// 路径相对**入口 HTML 所在目录**（与 file 属性同一基准），壁纸里可直接当 URL 用。
+/// 只扫目录内的普通文件，不递归；越界路径（绝对路径 / `..`）一律跳过。
+pub fn directory_files(
+    conn: &Connection,
+    wallpapers_dir: &Path,
+    item_id: &str,
+) -> Map<String, Value> {
+    let item_dir = wallpapers_dir.join(item_id);
+    let Some(project) = load_project(&item_dir) else {
+        return Map::new();
+    };
+    let overrides = read_overrides(conn, item_id);
+    let prefix = entry_dir_prefix(&item_dir);
+    let mut out = Map::new();
+
+    for (name, def) in raw_props(&project) {
+        if def.get("type").and_then(|t| t.as_str()) != Some("directory") {
+            continue;
+        }
+        // 目录值取「用户覆盖 > project.json 默认」，与 effective_props 同一优先级
+        let rel = overrides
+            .get(&name)
+            .and_then(|v| v.as_str())
+            .or_else(|| def.get("value").and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .trim()
+            .replace('\\', "/");
+        // 空值 / 绝对路径（WE 里表示用户系统目录，包外不可访问）/ 穿越一律跳过
+        if rel.is_empty() || rel.starts_with('/') || rel.split('/').any(|s| s == "..") {
+            continue;
+        }
+        let abs = item_dir.join(&rel);
+        if !abs.is_dir() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&abs) else {
+            continue;
+        };
+        let mut files: Vec<String> = entries
+            .flatten()
+            .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+            .filter_map(|e| {
+                let fname = e.file_name().to_string_lossy().into_owned();
+                // 隐藏文件（.DS_Store 等）不是壁纸素材
+                if fname.starts_with('.') {
+                    return None;
+                }
+                Some(format!("{prefix}{}/{}", rel.trim_end_matches('/'), fname,))
+            })
+            .collect();
+        if files.is_empty() {
+            continue;
+        }
+        // 目录序在不同文件系统上不稳定，排序保证同一壁纸每次拿到的清单一致
+        files.sort();
+        out.insert(name, json!(files));
+    }
+    out
 }
 
 /// 把用户覆盖值合并进 project.json 响应体，供**场景壁纸**渲染时读取。
@@ -328,28 +534,30 @@ fn decode_entities(input: &str) -> String {
             continue;
         };
         let body = &tail[1..end];
-        let decoded: Option<String> = if let Some(hex) =
-            body.strip_prefix("#x").or_else(|| body.strip_prefix("#X"))
-        {
-            u32::from_str_radix(hex, 16)
-                .ok()
-                .and_then(char::from_u32)
-                .map(String::from)
-        } else if let Some(dec) = body.strip_prefix('#') {
-            dec.parse::<u32>().ok().and_then(char::from_u32).map(String::from)
-        } else {
-            match body {
-                "lt" => Some("<".into()),
-                "gt" => Some(">".into()),
-                "quot" => Some("\"".into()),
-                "apos" => Some("'".into()),
-                // 各类空格实体统一压成普通空格（随后 split_whitespace 折叠）
-                "nbsp" | "ensp" | "emsp" | "thinsp" => Some(" ".into()),
-                // amp 放在最后一轮解，天然避免 &amp;lt; 被二次解码
-                "amp" => Some("&".into()),
-                _ => None,
-            }
-        };
+        let decoded: Option<String> =
+            if let Some(hex) = body.strip_prefix("#x").or_else(|| body.strip_prefix("#X")) {
+                u32::from_str_radix(hex, 16)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .map(String::from)
+            } else if let Some(dec) = body.strip_prefix('#') {
+                dec.parse::<u32>()
+                    .ok()
+                    .and_then(char::from_u32)
+                    .map(String::from)
+            } else {
+                match body {
+                    "lt" => Some("<".into()),
+                    "gt" => Some(">".into()),
+                    "quot" => Some("\"".into()),
+                    "apos" => Some("'".into()),
+                    // 各类空格实体统一压成普通空格（随后 split_whitespace 折叠）
+                    "nbsp" | "ensp" | "emsp" | "thinsp" => Some(" ".into()),
+                    // amp 放在最后一轮解，天然避免 &amp;lt; 被二次解码
+                    "amp" => Some("&".into()),
+                    _ => None,
+                }
+            };
         match decoded {
             Some(s) => {
                 out.push_str(&s);
@@ -389,7 +597,15 @@ pub fn describe(conn: &Connection, wallpapers_dir: &Path, item_id: &str) -> Vec<
     raw_props(&project)
         .into_iter()
         .map(|(name, def)| {
-            let ptype = def.get("type").and_then(|t| t.as_str()).unwrap_or("other").to_string();
+            // checkbox 是 bool 的别名（真实语料里 2 处）：wire 语义完全相同，
+            // 归一化成 bool，避免前端为同一个开关写两套渲染
+            let raw_type = def.get("type").and_then(|t| t.as_str()).unwrap_or("other");
+            let ptype = if raw_type == "checkbox" {
+                "bool"
+            } else {
+                raw_type
+            }
+            .to_string();
             let default = wire_value(&ptype, &def);
             let value = overrides.get(&name).cloned().or_else(|| default.clone());
             let text_raw = def.get("text").and_then(|t| t.as_str()).unwrap_or("");
@@ -445,7 +661,11 @@ fn str_field(v: &Value, key: &str) -> Option<String> {
 }
 
 /// 保存用户覆盖值（UI 直接传 wire 格式值），空对象等价于清除
-pub fn set_overrides(conn: &Connection, item_id: &str, values: &Map<String, Value>) -> Result<(), String> {
+pub fn set_overrides(
+    conn: &Connection,
+    item_id: &str,
+    values: &Map<String, Value>,
+) -> Result<(), String> {
     let key = format!("{OVERRIDES_KEY_PREFIX}{item_id}");
     if values.is_empty() {
         conn.execute("DELETE FROM settings WHERE key = ?1", [key])
@@ -457,7 +677,12 @@ pub fn set_overrides(conn: &Connection, item_id: &str, values: &Map<String, Valu
 }
 
 /// 合并写入单个属性的覆盖值（file 属性选择文件后调用；值相对壁纸根）
-pub fn set_single_override(conn: &Connection, item_id: &str, name: &str, value: Value) -> Result<(), String> {
+pub fn set_single_override(
+    conn: &Connection,
+    item_id: &str,
+    name: &str,
+    value: Value,
+) -> Result<(), String> {
     let mut m = read_overrides(conn, item_id);
     m.insert(name.to_string(), value);
     set_overrides(conn, item_id, &m)
@@ -484,6 +709,96 @@ mod tests {
         std::fs::create_dir_all(dir.join(item)).unwrap();
         std::fs::write(dir.join(item).join("project.json"), project).unwrap();
         dir
+    }
+
+    #[test]
+    fn global_language_is_injected_when_wallpaper_has_no_language_prop() {
+        let conn = mem_db();
+        crate::db::set_setting(&conn, LANGUAGE_SETTING_KEY, "japanese").unwrap();
+        // 壁纸只有 schemecolor，没有 language
+        let dir = fixture_dir(
+            "lang-add",
+            "100",
+            r#"{
+            "type":"scene",
+            "general":{"properties":{"c":{"type":"color","value":"1 0 0"}}}
+        }"#,
+        );
+        let props = effective_props(&conn, &dir, "100");
+        // 补了全局语言
+        assert_eq!(
+            props
+                .get("language")
+                .and_then(|v| v.get("value"))
+                .and_then(|v| v.as_str()),
+            Some("japanese"),
+            "壁纸无 language 属性时应补全局语言"
+        );
+        // 原属性不受影响
+        assert!(props.contains_key("c"));
+    }
+
+    #[test]
+    fn wallpaper_own_language_prop_is_never_overridden() {
+        let conn = mem_db();
+        crate::db::set_setting(&conn, LANGUAGE_SETTING_KEY, "simplifiedchinese").unwrap();
+        // 壁纸自带 language，且是数字枚举（很多多语言壁纸用 1/2/3）
+        let dir = fixture_dir(
+            "lang-own",
+            "101",
+            r#"{
+            "type":"scene",
+            "general":{"properties":{"language":{
+                "type":"combo",
+                "options":[{"label":"English","value":"1"},{"label":"中文","value":"3"}],
+                "value":"1"}}}
+        }"#,
+        );
+        let props = effective_props(&conn, &dir, "101");
+        let v = props
+            .get("language")
+            .and_then(|v| v.get("value"))
+            .and_then(|v| v.as_str());
+        assert_eq!(
+            v,
+            Some("1"),
+            "壁纸自带 language（数字枚举）时不得以全局字符串覆盖"
+        );
+    }
+
+    #[test]
+    fn global_language_invalid_value_falls_back_to_default() {
+        let conn = mem_db();
+        crate::db::set_setting(&conn, LANGUAGE_SETTING_KEY, "klingon").unwrap();
+        assert_eq!(global_language(&conn), LANGUAGE_DEFAULT);
+    }
+
+    #[test]
+    fn checkbox_is_normalized_to_bool() {
+        let conn = mem_db();
+        let dir = fixture_dir(
+            "checkbox",
+            "102",
+            r#"{
+            "type":"scene",
+            "general":{"properties":{"on":{"type":"checkbox","value":true}}}
+        }"#,
+        );
+        let defs = describe(&conn, &dir, "102");
+        let on = defs
+            .iter()
+            .find(|d| d.name == "on")
+            .expect("checkbox 属性应保留");
+        assert_eq!(
+            on.ptype, "bool",
+            "checkbox 必须归一化成 bool，前端只渲染一套开关"
+        );
+    }
+
+    /// 既有测试断言的是 project.json 自身属性的处理；全局 language 注入是正交逻辑。
+    /// 用它在断言前剔掉注入项，避免给每个计数断言都 +1、又不掩盖真正的属性丢失。
+    fn author_props_count(props: &Map<String, Value>) -> usize {
+        props.len() - usize::from(props.contains_key("language"))
     }
 
     const SAMPLE: &str = r#"{
@@ -577,9 +892,7 @@ mod tests {
             }}"#,
         );
         let defs = describe(&conn, &dir, "x6");
-        let text = |n: &str| {
-            defs.iter().find(|d| d.name == n).unwrap().text.clone()
-        };
+        let text = |n: &str| defs.iter().find(|d| d.name == n).unwrap().text.clone();
         assert_eq!(text("a"), "阿尔法", "zh-chs 命中（语言标签大小写不敏感）");
         assert_eq!(text("b"), "貝塔", "zh-chs 缺该键 → 逐键回退 zh-cht");
         assert_eq!(text("c"), "Gamma", "前两档都缺 → 回退 en-us");
@@ -598,7 +911,11 @@ mod tests {
         assert_eq!(strip_html("a&nbsp;&emsp;b"), "a b", "多个空格实体折叠");
         assert_eq!(strip_html("&amp;lt;"), "&lt;", "amp 解出的 & 不被二次解码");
         assert_eq!(strip_html("A &amp; B"), "A & B");
-        assert_eq!(strip_html("100% &unknownent; x"), "100% &unknownent; x", "未知实体原样保留");
+        assert_eq!(
+            strip_html("100% &unknownent; x"),
+            "100% &unknownent; x",
+            "未知实体原样保留"
+        );
         assert_eq!(strip_html("Q&A 100&"), "Q&A 100&", "裸 & 不误吞后文");
         assert_eq!(strip_html("&#x2030"), "&#x2030", "缺分号不解码");
     }
@@ -650,7 +967,7 @@ mod tests {
             }}}"#,
         );
         let props = effective_props(&conn, &dir, "x8");
-        assert_eq!(props.len(), 3, "条件不成立的属性照样下发");
+        assert_eq!(author_props_count(&props), 3, "条件不成立的属性照样下发");
         assert_eq!(props.get("hidden").unwrap(), &json!({"value": 0.5}));
         assert_eq!(props.get("never").unwrap(), &json!({"value": true}));
     }
@@ -698,7 +1015,10 @@ mod tests {
         bom.extend_from_slice(&std::fs::read(dir.join("x21").join("project.json")).unwrap());
         let out = merge_overrides_into_project(&conn, "x21", bom);
         let v: Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(v["general"]["properties"]["schemecolor"]["value"], json!("0 1 0"));
+        assert_eq!(
+            v["general"]["properties"]["schemecolor"]["value"],
+            json!("0 1 0")
+        );
         assert!(
             v["general"]["properties"].get("goneProp").is_none(),
             "陈旧覆盖值不得凭空生成属性"
@@ -710,11 +1030,12 @@ mod tests {
     }
 
     #[test]
-    fn effective_props_merges_overrides_and_set_overrides_roundtrip() {        let conn = mem_db();
+    fn effective_props_merges_overrides_and_set_overrides_roundtrip() {
+        let conn = mem_db();
         let dir = fixture_dir("merge", "x2", SAMPLE);
         // 默认：screenFile 无值被跳过（6 个属性 − 1），disableRili=false
         let props = effective_props(&conn, &dir, "x2");
-        assert_eq!(props.len(), 5);
+        assert_eq!(author_props_count(&props), 5);
         assert!(props.get("screenFile").is_none(), "无值的 file 不下发");
         assert_eq!(props.get("disableRili").unwrap(), &json!({"value": false}));
 
@@ -724,7 +1045,10 @@ mod tests {
         overrides.insert("disableRili".into(), json!(true));
         set_overrides(&conn, "x2", &overrides).unwrap();
         let props = effective_props(&conn, &dir, "x2");
-        assert_eq!(props.get("schemecolor").unwrap(), &json!({"value": "1 0 0"}));
+        assert_eq!(
+            props.get("schemecolor").unwrap(),
+            &json!({"value": "1 0 0"})
+        );
         assert_eq!(props.get("disableRili").unwrap(), &json!({"value": true}));
 
         // describe 反映覆盖状态与当前值
@@ -787,12 +1111,27 @@ mod tests {
     #[test]
     fn missing_project_json_yields_empty() {
         let conn = mem_db();
+        // project.json 存在但为空对象：作者属性为空（describe 不含全局注入的 language）
         let dir = fixture_dir("empty", "nope", "{}");
         assert!(describe(&conn, &dir, "nope").is_empty());
-        assert!(effective_props(&conn, &dir, "nope").is_empty());
+        // effective_props 仍会补全局语言（这是张有效壁纸，只是作者没写属性）。
+        // 作者属性数量（剔掉注入的 language）必须为 0
+        let eff = effective_props(&conn, &dir, "nope");
+        assert_eq!(author_props_count(&eff), 0);
+        assert_eq!(
+            eff.get("language")
+                .and_then(|v| v.get("value"))
+                .and_then(|v| v.as_str()),
+            Some(LANGUAGE_DEFAULT)
+        );
         // 无 properties 段
         let dir2 = fixture_dir("noprops", "x", r#"{"type":"web","file":"a.html"}"#);
         assert!(describe(&conn, &dir2, "x").is_empty());
+        assert_eq!(author_props_count(&effective_props(&conn, &dir2, "x")), 0);
+        // 真正没有 project.json 文件：整体为空（连 language 都无从判定壁纸类型）
+        let dir3 = fixture_dir("nofile", "y", "{}");
+        std::fs::remove_file(dir3.join("y").join("project.json")).unwrap();
+        assert!(effective_props(&conn, &dir3, "y").is_empty());
     }
 
     /// 真实数据形态：fileType/precision 透传；directory 不补入口前缀；file 空值不补前缀
@@ -835,8 +1174,155 @@ mod tests {
         );
     }
 
+    /// 预设物品（WE「另存为预设」）：本体只有扁平 preset，类型定义在 dependency 指向的
+    /// 基础壁纸里。合成失败会让壁纸一个属性都收不到 —— 真实表现是整页黑屏。
+    #[test]
+    fn preset_item_inherits_property_types_from_dependency() {
+        let conn = mem_db();
+        let dir = std::env::temp_dir().join("wpem-we-props-test-preset");
+        let _ = std::fs::remove_dir_all(&dir);
+        // 基础壁纸：提供 type/order/condition 等元信息
+        std::fs::create_dir_all(dir.join("2000")).unwrap();
+        std::fs::write(
+            dir.join("2000").join("project.json"),
+            r#"{"type":"web","file":"index.html","general":{"properties":{
+                "bgvideo": { "type": "file", "fileType": "video", "order": 10,
+                             "text": "背景视频", "value": "" },
+                "vol":     { "type": "slider", "order": 20, "min": 0, "max": 100, "value": 50 },
+                "enabled": { "type": "bool", "order": 30, "value": false },
+                "tip":     { "order": 40, "text": "纯显示项" }
+            }}}"#,
+        )
+        .unwrap();
+        // 预设物品：只有 preset，值覆盖基础壁纸默认值；末两项基础壁纸未定义
+        std::fs::create_dir_all(dir.join("1000")).unwrap();
+        std::fs::write(
+            dir.join("1000").join("project.json"),
+            r#"{"dependency":"2000","preset":{
+                "bgvideo": "files/clip.webm",
+                "vol": 80,
+                "enabled": true,
+                "custom_flag": "yes"
+            }}"#,
+        )
+        .unwrap();
+        // 入口 HTML（依赖内容已由下载器 merge_missing 合并进本体）
+        std::fs::write(dir.join("1000").join("index.html"), "<html></html>").unwrap();
+
+        let props = effective_props(&conn, &dir, "1000");
+        assert_eq!(
+            author_props_count(&props),
+            4,
+            "preset 的四个键都要下发：{props:?}"
+        );
+        // 类型来自基础壁纸：slider 是数值不是字符串，bool 是布尔
+        assert_eq!(props.get("vol").unwrap(), &json!({ "value": 80.0 }));
+        assert_eq!(props.get("enabled").unwrap(), &json!({ "value": true }));
+        // file 走入口前缀逻辑（根入口 → 无前缀），值取 preset 覆盖
+        assert_eq!(
+            props.get("bgvideo").unwrap(),
+            &json!({ "value": "files/clip.webm" })
+        );
+        // 基础壁纸未定义的 preset 键按字符串透传，不能丢
+        assert_eq!(
+            props.get("custom_flag").unwrap(),
+            &json!({ "value": "yes" })
+        );
+
+        // describe 也要能列出（属性编辑弹窗依赖它），且带上基础壁纸的元信息
+        let defs = describe(&conn, &dir, "1000");
+        let vol = defs.iter().find(|d| d.name == "vol").expect("vol 在列表里");
+        assert_eq!(vol.ptype, "slider");
+        assert_eq!(vol.max, Some(100.0));
+        // 纯显示项 tip 不是属性，不进列表
+        assert!(defs.iter().all(|d| d.name != "tip"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 预设物品的基础壁纸缺失（依赖没下载）时不能 panic，preset 值仍按字符串下发 ——
+    /// 有值总比黑屏强
+    #[test]
+    fn preset_without_dependency_still_delivers_values() {
+        let conn = mem_db();
+        let dir = fixture_dir(
+            "preset-nodep",
+            "1000",
+            r#"{"dependency":"9999","preset":{"a":"x","b":3}}"#,
+        );
+        let props = effective_props(&conn, &dir, "1000");
+        assert_eq!(author_props_count(&props), 2);
+        assert_eq!(props.get("a").unwrap(), &json!({ "value": "x" }));
+        // 无类型定义 → 字符串兜底（壁纸 JS 自行转型）
+        assert_eq!(props.get("b").unwrap(), &json!({ "value": "3" }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 复用 set_single_override（测试里经pub接口写覆盖）
     fn we_props_set_dir(conn: &Connection, item: &str, name: &str, path: &str) {
         crate::we_props::set_single_override(conn, item, name, json!(path)).unwrap();
+    }
+
+    /// 目录属性清单：路径相对入口目录、排序稳定、隐藏文件与越界路径被拒。
+    ///
+    /// 这条链路断了是**静默失效** —— 壁纸照常显示，只是幻灯片永远不换图，
+    /// 所以必须有测试盯着。
+    #[test]
+    fn directory_files_lists_relative_to_entry_dir() {
+        const PROJ: &str = r#"{
+            "file": "web/index.html",
+            "general": { "properties": {
+                "album":   { "order": 1, "type": "directory", "value": "media/pics" },
+                "outside": { "order": 2, "type": "directory", "value": "/Users/me/Pictures" },
+                "escape":  { "order": 3, "type": "directory", "value": "../../etc" },
+                "missing": { "order": 4, "type": "directory", "value": "nope" },
+                "notdir":  { "order": 5, "type": "text",      "value": "media/pics" }
+            } }
+        }"#;
+        let conn = mem_db();
+        let root = fixture_dir("dirfiles", "d1", PROJ);
+        let item = root.join("d1");
+        std::fs::create_dir_all(item.join("web")).unwrap();
+        std::fs::write(item.join("web/index.html"), "<html></html>").unwrap();
+        let pics = item.join("media/pics");
+        std::fs::create_dir_all(&pics).unwrap();
+        // 乱序写入，验证输出是排过序的
+        std::fs::write(pics.join("c.png"), b"x").unwrap();
+        std::fs::write(pics.join("a.jpg"), b"x").unwrap();
+        std::fs::write(pics.join("b.webp"), b"x").unwrap();
+        std::fs::write(pics.join(".DS_Store"), b"x").unwrap();
+        std::fs::create_dir_all(pics.join("nested")).unwrap();
+
+        let files = directory_files(&conn, &root, "d1");
+
+        // 只有可访问的包内目录进清单
+        assert_eq!(
+            files.keys().collect::<Vec<_>>(),
+            vec!["album"],
+            "绝对路径/穿越/不存在的目录/非 directory 类型都不该出现"
+        );
+        // 路径相对入口目录（web/），排序稳定，隐藏文件与子目录被排除
+        assert_eq!(
+            files.get("album").unwrap(),
+            &json!([
+                "web/media/pics/a.jpg",
+                "web/media/pics/b.webp",
+                "web/media/pics/c.png"
+            ])
+        );
+
+        // 用户改了目录 → 清单跟着走
+        std::fs::create_dir_all(item.join("alt")).unwrap();
+        std::fs::write(item.join("alt/z.png"), b"x").unwrap();
+        we_props_set_dir(&conn, "d1", "album", "alt");
+        let files = directory_files(&conn, &root, "d1");
+        assert_eq!(files.get("album").unwrap(), &json!(["web/alt/z.png"]));
+
+        // 空目录不下发（推空数组会让 shim 以为有清单却挑不出东西）
+        std::fs::create_dir_all(item.join("empty")).unwrap();
+        we_props_set_dir(&conn, "d1", "album", "empty");
+        assert!(directory_files(&conn, &root, "d1").is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

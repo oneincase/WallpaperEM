@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>壁纸设置</title>
+    <style>
+      /* 透明窗口：面板自带 rgba(--content) + backdrop-blur（磨砂，与主窗口一致）。
+         body 若有不透明底色会挡住透出效果，这里保持透明。 */
+      html, body, #root { height: 100%; margin: 0; background: transparent; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/props-main.tsx"></script>
+  </body>
+</html>

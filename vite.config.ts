@@ -24,6 +24,7 @@ export default defineConfig({
       input: {
         ui: here("index.html"),
         renderer: here("renderer/index.html"),
+        props: here("props.html"),
       },
     },
   },

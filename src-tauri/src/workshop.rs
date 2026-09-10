@@ -4,7 +4,6 @@
 
 use rusqlite::Connection;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -31,29 +30,15 @@ pub struct WorkshopService {
     client: SteamClient,
     db: Arc<Mutex<Connection>>,
     cache: Mutex<HashMap<String, (Instant, serde_json::Value)>>,
-    /// 工作友好（默认开启）：开启后过滤成人 / NSFW 内容（Arc 内部可变，支持运行时切换）
-    family_friendly: AtomicBool,
 }
 
 impl WorkshopService {
     pub fn new(client: SteamClient, db: Arc<Mutex<Connection>>) -> Self {
-        let family_friendly = db::get_setting(&db.lock().unwrap(), "family_friendly")
-            .map(|v| v != "false" && v != "0")
-            .unwrap_or(true);
         Self {
             client,
             db,
             cache: Mutex::new(HashMap::new()),
-            family_friendly: AtomicBool::new(family_friendly),
         }
-    }
-
-    /// 列表摘要是否应被过滤（工作友好开启 + 命中成人特征）
-    fn is_adult_summary(&self, it: &WorkshopItemSummary) -> bool {
-        if !self.family_friendly.load(Ordering::Relaxed) {
-            return false;
-        }
-        crate::sfw::is_adult_text(&it.title) || crate::sfw::is_adult_tags(&it.tags)
     }
 
     fn cache_get(&self, key: &str, ttl: Duration) -> Option<serde_json::Value> {
@@ -73,26 +58,44 @@ impl WorkshopService {
         }
     }
 
+    /// 把筛选参数归一成 Steam 的 (requiredtags, excludedtags)。
+    /// search 与 random 共用，保证两条路径的筛选语义完全一致。
+    fn resolve_tags(params: &WorkshopSearchParams) -> (Vec<String>, Vec<String>) {
+        let mut required: Vec<String> = Vec::new();
+        if let Some(t) = params.r#type.as_deref() {
+            if !t.is_empty() && t != "unknown" {
+                if let Some(tag) = TYPE_TAG.iter().find(|(k, _)| *k == t).map(|(_, v)| *v) {
+                    required.push(tag.to_string());
+                }
+            }
+        }
+        for tag in &params.tags {
+            let t = tag.trim();
+            // 类型入口与标签面板可能选到同一个标签（如都选了 Scene），去重避免重复参数
+            if !t.is_empty() && !required.iter().any(|x| x == t) {
+                required.push(t.to_string());
+            }
+        }
+        let excluded: Vec<String> = params
+            .excluded_tags
+            .iter()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        (required, excluded)
+    }
+
     /// 搜索/筛选工坊列表（SSR 解析 + 详情批量补齐 + 二次过滤 + 5min 缓存）
-    pub async fn search(&self, params: WorkshopSearchParams) -> Result<WorkshopSearchResult, String> {
+    pub async fn search(
+        &self,
+        params: WorkshopSearchParams,
+    ) -> Result<WorkshopSearchResult, String> {
         let key = format!("search:{params:?}");
         if let Some(v) = self.cache_get(&key, SEARCH_TTL) {
             return serde_json::from_value(v).map_err(|e| e.to_string());
         }
 
-        let mut required_tags: Vec<String> = Vec::new();
-        if let Some(t) = params.r#type.as_deref() {
-            if !t.is_empty() && t != "unknown" {
-                if let Some(tag) = TYPE_TAG.iter().find(|(k, _)| *k == t).map(|(_, v)| *v) {
-                    required_tags.push(tag.to_string());
-                }
-            }
-        }
-        if let Some(tag) = params.tag.as_deref() {
-            if !tag.is_empty() {
-                required_tags.push(tag.to_string());
-            }
-        }
+        let (required_tags, excluded_tags) = Self::resolve_tags(&params);
 
         let raw = browse_workshop_raw(
             &self.client,
@@ -100,20 +103,21 @@ impl WorkshopService {
                 query: params.query.clone(),
                 sort: params.sort.clone(),
                 page: params.page,
-                required_tags,
+                required_tags: required_tags.clone(),
+                excluded_tags: excluded_tags.clone(),
+                days: params.days,
+                created_after: params.created_after,
+                created_before: params.created_before,
+                updated_after: params.updated_after,
+                updated_before: params.updated_before,
             },
         )
         .await?;
 
         let items = self.enrich(&raw.items).await?;
 
-        // 工作友好（默认开启）：自动过滤成人内容
-        let items = items
-            .into_iter()
-            .filter(|i| !self.is_adult_summary(i))
-            .collect::<Vec<_>>();
-
-        // 服务端 requiredtags 可能不完整生效，本地二次过滤兜底
+        // 服务端 requiredtags 可能不完整生效，本地二次过滤兜底。
+        // 注意语义要与 Steam 保持一致：required 是 AND，excluded 是「命中任一即排除」。
         let items = items
             .into_iter()
             .filter(|i| {
@@ -121,11 +125,9 @@ impl WorkshopService {
                     Some(t) if !t.is_empty() => i.r#type == t,
                     _ => true,
                 };
-                let ok_tag = match params.tag.as_deref() {
-                    Some(t) if !t.is_empty() => i.tags.iter().any(|x| x == t),
-                    _ => true,
-                };
-                ok_type && ok_tag
+                let ok_required = required_tags.iter().all(|t| i.tags.iter().any(|x| x == t));
+                let ok_excluded = !excluded_tags.iter().any(|t| i.tags.iter().any(|x| x == t));
+                ok_type && ok_required && ok_excluded
             })
             .collect::<Vec<_>>();
 
@@ -134,45 +136,52 @@ impl WorkshopService {
 
         let page = params.page.unwrap_or(1);
         let has_more = if raw.total > 0 {
-            page < 1000 && (page as usize) * 30 < raw.total
+            page < 1000 && (page as usize) * crate::steam::browse::PAGE_SIZE < raw.total
         } else {
             raw.has_more
         };
-        let has_more = has_more && !items.is_empty();
+        // 本页被二次过滤清空不代表后面没有了：只有 Steam 也没给出下一页时才收尾
+        let has_more = has_more && !raw.items.is_empty();
 
         let result = WorkshopSearchResult {
             items,
             total: raw.total,
             page,
-            page_size: raw.items.len(),
+            page_size: crate::steam::browse::PAGE_SIZE,
             has_more,
         };
         self.cache_set(&key, &result);
         Ok(result)
     }
 
-    /// 随机壁纸推荐：先取第 1 页解析总数，再随机选一页（绕过缓存，保证每次不同）
-    pub async fn random(&self, sort: &str) -> Result<WorkshopSearchResult, String> {
-        let sort_owned = sort.to_string();
+    /// 随机壁纸推荐：先取第 1 页解析总数，再随机选一页（绕过缓存，保证每次不同）。
+    ///
+    /// 接受与 `search` 相同的筛选参数 —— 发现页与工坊页共用同一套条件，
+    /// 用户在工坊里排除了成人内容，发现页也不该再推给他。
+    pub async fn random(
+        &self,
+        params: WorkshopSearchParams,
+    ) -> Result<WorkshopSearchResult, String> {
+        let (required_tags, excluded_tags) = Self::resolve_tags(&params);
+        let mk = |page: u32| BrowseQuery {
+            query: params.query.clone(),
+            sort: params.sort.clone(),
+            page: Some(page),
+            required_tags: required_tags.clone(),
+            excluded_tags: excluded_tags.clone(),
+            days: params.days,
+            created_after: params.created_after,
+            created_before: params.created_before,
+            updated_after: params.updated_after,
+            updated_before: params.updated_before,
+        };
         // 第 1 页：用于解析 total 总数（也直接作为候选，若 random 失败可回退）
-        let raw1 = browse_workshop_raw(
-            &self.client,
-            &BrowseQuery {
-                sort: Some(sort_owned.clone()),
-                page: Some(1),
-                ..Default::default()
-            },
-        )
-        .await?;
+        let raw1 = browse_workshop_raw(&self.client, &mk(1)).await?;
         let total = raw1.total;
 
         if total == 0 {
             // 未解析到总数：直接返回第 1 页（不缓存）
             let items = self.enrich(&raw1.items).await?;
-            let items: Vec<_> = items
-                .into_iter()
-                .filter(|i| !self.is_adult_summary(i))
-                .collect();
             let page_size = items.len();
             let has_more = page_size > 0;
             return Ok(WorkshopSearchResult {
@@ -184,23 +193,11 @@ impl WorkshopService {
             });
         }
 
-        let max_page = ((total / 30).min(1000).max(1)) as u32;
+        let max_page = ((total / crate::steam::browse::PAGE_SIZE).min(1000).max(1)) as u32;
         let page = rand::Rng::gen_range(&mut rand::thread_rng(), 1..=max_page);
 
-        let raw = browse_workshop_raw(
-            &self.client,
-            &BrowseQuery {
-                sort: Some(sort_owned.clone()),
-                page: Some(page),
-                ..Default::default()
-            },
-        )
-        .await?;
+        let raw = browse_workshop_raw(&self.client, &mk(page)).await?;
         let items = self.enrich(&raw.items).await?;
-        let items: Vec<_> = items
-            .into_iter()
-            .filter(|i| !self.is_adult_summary(i))
-            .collect();
         let page_size = items.len();
         let has_more = page_size > 0;
         Ok(WorkshopSearchResult {
@@ -213,26 +210,13 @@ impl WorkshopService {
     }
 
     /// 单条目完整元数据（24h 缓存 + upsert）
-    pub async fn detail(&self, id: &str) -> Result<Option<WorkshopItem>, String> {        let key = format!("detail:{id}");
+    pub async fn detail(&self, id: &str) -> Result<Option<WorkshopItem>, String> {
+        let key = format!("detail:{id}");
         if let Some(v) = self.cache_get(&key, Duration::from_millis(DETAIL_TTL_MS as u64)) {
             return serde_json::from_value(v).map_err(|e| e.to_string());
         }
         let details = get_item_details(&self.client, &[id.to_string()]).await?;
         let item = details.into_iter().next();
-        // 工作友好（默认开启）：详情命中成人内容 → 视为不存在（自动过滤）
-        if self.family_friendly.load(Ordering::Relaxed) {
-            let adult = item.as_ref().is_some_and(|it| {
-                crate::sfw::is_adult_full(
-                    &it.title,
-                    &it.description,
-                    it.creator.as_deref(),
-                    &it.tags,
-                )
-            });
-            if adult {
-                return Ok(None);
-            }
-        }
         if let Some(it) = &item {
             let conn = self.db.lock().map_err(|e| e.to_string())?;
             db::upsert_workshop_item(&conn, it)?;
@@ -299,14 +283,14 @@ impl WorkshopService {
         let mut items = items;
         match sort.unwrap_or("trend") {
             "totaluniquesubscribers" => items.sort_by(|a, b| {
-                b.subscriptions.unwrap_or(0).cmp(&a.subscriptions.unwrap_or(0))
+                b.subscriptions
+                    .unwrap_or(0)
+                    .cmp(&a.subscriptions.unwrap_or(0))
             }),
-            "totalfavorited" => items.sort_by(|a, b| {
-                b.favorited.unwrap_or(0).cmp(&a.favorited.unwrap_or(0))
-            }),
-            "timecreated" => {
-                items.sort_by_key(|a| std::cmp::Reverse(a.time_created.unwrap_or(0)))
+            "totalfavorited" => {
+                items.sort_by(|a, b| b.favorited.unwrap_or(0).cmp(&a.favorited.unwrap_or(0)))
             }
+            "timecreated" => items.sort_by_key(|a| std::cmp::Reverse(a.time_created.unwrap_or(0))),
             _ => {} // trend 等：保持 Steam 返回顺序
         }
         items
@@ -326,9 +310,13 @@ pub async fn workshop_search(
 #[tauri::command]
 pub async fn workshop_random(
     svc: tauri::State<'_, Arc<WorkshopService>>,
-    sort: Option<String>,
+    params: Option<WorkshopSearchParams>,
 ) -> Result<WorkshopSearchResult, String> {
-    svc.random(sort.as_deref().unwrap_or("trend")).await
+    let mut p = params.unwrap_or_default();
+    if p.sort.is_none() {
+        p.sort = Some("trend".into());
+    }
+    svc.random(p).await
 }
 
 #[tauri::command]
@@ -337,22 +325,4 @@ pub async fn workshop_item(
     id: String,
 ) -> Result<Option<WorkshopItem>, String> {
     svc.detail(&id).await
-}
-
-/// 切换「工作友好」（自动过滤成人内容）。返回当前开关状态（默认开启）。
-#[tauri::command]
-pub async fn workshop_set_family_friendly(
-    svc: tauri::State<'_, Arc<WorkshopService>>,
-    enabled: bool,
-) -> Result<bool, String> {
-    {
-        let conn = svc.db.lock().map_err(|e| e.to_string())?;
-        db::set_setting(&conn, "family_friendly", if enabled { "true" } else { "false" })?;
-    }
-    svc.cache
-        .lock()
-        .unwrap()
-        .retain(|k, _| !k.starts_with("search:"));
-    svc.family_friendly.store(enabled, Ordering::Relaxed);
-    Ok(enabled)
 }

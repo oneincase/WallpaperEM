@@ -28,11 +28,15 @@ pub fn delete_password(username: &str) -> Result<(), String> {
         .map_err(|e| format!("Keychain 删除失败: {e}"))
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 
     /// 验证 Keychain 写入后可读回（应用重启后仍应有效）
+    ///
+    /// 仅 macOS：Linux 走内核 keyutils，容器/无头会话没有 session keyring
+    /// （PermissionDenied），且 secure_store 早已是主凭据方案，该回退路径
+    /// 在 Linux 上属尽力而为，不做集成测试断言。
     #[test]
     fn keychain_set_get_roundtrip() {
         let user = format!("test-user-{}", std::process::id());

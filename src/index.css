@@ -19,10 +19,13 @@
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]):not([data-theme="dark"]) {
-    --sidebar-alpha: 0.55;
-    --content: rgba(28, 28, 30, 0.85);
-    --sidebar: rgba(40, 40, 42, var(--sidebar-alpha));
-    --card: rgba(44, 44, 46, 0.72);
+    /* 深色下的明度关系：侧边栏（导航，最沉） < 内容区 < 卡片（最浅，浮在内容上）。
+       侧边栏基色要压得比内容区更暗，否则遇到浅色壁纸时透色会把它冲得比内容区还亮，
+       主次就反了。alpha 默认 0.72 也是为此 —— 0.55 时浅色壁纸几乎整片透上来。 */
+    --sidebar-alpha: 0.72;
+    --content: rgba(52, 52, 55, 0.9);
+    --sidebar: rgba(30, 30, 32, var(--sidebar-alpha));
+    --card: rgba(64, 64, 68, 0.8);
     --separator: rgba(255, 255, 255, 0.1);
     --text-1: #f5f5f7;
     --text-2: #98989d;
@@ -33,10 +36,11 @@
 /* 强制深色：不管系统，都用深色 */
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --sidebar-alpha: 0.55;
-  --content: rgba(28, 28, 30, 0.85);
-  --sidebar: rgba(40, 40, 42, var(--sidebar-alpha));
-  --card: rgba(44, 44, 46, 0.72);
+  /* 同上：侧边栏最沉 < 内容区 < 卡片最浅 */
+  --sidebar-alpha: 0.72;
+  --content: rgba(52, 52, 55, 0.9);
+  --sidebar: rgba(30, 30, 32, var(--sidebar-alpha));
+  --card: rgba(64, 64, 68, 0.8);
   --separator: rgba(255, 255, 255, 0.1);
   --text-1: #f5f5f7;
   --text-2: #98989d;
@@ -64,6 +68,21 @@ body {
   color: var(--text-1);
   user-select: none;
   cursor: default;
+}
+
+/* 独立「壁纸设置」窗口：高 alpha 半透明底色 = 磨砂质感（太透会看不清文字）。
+   不要用 backdrop-filter 磨砂——透明 WKWebView 里 backdrop 层不稳定，
+   内容绘制一两次后会被 WebKit 丢弃，表现为"刚开是磨砂、一两秒后变纯半透明"。 */
+.props-tint {
+  background: rgba(248, 248, 250, 0.88);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .props-tint {
+    background: rgba(30, 30, 32, 0.88);
+  }
+}
+:root[data-theme="dark"] .props-tint {
+  background: rgba(30, 30, 32, 0.88);
 }
 
 /* 系统风按钮 */
@@ -145,4 +164,17 @@ body {
   to {
     opacity: 1;
   }
+}
+
+/* 不确定态进度条：后端（steamcmd）不输出进度且拿不到条目总大小时使用 */
+@keyframes indeterminate-slide {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(300%);
+  }
+}
+.animate-indeterminate {
+  animation: indeterminate-slide 1.2s ease-in-out infinite;
 }

@@ -31,8 +31,12 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app", "dmg"],
-    "externalBin": ["binaries/depot-downloader"],
+    "targets": [
+      "app",
+      "dmg",
+      "deb",
+      "appimage"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -42,10 +46,27 @@
     "resources": {
       "../dist/renderer": "renderer",
       "../dist/assets": "assets",
-      "../dist/default-wallpaper": "default-wallpaper"
+      "../dist/default-wallpaper": "default-wallpaper",
+      "vendor/mediaremote-adapter": "mediaremote-adapter"
     },
     "macOS": {
-      "entitlements": "entitlements.plist"
-    }
+      "entitlements": "entitlements.plist",
+      "signingIdentity": "WallpaperEM Dev Signer"
+    },
+    "linux": {
+      "appimage": {},
+      "deb": {
+        "depends": [
+          "gstreamer1.0-plugins-base",
+          "gstreamer1.0-plugins-good",
+          "gstreamer1.0-plugins-bad",
+          "gstreamer1.0-libav"
+        ],
+        "recommends": [
+          "gstreamer1.0-pipewire"
+        ]
+      }
+    },
+    "category": "Utility"
   }
 }

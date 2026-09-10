@@ -19,8 +19,11 @@ use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder}
 
 use crate::download;
 
-/// 主窗口持续隐藏多久后释放（销毁窗口 -> 终止其 WebContent 进程）
-pub const RELEASE_AFTER: Duration = Duration::from_secs(10);
+/// 主窗口持续隐藏多久后释放（销毁窗口 -> 终止其 WebContent 进程）。
+/// 3s 的激进回收：主界面是纯管理面板，重建成本是一次页面加载（<1s），
+/// 常驻的 WebContent 进程（数百 MB）远比这个贵。下载/Guard/扫码登录期间
+/// 看门狗会跳过释放（on_tick 里的 is_busy 守卫），激进值不会打断流程。
+pub const RELEASE_AFTER: Duration = Duration::from_secs(3);
 /// 轮询周期（实际触发时延 = RELEASE_AFTER + 最多一次轮询间隔）
 const POLL: Duration = Duration::from_secs(1);
 
@@ -142,15 +145,18 @@ pub fn ensure_main_window(app: &AppHandle) {
     // 刚释放后 "main" label 可能仍被僵尸占用：destroy 的注册表清理是异步的，
     // 短间隔重试等其真正释放（避免一次失败后主窗口彻底出不来）。
     for attempt in 0..10 {
-        let built = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+        let builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
             .title("WallpaperEM")
             .inner_size(1240.0, 800.0)
             .min_inner_size(940.0, 600.0)
             .center()
+            .transparent(true);
+        // Overlay 标题栏/隐藏标题是 macOS-only API；Linux 下窗口带原生标题栏
+        #[cfg(target_os = "macos")]
+        let builder = builder
             .title_bar_style(tauri::TitleBarStyle::Overlay)
-            .hidden_title(true)
-            .transparent(true)
-            .build();
+            .hidden_title(true);
+        let built = builder.build();
         match built {
             Ok(w) => {
                 // 装饰与初始窗口一致：关闭=隐藏 + 侧栏 vibrancy

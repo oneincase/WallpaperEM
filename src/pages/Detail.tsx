@@ -6,13 +6,14 @@ import { useWallpaperMeta } from "../hooks/useWallpaperMeta";
 import { useItemProps } from "../hooks/useItemProps";
 import { WallpaperPropsModal } from "../components/WallpaperPropsModal";
 import { IconSliders } from "../components/icons";
+import { useMessage } from "../components/Message";
 
 export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
   const [item, setItem] = useState<WorkshopItem | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [enqueuing, setEnqueuing] = useState(false);
-  const [msg, setMsg] = useState("");
+  const msg = useMessage();
   const [faved, setFaved] = useState(false);
   const [applying, setApplying] = useState(false);
   const [showProps, setShowProps] = useState(false);
@@ -116,12 +117,11 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
                   disabled={enqueuing}
                   onClick={async () => {
                     setEnqueuing(true);
-                    setMsg("");
                     try {
                       await api.downloadEnqueue(item.id);
-                      setMsg("✅ 已加入下载队列，请到「下载」页查看进度");
+                      msg.success("已加入下载队列，请到「下载」页查看进度");
                     } catch (e) {
-                      setMsg(String(e));
+                      msg.error(String(e));
                     } finally {
                       setEnqueuing(false);
                     }
@@ -145,12 +145,11 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
                   title="需先下载到本地库"
                   onClick={async () => {
                     setApplying(true);
-                    setMsg("");
                     try {
                       await api.wallpaperApplyItem(item.id);
                       await refreshApplied();
                     } catch (e) {
-                      setMsg(String(e));
+                      msg.error(String(e));
                     } finally {
                       setApplying(false);
                     }
@@ -160,9 +159,9 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
                 </button>
               )}
               {downloaded && customizable && (
-                <button className="btn" onClick={() => setShowProps(true)} title="编辑壁纸自定义属性">
+                <button className="btn" onClick={() => setShowProps(true)} title="壁纸配置">
                   <IconSliders size={14} />
-                  自定义属性
+                  壁纸配置
                   {propDefs!.some((d) => d.overridden) && (
                     <span className="text-[11px] text-[var(--accent)]">•</span>
                   )}
@@ -183,7 +182,6 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
                 {faved ? "★ 已收藏" : "☆ 收藏"}
               </button>
             </div>
-            {msg && <div className="mt-2 text-[12.5px] text-[var(--text-2)]">{msg}</div>}
 
             {item.description && (
               <div className="mt-5">
@@ -197,7 +195,7 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
         )}
       </div>
 
-      {/* 自定义属性弹窗（project.json general.properties，是否可自定义与壁纸类型无关） */}
+      {/* 壁纸配置弹窗（作者属性 + 每壁纸播放设置） */}
       {showProps && item && (
         <WallpaperPropsModal
           itemId={item.id}

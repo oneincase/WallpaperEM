@@ -4,23 +4,35 @@
 //! 经 URL query 注入配置；屏幕布局变化由后台监控任务同步（2s）；
 //! 显示器睡眠由 CGDisplayIsAsleep 轮询（5s）驱动暂停/恢复。
 
+#[cfg(target_os = "linux")]
+pub mod linux;
+#[cfg(target_os = "macos")]
 pub mod macos;
+pub mod platform;
+pub mod pointer;
 
+use crate::audio_capture;
+use crate::db;
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
-use rusqlite::Connection;
-use crate::audio_capture;
-use crate::db;
 
 use crate::content_server::ContentServerState;
 
 pub const DEFAULT_FIT: &str = "cover";
-/// 渲染分辨率上限（有效 devicePixelRatio 的封顶）：越低越省内存（GPU 画布/纹理）。
-/// 1.0 = 按逻辑分辨率渲染（Retina 上约为原先 1/4 内存）；2.0 = 不封顶（原清晰度）。
-pub const DEFAULT_RENDER_DPR: f32 = 2.0;
+/// 清晰度（有效 devicePixelRatio 的封顶）：越低越省内存（GPU 画布/纹理）。
+/// 三档：0.8 省电 / 1 标准 / 2 高清。
+///
+/// 上限 2.0 而非更高：实际生效值是 `min(window.devicePixelRatio, cap)`，
+/// 而 Retina 的 dpr 就是 2 —— 更高的档位在任何 Mac 上都会被压到 2，只会让
+/// 下拉框多出"选了没变化"的空档位（此前 3x/4x/5x 就是这个问题）。
+/// 缩放模式下 WebKit 自己把 dpr 报成 1，也不需要更高的 cap 去补。
+pub const RENDER_DPR_MIN: f32 = 0.8;
+pub const RENDER_DPR_MAX: f32 = 2.0;
+pub const DEFAULT_RENDER_DPR: f32 = 1.0;
 /// 场景壁纸帧率上限（帧/秒）：越低 GPU 占用越低。可选 30 / 60 / 120，默认 60。
 pub const DEFAULT_SCENE_FPS: u32 = 60;
 
@@ -41,25 +53,11 @@ fn default_scene_fps() -> u32 {
 fn global_fit(conn: Option<&Connection>) -> String {
     let fit = conn.and_then(|c| db::get_setting(c, "wallpaper_fit"));
     match fit.as_deref() {
-        Some("contain") | Some("stretch") | Some("cover") => fit.unwrap_or_else(|| DEFAULT_FIT.into()),
+        Some("contain") | Some("stretch") | Some("cover") => {
+            fit.unwrap_or_else(|| DEFAULT_FIT.into())
+        }
         _ => DEFAULT_FIT.into(),
     }
-}
-
-/// 把全局显示模式写进配置（应用/恢复壁纸时统一以全局为准，实现"全局一个开关"）。
-fn apply_global_fit(app: &AppHandle, cfg: &mut WallpaperConfig) {
-    let fit: String;
-    {
-        let db = app.try_state::<Arc<Mutex<Connection>>>();
-        fit = match db {
-            Some(state) => match state.lock() {
-                Ok(conn) => global_fit(Some(&conn)),
-                Err(_) => DEFAULT_FIT.to_string(),
-            },
-            None => DEFAULT_FIT.to_string(),
-        };
-    }
-    cfg.fit = fit;
 }
 
 /// 全局渲染分辨率上限（有效 dpr 封顶），读取设置 `wallpaper_render_dpr`，非法值回退到默认。
@@ -69,23 +67,7 @@ fn global_render_dpr(conn: Option<&Connection>) -> f32 {
         .as_deref()
         .and_then(|s| s.trim().parse::<f32>().ok())
         .unwrap_or(DEFAULT_RENDER_DPR);
-    parsed.clamp(0.5, 2.0)
-}
-
-/// 把全局渲染分辨率上限写进配置（应用/恢复壁纸时统一以全局为准）。
-fn apply_global_render_dpr(app: &AppHandle, cfg: &mut WallpaperConfig) {
-    let dpr: f32;
-    {
-        let db = app.try_state::<Arc<Mutex<Connection>>>();
-        dpr = match db {
-            Some(state) => match state.lock() {
-                Ok(conn) => global_render_dpr(Some(&conn)),
-                Err(_) => DEFAULT_RENDER_DPR,
-            },
-            None => DEFAULT_RENDER_DPR,
-        };
-    }
-    cfg.render_dpr = dpr;
+    parsed.clamp(RENDER_DPR_MIN, RENDER_DPR_MAX)
 }
 
 /// 全局场景帧率上限（读设置 `wallpaper_scene_fps`），只允许 30/60/120，非法值回退 60。
@@ -101,20 +83,183 @@ pub(crate) fn global_scene_fps(conn: Option<&Connection>) -> u32 {
     }
 }
 
-/// 把全局场景帧率写进配置（应用/恢复壁纸时统一以全局为准）。
-fn apply_global_scene_fps(app: &AppHandle, cfg: &mut WallpaperConfig) {
-    let fps: u32;
-    {
-        let db = app.try_state::<Arc<Mutex<Connection>>>();
-        fps = match db {
-            Some(state) => match state.lock() {
-                Ok(conn) => global_scene_fps(Some(&conn)),
-                Err(_) => DEFAULT_SCENE_FPS,
-            },
-            None => DEFAULT_SCENE_FPS,
-        };
+// ---------- 每壁纸播放设置（对标 WE 的「壁纸配置」）----------
+//
+// WE 的播放设置是**按壁纸记忆**的：A 壁纸调过音量，切到 B 再切回 A 仍是那个音量。
+// 我们此前只有全局单例（设置页那几项），换壁纸就丢。
+//
+// 存储沿用作者属性同一套路：settings 表键 `play_cfg:{item_id}`，值为 JSON 对象。
+// 不新建表的理由是这里天然是稀疏的键值覆盖 —— 只存"用户显式改过的项"，
+// 没有的字段回落全局默认。新建表反而要处理"行存在但字段为 NULL"的三态。
+//
+// 语义严格是三态，不能简化成两态：
+//   字段缺失   → 跟随全局（用户没碰过）
+//   字段有值   → 本壁纸专属，覆盖全局
+// 所以用 Option<T> 而不是"等于默认值就算跟随" —— 后者会让"用户特意设成与
+// 当前全局相同的值"在全局改动后被意外带走。
+
+/// 单张壁纸的播放设置覆盖。None 字段 = 跟随全局默认。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ItemPlayConfig {
+    /// 显示模式（cover/contain/stretch）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fit: Option<String>,
+    /// 清晰度（有效 dpr 封顶）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_dpr: Option<f32>,
+    /// 帧率限制
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene_fps: Option<u32>,
+    /// 音量 0..1（0 即静音）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<f32>,
+}
+
+fn play_cfg_key(item_id: &str) -> String {
+    format!("play_cfg:{item_id}")
+}
+
+/// 读某壁纸的播放设置覆盖（无记录或解析失败 → 全跟随全局）
+pub(crate) fn item_play_config(conn: &Connection, item_id: &str) -> ItemPlayConfig {
+    db::get_setting(conn, &play_cfg_key(item_id))
+        .and_then(|s| serde_json::from_str::<ItemPlayConfig>(&s).ok())
+        .unwrap_or_default()
+}
+
+/// 写某壁纸的播放设置覆盖。全字段为 None 时删除该键（回到「完全跟随全局」）
+fn set_item_play_config(
+    conn: &Connection,
+    item_id: &str,
+    v: &ItemPlayConfig,
+) -> Result<(), String> {
+    let key = play_cfg_key(item_id);
+    let empty =
+        v.fit.is_none() && v.render_dpr.is_none() && v.scene_fps.is_none() && v.volume.is_none();
+    if empty {
+        // 留一个空 JSON 会让「跟随全局」和「曾经改过又还原」在 DB 里长得不一样，
+        // 后续想按 key 存在性做统计就会错；直接删干净
+        conn.execute(
+            "DELETE FROM settings WHERE key = ?1",
+            rusqlite::params![key],
+        )
+        .map_err(|e| e.to_string())?;
+        return Ok(());
     }
-    cfg.scene_fps = fps;
+    let json = serde_json::to_string(v).map_err(|e| e.to_string())?;
+    db::set_setting(conn, &key, &json).map_err(|e| e.to_string())
+}
+
+/// 把「全局默认 + 本壁纸覆盖」合成进配置。
+///
+/// 取代原先分散的 apply_global_fit / _render_dpr / _scene_fps 三连调用 ——
+/// 那三个只认全局，加每壁纸覆盖时三处调用点都得改，容易漏一处导致
+/// 「应用时生效、睡眠恢复后又变回全局」这类难查的不一致。
+fn apply_play_config(app: &AppHandle, cfg: &mut WallpaperConfig, item_id: Option<&str>) {
+    let db = app.try_state::<Arc<Mutex<Connection>>>();
+    let Some(state) = db else {
+        cfg.fit = DEFAULT_FIT.into();
+        cfg.render_dpr = DEFAULT_RENDER_DPR;
+        cfg.scene_fps = DEFAULT_SCENE_FPS;
+        return;
+    };
+    let Ok(conn) = state.lock() else {
+        cfg.fit = DEFAULT_FIT.into();
+        cfg.render_dpr = DEFAULT_RENDER_DPR;
+        cfg.scene_fps = DEFAULT_SCENE_FPS;
+        return;
+    };
+    // 先铺全局
+    cfg.fit = global_fit(Some(&conn));
+    cfg.render_dpr = global_render_dpr(Some(&conn));
+    cfg.scene_fps = global_scene_fps(Some(&conn));
+    // 再叠本壁纸覆盖
+    if let Some(id) = item_id {
+        let ov = item_play_config(&conn, id);
+        if let Some(f) = ov.fit.as_deref() {
+            if matches!(f, "cover" | "contain" | "stretch") {
+                cfg.fit = f.to_string();
+            }
+        }
+        if let Some(d) = ov.render_dpr {
+            cfg.render_dpr = d.clamp(RENDER_DPR_MIN, RENDER_DPR_MAX);
+        }
+        if let Some(f) = ov.scene_fps {
+            if matches!(f, 30 | 60 | 120) {
+                cfg.scene_fps = f;
+            }
+        }
+        if let Some(v) = ov.volume {
+            // muted 是 renderer 侧的开关；音量 0 即静音，非 0 则取消静音
+            cfg.muted = v <= 0.0;
+        }
+    }
+}
+
+/// 读某壁纸的播放设置（给前端：同时给出覆盖值与当前全局默认，便于显示「跟随全局」）
+#[tauri::command(rename = "wallpaper_item_play_config")]
+pub fn item_play_config_get(app: AppHandle, item_id: String) -> Result<serde_json::Value, String> {
+    let db = app
+        .try_state::<Arc<Mutex<Connection>>>()
+        .ok_or("DB 未就绪")?;
+    let conn = db.lock().map_err(|e| e.to_string())?;
+    let ov = item_play_config(&conn, &item_id);
+    Ok(serde_json::json!({
+        "override": ov,
+        "globals": {
+            "fit": global_fit(Some(&conn)),
+            "renderDpr": global_render_dpr(Some(&conn)),
+            "sceneFps": global_scene_fps(Some(&conn)),
+        }
+    }))
+}
+
+/// 写某壁纸的播放设置并立即生效（该壁纸正在播放时才重下发）
+#[tauri::command(rename = "wallpaper_item_play_config_set")]
+pub fn item_play_config_set(
+    app: AppHandle,
+    item_id: String,
+    config: ItemPlayConfig,
+) -> Result<(), String> {
+    {
+        let db = app
+            .try_state::<Arc<Mutex<Connection>>>()
+            .ok_or("DB 未就绪")?;
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        set_item_play_config(&conn, &item_id, &config)?;
+    }
+    // 只有这张壁纸正在某个屏幕上播放时才需要即时下发；否则下次应用时自然生效
+    let playing = active_items(app.clone()).unwrap_or_default();
+    if !playing.iter().any(|i| i == &item_id) {
+        return Ok(());
+    }
+    if let Some(f) = config.fit.as_deref() {
+        eval_all(
+            &app,
+            &format!(
+                "window.__wp && window.__wp.setFit({})",
+                serde_json::json!(f)
+            ),
+        );
+    }
+    if let Some(d) = config.render_dpr {
+        let d = d.clamp(RENDER_DPR_MIN, RENDER_DPR_MAX);
+        eval_all(
+            &app,
+            &format!("window.__wp && window.__wp.setRenderDpr({d})"),
+        );
+    }
+    if let Some(f) = config.scene_fps {
+        eval_all(
+            &app,
+            &format!("window.__wp && window.__wp.setSceneFps({f})"),
+        );
+    }
+    if let Some(v) = config.volume {
+        let v = v.clamp(0.0, 1.0);
+        eval_all(&app, &format!("window.__wp && window.__wp.setVolume({v})"));
+    }
+    Ok(())
 }
 
 fn default_muted() -> bool {
@@ -172,6 +317,9 @@ pub struct WallpaperEngineState {
     /// 最近一次会话配置（显示器 ID 变更/新增屏时作为恢复兜底）
     pub default: Mutex<Option<WallpaperConfig>>,
     pub paused: Mutex<bool>,
+    /// 「自动暂停」自己挂上的暂停（区别于用户手动暂停）：回到桌面时只恢复
+    /// 这个标志置位的暂停，用户手动暂停不受前台切换影响
+    pub auto_paused: Mutex<bool>,
 }
 
 impl Default for WallpaperEngineState {
@@ -180,6 +328,7 @@ impl Default for WallpaperEngineState {
             windows: Mutex::new(HashMap::new()),
             default: Mutex::new(None),
             paused: Mutex::new(false),
+            auto_paused: Mutex::new(false),
         }
     }
 }
@@ -205,10 +354,22 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
     if audio_capture::wait_until_ready(app, std::time::Duration::from_secs(6)) {
         tracing::info!("audio capture ready; creating wallpaper windows");
     } else {
-        tracing::info!("audio capture not ready (disabled/failed/slow); relying on shim SSE reconnect");
+        tracing::info!(
+            "audio capture not ready (disabled/failed/slow); relying on shim SSE reconnect"
+        );
     }
     ensure_windows(app);
     start_monitor(app);
+    // 自动暂停（默认关）：监听前台应用切换，切到非桌面暂停、回桌面恢复
+    // （仅 macOS 有前台应用观察者；Linux 后端是空实现，开关暂不生效果详见 linux.rs）
+    #[cfg(target_os = "linux")]
+    platform::store_app_handle(app);
+    platform::start_auto_pause_observer(app);
+    // 交互态下点桌面不一定触发前台切换（壁纸窗无边框不能成为 key），
+    // 补一条「点击落在壁纸窗口 = 回到桌面」的直接恢复信号（仅 macOS 有实现）
+    platform::start_desktop_click_monitor(app);
+    // 指针注入：非交互态（壁纸在图标下方）收不到真实鼠标，靠轮询系统光标补上
+    pointer::start(app, current_interactive(app));
     tracing::info!("wallpaper engine ready");
     Ok(())
 }
@@ -229,12 +390,11 @@ fn restore_sessions(app: &AppHandle) {
             Ok(s) => s,
             Err(_) => return,
         };
-        let rows = match stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-        {
-            Ok(rows) => rows,
-            Err(_) => return,
-        };
+        let rows =
+            match stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))) {
+                Ok(rows) => rows,
+                Err(_) => return,
+            };
         let mut restored: HashMap<String, WallpaperConfig> = HashMap::new();
         let mut most_recent: Option<WallpaperConfig> = None;
         for row in rows.flatten() {
@@ -262,7 +422,7 @@ fn restore_sessions(app: &AppHandle) {
 
 /// 确保每个活动显示器都有壁纸窗口（创建/缩放/回收）
 fn ensure_windows(app: &AppHandle) {
-    ensure_windows_inner(app, macos::display_asleep());
+    ensure_windows_inner(app, platform::display_asleep());
 }
 
 /// `display_asleep` 由调用方传入：monitor 用「CG 报告 && 音频样本停止流动」的
@@ -277,7 +437,7 @@ fn ensure_windows_inner(app: &AppHandle, display_asleep: bool) {
     if display_asleep {
         return;
     }
-    let screens = macos::active_screens();
+    let screens = platform::active_screens();
     // 同理：空列表只说明显示器暂时不可枚举（睡眠/热插拔过渡），绝不能当作
     // 「用户拔掉了全部显示器」去销毁窗口；仅在确认还有显示器时才做增删。
     if screens.is_empty() {
@@ -319,7 +479,7 @@ fn ensure_windows_inner(app: &AppHandle, display_asleep: bool) {
             .unwrap_or_default();
         match app.get_webview_window(label) {
             Some(win) => {
-                macos::set_frame(&win, *x, *y, *w, *h);
+                platform::set_frame(&win, *x, *y, *w, *h);
             }
             None => {
                 if let Err(e) = create_desktop_window(app, label, &cfg, (*x, *y, *w, *h)) {
@@ -372,13 +532,58 @@ fn refresh_src(app: &AppHandle, cfg: &mut WallpaperConfig) {
     if !src.starts_with("http://127.0.0.1:") {
         return;
     }
-    let marker = if cfg.r#type == "web" { "/web/" } else { "/media/" };
+    let marker = if cfg.r#type == "web" {
+        "/web/"
+    } else {
+        "/media/"
+    };
     let Some(idx) = src.find(marker) else { return };
     let after = &src[idx + marker.len()..]; // <token>/<item_id>/<rest...>
-    let Some(rest) = after.splitn(2, '/').nth(1) else { return }; // <item_id>/<rest...>
-    let base = if cfg.r#type == "web" { web_base(app) } else { media_base(app) };
+    let Some(rest) = after.splitn(2, '/').nth(1) else {
+        return;
+    }; // <item_id>/<rest...>
+    let base = if cfg.r#type == "web" {
+        web_base(app)
+    } else {
+        media_base(app)
+    };
     let Some(base) = base else { return };
     cfg.src = Some(format!("{base}/{rest}"));
+}
+
+/// 从配置里反解 item_id，供每壁纸播放设置取覆盖值。
+///
+/// 三处装配点（新建窗口 / 主线程应用 / 强制重载）手上只有 `WallpaperConfig`，
+/// 没有独立的 item_id 参数。而 src 本身就带着它：
+///   scene → src 直接是 item_id
+///   web / 媒体 → `http://127.0.0.1:<port>/<web|media>/<token>/<item_id>/...`
+/// 拿不到（外部 URL、原型面板的相对路径、canvas 演示）时返回 None，
+/// 调用方退化为"只用全局默认"，与加这个特性之前的行为一致。
+fn item_id_of(cfg: &WallpaperConfig) -> Option<String> {
+    let src = cfg.src.as_deref()?;
+    if cfg.r#type == "scene" {
+        // 库形态的 scene src 就是 item_id（纯数字或本地导入的目录名）
+        if !src.contains('/') && !src.is_empty() {
+            return Some(src.to_string());
+        }
+    }
+    if !src.starts_with("http://127.0.0.1:") {
+        return None;
+    }
+    let marker = if cfg.r#type == "web" {
+        "/web/"
+    } else {
+        "/media/"
+    };
+    let idx = src.find(marker)?;
+    let after = &src[idx + marker.len()..]; // <token>/<item_id>/<rest...>
+    let mut it = after.splitn(3, '/');
+    let _token = it.next()?;
+    let id = it.next()?;
+    if id.is_empty() {
+        return None;
+    }
+    Some(id.to_string())
 }
 
 fn create_desktop_window(
@@ -391,10 +596,10 @@ fn create_desktop_window(
     cfg.media_base = media_base(app);
     // 会话恢复来的 src 可能带上次运行的过期 token，用当前基址重写
     refresh_src(app, &mut cfg);
-    apply_global_fit(app, &mut cfg);
-    apply_global_render_dpr(app, &mut cfg);
-    apply_global_scene_fps(app, &mut cfg);
-    let query = config_query(&cfg);
+    // 全局默认 + 本壁纸覆盖（WE 的播放设置是按壁纸记忆的）
+    let item = item_id_of(&cfg);
+    apply_play_config(app, &mut cfg, item.as_deref());
+    let query = config_query_with_audio(&cfg, content_token(app).as_deref());
     // 渲染器页与媒体同源（内容服务器），消除跨源 fetch 限制
     let port: u16 = match app.try_state::<Arc<Mutex<u16>>>() {
         Some(s) => match s.lock() {
@@ -404,10 +609,9 @@ fn create_desktop_window(
         None => 0,
     };
     let url = if port > 0 {
-        let parsed: url::Url =
-            format!("http://127.0.0.1:{port}/renderer/index.html{query}")
-                .parse()
-                .map_err(|e: url::ParseError| format!("无效的渲染器 URL: {e}"))?;
+        let parsed: url::Url = format!("http://127.0.0.1:{port}/renderer/index.html{query}")
+            .parse()
+            .map_err(|e: url::ParseError| format!("无效的渲染器 URL: {e}"))?;
         WebviewUrl::External(parsed)
     } else {
         WebviewUrl::App(format!("renderer/index.html{query}").into())
@@ -427,10 +631,14 @@ fn create_desktop_window(
         .build()
         .map_err(|e| e.to_string())?;
 
-    #[cfg(target_os = "macos")]
-    macos::apply_desktop_window(&window, frame, current_interactive(app));
+    platform::apply_desktop_window(&window, frame, current_interactive(app));
 
     window.show().map_err(|e| e.to_string())?;
+    // 黑屏加固：窗口是 visible(false) 创建的，建窗瞬间 apply 时 occlusionState
+    // 尚无 visible 位（实测 8192），WebKit 可能把页面判为不可见而停帧（黑屏）。
+    // 按既有经验「show 之后重设层级 + orderFrontRegardless」，show 后再 apply
+    // 一次（幂等），此时窗口已可见，遮挡态与合成层级都被矫正。
+    platform::apply_desktop_window(&window, frame, current_interactive(app));
     tracing::info!("wallpaper window {label} created: {cfg:?}");
     Ok(window)
 }
@@ -441,7 +649,7 @@ fn apply_on_main(
     cfg: WallpaperConfig,
     item_id: Option<&str>,
 ) -> Result<(), String> {
-    let screens = macos::active_screens();
+    let screens = platform::active_screens();
     let targets: Vec<(String, (f64, f64, f64, f64))> = screens
         .iter()
         .filter(|s| match &display_id {
@@ -454,28 +662,34 @@ fn apply_on_main(
         return Err("未找到目标显示器".into());
     }
 
-    let state = app.try_state::<WallpaperEngineState>().ok_or("引擎未就绪")?;
-    let db = app.try_state::<Arc<Mutex<rusqlite::Connection>>>().ok_or("DB 未就绪")?;
+    let state = app
+        .try_state::<WallpaperEngineState>()
+        .ok_or("引擎未就绪")?;
+    let db = app
+        .try_state::<Arc<Mutex<rusqlite::Connection>>>()
+        .ok_or("DB 未就绪")?;
 
     for (label, frame) in &targets {
         let window = match app.get_webview_window(label) {
             Some(w) => w,
             None => create_desktop_window(app, label, &cfg, *frame).map_err(|e| e.to_string())?,
         };
-        #[cfg(target_os = "macos")]
-        macos::apply_desktop_window(&window, *frame, current_interactive(app));
+        platform::apply_desktop_window(&window, *frame, current_interactive(app));
 
         let mut cfg2 = cfg.clone();
         cfg2.media_base = media_base(app);
-        apply_global_fit(app, &mut cfg2);
-        apply_global_render_dpr(app, &mut cfg2);
-        apply_global_scene_fps(app, &mut cfg2);
+        let item2 = item_id_of(&cfg2);
+        apply_play_config(app, &mut cfg2, item2.as_deref());
         let js = format!(
             "window.__wp && window.__wp.setWallpaper({})",
             serde_json::to_string(&cfg2).map_err(|e| e.to_string())?
         );
         window.eval(&js).map_err(|e| e.to_string())?;
-        state.windows.lock().unwrap().insert(label.clone(), cfg2.clone());
+        state
+            .windows
+            .lock()
+            .unwrap()
+            .insert(label.clone(), cfg2.clone());
 
         // 会话持久化（item_id 供「已应用」标识 + 未来按条目恢复）
         if let Ok(conn) = db.lock() {
@@ -493,6 +707,11 @@ fn apply_on_main(
             );
         }
     }
+
+    // 系统静态壁纸同步（默认开）：抽首帧/代表帧设为系统桌面壁纸，
+    // 锁屏/引擎未运行时与桌面视觉一致。失败只记日志，不影响应用结果
+    crate::system_wallpaper::sync_after_apply(app, &cfg.r#type, cfg.src.as_deref(), item_id);
+
     Ok(())
 }
 
@@ -509,7 +728,25 @@ fn eval_all(app: &AppHandle, js: &str) {
     }
 }
 
-/// 是否开启「交互壁纸」（壁纸窗口在桌面图标之上并接收鼠标）；默认关闭
+/// 通知所有壁纸窗口切换系统音频源。
+///
+/// 开启时下发内容服务器 token，渲染器订阅 /audio-stream SSE 并把频谱注入库；
+/// 关闭时渲染器回落到库的内置模拟源。**不重挂壁纸** —— 库的音频泵逐帧选源，
+/// setAudio 可在任意时刻生效，重挂会让场景重新下载解析上百 MB 的 pkg。
+pub fn notify_system_audio(app: &AppHandle, enabled: bool) {
+    let token = content_token(app).unwrap_or_default();
+    let js = if enabled && !token.is_empty() {
+        format!(
+            "window.__wp && window.__wp.setSystemAudio(true, {})",
+            serde_json::to_string(&token).unwrap_or_else(|_| "\"\"".into())
+        )
+    } else {
+        "window.__wp && window.__wp.setSystemAudio(false)".to_string()
+    };
+    eval_all(app, &js);
+}
+
+/// 是否开启「隐藏图标」（壁纸窗口在桌面图标之上并接收鼠标）；默认关闭
 fn current_interactive(app: &AppHandle) -> bool {
     let Some(db) = app.try_state::<Arc<Mutex<rusqlite::Connection>>>() else {
         return false;
@@ -587,7 +824,7 @@ fn start_monitor(app: &AppHandle) {
             if ticks % 30 == 0 {
                 tracing::debug!(
                     "wallpaper monitor alive (ticks={ticks}, display_asleep={})",
-                    macos::display_asleep()
+                    platform::display_asleep()
                 );
             }
         }
@@ -615,7 +852,7 @@ fn monitor_tick(
         let app3 = app.clone();
         let (fresh_flag, done_flag) = (fresh.clone(), done.clone());
         let _ = app.run_on_main_thread(move || {
-            let a = macos::display_asleep();
+            let a = platform::display_asleep();
             ensure_windows_inner(&app3, a);
             fresh_flag.store(a, std::sync::atomic::Ordering::Relaxed);
             done_flag.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -673,7 +910,10 @@ fn monitor_tick(
             }
             if *audio_stale_ticks >= 5 {
                 *audio_stale_ticks = 0;
-                if shared.ever_received.load(std::sync::atomic::Ordering::Relaxed) {
+                if shared
+                    .ever_received
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
                     *last_audio_seq = 0;
                     action.restart_audio = true;
                 }
@@ -683,7 +923,10 @@ fn monitor_tick(
             // 拒绝）。若此前曾成功工作过（权限必然已授予），每 ~30s 自动重试，
             // 开盖后自行恢复；从未成功过（无权限等永久性问题）不重试。
             *audio_stale_ticks = 0;
-            if shared.ever_received.load(std::sync::atomic::Ordering::Relaxed) {
+            if shared
+                .ever_received
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 *failed_retry_ticks += 1;
                 if *failed_retry_ticks >= 15 {
                     *failed_retry_ticks = 0;
@@ -728,7 +971,13 @@ fn monitor_tick(
 
 fn has_web_wallpaper(app: &AppHandle) -> bool {
     app.try_state::<WallpaperEngineState>()
-        .map(|st| st.windows.lock().unwrap().values().any(|c| c.r#type == "web"))
+        .map(|st| {
+            st.windows
+                .lock()
+                .unwrap()
+                .values()
+                .any(|c| c.r#type == "web")
+        })
         .unwrap_or(false)
 }
 
@@ -746,10 +995,9 @@ fn spawn_force_reload(app: AppHandle) {
             if let Some(w) = app.get_webview_window(&label) {
                 cfg.media_base = media_base(&app);
                 refresh_src(&app, &mut cfg);
-                apply_global_fit(&app, &mut cfg);
-                apply_global_render_dpr(&app, &mut cfg);
-                apply_global_scene_fps(&app, &mut cfg);
-                let query = config_query(&cfg);
+                let item = item_id_of(&cfg);
+                apply_play_config(&app, &mut cfg, item.as_deref());
+                let query = config_query_with_audio(&cfg, content_token(&app).as_deref());
                 if let Some(port) = app
                     .try_state::<Arc<Mutex<u16>>>()
                     .and_then(|p| p.lock().ok().map(|g| *g))
@@ -770,14 +1018,18 @@ fn url_encode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
     out
 }
 
-fn config_query(cfg: &WallpaperConfig) -> String {
+/// 渲染器 URL 的 query。`audio_token` 非空时渲染器会订阅 /audio-stream SSE，
+/// 把系统音频频谱注入库（scene 与 web 壁纸共用同一份数据）。
+fn config_query_with_audio(cfg: &WallpaperConfig, audio_token: Option<&str>) -> String {
     let mut parts = vec![format!("type={}", url_encode(&cfg.r#type))];
     if let Some(src) = &cfg.src {
         parts.push(format!("src={}", url_encode(src)));
@@ -791,13 +1043,46 @@ fn config_query(cfg: &WallpaperConfig) -> String {
         // 渲染器与 PreviewModal 均读取 `mediaBase`，保持命名一致
         parts.push(format!("mediaBase={}", url_encode(base)));
     }
+    if let Some(tok) = audio_token {
+        parts.push(format!("audioToken={}", url_encode(tok)));
+    }
     format!("?{}", parts.join("&"))
+}
+
+/// 内容服务器 token（渲染器订阅 /audio-stream 需要）
+fn content_token(app: &AppHandle) -> Option<String> {
+    app.try_state::<ContentServerState>()
+        .map(|s| s.token.clone())
+}
+
+/// 显式应用新壁纸后，若当前暂停是「自动暂停」挂的则立即恢复播放。
+///
+/// 用户在设置界面点「应用」是在主动要求「给我看这张壁纸」；自动暂停只是
+/// 切到后台时的临时状态，不该让新壁纸以暂停态挂载（看起来像壁纸坏了）。
+/// 用户手动暂停不受影响（auto_paused=false 时不动）；轮播走 apply_item_inner，
+/// 不触发本逻辑 —— 后台自动切换不该在用户看不见时恢复播放白烧 GPU。
+fn resume_if_auto_paused(app: &AppHandle) {
+    let Some(st) = app.try_state::<WallpaperEngineState>() else {
+        return;
+    };
+    let was_auto = {
+        let mut g = st.auto_paused.lock().unwrap();
+        std::mem::replace(&mut *g, false)
+    };
+    if was_auto {
+        let _ = resume_all(app.clone());
+        tracing::info!("auto-pause: 应用新壁纸，恢复播放");
+    }
 }
 
 // ---------- 命令 ----------
 
 #[tauri::command(rename = "wallpaper_apply")]
-pub fn apply(app: AppHandle, config: WallpaperConfig, display_id: Option<String>) -> Result<(), String> {
+pub fn apply(
+    app: AppHandle,
+    config: WallpaperConfig,
+    display_id: Option<String>,
+) -> Result<(), String> {
     let (tx, rx) = std::sync::mpsc::channel();
     let app2 = app.clone();
     app.run_on_main_thread(move || {
@@ -805,7 +1090,11 @@ pub fn apply(app: AppHandle, config: WallpaperConfig, display_id: Option<String>
         let _ = tx.send(res);
     })
     .map_err(|e| e.to_string())?;
-    rx.recv().map_err(|e| format!("壁纸引擎未响应: {e}"))?
+    let res = rx.recv().map_err(|e| format!("壁纸引擎未响应: {e}"))?;
+    if res.is_ok() {
+        resume_if_auto_paused(&app);
+    }
+    res
 }
 
 #[tauri::command(rename = "wallpaper_stop")]
@@ -833,7 +1122,10 @@ pub fn stop(app: AppHandle, display_id: Option<String>) -> Result<(), String> {
             if let Some(db) = &db {
                 if let Ok(conn) = db.lock() {
                     let key = label.strip_prefix("wallpaper-").unwrap_or(label);
-                    let _ = conn.execute("DELETE FROM wallpaper_sessions WHERE display_id = ?1", [key]);
+                    let _ = conn.execute(
+                        "DELETE FROM wallpaper_sessions WHERE display_id = ?1",
+                        [key],
+                    );
                 }
             }
         }
@@ -855,20 +1147,39 @@ pub fn list_sessions(_app: AppHandle, state: State<'_, WallpaperEngineState>) ->
 /// 且重启后仍能反映「上次应用」的壁纸。
 #[tauri::command(rename = "wallpaper_active_items")]
 pub fn active_items(app: AppHandle) -> Result<Vec<String>, String> {
-    let db = app.try_state::<Arc<Mutex<rusqlite::Connection>>>().ok_or("DB 未就绪")?;
-    let conn = db.lock().map_err(|e| e.to_string())?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT DISTINCT item_id FROM wallpaper_sessions
-             WHERE item_id IS NOT NULL AND item_id != ''",
-        )
-        .map_err(|e| e.to_string())?;
-    let ids = stmt
-        .query_map([], |r| r.get::<_, String>(0))
-        .map_err(|e| e.to_string())?
-        .filter_map(|r| r.ok())
-        .collect::<Vec<_>>();
-    Ok(ids)
+    let db = app
+        .try_state::<Arc<Mutex<rusqlite::Connection>>>()
+        .ok_or("DB 未就绪")?;
+    let ids: Vec<String> = {
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT item_id FROM wallpaper_sessions
+                 WHERE item_id IS NOT NULL AND item_id != ''",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    // 过滤文件已丢失的条目：否则本地库会给一张已被删掉文件的壁纸打「已应用」徽章，
+    // 且应用按钮被永久禁用 —— 用户既看不出问题，也没法重新应用。
+    // 根目录读不到时（数据目录未就绪/权限缺失）不做过滤，避免误判成全部丢失。
+    let root_ok = crate::library::wallpapers_dir(&app)
+        .map(|d| d.is_dir())
+        .unwrap_or(false);
+    if !root_ok {
+        return Ok(ids);
+    }
+    Ok(ids
+        .into_iter()
+        .filter(|id| {
+            crate::library::item_dir(&app, id)
+                .map(|d| crate::library::item_files_exist(&d))
+                .unwrap_or(true)
+        })
+        .collect())
 }
 
 #[tauri::command(rename = "wallpaper_pause_all")]
@@ -891,14 +1202,19 @@ pub fn resume_all(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command(rename = "wallpaper_set_volume")]
 pub fn set_volume(app: AppHandle, volume: f64) -> Result<(), String> {
-    eval_all(&app, &format!("window.__wp && window.__wp.setVolume({volume})"));
+    eval_all(
+        &app,
+        &format!("window.__wp && window.__wp.setVolume({volume})"),
+    );
     Ok(())
 }
 
 #[tauri::command(rename = "wallpaper_set_fit")]
 pub fn set_fit(app: AppHandle, fit: String) -> Result<(), String> {
     if !matches!(fit.as_str(), "cover" | "contain" | "stretch") {
-        return Err(format!("未知的显示模式: {fit}（可选 cover/contain/stretch）"));
+        return Err(format!(
+            "未知的显示模式: {fit}（可选 cover/contain/stretch）"
+        ));
     }
     // 持久化为全局显示模式（下次应用/恢复壁纸时统一生效）
     if let Some(db) = app.try_state::<Arc<Mutex<Connection>>>() {
@@ -914,13 +1230,37 @@ pub fn set_fit(app: AppHandle, fit: String) -> Result<(), String> {
 /// 设置全局渲染分辨率上限（有效 dpr 封顶），持久化并对所有壁纸窗口实时生效。
 #[tauri::command(rename = "wallpaper_set_render_dpr")]
 pub fn set_render_dpr(app: AppHandle, dpr: f32) -> Result<(), String> {
-    let dpr = dpr.clamp(0.5, 2.0);
+    let dpr = dpr.clamp(RENDER_DPR_MIN, RENDER_DPR_MAX);
     if let Some(db) = app.try_state::<Arc<Mutex<Connection>>>() {
         if let Ok(conn) = db.lock() {
             let _ = db::set_setting(&conn, "wallpaper_render_dpr", &format!("{dpr}"));
         }
     }
-    eval_all(&app, &format!("window.__wp && window.__wp.setRenderDpr({dpr})"));
+    tracing::info!("render dpr set: {dpr}");
+    eval_all(
+        &app,
+        &format!("window.__wp && window.__wp.setRenderDpr({dpr})"),
+    );
+    Ok(())
+}
+
+/// 设置全局语言（壁纸 `language` 属性的默认值）。
+///
+/// 与清晰度/帧率不同，语言是**挂载时**经 properties 注入的（见
+/// we_props::effective_props 与内容服务器 /props 端点），改完不实时下发，
+/// 当前正在播放的壁纸要等下次应用才生效 —— 语言决定壁纸脚本分支，中途热切
+/// 比重新挂载更容易出错。UI 侧应提示「重新应用壁纸后生效」。
+#[tauri::command(rename = "wallpaper_set_language")]
+pub fn set_language(app: AppHandle, language: String) -> Result<(), String> {
+    if !crate::we_props::LANGUAGE_CHOICES.contains(&language.as_str()) {
+        return Err(format!("不支持的语言: {language}"));
+    }
+    if let Some(db) = app.try_state::<Arc<Mutex<Connection>>>() {
+        if let Ok(conn) = db.lock() {
+            let _ = db::set_setting(&conn, crate::we_props::LANGUAGE_SETTING_KEY, &language);
+        }
+    }
+    tracing::info!("language set: {language}");
     Ok(())
 }
 
@@ -935,14 +1275,19 @@ pub fn set_scene_fps(app: AppHandle, fps: u32) -> Result<(), String> {
             let _ = db::set_setting(&conn, "wallpaper_scene_fps", &fps.to_string());
         }
     }
-    eval_all(&app, &format!("window.__wp && window.__wp.setSceneFps({fps})"));
+    eval_all(
+        &app,
+        &format!("window.__wp && window.__wp.setSceneFps({fps})"),
+    );
     Ok(())
 }
 
-/// 设置「交互壁纸」开关（壁纸窗口在桌面图标之上，可接收鼠标/互动）。默认关闭。
+/// 设置「隐藏图标」开关（桌面图标之下/壁纸上方 = 默认；开启后壁纸窗口在桌面图标之上，可接收鼠标/互动）。默认关闭。
 #[tauri::command(rename = "wallpaper_interactive_set")]
 pub fn interactive_set(app: AppHandle, enabled: bool) -> Result<(), String> {
-    let db = app.try_state::<Arc<Mutex<rusqlite::Connection>>>().ok_or("DB 未就绪")?;
+    let db = app
+        .try_state::<Arc<Mutex<rusqlite::Connection>>>()
+        .ok_or("DB 未就绪")?;
     {
         let conn = db.lock().map_err(|e| e.to_string())?;
         db::set_setting(
@@ -954,14 +1299,16 @@ pub fn interactive_set(app: AppHandle, enabled: bool) -> Result<(), String> {
     // 重新应用所有壁纸窗口的层级/鼠标行为（改设置即生效）
     let (tx, rx) = std::sync::mpsc::channel();
     let app2 = app.clone();
+    let interactive = current_interactive(&app);
+    pointer::set_interactive(interactive);
     app.run_on_main_thread(move || {
         let res = (|| -> Result<(), String> {
             let interactive = current_interactive(&app2);
-            let screens = macos::active_screens();
+            let screens = platform::active_screens();
             for s in &screens {
                 let label = format!("wallpaper-{}", s.id);
                 if let Some(w) = app2.get_webview_window(&label) {
-                    macos::apply_desktop_window(&w, (s.x, s.y, s.w, s.h), interactive);
+                    platform::apply_desktop_window(&w, (s.x, s.y, s.w, s.h), interactive);
                 }
             }
             Ok(())
@@ -1030,7 +1377,9 @@ pub(crate) fn find_first_html(dir: &std::path::Path) -> Option<String> {
 
 /// 解析本地库壁纸文件 → 渲染器配置（src 指向内容服务器媒体 URL）
 fn resolve_item_config(app: &AppHandle, item_id: &str) -> Result<WallpaperConfig, String> {
-    let db = app.try_state::<Arc<Mutex<rusqlite::Connection>>>().ok_or("DB 未就绪")?;
+    let db = app
+        .try_state::<Arc<Mutex<rusqlite::Connection>>>()
+        .ok_or("DB 未就绪")?;
     let (wtype,) = {
         let conn = db.lock().map_err(|e| e.to_string())?;
         conn.query_row(
@@ -1046,6 +1395,13 @@ fn resolve_item_config(app: &AppHandle, item_id: &str) -> Result<WallpaperConfig
         .map_err(|e| e.to_string())?
         .join("wallpapers")
         .join(item_id);
+    // 文件被手工删除时，下面各类型分支只会报「未找到视频文件」「不支持的壁纸类型」
+    // 之类的错，掩盖真实原因。这里先给准确诊断。
+    if !crate::library::item_files_exist(&dir) {
+        return Err(
+            "壁纸文件已丢失（可能被手动删除）。请在本地库点「清理失效条目」后重新下载".into(),
+        );
+    }
     let media = media_base(app).ok_or("内容服务器未就绪")?;
 
     let find_first = |exts: &[&str]| -> Option<String> {
@@ -1062,8 +1418,7 @@ fn resolve_item_config(app: &AppHandle, item_id: &str) -> Result<WallpaperConfig
 
     let mut cfg = match wtype.as_str() {
         "video" => {
-            let src = find_first(&[".mp4", ".webm", ".mov"])
-                .ok_or("未找到视频文件")?;
+            let src = find_first(&[".mp4", ".webm", ".mov"]).ok_or("未找到视频文件")?;
             WallpaperConfig {
                 r#type: "video".into(),
                 src: Some(src),
@@ -1105,21 +1460,36 @@ fn resolve_item_config(app: &AppHandle, item_id: &str) -> Result<WallpaperConfig
             }
         }
         "scene" => {
-            let has_pkg = dir.join("scenes/scene.pkg").is_file()
-                || dir.join("scene.pkg").is_file();
+            let has_pkg = dir.join("scenes/scene.pkg").is_file() || dir.join("scene.pkg").is_file();
             if !has_pkg {
-                // 有依赖声明但本地缺 scene.pkg：提示重新下载（会自动拉取依赖）
-                let dep = std::fs::read_to_string(dir.join("project.json"))
-                    .ok()
-                    .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-                    .and_then(|v| v.get("dependency").and_then(|d| d.as_str()).map(|s| s.to_string()))
-                    .filter(|d| !d.is_empty());
-                if let Some(dep_id) = dep {
-                    return Err(format!(
-                        "未找到 scene.pkg（该壁纸依赖工坊物品 {dep_id}）。请到「下载」页删除并重新下载本壁纸，会自动拉取依赖。"
-                    ));
+                // 缺 scene.pkg：先用本地已有的依赖内容补齐；仍缺的自动加入下载队列
+                let dep_ids = crate::download::read_project_json(&dir.join("project.json"))
+                    .map(|v| crate::download::parse_dependency_ids(&v, item_id))
+                    .unwrap_or_default();
+                if dep_ids.is_empty() {
+                    return Err("未找到 scene.pkg".into());
                 }
-                return Err("未找到 scene.pkg".into());
+                let Some(svc) = app.try_state::<Arc<crate::download::DownloadService>>() else {
+                    return Err(format!(
+                        "未找到 scene.pkg（该壁纸依赖工坊内容 {}）",
+                        dep_ids.join("、")
+                    ));
+                };
+                let missing = svc.settle_dependencies(&dir, &dep_ids);
+                if !missing.is_empty() {
+                    let queued = svc.enqueue_dependency_tasks(&missing, std::slice::from_ref(&dir));
+                    if !queued.is_empty() {
+                        return Err(format!(
+                            "该壁纸依赖工坊内容 {}，已自动加入下载队列，下载完成后重新应用即可",
+                            queued.join("、")
+                        ));
+                    }
+                }
+                let has_pkg =
+                    dir.join("scenes/scene.pkg").is_file() || dir.join("scene.pkg").is_file();
+                if !has_pkg {
+                    return Err("未找到 scene.pkg（依赖内容已合并但仍缺入口文件）".into());
+                }
             }
             WallpaperConfig {
                 r#type: "scene".into(),
@@ -1144,18 +1514,29 @@ fn resolve_item_config(app: &AppHandle, item_id: &str) -> Result<WallpaperConfig
     Ok(cfg)
 }
 
-/// 把本地库条目应用到桌面（解析文件 → 全部显示器）
-#[tauri::command(rename = "wallpaper_apply_item")]
-pub fn apply_item(app: AppHandle, item_id: String) -> Result<(), String> {
-    let cfg = resolve_item_config(&app, &item_id)?;
+/// 把本地库条目应用到桌面（解析文件 → 全部显示器）。
+/// 内部共用实现：不触碰播放/暂停状态（轮播在后台切换时必须保持自动暂停）。
+fn apply_item_inner(app: &AppHandle, item_id: &str) -> Result<(), String> {
+    let cfg = resolve_item_config(app, item_id)?;
     let (tx, rx) = std::sync::mpsc::channel();
     let app2 = app.clone();
+    let item_id = item_id.to_string();
     app.run_on_main_thread(move || {
         let res = apply_on_main(&app2, None, cfg, Some(&item_id));
         let _ = tx.send(res);
     })
     .map_err(|e| e.to_string())?;
     rx.recv().map_err(|e| format!("壁纸引擎未响应: {e}"))?
+}
+
+/// 把本地库条目应用到桌面（用户显式点击；自动暂停态下立即恢复播放）
+#[tauri::command(rename = "wallpaper_apply_item")]
+pub fn apply_item(app: AppHandle, item_id: String) -> Result<(), String> {
+    let res = apply_item_inner(&app, &item_id);
+    if res.is_ok() {
+        resume_if_auto_paused(&app);
+    }
+    res
 }
 
 /// 本地库条目预览信息（复用配置解析；前端按类型渲染弹框）
@@ -1182,8 +1563,7 @@ fn list_playlists(conn: &Connection) -> Result<Vec<Playlist>, String> {
     let rows = stmt
         .query_map([], |r| {
             let raw: String = r.get(2)?;
-            let item_ids: Vec<String> =
-                serde_json::from_str(&raw).unwrap_or_default();
+            let item_ids: Vec<String> = serde_json::from_str(&raw).unwrap_or_default();
             Ok(Playlist {
                 id: r.get(0)?,
                 name: r.get(1)?,
@@ -1192,7 +1572,8 @@ fn list_playlists(conn: &Connection) -> Result<Vec<Playlist>, String> {
             })
         })
         .map_err(|e| e.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1213,7 +1594,11 @@ pub fn playlist_create(
     let conn = db.lock().map_err(|e| e.to_string())?;
     conn.execute(
         "INSERT INTO playlists(name, item_ids, interval_sec) VALUES (?1, ?2, ?3)",
-        rusqlite::params![name, serde_json::to_string(&item_ids).unwrap_or_default(), interval_sec.max(30)],
+        rusqlite::params![
+            name,
+            serde_json::to_string(&item_ids).unwrap_or_default(),
+            interval_sec.max(30)
+        ],
     )
     .map_err(|e| e.to_string())?;
     Ok(conn.last_insert_rowid())
@@ -1235,21 +1620,32 @@ pub fn playlist_apply(app: AppHandle, id: i64) -> Result<serde_json::Value, Stri
     let playlist = {
         let conn = db.lock().map_err(|e| e.to_string())?;
         let all = list_playlists(&conn)?;
-        all.into_iter().find(|p| p.id == id).ok_or("播放列表不存在")?
+        all.into_iter()
+            .find(|p| p.id == id)
+            .ok_or("播放列表不存在")?
     };
     if playlist.item_ids.is_empty() {
         return Err("播放列表为空".into());
     }
     {
         let conn = db.lock().map_err(|e| e.to_string())?;
-        db::set_setting(&conn, "active_playlist", &serde_json::to_string(&playlist).unwrap_or_default())?;
+        db::set_setting(
+            &conn,
+            "active_playlist",
+            &serde_json::to_string(&playlist).unwrap_or_default(),
+        )?;
         db::set_setting(&conn, "playlist_index", "0")?;
     }
     // 应用第一项
     if let Some(first) = playlist.item_ids.first() {
         apply_item(app.clone(), first.clone())?;
     }
-    tracing::info!("playlist {} activated ({} items, {}s)", playlist.name, playlist.item_ids.len(), playlist.interval_sec);
+    tracing::info!(
+        "playlist {} activated ({} items, {}s)",
+        playlist.name,
+        playlist.item_ids.len(),
+        playlist.interval_sec
+    );
     Ok(serde_json::to_value(&playlist).unwrap_or_default())
 }
 
@@ -1276,7 +1672,7 @@ pub fn next(app: AppHandle) -> Result<serde_json::Value, String> {
         let conn = db.lock().map_err(|e| e.to_string())?;
         db::set_setting(&conn, "playlist_index", &next_idx.to_string())?;
     }
-    apply_item(app.clone(), item.clone())?;
+    apply_item_inner(&app, &item)?;
     Ok(serde_json::json!({ "itemId": item, "index": next_idx }))
 }
 
@@ -1315,6 +1711,98 @@ pub fn start_playlist_rotation(app: &AppHandle) {
 mod tests {
     use super::*;
 
+    fn play_cfg_db() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        c
+    }
+
+    /// 每壁纸播放设置的三态语义：缺失=跟随全局、有值=专属、全空=删键。
+    ///
+    /// 三态是这个特性的核心，也最容易写错成两态（"等于默认值就算跟随"）——
+    /// 那样用户特意设成与全局相同的值，会在全局改动后被意外带走。
+    #[test]
+    fn item_play_config_three_state_roundtrip() {
+        let c = play_cfg_db();
+        // 无记录 → 全部跟随全局
+        let empty = item_play_config(&c, "123");
+        assert!(empty.fit.is_none() && empty.render_dpr.is_none());
+        assert!(empty.scene_fps.is_none() && empty.volume.is_none());
+
+        // 只覆盖一项，其余仍跟随
+        let mut v = ItemPlayConfig::default();
+        v.render_dpr = Some(2.0);
+        set_item_play_config(&c, "123", &v).unwrap();
+        let got = item_play_config(&c, "123");
+        assert_eq!(got.render_dpr, Some(2.0));
+        assert!(got.fit.is_none(), "未设置的项必须保持 None（跟随全局）");
+
+        // 覆盖值与全局默认相同也算"专属"：不能因为值一样就当没设
+        let mut same = ItemPlayConfig::default();
+        same.scene_fps = Some(DEFAULT_SCENE_FPS);
+        set_item_play_config(&c, "456", &same).unwrap();
+        assert_eq!(
+            item_play_config(&c, "456").scene_fps,
+            Some(DEFAULT_SCENE_FPS)
+        );
+
+        // 全字段 None → 删键（而不是留一个空 JSON）
+        set_item_play_config(&c, "123", &ItemPlayConfig::default()).unwrap();
+        let left: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM settings WHERE key = 'play_cfg:123'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            left, 0,
+            "回到全跟随时应删键，避免与'从未设置'在库里长得不一样"
+        );
+
+        // 壁纸之间互不影响
+        assert_eq!(
+            item_play_config(&c, "456").scene_fps,
+            Some(DEFAULT_SCENE_FPS)
+        );
+    }
+
+    /// item_id 反解：三种 src 形态 + 拿不到时返回 None（退化为只用全局）
+    #[test]
+    fn item_id_of_parses_all_src_shapes() {
+        let mk = |t: &str, src: Option<&str>| WallpaperConfig {
+            r#type: t.into(),
+            src: src.map(|s| s.into()),
+            ..Default::default()
+        };
+        // scene：src 就是 item_id
+        assert_eq!(
+            item_id_of(&mk("scene", Some("3781035191"))).as_deref(),
+            Some("3781035191")
+        );
+        // web / 媒体：从 /web/<token>/<item>/... 里取第二段
+        assert_eq!(
+            item_id_of(&mk(
+                "web",
+                Some("http://127.0.0.1:1/web/tok/3406740580/index.html")
+            ))
+            .as_deref(),
+            Some("3406740580")
+        );
+        assert_eq!(
+            item_id_of(&mk("video", Some("http://127.0.0.1:1/media/tok/999/a.mp4"))).as_deref(),
+            Some("999")
+        );
+        // 拿不到：外部 URL / 无 src / 相对路径
+        assert_eq!(
+            item_id_of(&mk("web", Some("https://example.com/x.html"))),
+            None
+        );
+        assert_eq!(item_id_of(&mk("web", None)), None);
+        assert_eq!(item_id_of(&mk("canvas", Some("/test-media/x"))), None);
+    }
+
     fn fixture(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("wpem-entry-test-{tag}"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1334,16 +1822,28 @@ mod tests {
         let d = fixture("backslash");
         std::fs::create_dir_all(d.join("pages")).unwrap();
         std::fs::write(d.join("pages/a.html"), "x").unwrap();
-        std::fs::write(d.join("project.json"), r#"{"type":"web","file":"pages\\a.html"}"#).unwrap();
+        std::fs::write(
+            d.join("project.json"),
+            r#"{"type":"web","file":"pages\\a.html"}"#,
+        )
+        .unwrap();
         assert_eq!(project_json_entry(&d).as_deref(), Some("pages/a.html"));
 
         // 声明的文件不存在 → None（交给后续常规探测）
         let d = fixture("missing");
-        std::fs::write(d.join("project.json"), r#"{"type":"web","file":"nope.html"}"#).unwrap();
+        std::fs::write(
+            d.join("project.json"),
+            r#"{"type":"web","file":"nope.html"}"#,
+        )
+        .unwrap();
         assert_eq!(project_json_entry(&d), None);
 
         // 路径穿越与绝对路径一律拒绝
-        for bad in [r#"{"file":"../../etc/passwd"}"#, r#"{"file":"/etc/passwd"}"#, r#"{"file":""}"#] {
+        for bad in [
+            r#"{"file":"../../etc/passwd"}"#,
+            r#"{"file":"/etc/passwd"}"#,
+            r#"{"file":""}"#,
+        ] {
             let d = fixture("unsafe");
             std::fs::write(d.join("project.json"), bad).unwrap();
             assert_eq!(project_json_entry(&d), None, "应拒绝: {bad}");

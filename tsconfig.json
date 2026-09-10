@@ -4,7 +4,12 @@
     "useDefineForClassFields": true,
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "module": "ESNext",
-    "skipLibCheck": true,
+    // 刻意关闭：webwallgl@1.1.0 的 webwallgl.d.ts 曾把类型写成
+    // `export { type X } from "./types"`（只转发、不引入本文件作用域），
+    // 函数签名引用到未定义标识符。开着 skipLibCheck 时这 7 个 TS2304 被吞掉，
+    // 后果是库的所有导出静默退化成 any —— 看起来能用，实则零类型检查。
+    // 上游已修复（1.3.5 起随包发布正确的 d.ts），这里保持关闭以便下次立即暴露。
+    "skipLibCheck": false,
     "moduleResolution": "bundler",
     "allowJs": true,
     "resolveJsonModule": true,

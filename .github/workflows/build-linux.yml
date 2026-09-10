@@ -1,0 +1,108 @@
+name: 打包 Linux（deb + AppImage）
+
+# 推送形如 v0.1.0 的标签时触发（tag 号需与 src-tauri/tauri.conf.json 的 version 一致）。
+on:
+  push:
+    tags:
+      - 'v*'
+  # 也可以在 Actions 页面手动触发
+  workflow_dispatch: {}
+
+# 需要读取仓库 + 写 release 附件
+permissions:
+  contents: write
+
+concurrency:
+  group: build-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-linux:
+    # ubuntu-22.04：glibc 基线更老，打出来的 deb/AppImage 兼容更多发行版
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # webwallgl 是自维护渲染库（package.json 里 file:../webwallgl-github/dist/lib），
+      # 需先拉到仓库平级目录并构建出 dist/lib，否则 pnpm install 解析不到
+      - name: 检出 webwallgl
+        uses: actions/checkout@v4
+        with:
+          repository: oneincase/webwallgl
+          path: webwallgl-github-src
+
+      # actions/checkout 不允许直接检出到 workspace 外，先落到子目录再移到平级
+      - name: 移动到仓库平级目录
+        run: mv webwallgl-github-src ../webwallgl-github
+
+      - name: 安装 Tauri Linux 依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl wget file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libdbus-1-dev \
+            patchelf
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+          components: clippy,rustfmt
+
+      - name: Rust 构建缓存
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: 构建 webwallgl 库产物（dist/lib）
+        working-directory: ../webwallgl-github
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build:lib
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 构建 Tauri（.deb + .AppImage）
+        # beforeBuildCommand 会先跑 pnpm --filter @we/desktop build 生成前端 dist/，
+        # 再编译 Rust release 并打包 deb/appimage（targets 在 tauri.conf.json）。
+        run: pnpm tauri build
+
+      - name: 上传构建产物（artifact）
+        uses: actions/upload-artifact@v4
+        with:
+          name: WallpaperEM-linux-${{ github.ref_name }}
+          path: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+
+      - name: 把安装包附加到对应 tag 的 Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          files: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/appimage/*.AppImage
+          draft: false
+          prerelease: false

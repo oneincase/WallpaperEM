@@ -2,6 +2,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, TYPE_LABELS, type FavoriteItem } from "../api/steam";
 import { WallpaperCard, TypeChip } from "../components/WallpaperCard";
+import { EmptyState } from "../components/EmptyState";
 
 export function FavoritesPage({ onOpenDetail }: { onOpenDetail: (id: string) => void }) {
   const [items, setItems] = useState<FavoriteItem[]>([]);
@@ -31,8 +32,12 @@ export function FavoritesPage({ onOpenDetail }: { onOpenDetail: (id: string) => 
 
       {loading && <div className="shrink-0 text-[13px] text-[var(--text-2)] mb-4">加载中…</div>}
       {!loading && items.length === 0 && (
-        <div className="shrink-0 card p-12 text-center text-[13px] text-[var(--text-2)] mb-4">
-          暂无收藏 —— 在壁纸详情页点击「收藏」
+        <div className="shrink-0 card mb-4">
+          <EmptyState
+            art="favorite"
+            title="还没有收藏"
+            hint="在壁纸详情页点击「收藏」，喜欢的壁纸会集中到这里"
+          />
         </div>
       )}
 

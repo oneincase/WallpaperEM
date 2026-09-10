@@ -1,0 +1,43 @@
+# WallpaperEM Linux 本地打包/测试环境（Ubuntu 24.04 + Node 22 + Rust stable）
+#
+# 用法（推荐走 scripts/build-linux-docker.sh）：
+#   docker build --platform linux/arm64 -f Dockerfile.linux -t wpem-linux-build .
+#
+# 说明：
+# - Ubuntu 24.04 自带 libwebkit2gtk-4.1-dev（Tauri 2.x 需要）
+# - Node 用官方 tarball（nodesource 之外的零依赖方案），按构建架构自动选 arm64/x64
+# - 预装 xvfb + dbus-x11 + mesa，供容器内无头冒烟测试（能真实创建窗口/起内容服务器）
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential pkg-config curl wget file xz-utils ca-certificates \
+    # Tauri 系统依赖
+    libwebkit2gtk-4.1-dev libssl-dev libayatana-appindicator3-dev xdg-utils \
+    libwayland-dev \
+    librsvg2-dev libxdo-dev libdbus-1-dev patchelf \
+    # 视频壁纸编解码（WebKitGTK/GStreamer）
+    gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav \
+    # 无头冒烟测试
+    xvfb dbus-x11 libgl1-mesa-dri libegl-mesa0 libgles2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node 22 LTS（pnpm 11 需要 >= 22.13）
+ARG TARGETARCH
+RUN case "$TARGETARCH" in \
+      amd64) NODE_ARCH=x64 ;; \
+      arm64) NODE_ARCH=arm64 ;; \
+      *) echo "unsupported TARGETARCH=$TARGETARCH" && exit 1 ;; \
+    esac \
+    && curl -fsSL "https://nodejs.org/dist/v22.14.0/node-v22.14.0-linux-${NODE_ARCH}.tar.xz" \
+       | tar -xJ -C /usr/local --strip-components=1 \
+    && corepack enable && corepack prepare pnpm@11 --activate
+
+# Rust stable（minimal profile，够用且快）
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --profile minimal --default-toolchain stable
+ENV PATH=/root/.cargo/bin:$PATH
+
+WORKDIR /build
+CMD ["bash", "/src/app/scripts/linux-docker-entrypoint.sh"]

@@ -20,11 +20,13 @@ import {
   IconAuto,
 } from "./components/icons";
 import { applySidebarAlpha, getSidebarAlpha } from "./lib/sidebar";
+import { readState, writeState } from "./lib/cache-snapshots";
 
 type PageId = "home" | "workshop" | "downloads" | "library" | "favorites" | "settings";
 type Theme = "system" | "light" | "dark";
 
 const THEME_STORAGE_KEY = "we.theme";
+const PAGE_STORAGE_KEY = "nav.page";
 
 const NAV: { id: PageId; label: string; icon: ReactNode; group: string }[] = [
   { id: "home", label: "发现", icon: <IconHome />, group: "浏览" },
@@ -55,12 +57,23 @@ function readInitialTheme(): Theme {
   return "system";
 }
 
+/**
+ * 恢复上次所在页面。窗口被释放后重建是全新 JS 上下文，不持久化就必然落回
+ * 发现页 —— 而发现页恰好是最慢的链路（workshop_random 三次串行网络请求）。
+ * 「设置」刻意不恢复：那是一次性操作页，下次进来想看的多半是内容。
+ */
+function readInitialPage(): PageId {
+  const p = readState<string>(PAGE_STORAGE_KEY, "home");
+  const valid: PageId[] = ["home", "workshop", "downloads", "library", "favorites"];
+  return (valid as string[]).includes(p) ? (p as PageId) : "home";
+}
+
 export default function App() {
   return <Shell />;
 }
 
 function Shell() {
-  const [page, setPage] = useState<PageId>("home");
+  const [page, setPage] = useState<PageId>(readInitialPage);
   // 详情抽屉：detailId 非 null 时抽屉挂载；shown 控制滑入/滑出（关闭时先滑出、
   // 动画结束再卸载，保证「向右滑动隐藏」可见）
   const [detailId, setDetailId] = useState<string | null>(null);
@@ -124,6 +137,7 @@ function Shell() {
     setDetailId(null);
     setDetailShown(false);
     setPage(p);
+    writeState(PAGE_STORAGE_KEY, p);
   };
 
   // 打开详情抽屉：从右侧滑入（面板先以滑出位挂载，下一帧再过渡到滑入位）
@@ -175,7 +189,9 @@ function Shell() {
     });
   };
 
-  const width = collapsed ? "w-[52px]" : "w-60";
+  // 收缩态宽度对齐 macOS 红绿灯按钮组（三个按钮 + 左右留白约 78px）。
+  // 窄于此值时红绿灯会越过侧边栏边界压到内容区上，看起来像浮在网格里。
+  const width = collapsed ? "w-[78px]" : "w-60";
 
   return (
     <div className="flex h-full">
@@ -198,10 +214,10 @@ function Shell() {
               onClick={toggleCollapsed}
               title="展开侧边栏"
               aria-label="展开侧边栏"
-              className="group relative flex h-6 w-6 items-center justify-center rounded-[7px] overflow-hidden text-[var(--text-2)] transition-colors hover:bg-black/5 hover:text-[var(--text-1)] dark:hover:bg-white/8"
+              className="group relative flex h-8 w-8 items-center justify-center rounded-[8px] overflow-hidden text-[var(--text-2)] transition-colors hover:bg-black/5 hover:text-[var(--text-1)] dark:hover:bg-white/8"
             >
               <img
-                src="/icon/icon_32x32.png"
+                src="/icon/icon_32x32@2x.png"
                 alt=""
                 className="h-full w-full object-contain transition-opacity group-hover:opacity-0"
               />
@@ -211,8 +227,8 @@ function Shell() {
             </button>
           ) : (
             <>
-              <div className="h-6 w-6 shrink-0 rounded-[7px] overflow-hidden shadow-sm">
-                <img src="/icon/icon_32x32.png" alt="" className="h-full w-full object-contain" />
+              <div className="h-8 w-8 shrink-0 rounded-[8px] overflow-hidden shadow-sm">
+                <img src="/icon/icon_32x32@2x.png" alt="" className="h-full w-full object-contain" />
               </div>
               <span className="text-[13.5px] font-semibold tracking-tight">WallpaperEM</span>
               <button

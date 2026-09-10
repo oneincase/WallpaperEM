@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use rusqlite::Connection;
 use serde_json::json;
 use tauri::{AppHandle, Manager};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::util::random_hex;
 
@@ -27,9 +27,14 @@ pub struct ContentServerState {
     pub renderer_dir: PathBuf,
     /// 系统音频捕获共享帧（二期：/audio-stream SSE 端点 + shim 引导标记）
     pub audio: Arc<crate::audio_capture::AudioShared>,
+    /// 系统「正在播放」共享快照（/now-playing SSE 端点）
+    pub media: Arc<crate::now_playing::MediaShared>,
     /// 当前存活的 /audio-stream SSE 客户端数（壁纸页存活信号：新 shim 下每个
     /// web 壁纸页加载后必然持有 1 条连接；睡眠唤醒后若为 0 说明页面已僵死）
     pub sse_clients: Arc<std::sync::atomic::AtomicUsize>,
+    /// 渲染器「ready」信号时间戳（epoch millis）：壁纸挂载成功后经 /diag 回流。
+    /// system_wallpaper 的场景/网页截图等它，避免截到未渲染完成的黑屏
+    pub wallpaper_ready_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ContentServerState {
@@ -68,7 +73,9 @@ pub fn init(app: &AppHandle) -> Result<(), String> {
             .map(|r| r.join("renderer"))
             .unwrap_or_default(),
         audio,
+        media: crate::now_playing::shared(),
         sse_clients: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        wallpaper_ready_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
     app.manage(state.clone());
 
@@ -85,7 +92,10 @@ pub fn init(app: &AppHandle) -> Result<(), String> {
         if let Some(st) = app2.try_state::<Arc<Mutex<u16>>>() {
             *st.lock().unwrap() = port;
         }
-        tracing::info!("content server listening on 127.0.0.1:{port} (token={})", state.token);
+        tracing::info!(
+            "content server listening on 127.0.0.1:{port} (token={})",
+            state.token
+        );
 
         loop {
             let Ok((mut stream, _)) = listener.accept().await else {
@@ -94,7 +104,13 @@ pub fn init(app: &AppHandle) -> Result<(), String> {
             let state = state.clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = handle_conn(&mut stream, &state).await {
-                    tracing::debug!("content server conn error: {e}");
+                    // 视频/WebCodecs 拉流时中止 Range 请求是常态（缓冲够了就取消），
+                    // Broken pipe / Connection reset 不算异常，不刷日志
+                    if e.contains("Broken pipe") || e.contains("Connection reset") {
+                        tracing::trace!("content server conn closed: {e}");
+                    } else {
+                        tracing::debug!("content server conn error: {e}");
+                    }
                 }
             });
         }
@@ -107,13 +123,20 @@ pub fn init(app: &AppHandle) -> Result<(), String> {
 async fn proxy_renderer(
     stream: &mut tokio::net::TcpStream,
     path: &str,
+    query: &str,
     state: &ContentServerState,
 ) -> Result<(), String> {
     #[cfg(debug_assertions)]
     {
         // dev：代理到 vite dev server（与 tauri.conf devUrl 一致）
         let vite_path = path.trim_start_matches('/');
-        let upstream = format!("http://localhost:1420/{vite_path}");
+        // query 必须原样带上：vite 预打包依赖靠 `?v=<hash>` 区分版本，
+        // 丢掉它会拿到 404 或过期产物
+        let upstream = if query.is_empty() {
+            format!("http://localhost:1420/{vite_path}")
+        } else {
+            format!("http://localhost:1420/{vite_path}?{query}")
+        };
         // 本地 vite 直连，绝不走系统代理（否则 dev 下渲染器页/媒体加载失败）
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -148,7 +171,9 @@ async fn proxy_renderer(
     #[cfg(not(debug_assertions))]
     {
         // prod：服务打包进资源目录的 dist/renderer
-        let res = state.renderer_dir.join(path.trim_start_matches("/renderer/"));
+        let res = state
+            .renderer_dir
+            .join(path.trim_start_matches("/renderer/"));
         let file = if res.is_dir() {
             res.join("index.html")
         } else {
@@ -377,7 +402,17 @@ async fn handle_conn(
 
     // 渲染器页：与媒体同源（免 CORS）。dev → 代理 vite；prod → 资源目录
     if path.starts_with("/renderer") {
-        return proxy_renderer(stream, path, state).await;
+        return proxy_renderer(stream, path, query, state).await;
+    }
+
+    // dev：渲染器改用 npm 依赖（webwallgl）后，vite 把裸模块重写成
+    // `/node_modules/.vite/deps/xxx.js?v=<hash>` 绝对路径。这类请求不在
+    // /renderer 前缀下，必须单独放行，否则渲染页一进来就 404、整个模块不执行
+    // （症状：壁纸窗口全黑，且连 /diag 诊断都发不出来）。
+    // prod 由 vite 打包进 /assets，不会出现该路径。
+    #[cfg(debug_assertions)]
+    if path.starts_with("/node_modules") || path.starts_with("/@vite") || path.starts_with("/@id") {
+        return proxy_renderer(stream, path, query, state).await;
     }
 
     // 默认壁纸页（无壁纸时的默认 HTML 壁纸）
@@ -399,8 +434,43 @@ async fn handle_conn(
             .strip_prefix("msg=")
             .map(|m| percent_decode(m))
             .unwrap_or_default();
+        // 渲染器挂载成功信号（"[type src] ready"）：记时间戳供场景/网页截图等待
+        if msg.ends_with("] ready") {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            state
+                .wallpaper_ready_ms
+                .store(now, std::sync::atomic::Ordering::Relaxed);
+        }
         tracing::warn!("[renderer diag] {msg}");
         return respond(stream, 200, "OK", "text/plain", b"ok", None).await;
+    }
+
+    // 壁纸生效属性（场景/媒体壁纸挂载前拉取一次，作为 mount() 的 properties 选项）。
+    //
+    // 网页壁纸走 HTML 改写时的 __weSeedProps，已有注入路径；场景/媒体壁纸没有
+    // 入口 HTML 可改写，只能由渲染器在挂载前显式拉一次。返回的就是 effective_props
+    // （project.json 默认 + 用户覆盖 + 全局语言兜底），与网页壁纸同源，避免两边
+    // 对"某属性当前是什么值"给出不同答案。
+    //   /props/{token}/{item_id}  →  {"name":{"value":...}, ...}
+    if let Some(rest) = path.strip_prefix("/props/") {
+        let segs: Vec<&str> = rest.split('/').collect();
+        if segs.len() < 2 || segs[0] != state.token {
+            return respond(stream, 401, "Unauthorized", "text/plain", b"", None).await;
+        }
+        let item_id = percent_decode(segs[1]);
+        let props = {
+            match state.db.lock() {
+                Ok(conn) => {
+                    crate::we_props::effective_props(&conn, &state.wallpapers_dir, &item_id)
+                }
+                Err(_) => serde_json::Map::new(),
+            }
+        };
+        let body = serde_json::to_vec(&props).unwrap_or_default();
+        return respond(stream, 200, "OK", "application/json", &body, None).await;
     }
 
     // 系统音频频谱推送（SSE，二期）：壁纸页内 shim 经 EventSource 订阅
@@ -409,6 +479,47 @@ async fn handle_conn(
             return respond(stream, 401, "Unauthorized", "text/plain", b"", None).await;
         }
         return audio_stream_sse(stream, state).await;
+    }
+
+    // 系统「正在播放」推送（SSE）：歌名/艺人/专辑/进度/封面，喂库的 setMedia
+    if let Some(tok) = path.strip_prefix("/now-playing/") {
+        if tok != state.token {
+            return respond(stream, 401, "Unauthorized", "text/plain", b"", None).await;
+        }
+        return now_playing_sse(stream, state).await;
+    }
+
+    // 媒体反向控制：壁纸里的播放/暂停、上下一曲按钮转发给真实播放器。
+    // /media-command/{token}/{play|pause|playPause|next|previous}
+    // 走 HTTP 而非 Tauri 命令：壁纸页是 iframe 里的普通网页，没有 IPC 通道。
+    // 用 GET 而非 POST：这个服务器整体只放行 GET/OPTIONS，而端点只监听本机、
+    // 带 token 鉴权，没必要为一个按钮给全局开 POST
+    if let Some(rest) = path.strip_prefix("/media-command/") {
+        let mut segs = rest.splitn(2, '/');
+        let tok = segs.next().unwrap_or("");
+        let cmd = segs.next().unwrap_or("");
+        if tok != state.token {
+            return respond(stream, 401, "Unauthorized", "text/plain", b"", None).await;
+        }
+        let Some(cmd) = crate::now_playing::MediaCommand::parse(cmd) else {
+            return respond(
+                stream,
+                400,
+                "Bad Request",
+                "text/plain",
+                b"unknown command",
+                None,
+            )
+            .await;
+        };
+        let body: &[u8] = match crate::now_playing::send_command(cmd) {
+            Ok(()) => b"ok",
+            Err(e) => {
+                tracing::warn!("media command failed: {e}");
+                b"failed"
+            }
+        };
+        return respond(stream, 200, "OK", "text/plain", body, None).await;
     }
 
     // 目录属性随机文件（WE wallpaperRequestRandomFileForProperty 契约）：
@@ -533,9 +644,18 @@ async fn handle_conn(
         })
         .unwrap_or_default();
 
-    let data = tokio::fs::read(&file).await.map_err(|e| e.to_string())?;
     let mime = mime_for(&file);
 
+    // 需要改写响应体的小文件（HTML 注入 shim / project.json 合并属性覆盖）才整读；
+    // 其余文件（视频/音频/图片，尤其 4K 视频）走流式服务：**绝不整文件进内存**。
+    // 旧实现对每个请求都整读再切片，而 WebKit 播放期会发大量小段 Range 请求 ——
+    // 每次请求都付出「读整个视频」的磁盘与内存代价；循环交接处备用元素的首批
+    // 取数因此被拖慢 ~1s，表现为壁纸每圈卡一下。
+    if !mime.starts_with("text/html") && rel_path != "project.json" {
+        return serve_file_stream(stream, &file, &mime, &range).await;
+    }
+
+    let data = tokio::fs::read(&file).await.map_err(|e| e.to_string())?;
     // WE 网页壁纸兼容 shim：库内条目的 HTML 响应注入引导数据（属性/fps）+ 脚本，
     // 拼在 <head> 后先于壁纸自身脚本执行（属性监听、音频 API、rAF 节流均依赖此时机）
     let data = if mime.starts_with("text/html") {
@@ -554,16 +674,8 @@ async fn handle_conn(
     let total = data.len() as u64;
 
     if range.starts_with("bytes=") {
-        let spec = &range[6..];
-        let spec = spec.split(',').next().unwrap_or("").trim();
-        if let Some((s, e)) = spec.split_once('-') {
-            let start: u64 = s.parse().unwrap_or(0);
-            let end: u64 = if e.is_empty() {
-                total.saturating_sub(1)
-            } else {
-                e.parse().unwrap_or(total.saturating_sub(1)).min(total.saturating_sub(1))
-            };
-            if start <= end && start < total {
+        if let Some((start, end)) = parse_range(&range, total) {
+            {
                 let slice = &data[start as usize..=end as usize];
                 let resp = format!(
                     "HTTP/1.1 206 Partial Content\r\nContent-Type: {mime}\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -591,7 +703,10 @@ async fn handle_conn(
         "OK",
         &mime,
         &data,
-        Some(&format!("Accept-Ranges: bytes\r\nContent-Length: {}", data.len())),
+        Some(&format!(
+            "Accept-Ranges: bytes\r\nContent-Length: {}",
+            data.len()
+        )),
     )
     .await
 }
@@ -624,7 +739,9 @@ async fn audio_stream_sse(
         )
         .await
         .map_err(|e| e.to_string())?;
-    state.sse_clients.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    state
+        .sse_clients
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let result = stream_loop_sse(stream, state).await;
     state
         .sse_clients
@@ -645,7 +762,11 @@ async fn stream_loop_sse(
         let (seq, bands) = state.audio.snapshot();
         let data = format!(
             "data: [{}]\n\n",
-            bands.iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>().join(",")
+            bands
+                .iter()
+                .map(|v| format!("{v:.3}"))
+                .collect::<Vec<_>>()
+                .join(",")
         );
         // seq 仅用于调试判断新鲜度，此处无条件推送（静音时为 0 帧，保持客户端活动）
         let _ = seq;
@@ -658,20 +779,114 @@ async fn stream_loop_sse(
     }
 }
 
-/// WE 网页壁纸兼容层：把引导数据（project.json 属性 + fps）与 shim 脚本拼进 HTML。
-/// 位置选 <head> 开标签之后（保证先于壁纸脚本执行）；无 <head> 则前置。
+/// SSE：系统「正在播放」快照。与音频端点不同，这里**只在快照变化时**推送
+/// —— 封面 base64 有上百 KB，按帧推会把连接打满。
+///
+/// 进度（position）例外：播放中它每秒都在变，但 now_playing 侧只在收到系统通知
+/// 时更新，所以这里按固定间隔重推一次让壁纸的进度条能走动。壁纸自己也会用
+/// position + 本地时钟外推，所以这个间隔不必很密。
+async fn now_playing_sse(
+    stream: &mut tokio::net::TcpStream,
+    state: &ContentServerState,
+) -> Result<(), String> {
+    // adapter 起不来（perl 缺失 / Apple 封了这条路）时 503：EventSource 会自动
+    // 重试，若后续恢复即自愈。壁纸侧因此不会装上一个永远空的媒体源
+    if !state.media.is_available() {
+        return respond(
+            stream,
+            503,
+            "Service Unavailable",
+            "text/plain",
+            b"now playing unavailable",
+            None,
+        )
+        .await;
+    }
+    stream
+        .write_all(
+            b"HTTP/1.1 200 OK\r\n\
+              Content-Type: text/event-stream\r\n\
+              Cache-Control: no-cache\r\n\
+              Connection: close\r\n\
+              Access-Control-Allow-Origin: *\r\n\r\n",
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut last_seq = u64::MAX; // 保证首轮必发一次当前状态（含「无媒体」）
+    let mut ticks = 0u32;
+    loop {
+        let (seq, snap) = state.media.snapshot();
+        // 内容变了就发；否则每 ~2s 补一次让播放进度前进（约 8 * 250ms）
+        let heartbeat = snap.state == 1 && ticks % 8 == 0;
+        if seq != last_seq || heartbeat {
+            last_seq = seq;
+            let json = serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into());
+            let data = format!("data: {json}\n\n");
+            match stream.write_all(data.as_bytes()).await {
+                Ok(_) => {
+                    let _ = stream.flush().await;
+                }
+                Err(e) => return Err(format!("now-playing sse client disconnected: {e}")),
+            }
+        }
+        ticks = ticks.wrapping_add(1);
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+///
+/// 为什么由 host 注入而不是交给库：库的 mountWeb 对**同源**入口只做 attachIframe
+/// （保留原 URL，壁纸的相对资源才能正常加载），注入交给 host；只有跨源时它才
+/// 走 fetch + rewriteHtml + blob URL 那条路。我们的壁纸都经内容服务器同源提供，
+/// 所以走的是前者 —— shim 必须由这里注入，且必须是**库自带的那一份**
+/// （src/we_shim.js 从 bundle 提取），否则库的音频/媒体泵调 __wePushAudio
+/// 等接口时会全部落空。
+///
+/// 种子脚本用库的协议（__weSetFps / __weSetVolume / __weSeedProps），
+/// 与库 buildSeedScript 产出的形式一致。位置选 <head> 开标签之后，
+/// 保证先于壁纸自身脚本执行。
 fn inject_we_shim(state: &ContentServerState, item_id: &str, html: Vec<u8>) -> Vec<u8> {
-    let mut boot = crate::we_props::boot_json(&state.db, &state.wallpapers_dir, item_id);
-    // 系统音频：SSE 端点地址（壁纸页与内容服务器同源，EventSource 直接订阅）
-    boot["token"] = serde_json::json!(state.token);
-    boot["systemAudio"] = serde_json::json!(state.audio.is_running());
+    let boot = crate::we_props::boot_json(&state.db, &state.wallpapers_dir, item_id);
+    let fps = boot.get("fps").and_then(|v| v.as_i64()).unwrap_or(60);
+    let props = boot
+        .get("props")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+
     // 属性文本可能含 script 结束标签：JSON 内把 "<" 转义为 \u003c（合法 JSON 转义，
     // 解析回原文本），确保注入文本中不出现标签结束序列
-    let boot_str = serde_json::to_string(&boot)
+    let props_str = serde_json::to_string(&props)
         .unwrap_or_else(|_| "{}".into())
         .replace("</", "\\u003c/");
+
+    let mut seed = format!("window.__weSetFps({fps});");
+    if props.as_object().map(|m| !m.is_empty()).unwrap_or(false) {
+        seed.push_str(&format!("window.__weSeedProps({props_str});"));
+    }
+    // 目录属性的文件清单：库的 shim 从父页预推的清单里挑随机文件
+    // （官方 CEF 直接读文件系统，浏览器里做不到）。不推的话
+    // wallpaperRequestRandomFileForProperty 恒回空串，幻灯片壁纸的图片永远不换。
+    let dir_files = match state.db.lock() {
+        Ok(conn) => crate::we_props::directory_files(&conn, &state.wallpapers_dir, item_id),
+        Err(_) => Default::default(),
+    };
+    for (prop, files) in &dir_files {
+        let payload = serde_json::to_string(files)
+            .unwrap_or_else(|_| "[]".into())
+            .replace("</", "\\u003c/");
+        let prop_str = serde_json::to_string(prop)
+            .unwrap_or_else(|_| "\"\"".into())
+            .replace("</", "\\u003c/");
+        seed.push_str(&format!(
+            "window.__wePushDirectoryFiles&&window.__wePushDirectoryFiles({prop_str},{payload});"
+        ));
+    }
+    // 系统音频经父页的音频泵推入（__wePushAudio），shim 不再自行订阅 SSE ——
+    // 一份数据两处订阅会让 iframe 里外各建一条连接，且 shim 侧无法参与库的
+    // 「外部帧优先」逻辑。token 仍下发给渲染器页（URL 的 audioToken）。
     let prelude = format!(
-        "<script>window.__WE_BOOT={boot_str};</script><script>{}</script>",
+        "<script>{}</script><script>{seed}</script>",
         crate::we_shim::SRC
     );
     let text = String::from_utf8_lossy(&html);
@@ -718,22 +933,21 @@ mod tests {
         let Ok(dump_root) = std::env::var("WPEM_DUMP_DIR") else {
             return;
         };
-        let wallpapers_dir = std::path::PathBuf::from(
-            std::env::var("WPEM_WALLPAPERS_DIR").unwrap_or_else(|_| {
-                dirs_shim().join("wallpapers").to_string_lossy().into_owned()
-            }),
-        );
+        let wallpapers_dir =
+            std::path::PathBuf::from(std::env::var("WPEM_WALLPAPERS_DIR").unwrap_or_else(|_| {
+                dirs_shim()
+                    .join("wallpapers")
+                    .to_string_lossy()
+                    .into_owned()
+            }));
         // 直接只读打开真实库 DB 副本：取 web 条目清单 + 用户属性覆盖 + fps，
         // 与生产 boot_json 完全同源（effective_props 只依赖 settings 表）
         let db_path = std::env::var("WPEM_DB_COPY").unwrap_or_default();
         let conn = if db_path.is_empty() {
             Connection::open_in_memory().unwrap()
         } else {
-            Connection::open_with_flags(
-                &db_path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-            )
-            .unwrap()
+            Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap()
         };
         let db = Arc::new(Mutex::new(conn));
         let state = ContentServerState {
@@ -743,7 +957,9 @@ mod tests {
             wallpapers_dir: wallpapers_dir.clone(),
             renderer_dir: Default::default(),
             audio: std::sync::Arc::new(crate::audio_capture::AudioShared::new()),
+            media: crate::now_playing::shared(),
             sse_clients: Default::default(),
+            wallpaper_ready_ms: Default::default(),
         };
 
         let items: Vec<String> = {
@@ -777,28 +993,32 @@ mod tests {
             let mut htmls: Vec<std::path::PathBuf> = Vec::new();
             collect_htmls(&dir, &mut htmls);
             for path in htmls {
-                let Ok(raw) = std::fs::read(&path) else { continue };
-                let rel = path.strip_prefix(&dir).unwrap().to_string_lossy().into_owned();
+                let Ok(raw) = std::fs::read(&path) else {
+                    continue;
+                };
+                let rel = path
+                    .strip_prefix(&dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
                 let out = inject_we_shim(&state, item, raw);
                 let text = String::from_utf8_lossy(&out).into_owned();
                 let lower = text.to_ascii_lowercase();
-                // 不变式 1：prelude 恰好一次
-                let boot_n = lower.matches("window.__we_boot={").count();
-                if boot_n != 1 {
-                    problems.push(format!("{item}/{rel}: __WE_BOOT 出现 {boot_n} 次"));
+                // 不变式 1：种子脚本恰好一次
+                let boot_n = lower.matches("window.__weseedprops(").count()
+                    + lower.matches("window.__wesetfps(").count();
+                if boot_n == 0 {
+                    problems.push(format!("{item}/{rel}: 未注入种子脚本"));
                 }
                 // 不变式 2：有 <head> 时注入点必须在 <head 开标签之内（'</head' 之前）
                 if lower.contains("<head") {
                     let head_ins = find_head_open(&lower).unwrap();
                     assert!(
-                        lower[head_ins..].contains("__we_boot"),
+                        lower[head_ins..].contains("__wesetfps"),
                         "{item}/{rel}: 注入点不在 <head> 内"
                     );
                     let head_end = lower.find("</head").unwrap();
-                    assert!(
-                        head_ins < head_end,
-                        "{item}/{rel}: 注入点落在 </head> 之后"
-                    );
+                    assert!(head_ins < head_end, "{item}/{rel}: 注入点落在 </head> 之后");
                 }
                 let dest = std::path::Path::new(&dump_root).join(item).join(&rel);
                 std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
@@ -811,7 +1031,10 @@ mod tests {
             serde_json::to_string_pretty(&problems).unwrap(),
         )
         .unwrap();
-        println!("dumped {dumped} injected html files, {} problems", problems.len());
+        println!(
+            "dumped {dumped} injected html files, {} problems",
+            problems.len()
+        );
         for p in &problems {
             println!("  ⚠ {p}");
         }
@@ -825,9 +1048,11 @@ mod tests {
             let p = e.path();
             if p.is_dir() {
                 collect_htmls(&p, out);
-            } else if p.extension().and_then(|x| x.to_str()).map(|x| {
-                x.eq_ignore_ascii_case("html") || x.eq_ignore_ascii_case("htm")
-            }) == Some(true)
+            } else if p
+                .extension()
+                .and_then(|x| x.to_str())
+                .map(|x| x.eq_ignore_ascii_case("html") || x.eq_ignore_ascii_case("htm"))
+                == Some(true)
             {
                 out.push(p);
             }
@@ -836,7 +1061,9 @@ mod tests {
 
     /// 无 dirs crate 时的 home 目录兜底（仅测试用）
     fn dirs_shim() -> std::path::PathBuf {
-        std::env::var("HOME").map(std::path::PathBuf::from).unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+        std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
     }
 
     /// 随机文件端点的目录挑选逻辑：只挑普通文件、路径相对壁纸根、空目录 None
@@ -864,6 +1091,86 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// 注入的 shim 必须与 webwallgl bundle 里那份逐字节一致。
+    ///
+    /// 库的 mountWeb 对同源 iframe 把 shim 注入交给 host，之后它的音频/媒体泵
+    /// 直接调 __wePushAudio / __wePushMedia 等接口。两边一旦漂移（升级库但忘了跑
+    /// scripts/sync-we-shim.cjs），壁纸仍能显示，只是音频可视化永远不动 ——
+    /// 这种「看起来没坏」的故障最难查，用测试把它变成明确失败。
+    ///
+    /// node_modules 不存在时跳过（CI 只跑 cargo 的场景）。
+    #[test]
+    fn shim_matches_library_bundle() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let bundle = repo.join("node_modules/webwallgl/webwallgl.mjs");
+        if !bundle.is_file() {
+            eprintln!("跳过：{} 不存在（未装依赖）", bundle.display());
+            return;
+        }
+        let src = std::fs::read_to_string(&bundle).unwrap();
+        let key = "const shimSource = ";
+        let at = src
+            .find(key)
+            .expect("bundle 里没有 shimSource —— 库内部结构变了");
+        let start = at + key.len();
+        let quote = src[start..].chars().next().unwrap();
+        assert!(quote == '\'' || quote == '"', "shimSource 不是字符串字面量");
+
+        // 逐字符扫到未转义的收尾引号
+        let bytes: Vec<char> = src[start + 1..].chars().collect();
+        let mut raw = String::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == '\\' && i + 1 < bytes.len() {
+                raw.push(bytes[i]);
+                raw.push(bytes[i + 1]);
+                i += 2;
+                continue;
+            }
+            if bytes[i] == quote {
+                break;
+            }
+            raw.push(bytes[i]);
+            i += 1;
+        }
+
+        // 还原转义（与 scripts/sync-we-shim.cjs 同一套规则）
+        let mut expected = String::with_capacity(raw.len());
+        let chars: Vec<char> = raw.chars().collect();
+        let mut j = 0;
+        while j < chars.len() {
+            if chars[j] == '\\' && j + 1 < chars.len() {
+                match chars[j + 1] {
+                    'n' => expected.push('\n'),
+                    't' => expected.push('\t'),
+                    'r' => expected.push('\r'),
+                    '\\' => expected.push('\\'),
+                    '\'' => expected.push('\''),
+                    '"' => expected.push('"'),
+                    '0' => expected.push('\0'),
+                    // 未知转义序列原样保留两个字符
+                    other => {
+                        expected.push('\\');
+                        expected.push(other);
+                    }
+                }
+                j += 2;
+            } else {
+                expected.push(chars[j]);
+                j += 1;
+            }
+        }
+
+        assert_eq!(
+            crate::we_shim::SRC,
+            expected,
+            "we_shim.js 与 webwallgl bundle 不一致 —— 请运行 `node scripts/sync-we-shim.cjs`"
+        );
+    }
+
     /// 找到 <head> 后插入点应在开标签 `>` 之后（即 prelude 位于 </head> 之前、
     /// 壁纸自身脚本之前）
     #[test]
@@ -880,11 +1187,50 @@ mod tests {
         assert_eq!(find_head_open("<html><body>"), None);
     }
 
+    /// 会被脚本"按类型消费"的资源必须有正确 Content-Type。
+    ///
+    /// 回归防护：`XMLHttpRequest.responseXML` 只在 Content-Type 属 XML 类型时才
+    /// 解析，标成 application/octet-stream 会返回 null。3406740580（pano2vr
+    /// 全景）用 responseXML 读 pano.xml，漏了 xml 映射就整张壁纸空屏，且
+    /// HTTP 200、无控制台报错 —— 极难从现象反推，故用测试锁住。
+    #[test]
+    fn mime_for_covers_script_consumed_types() {
+        // XML 家族（responseXML / DOMParser 依赖）
+        assert!(
+            mime_for(Path::new("pano.xml")).contains("xml"),
+            "pano.xml 必须报 XML 类型，否则 responseXML 返回 null（3406740580 空屏）"
+        );
+        assert_eq!(mime_for(Path::new("a.svg")), "image/svg+xml");
+        // 文本
+        assert!(mime_for(Path::new("cfg.txt")).starts_with("text/plain"));
+        assert!(mime_for(Path::new("data.csv")).starts_with("text/plain"));
+        assert_eq!(mime_for(Path::new("sub.vtt")), "text/vtt");
+        // 常见媒体/字体
+        assert_eq!(mime_for(Path::new("a.m4a")), "audio/mp4");
+        assert_eq!(mime_for(Path::new("a.flac")), "audio/flac");
+        assert_eq!(mime_for(Path::new("f.ttf")), "font/ttf");
+        assert_eq!(mime_for(Path::new("f.otf")), "font/otf");
+        assert_eq!(mime_for(Path::new("i.avif")), "image/avif");
+        // 大小写不敏感
+        assert!(mime_for(Path::new("PANO.XML")).contains("xml"));
+        // 私有二进制仍应是 octet-stream（不要为了"更准"给它们编类型）
+        assert_eq!(mime_for(Path::new("scene.pkg")), "application/octet-stream");
+        assert_eq!(mime_for(Path::new("x.tex")), "application/octet-stream");
+        // 未知扩展名兜底
+        assert_eq!(
+            mime_for(Path::new("x.unknownext")),
+            "application/octet-stream"
+        );
+    }
+
     #[test]
     fn inject_splices_after_head_and_escapes_closing_tag() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute("CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)", [])
-            .unwrap();
+        conn.execute(
+            "CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            [],
+        )
+        .unwrap();
         let dir = std::env::temp_dir().join("wpem-inject-test-item");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -900,22 +1246,109 @@ mod tests {
             wallpapers_dir: std::env::temp_dir(),
             renderer_dir: Default::default(),
             audio: std::sync::Arc::new(crate::audio_capture::AudioShared::new()),
+            media: crate::now_playing::shared(),
             sse_clients: Default::default(),
+            wallpaper_ready_ms: Default::default(),
         };
-        let html = b"<!DOCTYPE html><html><head><meta charset=utf-8></head><body></body></html>".to_vec();
+        let html =
+            b"<!DOCTYPE html><html><head><meta charset=utf-8></head><body></body></html>".to_vec();
         let out = inject_we_shim(&state, "wpem-inject-test-item", html);
         let s = String::from_utf8(out).unwrap();
         // prelude 拼在 <head …> 之后、</head> 之前
         let (before, after) = s.split_once("</head>").unwrap();
-        assert!(before.contains("__WE_BOOT"), "引导数据应在 </head> 之前");
-        assert!(before.contains("__weSetFps"), "shim 控制接口应在 </head> 之前");
+        assert!(
+            before.contains("__weSeedProps"),
+            "种子属性应在 </head> 之前"
+        );
+        assert!(
+            before.contains("__weSetFps"),
+            "shim 控制接口应在 </head> 之前"
+        );
         assert!(after.contains("<body>"));
         // 属性值里的标签结束序列被 JSON unicode 转义（解析回原文本，且不会提前闭合标签）
         assert!(s.contains(r"a\u003c/script>b"), "值中的结束标签已转义");
         assert!(!s.contains("a</script>b"), "原文中的结束标签不应原样出现");
-        // 引导赋值只出现一次（shim 内的读取引用不算；一次注入，不会叠加）
-        assert_eq!(s.matches("window.__WE_BOOT={").count(), 1);
+        // 种子脚本只出现一次（一次注入，不会叠加）
+        assert_eq!(s.matches("window.__weSeedProps(").count(), 1);
     }
+}
+
+/// 解析 "bytes=start-end"（单区间，开口端按 total 补齐）。不合法/越界返回 None
+///（调用方回 416）。
+fn parse_range(range: &str, total: u64) -> Option<(u64, u64)> {
+    let spec = range.strip_prefix("bytes=")?;
+    let spec = spec.split(',').next()?.trim();
+    let (s, e) = spec.split_once('-')?;
+    let start: u64 = s.parse().unwrap_or(0);
+    let end: u64 = if e.is_empty() {
+        total.saturating_sub(1)
+    } else {
+        e.parse()
+            .unwrap_or(total.saturating_sub(1))
+            .min(total.saturating_sub(1))
+    };
+    (start <= end && start < total).then_some((start, end))
+}
+
+/// 流式文件服务（视频等大文件）：Range 只 seek + 读请求区间，完整请求也流式写，
+/// 全程不把整个文件读进内存。WebKit 播放期发大量小段 Range 请求，这是视频
+/// 壁纸流畅播放（尤其循环交接处备用元素取数）的关键路径。
+async fn serve_file_stream(
+    stream: &mut tokio::net::TcpStream,
+    file: &Path,
+    mime: &str,
+    range: &str,
+) -> Result<(), String> {
+    let total = tokio::fs::metadata(file)
+        .await
+        .map_err(|e| e.to_string())?
+        .len();
+    let mut f = tokio::fs::File::open(file)
+        .await
+        .map_err(|e| e.to_string())?;
+    if range.starts_with("bytes=") {
+        if let Some((start, end)) = parse_range(range, total) {
+            {
+                let len = end - start + 1;
+                f.seek(std::io::SeekFrom::Start(start))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Type: {mime}\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
+                );
+                stream
+                    .write_all(head.as_bytes())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let mut limited = f.take(len);
+                tokio::io::copy(&mut limited, stream)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                return Ok(());
+            }
+        }
+        return respond(
+            stream,
+            416,
+            "Range Not Satisfiable",
+            "text/plain",
+            format!("Content-Range: bytes */{total}").as_bytes(),
+            None,
+        )
+        .await;
+    }
+    // 无 Range 的完整请求同样流式写（预览可能整取大图/大文件）
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nAccess-Control-Allow-Origin: *\r\nAccept-Ranges: bytes\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(head.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+    tokio::io::copy(&mut f, stream)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 async fn respond(
@@ -998,6 +1431,17 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// 扩展名 → Content-Type。
+///
+/// 缺一个类型的后果不只是"标注不准"：`XMLHttpRequest.responseXML` 按规范只在
+/// Content-Type 属于 XML 类型时才解析，落到 `application/octet-stream` 会拿到
+/// null。实测 3406740580（pano2vr 全景壁纸）就是这样整张不显示 —— 它用
+/// responseXML 读 pano.xml 拿全景配置，解析不出来就建不起场景，而 HTTP 全是
+/// 200、控制台也不报错，只有画面空着（本地静态服务器把 .xml 标成
+/// application/xml，所以同一份文件在上游 bench 里正常）。
+///
+/// 所以这里宁可多列几个：**会被脚本按类型消费**的文本/XML/字幕/字体尤其不能漏。
+/// 真正该保持 octet-stream 的是 pkg / tex 那类私有二进制。
 fn mime_for(path: &Path) -> &'static str {
     match path
         .extension()
@@ -1013,19 +1457,31 @@ fn mime_for(path: &Path) -> &'static str {
         "jpg" | "jpeg" => "image/jpeg",
         "png" => "image/png",
         "webp" => "image/webp",
+        "avif" => "image/avif",
+        "bmp" => "image/bmp",
+        "ico" => "image/x-icon",
         "html" | "htm" => "text/html; charset=utf-8",
         "css" => "text/css",
         "js" | "mjs" => "text/javascript",
         "json" => "application/json",
+        // XML 家族：responseXML / DOMParser 依赖它，漏了会让配置驱动的壁纸空屏
+        "xml" => "text/xml; charset=utf-8",
+        "svg" => "image/svg+xml",
+        // 纯文本：作者常用 .txt/.csv 存配置或歌词
+        "txt" | "csv" | "md" => "text/plain; charset=utf-8",
+        "vtt" => "text/vtt",
         "wasm" => "application/wasm",
         "pkg" => "application/octet-stream",
         "tex" => "application/octet-stream",
         "mp3" => "audio/mpeg",
-        "ogg" => "audio/ogg",
+        "ogg" | "oga" => "audio/ogg",
         "wav" => "audio/wav",
-        "svg" => "image/svg+xml",
+        "m4a" => "audio/mp4",
+        "flac" => "audio/flac",
         "woff" => "font/woff",
         "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
         _ => "application/octet-stream",
     }
 }

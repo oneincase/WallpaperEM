@@ -31,7 +31,6 @@ pub fn favorites_list(app: AppHandle) -> Result<Vec<FavoriteItem>, String> {
              ORDER BY f.created_at DESC",
         )
         .map_err(|e| e.to_string())?;
-    let family_friendly = crate::sfw::is_family_friendly(&conn);
     let rows = stmt
         .query_map([], |r| {
             let preview: String = r.get(2)?;
@@ -42,7 +41,11 @@ pub fn favorites_list(app: AppHandle) -> Result<Vec<FavoriteItem>, String> {
                 FavoriteItem {
                     item_id: r.get(0)?,
                     title,
-                    preview_url: if preview.is_empty() { None } else { Some(preview) },
+                    preview_url: if preview.is_empty() {
+                        None
+                    } else {
+                        Some(preview)
+                    },
                     r#type: r.get(3)?,
                     created_at: r.get(4)?,
                 },
@@ -51,9 +54,6 @@ pub fn favorites_list(app: AppHandle) -> Result<Vec<FavoriteItem>, String> {
         })
         .map_err(|e| e.to_string())?
         .filter_map(|r| r.ok())
-        .filter(|(it, tags)| {
-            !(family_friendly && crate::sfw::is_adult_item(&it.title, tags))
-        })
         .map(|(it, _)| it)
         .collect::<Vec<_>>();
     Ok(rows)
@@ -141,7 +141,7 @@ pub async fn network_probe(app: AppHandle) -> Result<serde_json::Value, String> 
     Ok(json!({
         "results": results,
         "allOk": all_ok,
-        "hint": if all_ok { "Steam 网络连通正常" } else { "部分主机不通：请配置代理（设置 → 下载 → 代理），或切换代理为全局模式" }
+        "hint": if all_ok { "Steam 网络连通正常" } else { "部分主机不通：请配置代理（设置 → 网络 → 代理），或切换代理为全局模式" }
     }))
 }
 
@@ -154,7 +154,10 @@ pub async fn diagnostics_export(app: AppHandle) -> Result<String, String> {
     let log_dir = app.path().app_log_dir().map_err(|e| e.to_string())?;
     let out_dir = data_dir.join("diagnostics");
     std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
-    let out_file = out_dir.join(format!("diagnostics-{}.zip", chrono::Utc::now().format("%Y%m%d-%H%M%S")));
+    let out_file = out_dir.join(format!(
+        "diagnostics-{}.zip",
+        chrono::Utc::now().format("%Y%m%d-%H%M%S")
+    ));
 
     let file = std::fs::File::create(&out_file).map_err(|e| e.to_string())?;
     let mut zip = zip::ZipWriter::new(file);
@@ -199,12 +202,22 @@ pub async fn diagnostics_export(app: AppHandle) -> Result<String, String> {
         "time": chrono::Utc::now().to_rfc3339(),
     });
     let _ = zip.start_file("environment.json", opts);
-    let _ = zip.write_all(serde_json::to_string_pretty(&info).unwrap_or_default().as_bytes());
+    let _ = zip.write_all(
+        serde_json::to_string_pretty(&info)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
 
     // 网络探测
-    let probe = network_probe(app.clone()).await.unwrap_or_else(|e| json!({ "error": e }));
+    let probe = network_probe(app.clone())
+        .await
+        .unwrap_or_else(|e| json!({ "error": e }));
     let _ = zip.start_file("network-probe.json", opts);
-    let _ = zip.write_all(serde_json::to_string_pretty(&probe).unwrap_or_default().as_bytes());
+    let _ = zip.write_all(
+        serde_json::to_string_pretty(&probe)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
 
     let _ = zip.finish();
     Ok(out_file.display().to_string())

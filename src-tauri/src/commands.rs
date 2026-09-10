@@ -45,9 +45,11 @@ pub fn settings_get(
     key: String,
 ) -> Result<Option<String>, String> {
     let conn = db.lock().map_err(|e| e.to_string())?;
-    conn.query_row("SELECT value FROM settings WHERE key = ?1", [&key], |r| r.get(0))
-        .optional()
-        .map_err(|e| e.to_string())
+    conn.query_row("SELECT value FROM settings WHERE key = ?1", [&key], |r| {
+        r.get(0)
+    })
+    .optional()
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

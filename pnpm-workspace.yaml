@@ -1,2 +1,7 @@
 allowBuilds:
   esbuild: false
+# webwallgl 是本项目自维护的渲染库（github.com/oneincase/webwallgl），
+# 发布后立即升级是常态，不适用「新版本冷却期」这条防供应链投毒的策略。
+# 只对它开豁免，其余依赖仍受策略保护。
+minimumReleaseAgeExclude:
+  - webwallgl
