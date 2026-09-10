@@ -246,13 +246,32 @@ pub fn library_list(
         items.retain(|it| it.missing);
     }
 
-    // 无工坊元数据的条目：回退到本地 preview.gif（经内容服务器）
+    // 无工坊元数据的条目：回退到本地 preview.*（经内容服务器）
     for it in items.iter_mut() {
         if it.preview_url.is_some() {
             continue;
         }
         if let Some(url) = local_preview_url(&app, &it.item_id) {
             it.preview_url = Some(url);
+            continue;
+        }
+        // 历史导入（本功能上线前）的视频没有 preview.*：惰性抽首帧补齐封面。
+        // 一次成型 —— 生成后下一轮列表直接命中 preview.png，不再走这里。
+        // 抽帧失败（mkv/avi 等系统解不了的格式）只记日志，条目保持无封面。
+        if it.r#type == "video" {
+            if let Ok(dir) = item_dir(&app, &it.item_id) {
+                if let Some(video) = first_video_file(&dir) {
+                    let out = dir.join("preview.png");
+                    match crate::system_wallpaper::video_poster_png(&video, &out) {
+                        Ok(()) => {
+                            it.preview_url = local_preview_url(&app, &it.item_id);
+                        }
+                        Err(e) => {
+                            tracing::warn!("视频封面惰性抽帧失败（{}）: {e}", it.item_id);
+                        }
+                    }
+                }
+            }
         }
     }
     Ok(items)
@@ -778,13 +797,20 @@ fn import_file_into(
             file_name.clone()
         };
         std::fs::copy(src, dest.join(&target_name)).map_err(|e| format!("拷贝失败: {e}"))?;
-        // 图片/gif 自身即可作预览（视频没有抽帧能力，暂不支持预览）
+        // 图片/gif 自身即可作预览；视频抽首帧做封面（复用系统壁纸同步的
+        // 抽帧实现；抽帧失败只记日志不阻塞导入 —— 封面是锦上添花）。
         // 注意：按真实扩展名只拷一份，旧实现把同一源同时写成 preview.gif +
         // preview.png 两个文件，扩展名与内容对不上，纯粹是 bug。
         if PREVIEW_COPY_EXTS.contains(&ext.as_str()) {
             let pext = if ext == "jpeg" { "jpg" } else { ext.as_str() };
             std::fs::copy(src, dest.join(format!("preview.{pext}")))
                 .map_err(|e| format!("生成预览失败: {e}"))?;
+        } else if VIDEO_EXTS.contains(&ext.as_str()) {
+            let video = dest.join(&target_name);
+            let out = dest.join("preview.png");
+            if let Err(e) = crate::system_wallpaper::video_poster_png(&video, &out) {
+                tracing::warn!("导入视频抽帧失败（不影响导入）: {e}");
+            }
         }
         Ok(())
     })();
@@ -856,6 +882,15 @@ fn import_dir_into(
     } else {
         dir_name.to_string()
     };
+    // 视频目录没有自带 preview.* 时抽首帧做封面（WE 工程自带 preview.gif 的不动）
+    if wtype == "video" && !has_preview_file(&dest) {
+        if let Some(video) = first_video_file(&dest) {
+            let out = dest.join("preview.png");
+            if let Err(e) = crate::system_wallpaper::video_poster_png(&video, &out) {
+                tracing::warn!("目录导入抽帧失败（不影响导入）: {e}");
+            }
+        }
+    }
     Ok(ImportCore {
         item_id,
         title,
@@ -1161,6 +1196,25 @@ fn import_one(app: &AppHandle, src: &Path) -> Result<ImportOne, String> {
         return Err(e);
     }
     Ok(ImportOne { core })
+}
+
+/// 目录内是否已有预览图（扩展名清单与 local_preview_url 保持一致）
+fn has_preview_file(dir: &Path) -> bool {
+    ["gif", "png", "jpg", "webp"]
+        .iter()
+        .any(|e| dir.join(format!("preview.{e}")).is_file())
+}
+
+/// 目录内第一个视频文件（按文件名排序，与 read_dir 枚举顺序无关，结果可复现）
+fn first_video_file(dir: &Path) -> Option<PathBuf> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| VIDEO_EXTS.contains(&ext_lower(Path::new(n)).as_str()))
+        .collect();
+    names.sort();
+    names.into_iter().next().map(|n| dir.join(n))
 }
 
 /// 目录内推断壁纸类型（无 project.json 时）。
@@ -1927,6 +1981,29 @@ mod tests {
         std::fs::write(d2.join("preview.png"), b"p").unwrap();
         std::fs::write(d2.join("bg.webp"), b"i").unwrap();
         assert_eq!(infer_type(&d2), "image");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn first_video_file_is_deterministic() {
+        let root = tmpdir("firstvideo");
+        // 多个视频时按文件名排序取第一个，与 read_dir 枚举顺序无关
+        for n in ["b.webm", "a.mp4", "c.mov"] {
+            std::fs::write(root.join(n), b"v").unwrap();
+        }
+        // 非视频文件不入选
+        std::fs::write(root.join("cover.png"), b"p").unwrap();
+        let got = first_video_file(&root).unwrap();
+        assert_eq!(got.file_name().unwrap().to_string_lossy(), "a.mp4");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn has_preview_file_matches_local_preview_url_exts() {
+        let root = tmpdir("haspreview");
+        assert!(!has_preview_file(&root));
+        std::fs::write(root.join("preview.png"), b"p").unwrap();
+        assert!(has_preview_file(&root));
         let _ = std::fs::remove_dir_all(&root);
     }
 

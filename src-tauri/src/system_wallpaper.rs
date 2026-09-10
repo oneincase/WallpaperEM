@@ -202,6 +202,14 @@ fn poster_frame(dir: &Path, item_id: &str, ty: &str) -> Result<PathBuf, String> 
 }
 
 /// 抽帧产物的缓存路径（新鲜度判断在 cache_fresh，由抽帧函数自己短路）
+/// 供库导入复用：视频抽首帧写 PNG（本地库卡片封面）。
+/// macOS = AVFoundation（mp4/mov/m4v 等系统可解码格式；mkv/avi/webm 可能失败）；
+/// Linux = 系统 ffmpeg（未安装则 Err）；其余平台不支持。失败由调用方自行降级
+/// （导入不该因没有封面而失败）。
+pub(crate) fn video_poster_png(video: &Path, out: &Path) -> Result<(), String> {
+    extract_video_frame(video, out)
+}
+
 fn cached_png(dir: &Path, item_id: &str, _source: &Path) -> Result<PathBuf, String> {
     Ok(dir.join(format!("system-wallpaper-{item_id}.png")))
 }
