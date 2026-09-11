@@ -1283,7 +1283,9 @@ fn resume_if_auto_paused(app: &AppHandle) {
 
 // ---------- 命令 ----------
 
-#[tauri::command(rename = "wallpaper_apply")]
+// `async` 让命令体在异步线程池执行、而非主线程的 WebView2 IPC 回调内 ——
+// Windows 上从 WebView2 回调里建 WebView2 会重入死锁（详见 apply_item_inner 注释）。
+#[tauri::command(async, rename = "wallpaper_apply")]
 pub fn apply(
     app: AppHandle,
     config: WallpaperConfig,
@@ -1303,7 +1305,7 @@ pub fn apply(
     res
 }
 
-#[tauri::command(rename = "wallpaper_stop")]
+#[tauri::command(async, rename = "wallpaper_stop")]
 pub fn stop(app: AppHandle, display_id: Option<String>) -> Result<(), String> {
     let (tx, rx) = std::sync::mpsc::channel();
     let app2 = app.clone();
@@ -1535,7 +1537,7 @@ pub fn set_filter(app: AppHandle, filter: String) -> Result<(), String> {
 }
 
 /// 设置「隐藏图标」开关（桌面图标之下/壁纸上方 = 默认；开启后壁纸窗口在桌面图标之上，可接收鼠标/互动）。默认关闭。
-#[tauri::command(rename = "wallpaper_interactive_set")]
+#[tauri::command(async, rename = "wallpaper_interactive_set")]
 pub fn interactive_set(app: AppHandle, enabled: bool) -> Result<(), String> {
     let db = app
         .try_state::<Arc<Mutex<rusqlite::Connection>>>()
@@ -1775,6 +1777,11 @@ fn apply_item_inner(app: &AppHandle, item_id: &str) -> Result<(), String> {
     let item_id = item_id.to_string();
     let tag = item_id.clone();
     tracing::info!("apply[{tag}]: 派发到主线程（type={}）", cfg.r#type);
+    // ⚠️ 本函数必须在**非主线程**上被调用（所有 tauri 命令入口都标了 `async`）。
+    // 同步命令运行在主线程的 WebView2 IPC 回调内，此时 run_on_main_thread 会内联
+    // 执行闭包，于是「在 WebView2 回调里再建 WebView2」触发 WebView2 线程模型的
+    // reentrancy 死锁：Windows 上整个应用卡死在建窗处（macOS 的 WKWebView 无此限制）。
+    // 若要在主线程内联调用，命令会阻塞在 rx.recv 上，连消息循环都无法泵送 —— 同样死。
     app.run_on_main_thread(move || {
         let t0 = std::time::Instant::now();
         tracing::info!("apply[{item_id}]: 主线程处理器进入");
@@ -1801,7 +1808,7 @@ fn apply_item_inner(app: &AppHandle, item_id: &str) -> Result<(), String> {
 }
 
 /// 把本地库条目应用到桌面（用户显式点击；自动暂停态下立即恢复播放）
-#[tauri::command(rename = "wallpaper_apply_item")]
+#[tauri::command(async, rename = "wallpaper_apply_item")]
 pub fn apply_item(app: AppHandle, item_id: String) -> Result<(), String> {
     let res = apply_item_inner(&app, &item_id);
     if res.is_ok() {
@@ -1885,7 +1892,7 @@ pub fn playlist_delete(app: AppHandle, id: i64) -> Result<bool, String> {
 }
 
 /// 激活播放列表：设置 active_playlist 并立即应用第一项
-#[tauri::command]
+#[tauri::command(async)]
 pub fn playlist_apply(app: AppHandle, id: i64) -> Result<serde_json::Value, String> {
     let db = app.state::<Arc<Mutex<rusqlite::Connection>>>();
     let playlist = {
@@ -1921,7 +1928,7 @@ pub fn playlist_apply(app: AppHandle, id: i64) -> Result<serde_json::Value, Stri
 }
 
 /// 下一张（手动或轮播定时）
-#[tauri::command(rename = "wallpaper_next")]
+#[tauri::command(async, rename = "wallpaper_next")]
 pub fn next(app: AppHandle) -> Result<serde_json::Value, String> {
     let db = app.state::<Arc<Mutex<rusqlite::Connection>>>();
     let (playlist, index) = {
