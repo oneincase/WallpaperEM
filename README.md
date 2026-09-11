@@ -1,7 +1,7 @@
 # WallpaperEM
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.4.0-informational)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.5.0-informational)](CHANGELOG.md)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue)](#平台说明--platform-notes)
 [![Tauri](https://img.shields.io/badge/Tauri-2.x-24C8DB?logo=tauri&logoColor=white)](https://tauri.app/)
 [![Renderer](https://img.shields.io/badge/renderer-webwallgl-8A2BE2)](https://github.com/oneincase/webwallgl)
@@ -13,6 +13,27 @@
 **WallpaperEM** 是一款开源的动态壁纸引擎：浏览并下载 Steam 创意工坊（Wallpaper Engine）壁纸，一键应用到桌面。支持 **视频 / GIF / 网页 / 场景（WebGL）/ 图片** 五类壁纸、多显示器、托盘与全局快捷键；内置 MCP 服务，可以用 AI 直接创作壁纸工程。
 
 **WallpaperEM** is an open-source dynamic wallpaper engine: browse and download Wallpaper Engine workshop wallpapers, then apply them to your desktop. It supports **video / GIF / web / scene (WebGL) / image** wallpapers across multiple displays, with a tray icon and global shortcuts — plus a built-in MCP server so AI agents can author wallpaper projects directly.
+
+---
+
+## 🖼️ 界面截图 / Screenshots
+
+<p align="center">
+  <img src="docs/img/shot-workshop.jpg" width="860" alt="Steam Workshop browse"/>
+</p>
+<p align="center"><sub>工坊 · 搜索 / 排序 / 筛选，一键下载 — Browse the Steam Workshop</sub></p>
+
+<p align="center">
+  <img src="docs/img/shot-wallpaper.jpg" width="860" alt="Wallpaper preview"/>
+</p>
+<p align="center"><sub>发现 · 随机推荐，点缩略图或箭头切换 — Discover: random wallpaper picks</sub></p>
+
+<p align="center">
+  <img src="docs/img/shot-settings.jpg" width="424" alt="Settings — General"/>
+  &nbsp;&nbsp;
+  <img src="docs/img/shot-about.jpg" width="424" alt="Settings — About & updates"/>
+</p>
+<p align="center"><sub>设置 · 通用（帧率 / 清晰度 / 音频可视化）— General &nbsp;&nbsp;·&nbsp;&nbsp; 设置 · 关于（软件更新）— About (updates)</sub></p>
 
 ---
 
