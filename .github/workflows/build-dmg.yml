@@ -26,6 +26,19 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
+      # webwallgl 是自维护渲染库，未发 npm；package.json 里依赖的是
+      # `file:../webwallgl-github/dist/lib`，必须与仓库平级检出并先构建出 dist/lib，
+      # 否则 `pnpm install` 直接 ENOENT 失败（别的平台工作流已这么做，这里补齐）。
+      - name: 检出 webwallgl
+        uses: actions/checkout@v4
+        with:
+          repository: oneincase/webwallgl
+          path: webwallgl-github-src
+
+      # actions/checkout 不允许直接检出到 workspace 外，先落到子目录再移到平级
+      - name: 移动到仓库平级目录
+        run: mv webwallgl-github-src ../webwallgl-github
+
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -50,6 +63,14 @@ jobs:
           # pnpm 11 需要 Node >= 22.13；Node 20 已被 GitHub Actions 弃用，改用 LTS 22
           node-version: 22
           cache: pnpm
+
+      # 不用 --frozen-lockfile：webwallgl 自身在迭代，其 lockfile 可能滞后于源码；
+      # 这里优先「能构建出 dist/lib」。WallpaperEM 自身仍走 frozen，保证可复现。
+      - name: 构建 webwallgl 库产物（dist/lib）
+        working-directory: ../webwallgl-github
+        run: |
+          pnpm install --no-frozen-lockfile
+          pnpm run build:lib
 
       - name: 安装依赖
         run: pnpm install --frozen-lockfile
