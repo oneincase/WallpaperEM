@@ -52,6 +52,17 @@ jobs:
             bundles: |
               src-tauri/target/release/bundle/nsis/*.exe
               src-tauri/target/release/bundle/msi/*.msi
+          - os: windows-latest
+            # Windows ARM64（Surface Pro X、骁龙本等）：GitHub 没有稳定的 arm64 Windows
+            # runner 标签，所以在 x64 runner 上交叉编译 —— 装上 aarch64-pc-windows-msvc
+            # 目标，并把 MSVC 环境切到 VS 自带的 ARM64 工具链（windows-latest 镜像已装）。
+            targets: aarch64-pc-windows-msvc
+            msvc_arch: arm64
+            build_args: --target aarch64-pc-windows-msvc
+            label: Windows-arm64
+            bundles: |
+              src-tauri/target/aarch64-pc-windows-msvc/release/bundle/nsis/*.exe
+              src-tauri/target/aarch64-pc-windows-msvc/release/bundle/msi/*.msi
 
     runs-on: ${{ matrix.os }}
 
@@ -125,6 +136,14 @@ jobs:
 
       - name: 安装依赖
         run: pnpm install --frozen-lockfile
+
+      - name: 切换 MSVC 工具链到 ARM64（仅 Windows arm64 行）
+        # 交叉编译 aarch64-pc-windows-msvc 要用 VS 的 ARM64 cl.exe/link.exe；
+        # 该 action 会把这套环境导出到后续步骤（INCLUDE/LIB/PATH）。
+        if: matrix.msvc_arch
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc_arch }}
 
       - name: 构建（不签名、不发 Release）
         # tauri.conf.json 里 bundle.macOS.signingIdentity 写的是本机证书名

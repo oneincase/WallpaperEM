@@ -97,7 +97,7 @@
 | --- | --- | --- | --- |
 | macOS 13+ | 原生桌面层窗口（图标之下 / 之上两档） | MediaRemote（经 [mediaremote-adapter](https://github.com/ungive/mediaremote-adapter)） | ScreenCaptureKit loopback（需屏幕录制权限） |
 | Linux（X11） | X11 桌面层窗口 | MPRIS（D-Bus） | 暂未接入（待 PipeWire） |
-| Windows 10/11 | `WorkerW` 父子化 / Z 序置底 | GSMTC（`Windows.Media.Control`） | WASAPI loopback（免权限） |
+| Windows 10/11（x64 / ARM64） | `WorkerW` 父子化 / Z 序置底 | GSMTC（`Windows.Media.Control`） | WASAPI loopback（免权限） |
 
 ---
 
@@ -129,10 +129,12 @@ sudo apt install libwebkit2gtk-4.1-dev build-essential curl wget file \
   `sudo dpkg --add-architecture i386 && sudo apt install libc6:i386 libstdc++6:i386`。
   应用内安装 steamcmd 时会自动检测并提示。
 
-**Windows 10/11**
+**Windows 10/11（x64 / ARM64）**
 
 - **Visual Studio Build Tools**（MSVC + Windows SDK）
 - **WebView2 Runtime**（Win11 自带；Win10 安装包会自动带上引导器）
+- 本地出 ARM64 包同样是**交叉编译**（x64 机器即可）：`rustup target add aarch64-pc-windows-msvc`，
+  并在 VS 的「ARM64 生成工具」环境下构建（CI 用 `ilammy/msvc-dev-cmd` arch=arm64 切换）
 
 ### 安装依赖 / Install dependencies
 
@@ -159,7 +161,9 @@ pnpm tauri build
 >   - **universal（Intel + Apple Silicon）**：加 `--target universal-apple-darwin`，产物在
 >     `src-tauri/target/universal-apple-darwin/release/bundle/` 下；CI 默认出这个
 > - Linux：`bundle/deb/*.deb`、`bundle/appimage/*.AppImage`
-> - Windows：`bundle/nsis/*.exe`、`bundle/msi/*.msi`（见 `.github/workflows/build-windows.yml`）
+> - Windows：`bundle/nsis/*.exe`、`bundle/msi/*.msi`
+>   - ARM64：加 `--target aarch64-pc-windows-msvc`，产物在 `src-tauri/target/aarch64-pc-windows-msvc/release/bundle/` 下
+>   - 见 `.github/workflows/build-windows.yml`（x64 / arm64 矩阵）
 
 > **关于 steamcmd / About steamcmd**
 > 下载工坊内容使用 Valve 官方 steamcmd，首次在「设置 → 账号」点「安装」即可（约 2.5 MB 引导包，初始化后约 85 MB，装在应用数据目录，不随安装包分发）。
@@ -202,7 +206,7 @@ pnpm tauri build
 
 - 桌面层通过把窗口 `SetParent` 到资源管理器的 `WorkerW` 实现；「交互模式」下脱离 `WorkerW` 并压到 Z 序最底、盖住桌面图标。
 - 音频可视化走 **WASAPI 共享模式 loopback**（抓默认渲染端点混音），**不需要任何权限**。
-- 需要 **WebView2 Runtime**（Win11 自带）。
+- 需要 **WebView2 Runtime**（Win11 自带；ARM64 的 Win11 也预装）。
 
 ---
 

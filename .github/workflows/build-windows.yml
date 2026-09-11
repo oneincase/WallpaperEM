@@ -1,4 +1,4 @@
-name: 打包 Windows（NSIS 安装器 + MSI）
+name: 打包 Windows（x64 + ARM64，NSIS 安装器 + MSI）
 
 # 推送形如 v0.1.0 的标签时触发（tag 号需与 src-tauri/tauri.conf.json 的 version 一致）。
 on:
@@ -18,9 +18,24 @@ concurrency:
 
 jobs:
   build-windows:
-    # windows-latest 自带 MSVC 工具链与 Windows SDK，Tauri 需要的 WebView2 也在系统里（Win11）。
-    # NSIS 与 WiX 由 tauri-bundler 在构建时自动下载，无需预装。
+    # windows-latest 自带 MSVC（含 ARM64 工具链）与 Windows SDK；NSIS 与 WiX 由
+    # tauri-bundler 在构建时自动下载，无需预装。
+    #
+    # ARM64 在 x64 runner 上**交叉编译**：GitHub 目前没有稳定的 arm64 Windows
+    # runner 标签，所以装上 aarch64-pc-windows-msvc 目标，并把 MSVC 环境切到
+    # VS 自带的 ARM64 工具链（见 msvc-dev-cmd 步骤）。
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            label: x64
+          - target: aarch64-pc-windows-msvc
+            label: arm64
+            msvc_arch: arm64
+
     runs-on: windows-latest
+    name: Windows-${{ matrix.label }}
 
     steps:
       - name: 检出代码
@@ -42,8 +57,8 @@ jobs:
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
         with:
-          # Windows 宿主的默认目标就是 msvc，显式写出来是给 rust-cache 与后续工具链改动兜底
-          targets: x86_64-pc-windows-msvc
+          # 显式写出来是给 rust-cache 与后续工具链改动兜底；arm64 由矩阵决定
+          targets: ${{ matrix.target }}
           components: clippy,rustfmt
 
       - name: Rust 构建缓存
@@ -71,18 +86,26 @@ jobs:
       - name: 安装依赖
         run: pnpm install --frozen-lockfile
 
+      - name: 切换 MSVC 工具链到 ARM64（仅 arm64 行）
+        # 交叉编译要用 VS 的 ARM64 cl.exe/link.exe；该 action 把环境导出到后续步骤
+        if: matrix.msvc_arch
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc_arch }}
+
       - name: 构建 Tauri（.exe 安装器 + .msi）
         # beforeBuildCommand 会先跑 pnpm --filter @we/desktop build 生成前端 dist/，
-        # 再编译 Rust release 并打包 nsis/msi（targets 在 tauri.conf.json）。
-        run: pnpm tauri build
+        # 再编译 Rust release 并打包 nsis/msi（targets 见 tauri.windows.conf.json）。
+        # 显式 --target：产物落在 target/<triple>/release/bundle/ 下，两个架构互不覆盖。
+        run: pnpm tauri build --target ${{ matrix.target }}
 
       - name: 上传构建产物（artifact）
         uses: actions/upload-artifact@v4
         with:
-          name: WallpaperEM-windows-${{ github.ref_name }}
+          name: WallpaperEM-windows-${{ matrix.label }}-${{ github.ref_name }}
           path: |
-            src-tauri/target/release/bundle/nsis/*.exe
-            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.exe
+            src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi
           if-no-files-found: error
 
       - name: 把安装包附加到对应 tag 的 Release
@@ -91,7 +114,7 @@ jobs:
         with:
           name: ${{ github.ref_name }}
           files: |
-            src-tauri/target/release/bundle/nsis/*.exe
-            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.exe
+            src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi
           draft: false
           prerelease: false
