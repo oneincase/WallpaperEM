@@ -64,7 +64,8 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             libdbus-1-dev \
-            patchelf
+            patchelf \
+            xdg-utils
 
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
