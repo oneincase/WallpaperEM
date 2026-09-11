@@ -48,8 +48,8 @@ export function SettingsPage() {
   // 全局场景帧率上限（24/30/45/60/120，越低 GPU 占用越低），默认 24
   const [sceneFps, setSceneFps] = useState<number>(24);
   const [sceneFpsMsg, setSceneFpsMsg] = useState("");
-  // 壁纸语言（只影响壁纸的 language 属性，不是软件本体语言）。默认简体中文
-  const [language, setLanguage] = useState<string>("simplifiedchinese");
+  // 壁纸语言（只影响壁纸的 language 属性，不是软件本体语言）。默认英文
+  const [language, setLanguage] = useState<string>("english");
   // 界面语言（i18n）：这里只是订阅，取词走模块级 tr()；订阅是为了本页文案跟着变
   const locale = useLocale();
   const [sidebarAlpha, setSidebarAlphaState] = useState<number>(getSidebarAlpha);
@@ -590,14 +590,16 @@ export function SettingsPage() {
     }
   };
 
-  /** 状态标签：未启用 / 启动中 / 运行中 / 启动失败 */
+  /** 状态：未启动 / 运行中 / 启动失败 / 启动中。
+   *  这里存**中文原文**（不 tr）：下面的分支靠它做相等判断，一旦 tr 成译文，
+   *  英文环境下四个分支全不命中，整行会永远显示「启动中 / Starting…」 */
   const mcpState = !mcp?.enabled
-    ? tr("未启动")
+    ? "未启动"
     : mcp.running
-      ? tr("运行中")
+      ? "运行中"
       : mcp.lastError
-        ? tr("启动失败")
-        : tr("启动中");
+        ? "启动失败"
+        : "启动中";
 
   return (
     <div className="flex flex-col h-full px-7 py-5">

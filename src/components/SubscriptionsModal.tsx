@@ -20,7 +20,13 @@ import { tr, trMsg } from "../lib/i18n";
 
 type Phase =
   | { kind: "loading"; note: string }
-  | { kind: "needCode"; codeType: "device" | "email"; message: string }
+  | {
+      kind: "needCode";
+      codeType: "device" | "email";
+      message: string;
+      /** Steam 同时在手机 App 推了确认：此阶段后台轮询，点允许后自动继续 */
+      canConfirmOnPhone: boolean;
+    }
   | { kind: "pendingConfirmation"; message: string }
   | { kind: "badCredentials"; message: string; username: string }
   /** 扫码登录中：expired=true 停止轮询显示「刷新二维码」覆盖层 */
@@ -67,7 +73,12 @@ export function SubscriptionsModal({
           loadingMore: false,
         });
       else if (r.status === "needCode")
-        setPhase({ kind: "needCode", codeType: r.codeType, message: r.message });
+        setPhase({
+          kind: "needCode",
+          codeType: r.codeType,
+          message: r.message,
+          canConfirmOnPhone: r.canConfirmOnPhone ?? false,
+        });
       else if (r.status === "badCredentials")
         setPhase({
           kind: "badCredentials",
@@ -218,6 +229,40 @@ export function SubscriptionsModal({
     }
   }, [code, handleResp, onConfirmed]);
 
+  // 验证码页 + Steam 同时推了手机确认：定时轮询登录状态。用户直接在手机 App
+  // 点「允许」后自动放行——此前只认输入框，手机点了允许页面也一直停在输验证码。
+  // 后端每轮只做一次短轮询（不拉列表），这里串行 setTimeout 避免请求叠加。
+  const phoneConfirming = phase.kind === "needCode" && phase.canConfirmOnPhone;
+  useEffect(() => {
+    if (!phoneConfirming) return;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const tick = async () => {
+      if (stopped) return;
+      try {
+        const r = await api.accountWebLoginStart();
+        if (stopped) return;
+        if (r.status === "ok") {
+          onConfirmed();
+          return;
+        }
+        if (r.status === "badCredentials") {
+          setPhase({ kind: "badCredentials", message: r.message, username: r.username ?? "" });
+          return;
+        }
+        // 仍在等待（needCode / pendingConfirmation）：后端已顺带轮询过一轮，继续等
+      } catch {
+        /* 网络抖动忽略，下一轮再试 */
+      }
+      timer = setTimeout(() => void tick(), 3000);
+    };
+    timer = setTimeout(() => void tick(), 3000);
+    return () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [phoneConfirming, onConfirmed]);
+
   // Esc 关闭（下载中不关，避免误触）
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -342,6 +387,11 @@ export function SubscriptionsModal({
             <div className="text-[11.5px] text-[var(--text-2)]">
               {tr("只需验证一次：之后同步订阅免密免验证码")}
             </div>
+            {phase.canConfirmOnPhone && (
+              <div className="max-w-sm text-center text-[11.5px] leading-relaxed text-[var(--accent-strong)]">
+                {tr("Steam 手机 App 也弹出了「确认登录」：在手机上点「允许」即可，这里会自动继续")}
+              </div>
+            )}
             <input
               autoFocus
               value={code}

@@ -503,7 +503,13 @@ export interface SubscriptionItem {
  */
 export type SubscriptionsResponse =
   | { status: "ok"; items: SubscriptionItem[]; total: number; page: number }
-  | { status: "needCode"; codeType: "device" | "email"; message: string }
+  | {
+      status: "needCode";
+      codeType: "device" | "email";
+      message: string;
+      /** Steam 同时在手机 App 推了「确认登录」：前端可后台轮询，点允许后自动放行 */
+      canConfirmOnPhone?: boolean;
+    }
   | { status: "pendingConfirmation"; message: string }
   /** 本地保存的账号密码被 Steam 拒绝（EResult 5），需要用户重新输入 */
   | { status: "badCredentials"; message: string; username?: string }
@@ -513,7 +519,13 @@ export type SubscriptionsResponse =
 /** 网页会话建立结果（不含订阅数据）：ok=会话已建立 */
 export type AccountWebLoginResponse =
   | { status: "ok" }
-  | { status: "needCode"; codeType: "device" | "email"; message: string }
+  | {
+      status: "needCode";
+      codeType: "device" | "email";
+      message: string;
+      /** 同上：手机 App 确认通道可用，可轮询等待 */
+      canConfirmOnPhone?: boolean;
+    }
   | { status: "pendingConfirmation"; message: string }
   | { status: "badCredentials"; message: string; username?: string };
 

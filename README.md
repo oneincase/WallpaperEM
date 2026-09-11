@@ -97,7 +97,7 @@
 | --- | --- | --- | --- |
 | macOS 13+ | 原生桌面层窗口（图标之下 / 之上两档） | MediaRemote（经 [mediaremote-adapter](https://github.com/ungive/mediaremote-adapter)） | ScreenCaptureKit loopback（需屏幕录制权限） |
 | Linux（X11，x64 / ARM64） | X11 桌面层窗口 | MPRIS（D-Bus） | 暂未接入（待 PipeWire） |
-| Windows 10/11（x64 / ARM64） | `WorkerW` 父子化 / Z 序置底 | GSMTC（`Windows.Media.Control`） | WASAPI loopback（免权限） |
+| Windows 10/11（x64 / ARM64） | `Progman` / `WorkerW` 桌面层（含 Win11 raised-desktop 适配）/ Z 序置底 | GSMTC（`Windows.Media.Control`） | WASAPI loopback（免权限） |
 
 ---
 
@@ -207,9 +207,10 @@ pnpm tauri build
 
 ### Windows
 
-- 桌面层通过把窗口 `SetParent` 到资源管理器的 `WorkerW` 实现；「交互模式」下脱离 `WorkerW` 并压到 Z 序最底、盖住桌面图标。
+- 桌面层不依赖第三方插件，而是自行父子化并用 `GetParent` 校验：Win11 的 raised-desktop 结构（`Progman` 带 `WS_EX_NOREDIRECTIONBITMAP`）下按微软给第三方壁纸程序的指引，把壁纸窗口挂成 `Progman` 的子窗口、紧贴 `SHELLDLL_DefView` 之下，并把承载静态壁纸的 `WorkerW` 压到 Z 序最底；Win10 等经典结构仍走「兄弟 `WorkerW`」。「交互模式」下脱离桌面层并压到 Z 序最底、盖住桌面图标。
 - 音频可视化走 **WASAPI 共享模式 loopback**（抓默认渲染端点混音），**不需要任何权限**。
 - 需要 **WebView2 Runtime**（Win11 自带；ARM64 的 Win11 也预装）。
+- 支持 **Windows 10 / 11**，提供 **x64 与 ARM64** 两种安装包。
 
 ---
 

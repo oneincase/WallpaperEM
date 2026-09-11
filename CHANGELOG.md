@@ -4,6 +4,47 @@
 
 ## [Unreleased]
 
+_（暂无 / Nothing yet）_
+
+## [v0.5.0] - 2026-09-12
+
+### 🪟 多架构发布与 Windows 真机修复 / Multi-arch & Windows fixes
+
+- **发布矩阵扩到五条**：macOS 通用二进制（Apple Silicon + Intel，`lipo` 合并）、
+  Linux x64 / ARM64（各自原生 arm runner）、Windows x64 / ARM64（x64 runner 交叉编译
+  到 `aarch64-pc-windows-msvc`，并钉死 MSVC 的 ARM64 `link.exe` —— 否则会被 Git 自带的
+  同名程序抢占）。
+- **修 Windows「应用 / 预览壁纸」卡死**：Tauri 的同步命令运行在主线程的 WebView2 IPC
+  回调里，而 `run_on_main_thread` 在主线程上会**内联执行**闭包，于是 `WebviewWindowBuilder::build()`
+  变成「在 WebView2 自己的回调里再创建 WebView2」，违反其线程模型造成重入死锁，整个应用
+  冻结（macOS 的 WKWebView 无此限制，所以此前只在 Windows 暴露）。相关命令改为 `async`
+  在异步线程池执行，建窗回到事件循环顶层。
+- **重做 Windows 桌面层级**：弃用 `tauri-plugin-desktop-underlay`（它只用窗口 label 记录
+  「是否已下沉」且销毁时不清理，切壁纸的「销毁 + 同名重建」会让新窗口被误判为已下沉而跳过
+  `SetParent`，表现为**新设置的壁纸全屏盖在最顶层**）。改为自行父子化并用 `GetParent` 校验：
+  Win11 的 raised-desktop 结构（`Progman` 带 `WS_EX_NOREDIRECTIONBITMAP`）下按微软给第三方
+  壁纸程序的指引，把窗口挂成 `Progman` 的子窗口、紧贴 `SHELLDLL_DefView` 之下，并把承载
+  静态壁纸的 `WorkerW` 压到子窗口 Z 序最底；经典结构（Win10）仍走兄弟 `WorkerW`。跨进程
+  `SetParent` 在两进程 DPI 感知级别不一致时会失败，按 `UNAWARE` / `SYSTEM_AWARE` 依次重试；
+  任一步校验不过就退回 Z 序最底，保证「最坏只是图标被盖住，绝不出现壁纸盖住整个桌面」。
+- **steamcmd 不再弹控制台窗口**：所有子进程加 `CREATE_NO_WINDOW`（下载 / 校验 / 预热三条路径）。
+- **启动更快**：首次显示器枚举撞上驱动就绪过渡期（Windows 实测启动首帧返回空）时做有界短重试，
+  不再干等监控的 2s tick。
+- **设置 → 关于**：新增软件更新检查与一键下载（按 GitHub Release 校验）。
+
+### 🐛 修复 / Fixed（订阅同步手机确认、MCP 状态英文、壁纸语言默认）
+
+- **订阅同步：在 Steam 手机 App 点「允许」后，页面不再卡在「请输入令牌验证码」**。
+  手机令牌账号登录时 Steam 会同时下发「验证码」和「App 确认」两条通道，之前只走验证码
+  分支：用户明明已在手机上允许，页面仍停在输码页。现在进入码页后前端每 ~3s 后台轮询
+  登录状态，后端顺带查一次手机确认，确认即自动继续；码页同时提示「也可在手机 App 上点
+  「允许」」。另外修掉了后台轮询取走等待中会话、用户此刻手动提交验证码会误报「没有等待
+  验证码的登录会话」的竞态。
+- **「AI / MCP」页的状态描述在英文界面下不再永远显示 Starting…**：状态值比较误用了
+  翻译后的文案，英文环境下分支全不命中。改为用中文原文当比较键、只在渲染时翻译。
+- **「设置 → 通用 → 壁纸语言」默认改为 English**（此前为简体中文）；壁纸自带
+  `language` 属性时仍以壁纸为准。
+
 ### ✨ 新增与改进 / Added & Improved（界面多语言：中文 / English）
 
 - **设置 → 通用 →「界面语言」可切换整机语言，立即生效**：界面、托盘菜单、独立「壁纸设置」

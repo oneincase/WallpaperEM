@@ -238,6 +238,8 @@ export const EN_US: Record<string, string> = {
   "邮件验证码": "Email code",
   "验证并继续": "Verify and continue",
   "收不到验证码？改用扫码登录": "No code arriving? Sign in with a QR code instead",
+  "Steam 手机 App 也弹出了「确认登录」：在手机上点「允许」即可，这里会自动继续":
+    "The Steam mobile app also shows a sign-in approval — tap Allow there and this page continues automatically",
   "继续": "Continue",
   "二维码已过期": "QR code expired",
   "刷新二维码": "Refresh QR code",
@@ -811,6 +813,8 @@ export const EN_US_BACKEND: Record<string, string> = {
   "已保存的登录态续期失败：{re}。请重新扫码登录（本地同时没有可用密码：{e}）": "Refreshing the saved session failed: {}. Sign in by QR again (and no usable password is stored: {})",
   "登录态续期失败：{re}；密码登录同样失败：{e}": "Session refresh failed: {}; signing in with the password failed too: {}",
   "请输入 Steam 手机令牌上的验证码": "Enter the code from the Steam mobile authenticator",
+  "请输入 Steam 手机令牌上的验证码；也可在 Steam 手机 App 上点「允许」":
+    "Enter the code from the Steam mobile authenticator — or tap Allow in the Steam mobile app",
   "Steam 已向 {} 发送验证码邮件，请查收": "Steam emailed a code to {} — check your inbox",
   "你的邮箱": "your email",
   "请在 Steam 手机 App 上确认这次登录，确认后点「继续」": "Approve this sign-in in the Steam mobile app, then tap Continue",

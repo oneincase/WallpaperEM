@@ -31,7 +31,7 @@ pub const LANGUAGE_SETTING_KEY: &str = "language";
 /// 自定义数字（language.value == 3）。全局语言只能注入"WE 语义"的值 ——
 /// 壁纸自己声明了 language 属性时一律以壁纸为准（见 effective_props），
 /// 只有壁纸没声明时才补这个全局默认，所以数字枚举类壁纸不会被错误覆盖。
-pub const LANGUAGE_DEFAULT: &str = "simplifiedchinese";
+pub const LANGUAGE_DEFAULT: &str = "english";
 pub const LANGUAGE_CHOICES: [&str; 6] = [
     "simplifiedchinese",
     "traditionalchinese",
@@ -41,7 +41,7 @@ pub const LANGUAGE_CHOICES: [&str; 6] = [
     "german",
 ];
 
-/// 读全局语言，非法/缺失回退简体中文。
+/// 读全局语言，非法/缺失回退英文。
 pub fn global_language(conn: &Connection) -> String {
     let raw = crate::db::get_setting(conn, LANGUAGE_SETTING_KEY).unwrap_or_default();
     if LANGUAGE_CHOICES.contains(&raw.as_str()) {

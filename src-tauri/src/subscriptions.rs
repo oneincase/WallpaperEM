@@ -39,6 +39,11 @@ pub struct PendingAuth {
     code_type: i32,
     /// 扫码会话当前要展示的二维码 URL（服务端会轮换，轮询可能下发新的）
     challenge_url: String,
+    /// Steam 是否也给「手机 App 点确认」通道（allowed_confirmations 里的
+    /// DeviceConfirmation/EmailConfirmation）。手机令牌账号通常同时给出验证码
+    /// 与 App 确认两条通道：本字段为 true 时，即使已经进了验证码页，也要
+    /// 短轮询看看用户是不是已经在手机上点了「允许」
+    device_confirmation: bool,
 }
 
 /// Tauri 托管状态
@@ -60,7 +65,13 @@ pub struct SubscriptionItem {
 /// 登录推进结果：要么拿到可用会话，要么告诉前端该干什么
 enum LoginStep {
     Session { steamid: u64, access_token: String },
-    NeedCode { code_type: i32, message: String },
+    /// 需要 Steam Guard 验证码。can_confirm_on_phone = Steam 同时在手机
+    /// App 推了「确认登录」，前端可后台轮询等待用户点允许，不必只盯着输入框
+    NeedCode {
+        code_type: i32,
+        message: String,
+        can_confirm_on_phone: bool,
+    },
     PendingConfirmation { message: String },
 }
 
@@ -68,10 +79,30 @@ fn poll_interval(sec: f32) -> Duration {
     Duration::from_secs_f32(sec.clamp(2.0, 10.0))
 }
 
-/// 在预算内轮询登录结果；拿到 token 即持久化会话。
-/// 返回 (结果, 最新 client_id)：服务端可能通过 new_client_id 轮换会话 id
-/// （验证码提交后常见），调用方要把它写回 PendingAuth，否则下次轮询
-/// 还用旧 id 会永远等不到——「输入正确验证码也登录不了」的典型成因
+/// 单次轮询登录状态。返回 (拿到 token 则为 Some, 服务端可能轮换后的 client_id)。
+/// 服务端会通过 new_client_id 轮换会话 id（验证码提交后常见），调用方必须把
+/// 最新 id 写回 PendingAuth，否则下次还用旧 id 会永远等不到——「输入正确验证码
+/// 也登录不了」的典型成因
+async fn poll_once(
+    client: &SteamClient,
+    client_id: u64,
+    request_id: &[u8],
+) -> Result<(Option<auth::PollResult>, u64), String> {
+    let mut client_id = client_id;
+    if let Some(res) = auth::poll_status(client, client_id, request_id).await? {
+        if res.new_client_id != 0 && res.new_client_id != client_id {
+            tracing::info!("订阅同步：服务端轮换 client_id {client_id} → {}", res.new_client_id);
+            client_id = res.new_client_id;
+        }
+        // 扫码场景下服务端可能只下发轮换的新二维码（无 token），不算成功
+        if !res.access_token.is_empty() && !res.refresh_token.is_empty() {
+            return Ok((Some(res), client_id));
+        }
+    }
+    Ok((None, client_id))
+}
+
+/// 在预算内轮询登录结果
 async fn poll_until_token(
     client: &SteamClient,
     client_id: u64,
@@ -79,18 +110,13 @@ async fn poll_until_token(
     interval_sec: f32,
     budget: Duration,
 ) -> Result<(Option<auth::PollResult>, u64), String> {
-    let mut client_id = client_id;
     let start = std::time::Instant::now();
+    let mut client_id = client_id;
     loop {
-        if let Some(res) = auth::poll_status(client, client_id, request_id).await? {
-            if res.new_client_id != 0 && res.new_client_id != client_id {
-                tracing::info!("订阅同步：服务端轮换 client_id {client_id} → {}", res.new_client_id);
-                client_id = res.new_client_id;
-            }
-            // 扫码场景下服务端可能只下发轮换的新二维码（无 token），不算成功
-            if !res.access_token.is_empty() && !res.refresh_token.is_empty() {
-                return Ok((Some(res), client_id));
-            }
+        let (res, latest) = poll_once(client, client_id, request_id).await?;
+        client_id = latest;
+        if res.is_some() {
+            return Ok((res, client_id));
         }
         if start.elapsed() >= budget {
             return Ok((None, client_id));
@@ -217,6 +243,12 @@ async fn login_step(
         .cloned()
     {
         let code_type = c.confirmation_type;
+        // 手机令牌账号上，Steam 通常同时给出「输验证码」和「手机 App 点确认」两条
+        // 通道。记下后者：前端即使已进验证码页，也要能等到用户在手机上点允许
+        let can_confirm_on_phone = begin.allowed.iter().any(|c| {
+            c.confirmation_type == auth::GUARD_DEVICE_CONFIRMATION
+                || c.confirmation_type == auth::GUARD_EMAIL_CONFIRMATION
+        });
         *state.0.lock().map_err(|e| e.to_string())? = Some(PendingAuth {
             client_id: begin.client_id,
             request_id: begin.request_id,
@@ -224,9 +256,14 @@ async fn login_step(
             interval_sec: begin.interval_sec,
             code_type,
             challenge_url: String::new(),
+            device_confirmation: can_confirm_on_phone,
         });
         let message = if code_type == auth::GUARD_DEVICE_CODE {
-            "请输入 Steam 手机令牌上的验证码".to_string()
+            if can_confirm_on_phone {
+                "请输入 Steam 手机令牌上的验证码；也可在 Steam 手机 App 上点「允许」".to_string()
+            } else {
+                "请输入 Steam 手机令牌上的验证码".to_string()
+            }
         } else {
             format!(
                 "Steam 已向 {} 发送验证码邮件，请查收",
@@ -237,7 +274,11 @@ async fn login_step(
                 }
             )
         };
-        return Ok(LoginStep::NeedCode { code_type, message });
+        return Ok(LoginStep::NeedCode {
+            code_type,
+            message,
+            can_confirm_on_phone,
+        });
     }
 
     // 无需验证码（含手机 App 点「确认」）：轮询等待
@@ -271,6 +312,7 @@ async fn login_step(
                 interval_sec: begin.interval_sec,
                 code_type: 0,
                 challenge_url: String::new(),
+                device_confirmation: false,
             });
             Ok(LoginStep::PendingConfirmation {
                 message: if needs_app_confirm {
@@ -290,13 +332,14 @@ async fn resume_pending(
     pending: &PendingAuth,
     username: &str,
     dir: &std::path::Path,
+    budget: Duration,
 ) -> Result<(LoginStep, u64), String> {
     let (res, latest_client_id) = poll_until_token(
         client,
         pending.client_id,
         &pending.request_id,
         pending.interval_sec,
-        POLL_BUDGET,
+        budget,
     )
     .await?;
     match res {
@@ -330,10 +373,15 @@ async fn resume_pending(
 fn step_to_json(step: LoginStep) -> Option<serde_json::Value> {
     match step {
         LoginStep::Session { .. } => None,
-        LoginStep::NeedCode { code_type, message } => Some(json!({
+        LoginStep::NeedCode {
+            code_type,
+            message,
+            can_confirm_on_phone,
+        } => Some(json!({
             "status": "needCode",
             "codeType": if code_type == auth::GUARD_DEVICE_CODE { "device" } else { "email" },
             "message": message,
+            "canConfirmOnPhone": can_confirm_on_phone,
         })),
         LoginStep::PendingConfirmation { message } => Some(json!({
             "status": "pendingConfirmation",
@@ -370,8 +418,48 @@ async fn ensure_session(
             }
         } else if p.code_type != 0 {
             let code_type = p.code_type;
+            // 手机令牌账号：Steam 同时给了「验证码」和「手机 App 点确认」两条通道。
+            // 用户很可能直接在手机上点了允许（而不是回来输码）——先短轮询一轮把
+            // 这个会话的 token 捞回来；没捞到就原样退回码页，并告诉前端可以后台
+            // 轮询。不做这一步的后果：页面永远停在「请输入令牌验证码」，
+            // 用户明明已在手机上允许，却一直登不进去。
+            if p.device_confirmation {
+                // 只查一次（前端每 ~3s 重复调用）：命令要尽快返回，
+                // 避免长时间把等待中的会话从 state 里占住，挡住用户手动输码
+                let (res, latest_client_id) = poll_once(client, p.client_id, &p.request_id).await?;
+                if let Some(tokens) = res {
+                    let (username, _, dir) = credentials(app)?;
+                    let account = if tokens.account_name.is_empty() {
+                        username
+                    } else {
+                        tokens.account_name
+                    };
+                    let _ =
+                        secure_store::save_session(&account, p.steamid, &tokens.access_token, &dir);
+                    return Ok(EnsureSession::Session {
+                        steamid: p.steamid,
+                        access_token: tokens.access_token,
+                    });
+                }
+                let step = LoginStep::NeedCode {
+                    code_type,
+                    can_confirm_on_phone: true,
+                    message: if code_type == auth::GUARD_DEVICE_CODE {
+                        "请输入 Steam 手机令牌上的验证码；也可在 Steam 手机 App 上点「允许」"
+                            .to_string()
+                    } else {
+                        "请输入 Steam 发送到你邮箱的验证码".to_string()
+                    },
+                };
+                *state.0.lock().map_err(|e| e.to_string())? = Some(PendingAuth {
+                    client_id: latest_client_id,
+                    ..p
+                });
+                return Ok(EnsureSession::Status(step_to_json(step).unwrap()));
+            }
             let step = LoginStep::NeedCode {
                 code_type,
+                can_confirm_on_phone: false,
                 message: if code_type == auth::GUARD_DEVICE_CODE {
                     "请输入 Steam 手机令牌上的验证码".to_string()
                 } else {
@@ -382,7 +470,8 @@ async fn ensure_session(
             return Ok(EnsureSession::Status(step_to_json(step).unwrap()));
         } else {
         let (username, _, dir) = credentials(app)?;
-        let (step, latest_client_id) = resume_pending(client, &p, &username, &dir).await?;
+        let (step, latest_client_id) =
+            resume_pending(client, &p, &username, &dir, POLL_BUDGET).await?;
         // 没轮到的把会话放回去（带上服务端可能轮换过的 client_id），下次继续
         if !matches!(step, LoginStep::Session { .. }) {
             *state.0.lock().map_err(|e| e.to_string())? = Some(PendingAuth {
@@ -571,7 +660,17 @@ pub async fn subscriptions_submit_code(
     if code.is_empty() {
         return Err("请输入验证码".into());
     }
-    let pending = state.0.lock().map_err(|e| e.to_string())?.take();
+    // 后端的「等手机确认」单次轮询可能正好把会话取走在途（窗口 = 一次请求）。
+    // 这里短暂等一下它放回，避免用户刚在手机上点了允许、又手动提交验证码时，
+    // 被误报「没有等待验证码的登录会话」
+    let mut pending = None;
+    for _ in 0..8 {
+        pending = state.0.lock().map_err(|e| e.to_string())?.take();
+        if pending.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
     let Some(p) = pending else {
         return Err("没有等待验证码的登录会话，请重新开始同步".into());
     };
@@ -582,7 +681,8 @@ pub async fn subscriptions_submit_code(
     auth::submit_guard_code(&client, p.client_id, p.steamid, &code, p.code_type).await?;
     // 提交后轮询拿 token；没拿到就存回会话让前端「继续」重试
     let (username, _, dir) = credentials(&app)?;
-    let (step, latest_client_id) = resume_pending(&client, &p, &username, &dir).await?;
+    let (step, latest_client_id) =
+        resume_pending(&client, &p, &username, &dir, POLL_BUDGET).await?;
     if !matches!(step, LoginStep::Session { .. }) {
         // 关键：码已提交过，存回时 code_type 置 0（不再需要验证码）。
         // 否则前端点「继续」会被 page_impl 弹回收码页，用户误以为码不对，
@@ -615,6 +715,7 @@ pub async fn subscriptions_qr_begin(
         interval_sec: begin.interval_sec,
         code_type: CODE_TYPE_QR,
         challenge_url: challenge_url.clone(),
+        device_confirmation: false,
     });
     Ok(json!({ "status": "qr", "challengeUrl": challenge_url }))
 }
