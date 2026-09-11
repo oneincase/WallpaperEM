@@ -112,8 +112,9 @@
 
 **macOS**
 
-- **macOS 13+（Apple Silicon）**
+- **macOS 13+**（Apple Silicon / Intel 通用包，universal binary）
 - **Xcode Command Line Tools**
+- 仅本地构建 Intel 切片时需要 `rustup target add x86_64-apple-darwin`（发布包由 CI 出 universal）
 
 **Linux**（主路径：X11 会话 + GNOME / KDE / Cinnamon / MATE / XFCE）
 
@@ -154,7 +155,9 @@ pnpm tauri build
 ```
 
 > 产物 / Bundles：
-> - macOS：`src-tauri/target/release/bundle/macos/WallpaperEM.app`、`bundle/dmg/*.dmg`
+> - macOS：`bundle/dmg/*.dmg`、`bundle/macos/WallpaperEM.app`
+>   - **universal（Intel + Apple Silicon）**：加 `--target universal-apple-darwin`，产物在
+>     `src-tauri/target/universal-apple-darwin/release/bundle/` 下；CI 默认出这个
 > - Linux：`bundle/deb/*.deb`、`bundle/appimage/*.AppImage`
 > - Windows：`bundle/nsis/*.exe`、`bundle/msi/*.msi`（见 `.github/workflows/build-windows.yml`）
 
