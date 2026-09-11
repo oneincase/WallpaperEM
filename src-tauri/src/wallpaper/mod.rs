@@ -467,6 +467,14 @@ fn restore_sessions(app: &AppHandle) {
     if let Some(st) = app.try_state::<WallpaperEngineState>() {
         let mut windows = st.windows.lock().unwrap();
         for (display_id, cfg) in restored {
+            // 逐条留痕：启动后若「没恢复壁纸」，看这一行就知道是库里的会话记录没了/解析失败，
+            // 还是记录在、但后续建窗环节被跳过（配合 create_window 的日志定位）。
+            tracing::info!(
+                "restore wallpaper on display {display_id}: type={} src={:?} item={:?}",
+                cfg.r#type,
+                cfg.src,
+                item_id_of(&cfg)
+            );
             windows.insert(format!("wallpaper-{display_id}"), cfg);
         }
         *st.default.lock().unwrap() = most_recent;
@@ -478,6 +486,9 @@ fn restore_sessions(app: &AppHandle) {
 fn ensure_windows(app: &AppHandle) {
     ensure_windows_inner(app, platform::display_asleep());
 }
+
+/// 「没有会话配置所以不建窗」只提示一次，避免每 2s 刷屏
+static NO_CONFIG_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// `display_asleep` 由调用方传入：monitor 用「CG 报告 && 音频样本停止流动」的
 /// 复合判定（CGDisplayIsAsleep 的进程内状态在合盖唤醒后可能卡死在 true，
@@ -530,6 +541,12 @@ fn ensure_windows_inner(app: &AppHandle, display_asleep: bool) {
     // apply_on_main 按需建窗。
     for (label, (id, x, y, w, h)) in &desired {
         let Some(cfg) = configs.get(label).cloned().or_else(|| default_cfg.clone()) else {
+            // 启动后「一直不出壁纸」时，这一行是最直接的线索：库里没有任何会话配置
+            if !NO_CONFIG_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::info!(
+                    "ensure_windows: {label} 没有可用的会话配置（首次安装 / 会话已清空），不建壁纸窗口"
+                );
+            }
             continue;
         };
         match app.get_webview_window(label) {
@@ -706,12 +723,10 @@ fn create_desktop_window(
     );
 
     // ⚠️ tauri-plugin-desktop-underlay 只用**窗口 label**记录「是否已下沉到桌面层」，
-    // 且窗口销毁时它不会清理这条记录。同一个 label 的窗口销毁重建后（切壁纸走的就是
-    // 销毁重建），`is_desktop_underlay()` 会返回陈旧的 true，后面的
-    // `set_desktop_underlay(true)` 被判定为「已是 underlay」而 no-op —— 新 HWND/NSWindow
-    // 从未真正下沉，于是以普通顶层窗口 show 出来，全屏盖在一切之上（Windows 实测：
-    // 重启后自动恢复的那张正常，新设置的一张必然盖住全屏）。建窗是句柄唯一更替的时机，
-    // 先强制清掉陈旧记录，让紧随其后的 apply_desktop_window 真正执行分层。
+    // 且窗口销毁时它不会清理这条记录。同一个 label 的窗口销毁重建后，`is_desktop_underlay()`
+    // 会返回陈旧的 true，`set_desktop_underlay(true)` 被判为「已是 underlay」而 no-op，
+    // 新窗口从未真正下沉。建窗是句柄唯一更替的时机，先强制清掉陈旧记录。
+    // （Windows 后端已自管父子化、不再用该插件，这里主要为 Linux 那条路径兜底。）
     if window.is_desktop_underlay() {
         if let Err(e) = window.set_desktop_underlay(false) {
             tracing::warn!("create_window[{label}]: 清理陈旧 underlay 状态失败: {e}");

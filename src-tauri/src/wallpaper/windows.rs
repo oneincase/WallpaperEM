@@ -25,7 +25,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, Runtime, WebviewWindow};
-use tauri_plugin_desktop_underlay::DesktopUnderlayExt;
+use windows::core::BOOL;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -34,13 +34,17 @@ use windows::Win32::System::Power::{
 };
 use windows::Win32::System::SystemServices::GUID_CONSOLE_DISPLAY_STATE;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
+use windows::Win32::UI::HiDpi::{
+    SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_SYSTEM_AWARE, DPI_AWARENESS_CONTEXT_UNAWARE,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClassNameW, GetCursorPos,
-    GetForegroundWindow, GetMessageW, GetParent, GetWindowThreadProcessId, RegisterClassW,
-    SetWindowPos, TranslateMessage, EVENT_SYSTEM_FOREGROUND, HWND_BOTTOM, HWND_MESSAGE, MSG,
-    PBT_POWERSETTINGCHANGE, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WINEVENT_OUTOFCONTEXT, WNDCLASSW, WM_POWERBROADCAST,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, EnumWindows, FindWindowA, FindWindowExA,
+    GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW, GetParent,
+    GetWindowThreadProcessId, RegisterClassW, SendMessageTimeoutA, SetParent, SetWindowPos,
+    TranslateMessage, EVENT_SYSTEM_FOREGROUND, HWND_BOTTOM, HWND_MESSAGE, MSG,
+    PBT_POWERSETTINGCHANGE, SMTO_NORMAL, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WINEVENT_OUTOFCONTEXT, WNDCLASSW, WM_POWERBROADCAST,
 };
 
 #[derive(Debug, Clone)]
@@ -76,6 +80,21 @@ const SCREENS_CACHE_TTL: Duration = Duration::from_millis(1500);
 
 /// 显示器是否处于关屏/睡眠（电源通知回调写入，`display_asleep` 读取）
 static DISPLAY_ASLEEP: AtomicBool = AtomicBool::new(false);
+
+/// 「显示器枚举为空」告警的限流时刻（指针线程会以 ~30Hz 调 active_screens，
+/// 过渡期可能连续为空，不能每次都打日志）
+static LAST_EMPTY_WARN: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn warn_empty_screens() {
+    if let Ok(mut g) = LAST_EMPTY_WARN.lock() {
+        let now = Instant::now();
+        if g.is_some_and(|t| now.duration_since(t) < Duration::from_secs(10)) {
+            return;
+        }
+        *g = Some(now);
+    }
+    tracing::warn!("windows: 显示器枚举为空（睡眠/热插拔过渡？），本次不写缓存");
+}
 
 /// 由 wallpaper::init 调用一次（屏幕枚举需要常驻 AppHandle）
 pub fn store_app_handle(app: &AppHandle) {
@@ -114,6 +133,14 @@ pub fn active_screens() -> Vec<ScreenInfo> {
         }
     }
     let out = query_monitors();
+    if out.is_empty() {
+        // ⚠️ 空列表**绝不写缓存**：显示器枚举会短暂返回空（睡眠/热插拔/会话切换过渡），
+        // 而指针线程以 ~30Hz 调本函数、监控 tick 每 2s 调一次 —— 一旦把空结果缓存住，
+        // 监控侧 `ensure_windows_inner` 会因 `screens.is_empty()` 持续提前返回，
+        // 表现就是「重启后一直不恢复桌面壁纸」。保持旧缓存/下次重查即可。
+        warn_empty_screens();
+        return Vec::new();
+    }
     if let Ok(mut cache) = SCREENS_CACHE.lock() {
         *cache = Some((Instant::now(), out.clone()));
     }
@@ -206,10 +233,11 @@ fn physical_for_frame(frame: (f64, f64, f64, f64)) -> (i32, i32, i32, i32) {
 /// 设置窗口 frame（逻辑坐标）
 pub fn set_frame<R: Runtime>(window: &WebviewWindow<R>, x: f64, y: f64, w: f64, h: f64) {
     let phys = physical_for_frame((x, y, w, h));
-    let underlay = window.is_desktop_underlay();
     match window.hwnd() {
         Ok(hwnd) if !hwnd.is_invalid() => unsafe {
-            if underlay {
+            // 以**真实父窗口**判断当前在哪一层（父子化后坐标是相对父客户区）。
+            // 不查任何缓存：缓存一旦与实际不一致，就会把窗口摆到错误的坐标系。
+            if has_parent(hwnd) {
                 place_in_underlay(hwnd, phys);
             } else {
                 place_top_level(hwnd, phys);
@@ -230,6 +258,13 @@ pub fn set_frame<R: Runtime>(window: &WebviewWindow<R>, x: f64, y: f64, w: f64, 
 ///
 /// `interactive=true`（「隐藏图标」开启）：脱离 WorkerW 并压到 Z 序最底，盖住
 /// 桌面图标但仍在普通应用窗口之下，直接接收真实鼠标事件。
+///
+/// ⚠️ 这里**不用** tauri-plugin-desktop-underlay 的 `set/is_desktop_underlay`：
+/// 它只用窗口 label 记录「是否已下沉」，窗口销毁时不会清理；切壁纸走的是
+/// 「销毁 + 同名重建」，重建后的窗口会被误判为「已是 underlay」而跳过 SetParent，
+/// 结果以普通顶层窗口 show 出来、全屏盖住一切（Windows 实测）。改为自己父子化，
+/// 并用 `GetParent` 读回真实父窗口校验；任何一步失败都退回 Z 序最底，宁可
+/// 「图标被壁纸盖住」也绝不出现「壁纸盖住整个桌面」。
 pub fn apply_desktop_window<R: Runtime>(
     window: &tauri::WebviewWindow<R>,
     frame: (f64, f64, f64, f64),
@@ -250,30 +285,125 @@ pub fn apply_desktop_window<R: Runtime>(
     };
 
     if interactive {
-        // 先脱离桌面层（SetParent(None)），再压到 Z 序最底
-        if window.is_desktop_underlay() {
-            tracing::info!("windows: 交互态：脱离桌面层（set_desktop_underlay(false)）");
-            if let Err(e) = window.set_desktop_underlay(false) {
-                tracing::warn!("windows: set_desktop_underlay(false) failed: {e}");
-            }
-        }
+        // 脱离桌面层（SetParent(None)），再压到 Z 序最底
+        unsafe { detach_from_parent(hwnd) };
         unsafe { place_top_level(hwnd, phys) };
     } else {
-        if !window.is_desktop_underlay() {
-            tracing::info!("windows: 非交互态：父子化到 WorkerW（set_desktop_underlay(true)）");
-            if let Err(e) = window.set_desktop_underlay(true) {
-                tracing::warn!("windows: set_desktop_underlay(true) failed: {e}");
+        match unsafe { parent_to_worker(hwnd) } {
+            Ok(worker) => {
+                tracing::info!("windows: 已父子化到壁纸 WorkerW {worker:?}");
+                unsafe { place_in_underlay(hwnd, phys) };
             }
-            tracing::info!("windows: set_desktop_underlay(true) 返回");
+            Err(e) => {
+                tracing::warn!(
+                    "windows: WorkerW 父子化失败（{e}）—— 退回 Z 序最底，避免全屏盖住桌面与应用"
+                );
+                unsafe { place_top_level(hwnd, phys) };
+            }
         }
-        unsafe { place_in_underlay(hwnd, phys) };
-        tracing::info!("windows: SetWindowPos 完成（phys={phys:?}）");
     }
     // 窗口是 visible(false) 创建的：几何/层级设置完再显示，避免闪现未定位的窗口
     let _ = window.show();
     tracing::info!(
         "windows: apply_desktop_window ok (interactive={interactive}, phys={phys:?})"
     );
+}
+
+/// 窗口是否已有父窗口（= 已下沉到 WorkerW）
+unsafe fn has_parent(hwnd: HWND) -> bool {
+    unsafe { matches!(GetParent(hwnd), Ok(p) if !p.is_invalid()) }
+}
+
+/// EnumWindows 回调：找到「承载桌面图标」的窗口后，取它**之后**的 WorkerW 兄弟 ——
+/// 那才是 Explorer 用来放壁纸的层（位于图标之下）。找到即写入 out。
+unsafe extern "system" fn enum_worker(window: HWND, out: LPARAM) -> BOOL {
+    unsafe {
+        let def_view =
+            FindWindowExA(Some(window), None, windows::core::s!("SHELLDLL_DefView"), None)
+                .unwrap_or_default();
+        if def_view.is_invalid() {
+            return true.into();
+        }
+        let worker = FindWindowExA(None, Some(window), windows::core::s!("WorkerW"), None)
+            .unwrap_or_default();
+        if worker.is_invalid() {
+            return true.into();
+        }
+        *(out.0 as *mut HWND) = worker;
+        true.into()
+    }
+}
+
+/// 把窗口父子化到「壁纸 WorkerW」，并用 `GetParent` 校验确实挂上了。
+///
+/// 跨进程 `SetParent` 在两个进程的 DPI 感知级别不一致时会失败（Windows 官方文档
+/// 明确记载的行为），而 Explorer 的 Progman/WorkerW 通常不是 Per-Monitor V2，本进程
+/// 却是 —— 所以这里依次换几个线程 DPI 上下文重试，直到校验通过。
+unsafe fn parent_to_worker(hwnd: HWND) -> Result<HWND, String> {
+    let mut last = String::from("未尝试任何 DPI 上下文");
+    for ctx in [
+        None,
+        Some(DPI_AWARENESS_CONTEXT_UNAWARE),
+        Some(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE),
+    ] {
+        let prev = ctx.map(|c| unsafe { SetThreadDpiAwarenessContext(c) });
+        let r = unsafe { try_parent_to_worker(hwnd) };
+        if let Some(p) = prev {
+            unsafe { SetThreadDpiAwarenessContext(p) };
+        }
+        match r {
+            Ok(w) => return Ok(w),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+unsafe fn try_parent_to_worker(hwnd: HWND) -> Result<HWND, String> {
+    unsafe {
+        let progman = FindWindowA(windows::core::s!("Progman"), None)
+            .map_err(|e| format!("找不到 Progman: {e}"))?;
+        // 让 Progman 生成承载壁纸的 WorkerW（0x052C 是通行做法）
+        let _ = SendMessageTimeoutA(
+            progman,
+            0x052C,
+            WPARAM(0x0000000D),
+            LPARAM(0x00000001),
+            SMTO_NORMAL,
+            1000,
+            None,
+        );
+        let mut worker = HWND::default();
+        let _ = EnumWindows(Some(enum_worker), LPARAM(&mut worker as *mut HWND as _));
+        if worker.is_invalid() {
+            // 退回 Progman 直属的 WorkerW
+            worker = FindWindowExA(Some(progman), None, windows::core::s!("WorkerW"), None)
+                .unwrap_or_default();
+        }
+        if worker.is_invalid() {
+            return Err("未找到壁纸 WorkerW".into());
+        }
+        // ⚠️ SetParent 返回的是「旧父窗口」：顶层窗口原本无父 ⇒ 返回 NULL，
+        // 而 windows-rs 会把 NULL 判成 Err（哪怕调用其实成功了）。故忽略返回值，
+        // 改用 GetParent 读回真实父窗口来校验。
+        let _ = SetParent(hwnd, Some(worker));
+        match GetParent(hwnd) {
+            Ok(p) if !p.is_invalid() && p == worker => Ok(worker),
+            Ok(p) => Err(format!(
+                "SetParent 后父窗口不是预期的 WorkerW（实际 parent={}, worker={}）",
+                p.0 as isize, worker.0 as isize
+            )),
+            Err(e) => Err(format!("SetParent 后读不到父窗口（{e}）")),
+        }
+    }
+}
+
+/// 解除与 WorkerW 的父子关系（回到顶层窗口）
+unsafe fn detach_from_parent(hwnd: HWND) {
+    unsafe {
+        // 同 parent_to_worker：返回值是旧父窗口，NULL 会被误判成 Err，忽略之
+        let _ = SetParent(hwnd, None);
+    }
 }
 
 /// 在 WorkerW 客户区内定位：WorkerW 覆盖整个虚拟屏，其客户区原点可能不在
