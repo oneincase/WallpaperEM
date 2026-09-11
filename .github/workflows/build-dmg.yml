@@ -55,6 +55,15 @@ jobs:
       - name: 构建 Tauri（.app + .dmg）
         # beforeBuildCommand 会先跑 pnpm --filter @we/desktop build 生成前端 dist/，
         # 再编译 Rust release 并打包 app/dmg。
+        #
+        # 签名：tauri.conf.json 的 bundle.macOS.signingIdentity 写的是本机证书名，
+        # CI 上不存在会让构建直接失败。默认 ad-hoc 签名（"-"）先把包出出来；要出
+        # 可对外分发的正式包，在仓库 Variables 里设
+        # APPLE_SIGNING_IDENTITY=<Developer ID 证书名>，并补
+        # APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_ID 等 secrets。
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY || '-' }}
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: pnpm tauri build
 
       - name: 上传构建产物（artifact）

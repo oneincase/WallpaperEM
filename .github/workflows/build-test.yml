@@ -1,0 +1,141 @@
+name: 测试打包（macOS / Linux / Windows，不发布）
+
+# 用途：手动触发，一次性构建三平台安装包，**只上传 artifact，绝不创建 Release**。
+# 发布仍由 `build-dmg.yml` / `build-linux.yml` / `build-windows.yml` 在推送 v* 标签时
+# 完成 —— 推 tag 就是人工确认那一步；本 workflow 不监听 tag、也不写 contents。
+#
+# webwallgl 是自维护渲染库，最新的改动只在你自己的仓库里（暂未发到 npm），
+# 所以这里始终从 GitHub 源码检出并构建 dist/lib，再让 `file:../webwallgl-github/dist/lib`
+# 依赖解析到它。可用 webwallgl_ref 指定要测的分支 / 标签 / SHA。
+on:
+  workflow_dispatch:
+    inputs:
+      webwallgl_ref:
+        description: 'webwallgl 的 ref（分支 / 标签 / commit SHA）；留空用其默认分支'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    strategy:
+      # 一个平台失败不影响其它平台继续出包（测试场景更关心看到全部结果）
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            label: macOS-arm64
+            bundles: |
+              src-tauri/target/release/bundle/dmg/*.dmg
+              src-tauri/target/release/bundle/macos/*.app
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            label: Linux-x64
+            bundles: |
+              src-tauri/target/release/bundle/deb/*.deb
+              src-tauri/target/release/bundle/appimage/*.AppImage
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: Windows-x64
+            bundles: |
+              src-tauri/target/release/bundle/nsis/*.exe
+              src-tauri/target/release/bundle/msi/*.msi
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # 先拉平级目录并把 dist/lib 构建出来，否则 pnpm install 解析不到 file: 依赖
+      - name: 检出 webwallgl（源码）
+        uses: actions/checkout@v4
+        with:
+          repository: oneincase/webwallgl
+          ref: ${{ inputs.webwallgl_ref }}
+          path: webwallgl-github-src
+
+      # actions/checkout 不允许直接检出到 workspace 之外，先落子目录再移平级
+      - name: 移到仓库平级目录
+        shell: bash
+        run: mv webwallgl-github-src ../webwallgl-github
+
+      - name: 安装 Linux 系统依赖
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl wget file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libdbus-1-dev \
+            patchelf
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust 构建缓存
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # 这里**不**用 --frozen-lockfile：webwallgl 正在迭代，lockfile 可能滞后于源码；
+      # 测试构建优先「能装出来」。WallpaperEM 自身仍走 frozen，保证仓库状态可复现。
+      - name: 构建 webwallgl dist/lib
+        working-directory: ../webwallgl-github
+        run: |
+          pnpm install --no-frozen-lockfile
+          pnpm run build:lib
+
+      - name: 记录 webwallgl 版本（便于确认测的是哪一版）
+        shell: bash
+        run: |
+          echo "webwallgl version: $(node -p "require('../webwallgl-github/dist/lib/package.json').version")"
+          echo "webwallgl ref: ${{ inputs.webwallgl_ref || '(默认分支)' }}"
+          echo "wallpaperem version: $(node -p "require('./src-tauri/tauri.conf.json').version")"
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 构建（不签名、不发 Release）
+        # tauri.conf.json 里 bundle.macOS.signingIdentity 写的是本机证书名
+        # （"WallpaperEM Dev Signer"），CI 上并不存在，直接构建会失败。
+        # 测试包用 ad-hoc 签名（"-"）兜底；以后要真签名，在仓库 Variables 里
+        # 加 APPLE_SIGNING_IDENTITY=<证书名> 即可覆盖，不用改本文件。
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY || '-' }}
+          # 没有配置签名证书时不要去自动发现钥匙串身份（会浪费几十秒并报错）
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: pnpm tauri build
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: WallpaperEM-test-${{ matrix.label }}-${{ github.sha }}
+          path: ${{ matrix.bundles }}
+          if-no-files-found: error
