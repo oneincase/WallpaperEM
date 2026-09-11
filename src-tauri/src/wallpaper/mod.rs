@@ -769,6 +769,32 @@ fn create_desktop_window(
     // 一次（幂等），此时窗口已可见，遮挡态与合成层级都被矫正。
     platform::apply_desktop_window(&window, frame, current_interactive(app));
     tracing::info!("wallpaper window {label} created: {cfg:?}");
+    // ⚠️ 只在 Windows 上做「延迟重挂」：新建的窗口是「从未显示过」的状态，此时直接
+    // 挂到 Win11 的 raised-desktop 层实测不生效（壁纸被原生壁纸盖住）；而手动开一次
+    // 「隐藏图标」再关掉 —— 也就是**先脱离、再挂回** —— 就正确。这里直接复刻这个
+    // 已被验证有效的动作：等窗口显示/合成稳定后，先按交互态脱离一次，再按真实设置
+    // 挂回去（两步都是幂等的，不重建窗口）。诊断用的层级 dump 也随之多打一份，
+    // 便于对比「新建时」与「重挂后」的差异。
+    #[cfg(target_os = "windows")]
+    {
+        let app2 = app.clone();
+        let label2 = label.to_string();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            let (tx, rx) = std::sync::mpsc::channel();
+            let _ = app2.run_on_main_thread(move || {
+                if let Some(w) = app2.get_webview_window(&label2) {
+                    let real = current_interactive(&app2);
+                    // 复刻「开一次隐藏图标 → 再关掉」：先脱离，再按真实设置挂回
+                    platform::apply_desktop_window(&w, frame, true);
+                    platform::apply_desktop_window(&w, frame, real);
+                    tracing::info!("create_window[{label2}]: 延迟重挂桌面层完成（real_interactive={real}）");
+                }
+                let _ = tx.send(());
+            });
+            let _ = rx.recv_timeout(Duration::from_secs(2));
+        });
+    }
     Ok(window)
 }
 

@@ -40,13 +40,13 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, EnumWindows, FindWindowA, FindWindowExA,
-    GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW, GetParent,
+    GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW, GetParent, GetWindow,
     GetWindowLongPtrW, GetWindowThreadProcessId, RegisterClassW, SendMessageTimeoutA, SetParent,
     SetWindowLongPtrW, SetWindowPos, TranslateMessage, EVENT_SYSTEM_FOREGROUND, GWL_EXSTYLE,
-    GWL_STYLE, HWND_BOTTOM, HWND_MESSAGE, MSG, PBT_POWERSETTINGCHANGE, SMTO_NORMAL,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WINEVENT_OUTOFCONTEXT, WNDCLASSW, WM_POWERBROADCAST, WS_CHILD,
-    WS_EX_NOREDIRECTIONBITMAP, WS_POPUP,
+    GWL_STYLE, GW_CHILD, GW_HWNDNEXT, HWND_BOTTOM, HWND_MESSAGE, MSG, PBT_POWERSETTINGCHANGE,
+    SMTO_NORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WINEVENT_OUTOFCONTEXT, WNDCLASSW, WM_POWERBROADCAST, WS_CHILD,
+    WS_EX_LAYERED, WS_EX_NOREDIRECTIONBITMAP, WS_POPUP, WS_VISIBLE,
 };
 
 #[derive(Debug, Clone)]
@@ -311,6 +311,7 @@ pub fn apply_desktop_window<R: Runtime>(
     }
     // 窗口是 visible(false) 创建的：几何/层级设置完再显示，避免闪现未定位的窗口
     let _ = window.show();
+    unsafe { dump_desktop_zorder(if interactive { "interactive" } else { "underlay" }, hwnd) };
     tracing::info!(
         "windows: apply_desktop_window ok (interactive={interactive}, phys={phys:?})"
     );
@@ -506,6 +507,43 @@ unsafe fn detach_from_parent(hwnd: HWND) {
                 let (_, style) = g.remove(i);
                 let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, style);
             }
+        }
+    }
+}
+
+/// 诊断：按 z 序（前 = 更靠上）打印 Progman 的子窗口，并标出我们的窗口。
+///
+/// 专治「新建时挂错层、手动开关一次就正常」这类问题：同一段挂载代码在两种时机
+/// 得到不同结果，只有把真实的子窗口顺序打出来才能看清窗口被插到了谁的前后。
+unsafe fn dump_desktop_zorder(tag: &str, me: HWND) {
+    unsafe {
+        let Ok(progman) = FindWindowA(windows::core::s!("Progman"), None) else {
+            return;
+        };
+        tracing::info!(
+            "windows[z/{tag}]: progman={} ex=0x{:X}",
+            progman.0 as isize,
+            GetWindowLongPtrW(progman, GWL_EXSTYLE) as u32
+        );
+        let mut child = GetWindow(progman, GW_CHILD).unwrap_or_default();
+        let mut n = 0;
+        while !child.is_invalid() && n < 10 {
+            let mut buf = [0u16; 96];
+            let len = GetClassNameW(child, &mut buf).max(0) as usize;
+            let class = String::from_utf16_lossy(&buf[..len.min(buf.len())]);
+            let style = GetWindowLongPtrW(child, GWL_STYLE) as u32;
+            let ex = GetWindowLongPtrW(child, GWL_EXSTYLE) as u32;
+            tracing::info!(
+                "windows[z/{tag}]: #{n}{} hwnd={} class={class:?} vis={} child={} layered={} noredir={}",
+                if child == me { " <== OUR WINDOW" } else { "" },
+                child.0 as isize,
+                style & (WS_VISIBLE.0 as u32) != 0,
+                style & (WS_CHILD.0 as u32) != 0,
+                ex & (WS_EX_LAYERED.0 as u32) != 0,
+                ex & (WS_EX_NOREDIRECTIONBITMAP.0 as u32) != 0,
+            );
+            child = GetWindow(child, GW_HWNDNEXT).unwrap_or_default();
+            n += 1;
         }
     }
 }
