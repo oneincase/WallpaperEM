@@ -96,7 +96,7 @@
 | 平台 / Platform | 桌面层 / Desktop layer | 正在播放 / Now Playing | 音频频谱 / Audio spectrum |
 | --- | --- | --- | --- |
 | macOS 13+ | 原生桌面层窗口（图标之下 / 之上两档） | MediaRemote（经 [mediaremote-adapter](https://github.com/ungive/mediaremote-adapter)） | ScreenCaptureKit loopback（需屏幕录制权限） |
-| Linux（X11） | X11 桌面层窗口 | MPRIS（D-Bus） | 暂未接入（待 PipeWire） |
+| Linux（X11，x64 / ARM64） | X11 桌面层窗口 | MPRIS（D-Bus） | 暂未接入（待 PipeWire） |
 | Windows 10/11（x64 / ARM64） | `WorkerW` 父子化 / Z 序置底 | GSMTC（`Windows.Media.Control`） | WASAPI loopback（免权限） |
 
 ---
@@ -116,7 +116,8 @@
 - **Xcode Command Line Tools**
 - 仅本地构建 Intel 切片时需要 `rustup target add x86_64-apple-darwin`（发布包由 CI 出 universal）
 
-**Linux**（主路径：X11 会话 + GNOME / KDE / Cinnamon / MATE / XFCE）
+**Linux**（主路径：X11 会话 + GNOME / KDE / Cinnamon / MATE / XFCE；x64 / ARM64 均可，
+arm64 需在 arm64 机器或 arm64 容器里构建以免交叉编译缺 sysroot）
 
 ```bash
 # Debian / Ubuntu 示例
@@ -161,6 +162,8 @@ pnpm tauri build
 >   - **universal（Intel + Apple Silicon）**：加 `--target universal-apple-darwin`，产物在
 >     `src-tauri/target/universal-apple-darwin/release/bundle/` 下；CI 默认出这个
 > - Linux：`bundle/deb/*.deb`、`bundle/appimage/*.AppImage`
+>   - ARM64：加 `--target aarch64-unknown-linux-gnu`，产物在 `src-tauri/target/aarch64-unknown-linux-gnu/release/bundle/` 下
+>     （CI 用原生 `ubuntu-24.04-arm` runner，不做交叉编译）
 > - Windows：`bundle/nsis/*.exe`、`bundle/msi/*.msi`
 >   - ARM64：加 `--target aarch64-pc-windows-msvc`，产物在 `src-tauri/target/aarch64-pc-windows-msvc/release/bundle/` 下
 >   - 见 `.github/workflows/build-windows.yml`（x64 / arm64 矩阵）
