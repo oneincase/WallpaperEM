@@ -1,0 +1,96 @@
+{
+  "camera": {
+    "center": "0.000 0.000 -1.000",
+    "eye": "0.000 0.000 0.000",
+    "up": "0.000 1.000 0.000"
+  },
+  "general": {
+    "ambientcolor": "0.300 0.300 0.300",
+    "bloom": false,
+    "camerafade": true,
+    "cameraparallax": true,
+    "cameraparallaxamount": 0.6,
+    "cameraparallaxdelay": 0.05,
+    "cameraparallaxmouseinfluence": 0,
+    "clearcolor": "0.020 0.030 0.060",
+    "clearenabled": true,
+    "orthogonalprojection": {
+      "height": 1080,
+      "width": 1920
+    },
+    "skylightcolor": "0.300 0.300 0.300"
+  },
+  "objects": [
+    {
+      "id": 1,
+      "name": "Background",
+      "image": "models/background.json",
+      "origin": "960.000 540.000 0.000",
+      "scale": "1.000 1.000 1.000",
+      "size": "1920.000 1080.000",
+      "angles": "0.000 0.000 0.000",
+      "parallaxDepth": "1.000 1.000",
+      "colorBlendMode": 0,
+      "visible": true
+    },
+    {
+      "id": 2,
+      "name": "Aurora Glow",
+      "image": "models/background.json",
+      "origin": "960.000 660.000 0.000",
+      "scale": "1.150 1.150 1.000",
+      "size": "1920.000 1080.000",
+      "angles": "0.000 0.000 0.000",
+      "parallaxDepth": "1.600 1.600",
+      "colorBlendMode": 0,
+      "visible": true,
+      "alpha": {
+        "value": 0.55,
+        "animation": {
+          "c0": [
+            {
+              "frame": 0,
+              "value": 0.35,
+              "front": { "enabled": true, "x": 0.33, "y": 0 },
+              "back": { "enabled": true, "x": -0.33, "y": 0 },
+              "lockangle": true,
+              "locklength": true
+            },
+            {
+              "frame": 150,
+              "value": 0.8,
+              "front": { "enabled": true, "x": 0.33, "y": 0 },
+              "back": { "enabled": true, "x": -0.33, "y": 0 },
+              "lockangle": true,
+              "locklength": true
+            },
+            {
+              "frame": 300,
+              "value": 0.35,
+              "front": { "enabled": true, "x": 0.33, "y": 0 },
+              "back": { "enabled": true, "x": -0.33, "y": 0 },
+              "lockangle": true,
+              "locklength": true
+            }
+          ],
+          "options": {
+            "fps": 30,
+            "length": 300,
+            "mode": "loop",
+            "name": "辉光呼吸"
+          }
+        }
+      }
+    },
+    {
+      "id": 3,
+      "name": "Fireflies",
+      "particle": "particles/presets/fireflies.json",
+      "origin": "960.000 540.000 0.000",
+      "scale": "1.000 1.000 1.000",
+      "angles": "0.000 0.000 0.000",
+      "parallaxDepth": "1.000 1.000",
+      "visible": true
+    }
+  ]
+}

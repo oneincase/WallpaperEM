@@ -25,6 +25,7 @@ import {
 import { evalCondition } from "../lib/weCondition";
 import { refreshItemPropsCache } from "../hooks/useItemProps";
 import { ConfirmModal } from "./ConfirmModal";
+import { tr, trMsg } from "../lib/i18n";
 import { EmptyState } from "./EmptyState";
 import { IconSliders } from "./icons";
 
@@ -50,6 +51,37 @@ function hexToRgbStr(hex: string): string | null {
 }
 
 const sameValue = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+
+/** WE 属性窗口里有对应控件的属性类型 */
+const KNOWN_PROP_TYPES = new Set([
+  "color",
+  "bool",
+  "slider",
+  "combo",
+  "textinput",
+  "file",
+  "directory",
+  "text",
+  "group",
+]);
+
+/** 该属性是否会在 WE 属性窗口里占一行（可编辑控件 / 非空分节标题） */
+function isDisplayableProp(p: WebPropDef): boolean {
+  if (!KNOWN_PROP_TYPES.has(p.ptype)) return false;
+  if (p.ptype === "text" || p.ptype === "group") return !!p.text.trim();
+  return true;
+}
+
+const IMAGE_FILE_EXT = /\.(png|jpe?g|webp|gif|bmp|avif|svg)$/i;
+
+/** 图片类 file 属性判定：project.json 的 fileType 常常不标（真实语料 50 个
+ *  file 属性只有 2 个标了 image），WE 按文件扩展名给预览，这里同样按扩展名兜底 */
+function isImageProp(p: WebPropDef, cur: unknown): boolean {
+  if (!cur) return false;
+  if (p.fileType === "image") return true;
+  if (p.fileType) return false; // 明确声明 video/audio 的不显示图
+  return IMAGE_FILE_EXT.test(String(cur).split(/[?#]/)[0]);
+}
 
 type SaveState = "idle" | "pending" | "saving" | "saved" | "error";
 
@@ -145,7 +177,10 @@ export function WallpaperPropsPanel({
       const rel = String(val ?? "").trim();
       if (!rel || !fileBase) return "";
       if (/^https?:\/\//i.test(rel) || rel.startsWith("data:")) return rel;
-      return fileBase + rel.replace(/^\/+/, "");
+      // Windows 作者写的反斜杠统一成正斜杠；剥掉 query/hash（本地文件用不到），
+      // 再按段编码 —— 中文/空格文件名不编码会让 <img> 请求直接 404
+      const clean = rel.split(/[?#]/)[0].replace(/\\/g, "/").replace(/^\/+/, "");
+      return fileBase + encodeURI(clean);
     },
     [fileBase],
   );
@@ -323,7 +358,12 @@ export function WallpaperPropsPanel({
   }, [close, confirmReset]);
 
   // ---- 派生：condition 显隐（按当前草稿求值，开关联动即时反映）+ 搜索过滤 ----
-  const all = defs ?? [];
+  // 只统计/渲染 WE 属性窗口真正会显示的项（与 WE 对齐，不多也不少）：
+  // - scenetexture / usershortcut 等 scene 内部类型没有对应控件，WE 不显示
+  // - 空 text 是作者留的空白间隔（kong10/fengexian3 这类间隔键很常见），
+  //   WE 显示为一小段空白，不占列表项、不参与计数与搜索
+  // 注意保存仍遍历完整 defs（doSave 用 defsRef），隐藏类型的已有覆盖不会丢
+  const all = useMemo(() => (defs ?? []).filter(isDisplayableProp), [defs]);
   const visible = useMemo(() => all.filter((p) => evalCondition(p.condition, draft)), [all, draft]);
   const q = query.trim().toLowerCase();
   const shown = useMemo(
@@ -341,11 +381,13 @@ export function WallpaperPropsPanel({
   );
 
   const showSearch = all.length > 6;
-  const searchHint = q ? `匹配 ${shown.length} 项` : "";
+  const searchHint = q ? tr("匹配 {n} 项", { n: shown.length }) : "";
   const infoBits = [
-    `共 ${all.length} 项`,
-    modifiedCount > 0 ? `已修改 ${modifiedCount} 项` : "",
-    visible.length < all.length ? `${all.length - visible.length} 项因条件隐藏` : "",
+    tr("共 {n} 项", { n: all.length }),
+    modifiedCount > 0 ? tr("已修改 {n} 项", { n: modifiedCount }) : "",
+    visible.length < all.length
+      ? tr("{n} 项因条件隐藏", { n: all.length - visible.length })
+      : "",
   ].filter(Boolean);
 
   return (
@@ -354,7 +396,7 @@ export function WallpaperPropsPanel({
         className={`props-embedded flex w-full flex-col overflow-hidden ${
           embedded
             ? "h-screen props-tint"
-            : "card h-[78vh] max-w-2xl"
+            : "card animate-modal-pop h-[78vh] max-w-2xl"
         }`}
         onClick={(e) => e.stopPropagation()}
       >
@@ -376,7 +418,7 @@ export function WallpaperPropsPanel({
           <div className="flex min-w-0 items-baseline gap-2">
             <span className="flex shrink-0 items-center gap-2 text-[14px] font-semibold">
               <IconSliders size={15} />
-              壁纸配置
+              {tr("壁纸配置")}
             </span>
             <span className="truncate text-[11.5px] text-[var(--text-2)]" title={title}>
               {title}
@@ -386,7 +428,7 @@ export function WallpaperPropsPanel({
             <button
               className="shrink-0 rounded-lg px-2 py-0.5 text-[18px] leading-none text-[var(--text-2)] hover:bg-black/5 dark:hover:bg-white/10"
               onClick={close}
-              aria-label="关闭"
+              aria-label={tr("关闭")}
             >
               ×
             </button>
@@ -398,15 +440,15 @@ export function WallpaperPropsPanel({
         <div className="flex shrink-0 items-center gap-1 border-b border-[var(--separator)] px-5 py-2">
           {(
             [
-              ["props", "作者属性", defs === null ? null : all.length],
-              ["play", "播放设置", playOverrideCount || null],
+              ["props", tr("作者属性"), defs === null ? null : all.length],
+              ["play", tr("播放设置"), playOverrideCount || null],
             ] as const
           ).map(([key, label, count]) => (
             <button
               key={key}
               className={`rounded-lg px-2.5 py-1 text-[12.5px] ${
                 tab === key
-                  ? "bg-[var(--accent)] text-white"
+                  ? "border border-[var(--accent-strong)] bg-[var(--accent)] text-[var(--accent-fg)]"
                   : "text-[var(--text-2)] hover:bg-black/5 dark:hover:bg-white/10"
               }`}
               onClick={() => setTab(key)}
@@ -430,21 +472,23 @@ export function WallpaperPropsPanel({
           />
         ) : loadError ? (
           <div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center">
-            <div className="text-[13px] text-red-500">读取失败：{loadError}</div>
+            <div className="text-[13px] text-red-500">
+              {tr("读取失败")}: {trMsg(loadError)}
+            </div>
             <button className="btn" onClick={close}>
-              关闭
+              {tr("关闭")}
             </button>
           </div>
         ) : defs === null ? (
           <div className="flex flex-1 items-center justify-center text-[13px] text-[var(--text-2)]">
-            正在读取 project.json…
+            {tr("正在读取 project.json…")}
           </div>
         ) : all.length === 0 ? (
           <div className="flex flex-1 items-center justify-center">
             <EmptyState
               art="props"
-              title="该壁纸没有作者定义的配置项"
-              hint="project.json 未声明 general.properties；「播放设置」仍可调整"
+              title={tr("该壁纸没有作者定义的配置项")}
+              hint={tr("project.json 未声明 general.properties；「播放设置」仍可调整")}
             />
           </div>
         ) : (
@@ -454,8 +498,8 @@ export function WallpaperPropsPanel({
               {showSearch && (
                 <input
                   type="text"
-                  className="w-52 rounded-lg border border-[var(--separator)] bg-[var(--card)] px-2.5 py-1 text-[12px] placeholder:text-[var(--text-2)]/60 focus:outline-none focus:ring-1 focus:ring-[var(--accent)]"
-                  placeholder="搜索属性…"
+                  className="w-52 rounded-lg border border-[var(--separator)] bg-[var(--card)] px-2.5 py-1 text-[12px] placeholder:text-[var(--text-2)]/60 focus:outline-none focus:ring-1 focus:ring-[var(--accent-strong)]"
+                  placeholder={tr("搜索属性…")}
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
                 />
@@ -469,7 +513,7 @@ export function WallpaperPropsPanel({
             {/* 属性列表 */}
             <div className="flex-1 overflow-y-auto px-5 py-3">
               {shown.length === 0 ? (
-                <EmptyState art="search" title={`没有匹配「${query}」的属性`} />
+                <EmptyState art="search" title={tr("没有匹配「{query}」的属性", { query })} />
               ) : (
                 <div className="flex flex-col gap-3">
                   {shown.map((p) => (
@@ -494,13 +538,13 @@ export function WallpaperPropsPanel({
                 }`}
               >
                 {saveState === "error"
-                  ? `保存失败：${errMsg}`
+                  ? `${tr("保存失败")}: ${trMsg(errMsg)}`
                   : saveState === "saving"
-                    ? "正在保存…"
+                    ? tr("正在保存…")
                     : saveState === "pending"
-                      ? "更改即将自动生效…"
+                      ? tr("更改即将自动生效…")
                       : saveState === "saved"
-                        ? "✓ 已保存并实时生效"
+                        ? tr("✓ 已保存并实时生效")
                         : ""}
               </span>
               <div className="ml-auto flex items-center gap-2">
@@ -509,12 +553,12 @@ export function WallpaperPropsPanel({
                   disabled={modifiedCount === 0}
                   onClick={() => setConfirmReset(true)}
                 >
-                  ↺ 恢复默认
+                  ↺ {tr("恢复默认")}
                 </button>
                 {/* 独立窗口的关闭走红绿灯，这里的完成是冗余 */}
                 {!embedded && (
                   <button className="btn btn-primary !py-1 !text-[12px]" onClick={close}>
-                    完成
+                    {tr("完成")}
                   </button>
                 )}
               </div>
@@ -525,9 +569,11 @@ export function WallpaperPropsPanel({
 
       {confirmReset && (
         <ConfirmModal
-          title="恢复默认"
-          message={`将清除该壁纸的全部作者属性覆盖（${modifiedCount} 项），恢复 project.json 默认值。`}
-          confirmText="恢复"
+          title={tr("恢复默认")}
+          message={tr("将清除该壁纸的全部作者属性覆盖（{n} 项），恢复 project.json 默认值。", {
+            n: modifiedCount,
+          })}
+          confirmText={tr("恢复")}
           onCancel={() => setConfirmReset(false)}
           onConfirm={resetAll}
         />
@@ -547,7 +593,7 @@ export function WallpaperPropsModal(props: {
 }) {
   return createPortal(
     <div
-      className="fixed inset-0 z-[80] flex items-center justify-center bg-black/50 p-8"
+      className="animate-overlay fixed inset-0 z-[80] flex items-center justify-center bg-black/50 p-8"
       onClick={props.onClose}
     >
       <WallpaperPropsPanel {...props} />
@@ -575,12 +621,17 @@ function PropRow({
   const cur = draft[p.name];
   const isDefault = sameValue(cur, p.default);
   const controlCls =
-    "rounded-lg border border-[var(--separator)] bg-[var(--card)] px-2.5 py-1.5 text-[12.5px] focus:outline-none focus:ring-1 focus:ring-[var(--accent)]";
+    "rounded-lg border border-[var(--separator)] bg-[var(--card)] px-2.5 py-1.5 text-[12.5px] focus:outline-none focus:ring-1 focus:ring-[var(--accent-strong)]";
 
   // WE 的 text 是静态说明/分节标题（不可编辑）；group 是分组标题（带 text 的
-  // 容器，真实数据 13 处）。两者都整行跨栏展示，充当分组分隔
+  // 容器，真实数据 13 处）。两者都整行跨栏展示，充当分组分隔。
+  // 未知类型（scenetexture/usershortcut 等 scene 专属）WE 不显示，整行跳过
+  // （列表已按 isDisplayableProp 预过滤，此为防御兜底）
+  if (!KNOWN_PROP_TYPES.has(p.ptype)) return null;
+
+  // 空标题是作者留的空白间隔：渲染一小段间距而不是键名（WE 行为）
   if (p.ptype === "text" || p.ptype === "group") {
-    if (!p.text && p.ptype === "group") return null; // 无标题的空分组不占位
+    if (!p.text) return <div className="h-1" aria-hidden />;
     return (
       <div
         className={`mt-1 border-t border-[var(--separator)] pt-2.5 leading-relaxed text-[var(--text-2)] ${
@@ -599,7 +650,7 @@ function PropRow({
       <div className="w-44 shrink-0 truncate text-[12.5px] text-[var(--text-2)]" title={p.name}>
         {p.text || p.name}
         {!isDefault && (
-          <span className="ml-1 text-[var(--accent)]" title="已自定义">
+          <span className="ml-1 text-[var(--accent-strong)]" title={tr("已自定义")}>
             •
           </span>
         )}
@@ -624,12 +675,12 @@ function PropRow({
             role="switch"
             aria-checked={!!cur}
             className={`relative h-[22px] w-10 rounded-full transition-colors ${
-              cur ? "bg-[var(--accent)]" : "bg-[var(--separator)]"
+              cur ? "bg-[var(--accent-strong)]" : "bg-[var(--separator)]"
             }`}
             onClick={() => onChange(p.name, !cur)}
           >
             <span
-              className="absolute top-0.5 h-[18px] w-[18px] rounded-full bg-white shadow transition-all"
+              className="absolute top-0.5 h-[18px] w-[18px] rounded-full bg-[var(--content)] shadow transition-all"
               style={{ left: cur ? 20 : 2 }}
             />
           </button>
@@ -653,17 +704,15 @@ function PropRow({
             {/* 图片类 file 属性显示缩略图（WE 编辑器就是这样：背景图/LED 背景
                 等属性在选择框旁给出当前图预览）。video/audio 没有可渲染的首帧，
                 仍只显示文件名。URL 拼不出（内容服务器未就绪）时退化为文件名。 */}
-            {p.fileType === "image" && cur ? (
-              <FileThumb url={fileUrl(cur)} />
-            ) : null}
+            {isImageProp(p, cur) ? <FileThumb url={fileUrl(cur)} /> : null}
             <span
               className="min-w-0 flex-1 truncate text-[11.5px] text-[var(--text-2)]"
               title={cur ? String(cur) : undefined}
             >
-              {cur ? shortFileName(String(cur)) : "未设置"}
+              {cur ? shortFileName(String(cur)) : tr("未设置")}
             </span>
             <button className="btn !py-1 !text-[11.5px]" onClick={() => void onFilePick(p)}>
-              选择文件…
+              {tr("选择文件…")}
             </button>
           </>
         )}
@@ -674,21 +723,17 @@ function PropRow({
               className="min-w-0 flex-1 truncate text-[11.5px] text-[var(--text-2)]"
               title={cur ? String(cur) : undefined}
             >
-              {cur ? String(cur) : "未设置"}
+              {cur ? String(cur) : tr("未设置")}
             </span>
             <button className="btn !py-1 !text-[11.5px]" onClick={() => void onFilePick(p)}>
-              选择目录…
+              {tr("选择目录…")}
             </button>
           </>
         )}
-        {/* 未支持的类型（scenetexture 等 scene 专属）只读展示当前值 */}
-        {!["color", "bool", "slider", "combo", "textinput", "file", "directory"].includes(p.ptype) && (
-          <span className="text-[11.5px] text-[var(--text-2)]">{String(cur ?? "")}</span>
-        )}
         {!isDefault && p.default !== null && (
           <button
-            className="text-[11px] text-[var(--text-2)] hover:text-[var(--accent)]"
-            title="恢复该属性默认值"
+            className="text-[11px] text-[var(--text-2)] hover:text-[var(--accent-strong)]"
+            title={tr("恢复该属性默认值")}
             onClick={() => onChange(p.name, p.default as WebPropValues[string])}
           >
             ↺
@@ -732,7 +777,7 @@ function SliderControl({
     <>
       <input
         type="range"
-        className="min-w-0 flex-1 accent-[var(--accent)]"
+        className="min-w-0 flex-1 accent-[var(--accent-strong)]"
         min={min}
         max={max}
         step={step}
@@ -741,7 +786,7 @@ function SliderControl({
       />
       <input
         type="text"
-        className="w-14 rounded-md border border-[var(--separator)] bg-[var(--card)] px-1.5 py-1 text-right text-[11.5px] focus:outline-none focus:ring-1 focus:ring-[var(--accent)]"
+        className="w-14 rounded-md border border-[var(--separator)] bg-[var(--card)] px-1.5 py-1 text-right text-[11.5px] focus:outline-none focus:ring-1 focus:ring-[var(--accent-strong)]"
         value={text ?? cur.toFixed(decimals)}
         onChange={(e) => setText(e.target.value)}
         onBlur={(e) => commit(e.target.value)}
@@ -783,7 +828,7 @@ function ComboControl({
     >
       {!hit && cur !== undefined && (
         <option value={String(cur)} disabled>
-          {String(cur)}（当前值不在可选范围）
+          {tr("{v}（当前值不在可选范围）", { v: String(cur) })}
         </option>
       )}
       {options.map((o) => (
@@ -804,11 +849,13 @@ const DPR_TIERS: Array<{ v: number; label: string }> = [
   { v: 2, label: "高清" },
 ];
 const FIT_LABELS: Record<string, string> = {
-  cover: "填充",
-  contain: "适应",
+  // 与设置页、托盘菜单同一套说法（cover/contain/stretch → 裁剪/缩放/拉伸），
+  // 同一个值在三处叫法必须一致，否则用户以为是不同的东西
+  cover: "裁剪",
+  contain: "缩放",
   stretch: "拉伸",
 };
-const FPS_TIERS = [30, 60, 120];
+const FPS_TIERS = [24, 30, 45, 60, 120];
 
 function PlayConfigPanel({
   play,
@@ -828,7 +875,13 @@ function PlayConfigPanel({
   if (!globals) {
     return (
       <div className="flex flex-1 items-center justify-center text-[13px] text-[var(--text-2)]">
-        {errMsg ? <span className="text-red-500">读取失败：{errMsg}</span> : "正在读取…"}
+        {errMsg ? (
+          <span className="text-red-500">
+            {tr("读取失败")}: {trMsg(errMsg)}
+          </span>
+        ) : (
+          tr("正在读取…")
+        )}
       </div>
     );
   }
@@ -836,13 +889,14 @@ function PlayConfigPanel({
     <>
       <div className="flex-1 overflow-y-auto px-5 py-3">
         <div className="mb-3 text-[11.5px] leading-relaxed text-[var(--text-2)]">
-          这些设置只作用于本张壁纸，切换壁纸后各自保留。选「跟随全局」则使用
-          设置 → 通用里的值。
+          {tr(
+            "这些设置只作用于本张壁纸，切换壁纸后各自保留。选「跟随全局」则使用设置 → 通用里的值。",
+          )}
         </div>
         <div className="flex flex-col gap-3">
           <PlayRow
-            label="显示模式"
-            desc="画面与屏幕比例不一致时如何填充"
+            label={tr("显示模式")}
+            desc={tr("画面与屏幕比例不一致时如何填充")}
             isOverride={play.fit !== undefined}
             onFollow={() => onChange({ fit: undefined })}
           >
@@ -853,18 +907,20 @@ function PlayConfigPanel({
                 onChange({ fit: (e.target.value || undefined) as ItemPlayConfig["fit"] })
               }
             >
-              <option value="">跟随全局（{FIT_LABELS[globals.fit] ?? globals.fit}）</option>
+              <option value="">
+                {tr("跟随全局（{v}）", { v: tr(FIT_LABELS[globals.fit] ?? globals.fit) })}
+              </option>
               {Object.entries(FIT_LABELS).map(([v, label]) => (
                 <option key={v} value={v}>
-                  {label}
+                  {tr(label)}
                 </option>
               ))}
             </select>
           </PlayRow>
 
           <PlayRow
-            label="清晰度"
-            desc="越高越清晰，显存占用也越高；实际生效值不超过屏幕像素比"
+            label={tr("清晰度")}
+            desc={tr("越高越清晰，显存占用也越高；实际生效值不超过屏幕像素比")}
             isOverride={play.renderDpr !== undefined}
             onFollow={() => onChange({ renderDpr: undefined })}
           >
@@ -876,19 +932,24 @@ function PlayConfigPanel({
               }
             >
               <option value="">
-                跟随全局（{DPR_TIERS.find((t) => t.v === globals.renderDpr)?.label ?? globals.renderDpr}）
+                {tr("跟随全局（{v}）", {
+                  v: tr(
+                    DPR_TIERS.find((t) => t.v === globals.renderDpr)?.label ??
+                      String(globals.renderDpr),
+                  ),
+                })}
               </option>
               {DPR_TIERS.map((t) => (
                 <option key={t.v} value={t.v}>
-                  {t.label}
+                  {tr(t.label)}
                 </option>
               ))}
             </select>
           </PlayRow>
 
           <PlayRow
-            label="帧率限制"
-            desc="越低 GPU 占用越低"
+            label={tr("帧率限制")}
+            desc={tr("越低 GPU 占用越低")}
             isOverride={play.sceneFps !== undefined}
             onFollow={() => onChange({ sceneFps: undefined })}
           >
@@ -899,7 +960,9 @@ function PlayConfigPanel({
                 onChange({ sceneFps: e.target.value ? Number(e.target.value) : undefined })
               }
             >
-              <option value="">跟随全局（{globals.sceneFps} FPS）</option>
+              <option value="">
+                {tr("跟随全局（{v}）", { v: `${globals.sceneFps} FPS` })}
+              </option>
               {FPS_TIERS.map((f) => (
                 <option key={f} value={f}>
                   {f} FPS
@@ -909,8 +972,8 @@ function PlayConfigPanel({
           </PlayRow>
 
           <PlayRow
-            label="音量"
-            desc="壁纸自带音频的音量；0 即静音。默认静音，避免多张壁纸同时出声"
+            label={tr("音量")}
+            desc={tr("壁纸自带音频的音量；0 即静音。默认静音，避免多张壁纸同时出声")}
             isOverride={play.volume !== undefined}
             onFollow={() => onChange({ volume: undefined })}
           >
@@ -922,7 +985,7 @@ function PlayConfigPanel({
                 step={0.05}
                 value={play.volume ?? 0}
                 onChange={(e) => onChange({ volume: Number(e.target.value) })}
-                className="w-28 accent-[var(--accent)]"
+                className="w-28 accent-[var(--accent-strong)]"
               />
               <span className="w-9 text-right text-[12px] tabular-nums text-[var(--text-2)]">
                 {Math.round((play.volume ?? 0) * 100)}%
@@ -935,17 +998,17 @@ function PlayConfigPanel({
       <div className="flex shrink-0 items-center gap-3 border-t border-[var(--separator)] px-5 py-3">
         <span className={`truncate text-[12px] ${errMsg ? "text-red-500" : "text-[var(--text-2)]"}`}>
           {errMsg
-            ? `保存失败：${errMsg}`
+            ? `${tr("保存失败")}: ${trMsg(errMsg)}`
             : overrideCount > 0
-              ? `${overrideCount} 项为本壁纸专属`
-              : "全部跟随全局设置"}
+              ? tr("{n} 项为本壁纸专属", { n: overrideCount })
+              : tr("全部跟随全局设置")}
         </span>
         <button
           className="btn ml-auto !py-1 !text-[12px]"
           disabled={overrideCount === 0}
           onClick={onResetAll}
         >
-          ↺ 全部跟随全局
+          ↺ {tr("全部跟随全局")}
         </button>
       </div>
     </>
@@ -953,7 +1016,7 @@ function PlayConfigPanel({
 }
 
 const playSelectCls =
-  "rounded-lg border border-[var(--separator)] bg-[var(--card)] px-2.5 py-1.5 text-[12.5px] focus:outline-none focus:ring-1 focus:ring-[var(--accent)]";
+  "rounded-lg border border-[var(--separator)] bg-[var(--card)] px-2.5 py-1.5 text-[12.5px] focus:outline-none focus:ring-1 focus:ring-[var(--accent-strong)]";
 
 function PlayRow({
   label,
@@ -976,11 +1039,11 @@ function PlayRow({
           {/* 标出哪些项被本壁纸覆盖了：不标的话用户分不清当前值是自己设的还是全局带来的 */}
           {isOverride && (
             <button
-              className="rounded bg-[var(--accent)]/15 px-1.5 text-[10px] text-[var(--accent)] hover:bg-[var(--accent)]/25"
+              className="rounded border border-[var(--separator)] bg-[var(--accent)] px-1.5 text-[10px] text-[var(--accent-strong)] hover:opacity-80"
               onClick={onFollow}
-              title="点击恢复为跟随全局"
+              title={tr("点击恢复为跟随全局")}
             >
-              专属 ×
+              {tr("专属")} ×
             </button>
           )}
         </div>

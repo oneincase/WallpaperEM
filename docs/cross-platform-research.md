@@ -1,9 +1,12 @@
-# 跨平台适配调研：Linux / 鸿蒙 PC
+# 跨平台适配调研：Linux / Windows / 鸿蒙 PC
 
-> 调研日期：2026-09-10，基于 v0.4.0（Tauri 2.11.2 + React 19 + Rust）。
-> 平台策略：**macOS（现状）→ Linux（近期目标）→ 鸿蒙 PC（长期观察）**。
-> Windows 不做 —— Wallpaper Engine 官方客户端已覆盖，没有差异化价值；
-> Linux 与鸿蒙 PC 上都没有成熟的 WE 兼容动态壁纸方案，是真正的空白市场。
+> 调研日期：2026-09-10（Windows 部分结论于 2026-09-11 更新），基于 v0.4.0（Tauri 2.11.2 + React 19 + Rust）。
+> 平台策略：**macOS（现状）→ Linux（已落地）→ Windows（已落地）→ 鸿蒙 PC（长期观察）**。
+> 本文原判断「Windows 不做 —— Wallpaper Engine 官方客户端已覆盖，没有差异化价值」
+> **已于 2026-09-11 推翻**：实际成本远低于预估（Win32 桌面层有 `WorkerW` 这一通行做法、
+> 音频有免授权的 WASAPI loopback、正在播放有 GSMTC、steamcmd 官方本就提供 Windows 版），
+> 而「与 macOS / Linux 共用同一套本地库与配置」本身就构成差异化。实施回写见 §8。
+> Linux 与鸿蒙 PC 上都没有成熟的 WE 兼容动态壁纸方案，仍是真正的空白市场。
 >
 > 结论先行：
 > - **Linux**：主要成本不在代码量（macOS 专属代码仅约 2600 行），而在桌面环境
@@ -180,3 +183,26 @@ Linux: Spike 验证(2~3天) → L0 trait 化重构(3~4天) → L1 桌面层窗�
 
 遗留（对应 §3.4 的 L2/L3 未完成项）：PipeWire 音频 loopback、wlroots layer-shell、
 前台应用检测（自动暂停）、GNOME 自定义窗口按钮、steamcmd 32 位依赖实机验证。
+
+---
+
+## 8. 实施回写（2026-09-11，Windows 已落地）
+
+沿用与 Linux 完全相同的**模块门面**结构新增 `windows.rs` 后端（业务代码零改动）：
+macOS 行为不变，Linux 未受影响。
+
+| 模块 | Windows 落地 |
+| --- | --- |
+| `wallpaper/windows.rs`（桌面层 / 屏幕枚举 / 睡眠 / 前台观察者 / 指针） | `tauri-plugin-desktop-underlay` 的 `SetParent → WorkerW`（插件 0.2.1 已含 Windows 实现，无需自研）；屏幕枚举走 Tauri `available_monitors`（物理像素 + per-monitor DPI → 逻辑坐标，id = 设备名 FNV 哈希，保证热插拔后会话恢复）；睡眠用 `GUID_CONSOLE_DISPLAY_STATE` 电源通知（事件驱动）；自动暂停用 `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)`；指针用 `GetCursorPos` + `GetAsyncKeyState`（免权限） |
+| `audio_capture/windows.rs` | WASAPI loopback（`AUDCLNT_STREAMFLAGS_LOOPBACK`），**无需任何授权**；频谱算法抽到共享的 `audio_capture/spectrum.rs`，与 macOS 输出同一条 64 段曲线（避免两平台观感不一致） |
+| `now_playing/windows.rs` | GSMTC（`Windows.Media.Control`）1s 轮询 + 封面按曲目缓存（魔数嗅探 MIME 转 data URL） |
+| `system_wallpaper.rs` | `SystemParametersInfoW(SPI_SETDESKWALLPAPER)`；抽帧策略与 Linux 相同（ffmpeg），scene/web 直接用工坊预览图 |
+| `ffmpeg.rs`（抽帧组件，Win/Linux 共用） | **运行时安装**静态构建到 `<app_data>/ffmpeg/`（Windows：gyan.dev essentials → BtbN win64-lgpl；Linux：johnvansickle → BtbN，按 arch 选源）：流式下载 + 进度事件、按扩展名解压（zip / tar.xz）、安装后 `-version` 自检；托管副本优先、其次系统 PATH。**不内置**是为避开 40~90MB 体积与 GPL 再分发义务（本文件 §2-3 的取舍继续成立，只是把「用户自己装」换成了「应用内一键装」） |
+| `download/pty.rs` | 从 POSIX pty 抽象为 `Pty` + `Writer` + `channel()`（spawn 后接线）：Windows 用三个匿名管道并把 stdout/stderr 合并成一条事件流；新增 `\r` 分行，流式上报 steamcmd 自更新的单行刷新进度 |
+| `download/steamcmd_install.rs` | 官方 `steamcmd.zip`（双源）+ `zip` crate 解压；`steamcmd.exe` / `steamclient(64).dll` 预热判据；HOME → `USERPROFILE` |
+| 窗口外观 | `apply_acrylic`（失败回退 `apply_blur`），与 macOS 的 `apply_vibrancy` 共用同一入口；「壁纸设置」窗口的磨砂 alpha 同样降到 0.78 |
+| 打包 / CI | `nsis`（currentUser，免管理员）+ `msi` targets、`icons/icon.ico`、WebView2 `downloadBootstrapper`；`.github/workflows/build-windows.yml`（`windows-latest`） |
+
+遗留（L2/L3）：资源管理器重启会重建 `WorkerW`，之后需重新应用壁纸才能回到桌面层；
+未做 Windows 代码签名（安装器会触发 SmartScreen 提示）；未做 ARM64 Windows 打包；
+「指针按压跟随」在 Windows 上只有只读光标状态（不做指针注入，与 macOS 的实现路径不同）。

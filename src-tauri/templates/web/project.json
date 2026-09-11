@@ -1,0 +1,43 @@
+{
+  "type": "web",
+  "title": "{{TITLE}}",
+  "file": "index.html",
+  "version": 1,
+  "tags": ["Everyone"],
+  "general": {
+    "properties": {
+      "schemecolor": {
+        "order": 0,
+        "text": "ui_browse_properties_scheme_color",
+        "type": "color",
+        "value": "0.28 0.62 1"
+      },
+      "speed": {
+        "order": 1,
+        "text": "动画速度",
+        "type": "slider",
+        "value": 0.5,
+        "min": 0,
+        "max": 2,
+        "step": 0.05,
+        "precision": 2
+      },
+      "mode": {
+        "order": 2,
+        "text": "形态",
+        "type": "combo",
+        "value": "aurora",
+        "options": [
+          { "label": "极光", "value": "aurora" },
+          { "label": "涟漪", "value": "ripple" }
+        ]
+      },
+      "showclock": {
+        "order": 3,
+        "text": "显示时间",
+        "type": "checkbox",
+        "value": true
+      }
+    }
+  }
+}

@@ -27,8 +27,10 @@ type WallpaperConfig = {
   fit?: WallpaperFit;
   /** 渲染分辨率上限（有效 devicePixelRatio 封顶），越低越省内存；默认 1 */
   renderDpr?: number;
-  /** 场景壁纸帧率上限（30/60/120），越低 GPU 占用越低；默认 60 */
+  /** 场景壁纸帧率上限（24/30/45/60/120），越低 GPU 占用越低；默认 24 */
   sceneFps?: number;
+  /** 全局滤镜 id（见 WALLPAPER_FILTERS 白名单），未知 id 按无滤镜处理 */
+  filter?: string;
   muted?: boolean;
   loop?: boolean;
   /** 内容服务器媒体基址：http://127.0.0.1:<port>/media/<token>（scene 拉取 pkg 用） */
@@ -43,6 +45,30 @@ function normalizeFit(fit?: WallpaperFit): "cover" | "contain" | "stretch" {
   return fit === "contain" || fit === "stretch" ? fit : "cover";
 }
 
+// ---- 全局滤镜（对齐上游独立测试台的实现）----
+//
+// 原生侧只传白名单 id，CSS filter 表达式只存在于这里：既避免把任意字符串塞进
+// style.filter（url() 可外链资源），也让 URL query 与 __wp.setFilter 共用一套契约。
+// 挂在 wrap 容器上而不是 canvas 上：scene 的 WebGL 画布、video/img、网页 iframe
+// 都是 wrap 的子节点，一处生效全类型覆盖，且换壁纸（子节点重建）不清除。
+const WALLPAPER_FILTERS: Record<string, string> = {
+  none: "",
+  blur: "blur(14px)",
+  grayscale: "grayscale(1)",
+  sepia: "sepia(0.75)",
+  vivid: "saturate(1.6)",
+  warm: "sepia(0.35) saturate(1.35) brightness(1.05)",
+  cool: "sepia(0.25) hue-rotate(175deg) saturate(1.3) brightness(1.03)",
+  invert: "invert(1)",
+  brighten: "brightness(1.3)",
+  darken: "brightness(0.72)",
+  contrast: "contrast(1.35)",
+};
+
+function applyWallpaperFilter(filter?: string) {
+  wrap.style.filter = WALLPAPER_FILTERS[filter ?? "none"] ?? "";
+}
+
 const state: {
   cfg: WallpaperConfig;
   /** 库实例：scene / web / video / gif / image 全部由它承载 */
@@ -53,7 +79,7 @@ const state: {
   canvas?: HTMLCanvasElement;
   ctx?: CanvasRenderingContext2D;
   raf?: number;
-  /** 默认壁纸降级页（库不提供降级，由宿主决定怎么兜） */
+  /** 降级时占位的 iframe（旧默认页残留字段；当前降级页是内联 SVG，不再用它） */
   iframe?: HTMLIFrameElement;
   /** 全局暂停态：库的 load() 会重置为播放态，切壁纸后需按此重新暂停 */
   paused: boolean;
@@ -686,6 +712,13 @@ async function fetchWallpaperProps(cfg: WallpaperConfig): Promise<
   }
 }
 
+// mount 的两级时长阈值（毫秒）：
+//   - 超过 SLOW 只上报一条「仍在解析」诊断，**绝不算失败**——大工程冷启动常见 10s+，
+//     旧的 10s 硬超时会误判失败，导致 ready 永远不上报（截图侧干等到超时）。
+//   - 超过 HARD 才兜底降级到默认壁纸，避免库内部真的卡死时窗口一片空白。
+const MOUNT_SLOW_MS = 10_000;
+const MOUNT_HARD_MS = 90_000;
+
 /** 经库挂载壁纸（scene / web / video / gif / image 走同一条路） */
 function mountViaLib(cfg: WallpaperConfig) {
   clear();
@@ -698,43 +731,77 @@ function mountViaLib(cfg: WallpaperConfig) {
   const seq = state.seq;
   reportDiag(cfg, "mount start");
 
-  // 库的 mount() 对某些类型（如 web 的 fetchProjectWire）可能延迟数百 ms
-  // 才触发首帧回调。设 10s 超时兜底，避免库内部挂起时整个页面卡住。
-  const timeout = new Promise<never>((_, reject) => {
-    setTimeout(() => reject(new Error("mount timeout (10s)")), 10000);
-  });
-
   void (async () => {
     try {
       // 场景/媒体壁纸挂载前拉取生效属性（project.json 覆盖 scene.json 默认 +
       // 全局语言兜底）。网页壁纸不需要（HTML 改写时已注入 __weSeedProps）。
-      // 与 mount 并行没有意义——属性决定首帧，晚到会闪一下，所以先 await。
+      // 属性决定首帧，晚到会闪一下，所以先 await 再 mount。
       let properties: Record<string, boolean | number | string> | undefined;
       if (cfg.type !== "web") {
         properties = await fetchWallpaperProps(cfg);
         const n = properties ? Object.keys(properties).length : 0;
         if (n > 0) reportDiag(cfg, `壁纸属性已载入（${n} 项，含 project.json 覆盖与语言）`);
       }
+      // 冷启动解析大工程（几十 MB 的 scene.pkg + 贴图）经常明显超过 10s。旧实现用
+      // Promise.race 在 10s 直接判失败，代价是双重的：**不上报 ready**（截图侧只能一路
+      // 干等到超时，报「等待渲染器就绪超时」），**且把还在解析的实例丢在一边**（漏 WebGL
+      // 上下文，下一次挂载又要从零解析）。实测「截图等就绪超时」几乎都是这么来的。
+      // 现在 10s 只上报一条「仍在解析」，真正的兜底放到 90s，且兜底后晚到的实例会被销毁。
+      const slowWarn = setTimeout(
+        () =>
+          reportDiag(
+            cfg,
+            `mount 仍在进行（已超过 ${MOUNT_SLOW_MS / 1000}s，大工程冷启动需要时间）`,
+          ),
+        MOUNT_SLOW_MS,
+      );
+      // 注意：**不能**在选项里写 `audio: undefined` / `media: undefined`。
+      // 库用 `if ("audio" in o)` 判「是否显式设置」——属性存在即命中，再经
+      // `o.audio ?? null` 变成 `null` = **显式禁用**：
+      //   - scene：`audioSim.enabled` 在挂载时按 `!rt.audioDisabled` 定死，
+      //     之后 `setAudio()` 把 audioDisabled 清回 false 也救不回来，频谱恒为空；
+      //   - web：音频泵按 `_webAudio === null || rt.audioDisabled` 直接不启动。
+      // 切壁纸会重建窗口（新页面 → SSE 必然重连），首帧常晚于挂载，
+      // 于是表现为「音频已在播放，设置壁纸后却没有可视化」。
+      // 没有源时**省略这个键**，让库按其内置模拟源起泵，随后由
+      // attachSystemAudio / attachSystemMedia 热装上真实源。
+      const mountOpts: Parameters<typeof mountLib>[1] = {
+        source,
+        fit: normalizeFit(cfg.fit),
+        renderDpr: cfg.renderDpr ?? 1,
+        fps: cfg.sceneFps ?? 24,
+        volume: cfg.muted === false ? 1 : 0,
+        // 场景壁纸的初始属性（project.json 值，含全局语言）
+        properties,
+        onDiagnostic: (msg: string, level: string) => reportDiag(cfg, `[${level}] ${msg}`),
+        onError: (err: Error) => reportDiag(cfg, `mount error: ${err.message}`),
+      };
+      if (systemAudio.alive) mountOpts.audio = systemAudio;
+      if (systemMedia.subscribed) mountOpts.media = systemMedia;
+      const mountPromise = mountLib(wrap, mountOpts);
       const inst = await Promise.race([
-        mountLib(wrap, {
-          source,
-          fit: normalizeFit(cfg.fit),
-          renderDpr: cfg.renderDpr ?? 1,
-          fps: cfg.sceneFps ?? 60,
-          volume: cfg.muted === false ? 1 : 0,
-          // 系统音频：捕获链路活着就用真实频谱，否则交给库的内置模拟源
-          // （传 undefined 而非 null —— null 是「禁用」，频谱恒为 0）
-          audio: systemAudio.alive ? systemAudio : undefined,
-          // 系统媒体：订阅建立后就传，没在播也是合法状态（hasMedia: false）。
-          // 不传的话库会用自带模拟源，壁纸上会显示假歌名/假封面
-          media: systemMedia.subscribed ? systemMedia : undefined,
-          // 场景壁纸的初始属性（project.json 值，含全局语言）
-          properties,
-          onDiagnostic: (msg, level) => reportDiag(cfg, `[${level}] ${msg}`),
-          onError: (err) => reportDiag(cfg, `mount error: ${err.message}`),
-        }),
-        timeout,
+        mountPromise,
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), MOUNT_HARD_MS)),
       ]);
+      clearTimeout(slowWarn);
+      if (!inst) {
+        // 兜底：库内部卡死时别让壁纸窗口空着，也让截图侧立刻拿到明确原因。
+        // 晚到的实例必须销毁，否则又是一次上下文泄漏。
+        reportDiag(cfg, `mount 超过 ${MOUNT_HARD_MS / 1000}s 仍未完成（疑似库内部卡住）`);
+        mountDefaultWallpaper();
+        void mountPromise
+          .then((late) => {
+            try {
+              late.destroy({ releasePkgCache: true });
+            } catch {
+              /* 忽略 */
+            }
+          })
+          .catch(() => {
+            /* 已在上面的 catch 里报过 */
+          });
+        return;
+      }
       // 装载期间又切了壁纸：本次结果作废，直接销毁避免泄漏 WebGL 上下文。
       // 它装载的是被取代的旧壁纸，缓存同样该弃（新的 mount 自己会拉自己的）
       if (seq !== state.seq) {
@@ -811,36 +878,36 @@ function startCanvasLoop() {
   state.raf = requestAnimationFrame(draw);
 }
 
-/// 默认壁纸：无壁纸/加载失败时，展示内置的精美 HTML 壁纸
-/// （由内容服务器提供，与渲染器同源）。库不自带降级页，这是宿主职责。
+/// 兜底提示：壁纸缺失/加载失败时，铺一层简洁的 SVG + 文案。
+/// 不再加载内置 HTML 页 —— 观感差，还多一层 iframe 与资源依赖。
 function mountDefaultWallpaper() {
   clear();
-  const f = document.createElement("iframe");
-  f.setAttribute("sandbox", "allow-scripts");
-  f.style.cssText =
-    "position:absolute;inset:0;width:100%;height:100%;border:none;background:transparent;";
-  try {
-    f.src = new URL("/default-wallpaper/index.html", location.origin).toString();
-  } catch {
-    f.src = "/default-wallpaper/index.html";
-  }
-  wrap.appendChild(f);
-  const blockIframe = () => {
-    try {
-      const doc = f.contentDocument;
-      if (doc) (window as any).__blockContextMenu?.(doc);
-    } catch {
-      /* 忽略 */
-    }
-  };
-  f.addEventListener("load", blockIframe);
-  state.iframe = f;
+  const box = document.createElement("div");
+  box.setAttribute("role", "img");
+  box.setAttribute("aria-label", "wallpaper unavailable");
+  box.style.cssText =
+    "position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;" +
+    "justify-content:center;gap:16px;background:#0e1013;color:rgba(255,255,255,.62);" +
+    "font:13px/1.7 -apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif;" +
+    "user-select:none;pointer-events:none;";
+  box.innerHTML =
+    '<svg width="76" height="76" viewBox="0 0 48 48" fill="none" aria-hidden="true">' +
+    '<rect x="5.5" y="9" width="37" height="30" rx="4.5" stroke="currentColor" stroke-opacity=".5" stroke-width="2"/>' +
+    '<circle cx="16" cy="19" r="3.2" fill="currentColor" fill-opacity=".5"/>' +
+    '<path d="M7.5 34.5l9.5-9.5 5.5 5.5L32 21l8.5 8.5" stroke="currentColor" stroke-opacity=".5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>' +
+    "</svg>" +
+    '<div style="text-align:center">壁纸无法加载' +
+    '<br><span style="opacity:.55">Wallpaper unavailable</span></div>';
+  wrap.appendChild(box);
 }
 
 function mount(cfg: WallpaperConfig) {
+  // 滤镜挂在 wrap 上（不是壁纸内容上），所以每次挂载都重设一次即可：
+  // clear() 只清子节点、不动 wrap 自身的 style
+  applyWallpaperFilter(cfg.filter);
   if (cfg.type === "canvas") mountCanvas();
   else if (cfg.src) mountViaLib(cfg);
-  else mountDefaultWallpaper(); // 无壁纸/未知类型 → 精美 HTML 默认壁纸
+  else mountDefaultWallpaper(); // 无壁纸/未知类型 → 内联 SVG + 文案提示
 }
 
 // 原生控制接口
@@ -856,6 +923,8 @@ declare global {
       restore(): void;
       setRenderDpr(dpr: number): void;
       setSceneFps(fps: number): void;
+      /** 切换全局滤镜：传白名单 id（WALLPAPER_FILTERS），未知 id 按无滤镜处理 */
+      setFilter(filter: string): void;
       /** 热更新 WE 用户属性（wire 格式：{name: {value: ...}}） */
       updateWebProps(props: Record<string, { value: unknown }>): void;
       /** 系统音频捕获开关变化（原生侧在用户切换设置后调用） */
@@ -933,6 +1002,11 @@ window.__wp = {
     state.cfg.sceneFps = fps;
     state.inst?.setFps(fps);
   },
+  // 切换滤镜：纯 CSS 合成层的事，不用重挂壁纸、不用碰库实例
+  setFilter(filter: string) {
+    state.cfg.filter = filter;
+    applyWallpaperFilter(filter);
+  },
   // 热更新 WE 用户属性（属性编辑保存后由原生侧调用，免刷新生效）
   updateWebProps(props: Record<string, { value: unknown }>) {
     // 库支持逐属性热更，不必重挂载（旧实现要重新下载解析上百 MB 的 scene.pkg）。
@@ -977,8 +1051,9 @@ const initialCfg: WallpaperConfig = {
   type: (params.get("type") as WallpaperConfig["type"]) ?? "canvas",
   src: params.get("src") ?? undefined,
   fit: (params.get("fit") as WallpaperConfig["fit"]) ?? "cover",
-  renderDpr: Number(params.get("renderDpr")) || 1,
-  sceneFps: Number(params.get("sceneFps")) || 60,
+  renderDpr: Number(params.get("renderDpr")) || 2,
+  sceneFps: Number(params.get("sceneFps")) || 24,
+  filter: params.get("filter") ?? undefined,
   muted: params.get("muted") !== "false",
   loop: params.get("loop") !== "false",
   mediaBase: params.get("mediaBase") ?? undefined,

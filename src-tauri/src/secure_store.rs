@@ -60,7 +60,12 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
 }
 
 /// 保存凭据（用户名明文 + 加密后的密码）到 <dir>/credentials.dat
+fn ensure_dir(dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())
+}
+
 pub fn save(username: &str, password: &str, dir: &Path) -> Result<(), String> {
+    ensure_dir(dir)?;
     let (ct, iv) = encrypt(password.as_bytes());
     let content = format!("{username}\n{}\n{}\n", hex(&iv), hex(&ct));
     let file = dir.join(FILE);
@@ -93,6 +98,49 @@ pub fn load(username: &str, dir: &Path) -> Result<Option<String>, String> {
         }
         _ => Ok(None),
     }
+}
+
+// ---------- Steam 网页会话 refresh token（订阅同步用，与下载凭据相互独立） ----------
+
+const SESSION_FILE: &str = "session.dat";
+
+/// 保存某账号的网页会话 token（access token JWT，同一 XOR 加密方案，文件与凭据分开：
+/// 清密码不该连带踢掉网页会话，反之亦然）。
+/// 注意：存的是 access token 而不是 refresh token——WebBrowser 平台签发的
+/// refresh token 在 WebAPI 网关续期会被拒（EResult 15），网页会话要用
+/// login.steampowered.com/jwt/ajaxrefresh 流程以 access token 换新（见 auth.rs）
+pub fn save_session(username: &str, steamid: u64, refresh_token: &str, dir: &Path) -> Result<(), String> {
+    ensure_dir(dir)?;
+    let (ct, iv) = encrypt(refresh_token.as_bytes());
+    let content = format!("{username}\n{steamid}\n{}\n{}\n", hex(&iv), hex(&ct));
+    std::fs::write(dir.join(SESSION_FILE), content).map_err(|e| e.to_string())
+}
+
+/// 读取保存的 (username, steamid, refresh_token)，不校验用户名。
+/// 扫码登录保存的账号可能和「设置 → 账号」里的下载账号不是同一个，
+/// 订阅同步只看「有没有可用的网页会话」，不该被用户名不匹配挡掉
+pub fn load_session_any(dir: &Path) -> Option<(String, u64, String)> {
+    let data = std::fs::read_to_string(dir.join(SESSION_FILE)).ok()?;
+    let mut lines = data.lines();
+    let username = lines.next()?.to_string();
+    let steamid: u64 = lines.next()?.parse().ok()?;
+    let iv = lines
+        .next()
+        .and_then(unhex)
+        .and_then(|v| <[u8; 16]>::try_from(v).ok())?;
+    let ct = lines.next().and_then(unhex)?;
+    let plain = decrypt(&iv, &ct);
+    let token = String::from_utf8_lossy(&plain).into_owned();
+    if token.is_empty() {
+        return None;
+    }
+    Some((username, steamid, token))
+}
+
+
+/// 清除保存的网页会话
+pub fn clear_session(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join(SESSION_FILE));
 }
 
 /// 该用户名是否已配置本地凭据

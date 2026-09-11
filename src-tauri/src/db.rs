@@ -118,6 +118,27 @@ fn migrate(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
         conn.pragma_update(None, "user_version", 5)?;
         tracing::info!("db migrated to version 5（清晰度档位收敛，修正 {fixed} 条壁纸覆盖）");
     }
+    if v < 6 {
+        // v6：本地导入条目的 tags 从来没写过（导入路径漏了这一步），而 v4 的回填
+        // 只从工坊缓存取 —— 本地导入（custom-*）在缓存里没有记录，于是筛选面板
+        // 按「视频/场景/网页」筛时，导入进来的壁纸一条都命中不到。
+        // 这里按 type 列补上类型标签；新导入的条目由 upsert_library_item 直接写。
+        let n = conn.execute(
+            "UPDATE library_items
+                SET tags = json_array(CASE lower(type)
+                        WHEN 'video' THEN 'Video'
+                        WHEN 'scene' THEN 'Scene'
+                        WHEN 'web' THEN 'Web'
+                        WHEN 'gif' THEN 'GIF'
+                        WHEN 'application' THEN 'Application'
+                     END)
+              WHERE (tags IS NULL OR tags = '' OR tags = '[]')
+                AND lower(type) IN ('video','scene','web','gif','application')",
+            [],
+        )?;
+        conn.pragma_update(None, "user_version", 6)?;
+        tracing::info!("db migrated to version 6（回填 {n} 条本地导入类型标签）");
+    }
     Ok(())
 }
 
@@ -253,7 +274,7 @@ mod tests {
 
     fn v4_db() -> Connection {
         // 复刻 v4 状态：跑 schema(v1) 后直接把 user_version 钉到 4，
-        // 并灌入旧档位值 —— 这样 migrate() 只会执行 v5 这一段
+        // 并灌入旧档位值与本地导入条目 —— 这样 migrate() 会执行 v5 与 v6 两段
         let c = Connection::open_in_memory().unwrap();
         c.execute_batch(include_str!("schema.sql")).unwrap();
         c.execute(
@@ -268,6 +289,15 @@ mod tests {
         .unwrap();
         c.pragma_update(None, "user_version", 4).unwrap();
         c
+    }
+
+    fn add_local_import(c: &Connection, id: &str, ty: &str, tags: Option<&str>) {
+        c.execute(
+            "INSERT INTO library_items(item_id, title, type, size_bytes, file_count, downloaded_at, tags)
+             VALUES (?1, ?2, ?3, 1, 1, 1, ?4)",
+            rusqlite::params![id, id, ty, tags],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -298,7 +328,36 @@ mod tests {
         let ver: i64 = c
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(ver, 5);
+        // 版本号是链式的：v4 的库跑一次 migrate() 会一路升到当前最新
+        assert_eq!(ver, 6);
+    }
+
+    #[test]
+    fn v6_backfills_type_tag_for_local_imports_without_tags() {
+        let c = v4_db();
+        // 本地导入的条目：类型有，标签空（导入路径历史遗漏）
+        add_local_import(&c, "custom-a", "video", None);
+        add_local_import(&c, "custom-b", "scene", Some("[]"));
+        // 已有标签的条目不能被覆盖（工坊缓存回填的题材标签要保住）
+        add_local_import(&c, "custom-c", "video", Some(r#"["Anime"]"#));
+        // 缓存里已有元数据的工坊条目不属于本次回填目标（v4 的语句会覆盖它，
+        // 但 v6 只处理「空标签」的条目，这里顺带确认没被写脏）
+        add_local_import(&c, "123", "video", Some(r#"["Video"]"#));
+
+        migrate(&c).unwrap();
+
+        let tags = |id: &str| -> String {
+            c.query_row(
+                "SELECT tags FROM library_items WHERE item_id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(tags("custom-a"), r#"["Video"]"#);
+        assert_eq!(tags("custom-b"), r#"["Scene"]"#);
+        assert_eq!(tags("custom-c"), r#"["Anime"]"#);
+        assert_eq!(tags("123"), r#"["Video"]"#);
     }
 
     #[test]

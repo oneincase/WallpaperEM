@@ -1,7 +1,9 @@
 //! Steam 客户端：统一 HTTP 客户端（代理 + 串行重试 + sessionid 反 403），对齐 Web 版 net.ts / steamFetch
 
+pub mod auth;
 pub mod browse;
 pub mod details;
+pub mod rsa;
 pub mod types;
 
 use reqwest::{Response, StatusCode};

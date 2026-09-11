@@ -5,14 +5,39 @@
 // itemId 经 URL query 传入（?item=<id>），由 Rust 开窗时决定。
 import ReactDOM from "react-dom/client";
 import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { WallpaperPropsPanel } from "./components/WallpaperPropsModal";
 import { api } from "./api/steam";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { pushLocaleToBackend, tr, useLocale } from "./lib/i18n";
 import "./index.css";
 
 function PropsWindow() {
+  // 独立窗口也要订阅语言：切换后标题与文案跟着变（窗口标题由 Rust 设，见下）
+  useLocale();
   const [itemId] = useState(() => new URLSearchParams(location.search).get("item") ?? "");
   const [title, setTitle] = useState(itemId);
+
+  // 窗口标题（任务栏/窗口列表里显示的那个）
+  useEffect(() => {
+    document.title = tr("壁纸设置");
+  }, []);
+
+  // 该窗口可能先于主窗口打开（托盘入口），自己推一次语言，保证 Rust 文案一致
+  useEffect(() => {
+    pushLocaleToBackend();
+  }, []);
+
+  // 平台标记给 CSS：macOS 有原生 vibrancy、Windows 有 acrylic，都是系统级磨砂，
+  // props-tint 才能降到 0.78
+  // 透出模糊；其他平台保持 0.88 高 alpha 兜底可读性（见 index.css .props-tint）
+  useEffect(() => {
+    invoke<{ os: string }>("app_info")
+      .then((i) => {
+        document.documentElement.dataset.os = i.os;
+      })
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     if (!itemId) return;
@@ -26,7 +51,7 @@ function PropsWindow() {
   if (!itemId) {
     return (
       <div className="flex h-full items-center justify-center text-[13px] text-[var(--text-2)]">
-        缺少壁纸 ID
+        {tr("缺少壁纸 ID")}
       </div>
     );
   }

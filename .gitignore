@@ -36,6 +36,7 @@ credentials.dat
 .vscode/
 *.swp
 *.swo
+.pnpm-store/
 
 .v2c/
 .video_agent/

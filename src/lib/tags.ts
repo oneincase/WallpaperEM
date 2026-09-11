@@ -3,11 +3,15 @@
 // 标签名必须与 Steam 工坊完全一致（大小写、空格都不能改）—— 它们直接作为
 // `requiredtags[]` / `excludedtags[]` 的值发给 Steam，写错就是静默零结果。
 //
-// ⚠️ Steam 对 requiredtags[] 是**严格 AND**，组内也不例外：
-// 同时选 Anime 和 Girls 得到的是「既是 Anime 又是 Girls」的极少量结果，
-// 不是两者的并集。UI 上要让用户理解「每多选一个标签，结果只会更少」。
+// 筛选语义（与 Steam 原生 requiredtags 的严格 AND 不同，见 workshop.rs）：
+// 组内多选是**并集**（选 Anime + Girls = 任一命中即显示），组间是交集，
+// 一个都不选 = 不约束（都显示）。每个标签只有选中/未选中两态，
+// **每个分组都能任选多个** —— 类型/分级/分类/分辨率也不例外。
 //
-// 分组与顺序对齐 WE 官方工坊筛选面板。
+// 分组与顺序对齐 WE 官方工坊筛选面板，但单选/多选不再跟官方走：官方面板把
+// 类型/分级/分类/分辨率做成单选，多选在这里更有用（「想看场景和视频」是个
+// 正常诉求），且组内并集的语义在本地库与工坊两条链路上都天然成立。
+import { getLocale } from "./i18n";
 
 export type TagGroupKind =
   | "type"
@@ -21,17 +25,21 @@ export type TagGroup = {
   kind: TagGroupKind;
   /** 面板上的分组标题 */
   label: string;
-  /** 单选（select 语义）还是多选（checkbox 语义）—— 与 WE 官方面板一致 */
-  multi: boolean;
   /** 标签英文原名（发给 Steam 的值） → 中文显示名 */
-  tags: { name: string; label: string }[];
+  tags: { name: string; label: string; libraryOnly?: boolean }[];
 };
+
+/**
+ * 「本地导入」分类标签（仅本地库筛选）：匹配 item_id 为 custom-* 的本地导入条目。
+ * 不是真实工坊标签，值特意用 $ 开头避免与任何 Steam 标签撞名；
+ * 后端 library_list 见到它会翻译成 `item_id LIKE 'custom-%'`。
+ */
+export const LOCAL_IMPORT_TAG = "$local";
 
 export const TAG_GROUPS: TagGroup[] = [
   {
     kind: "type",
     label: "类型",
-    multi: false,
     tags: [
       { name: "Scene", label: "场景" },
       { name: "Video", label: "视频" },
@@ -42,7 +50,6 @@ export const TAG_GROUPS: TagGroup[] = [
   {
     kind: "rating",
     label: "年龄分级",
-    multi: false,
     tags: [
       { name: "Everyone", label: "大众级" },
       { name: "Questionable", label: "指导级" },
@@ -52,17 +59,17 @@ export const TAG_GROUPS: TagGroup[] = [
   {
     kind: "category",
     label: "分类",
-    multi: false,
     tags: [
       { name: "Wallpaper", label: "壁纸" },
       { name: "Preset", label: "预设" },
       { name: "Asset", label: "素材" },
+      // 仅本地库筛选面板展示（工坊没有这个维度）
+      { name: LOCAL_IMPORT_TAG, label: "本地导入", libraryOnly: true },
     ],
   },
   {
     kind: "genre",
     label: "题材",
-    multi: true,
     tags: [
       { name: "Abstract", label: "抽象" },
       { name: "Animal", label: "动物" },
@@ -94,7 +101,6 @@ export const TAG_GROUPS: TagGroup[] = [
   {
     kind: "resolution",
     label: "分辨率",
-    multi: false,
     tags: [
       { name: "Standard Definition", label: "标清" },
       { name: "1280 x 720", label: "1280 × 720" },
@@ -126,7 +132,6 @@ export const TAG_GROUPS: TagGroup[] = [
   {
     kind: "misc",
     label: "功能特性",
-    multi: true,
     tags: [
       { name: "Approved", label: "官方推荐" },
       { name: "Audio responsive", label: "音频响应" },
@@ -146,6 +151,19 @@ export const TAG_GROUPS: TagGroup[] = [
 export const TAG_LABEL: Record<string, string> = Object.fromEntries(
   TAG_GROUPS.flatMap((g) => g.tags.map((t) => [t.name, t.label])),
 );
+
+/**
+ * 标签展示名：中文界面用中文标签，其它语言直接回落到 **Steam 原始英文标签名**。
+ *
+ * 刻意不走 tr() 文案表 —— 标签的英文名（`Anime` / `Pixel art` / `Video`）就是
+ * 工坊里的规范写法，再翻译一遍容易和工坊对不上，也白多维护几十条映射。
+ * 调用点都在渲染期，语言切换时随根组件重渲染自动更新。
+ */
+export function tagLabel(name: string): string {
+  const label = TAG_LABEL[name];
+  if (!label) return name;
+  return getLocale() === "zh-CN" ? label : name;
+}
 
 /** 工坊排序。实测只有 browsesort 生效，actualsort 完全无效 */
 export const WORKSHOP_SORTS = [
@@ -179,12 +197,44 @@ export const LIBRARY_SORTS = [
 
 export type LibrarySort = (typeof LIBRARY_SORTS)[number]["value"];
 
+/** 标签选择状态：两态（选中/未选中），选中的标签值为 true */
+export type TagSelection = Record<string, true>;
+
 /**
  * 默认筛选条件：默认只看大众级内容。
  *
  * 注意这与 Steam 网页端不同 —— 实测 Steam 默认不做任何年龄过滤。
- * 这里刻意收紧，避免首屏直接推成人内容；用户可在筛选面板里改。
+ * 这里刻意收紧，避免首屏直接推成人内容；用户可在筛选面板里改（全不选 = 都显示）。
  */
-export const DEFAULT_TAG_STATE: Record<string, "on" | "excluded"> = {
-  Everyone: "on",
+export const DEFAULT_TAG_SELECTION: TagSelection = {
+  Everyone: true,
 };
+
+/**
+ * 切换一个标签的选中态（两态：选中 ⇄ 未选中）。
+ * 任何分组都自由叠加（组内并集），不顶替同组其它标签。
+ */
+export function toggleTagSelection(sel: TagSelection, name: string): TagSelection {
+  const next = { ...sel };
+  if (next[name]) {
+    delete next[name];
+    return next;
+  }
+  next[name] = true;
+  return next;
+}
+
+/**
+ * 选择状态 → 分组标签列表（组内并集 OR、组间交集 AND）。
+ * 顺序固定随 TAG_GROUPS，保证指纹/缓存键稳定。空组剔除。
+ */
+export function selectedTagGroups(sel: TagSelection): string[][] {
+  return TAG_GROUPS.map((g) => g.tags.map((t) => t.name).filter((n) => sel[n])).filter(
+    (tags) => tags.length > 0,
+  );
+}
+
+/** 选中标签总数（筛选角标用） */
+export function selectedTagCount(sel: TagSelection): number {
+  return Object.keys(sel).length;
+}

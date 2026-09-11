@@ -12,13 +12,20 @@ pub fn ping() -> &'static str {
 }
 
 #[tauri::command]
-pub fn app_info() -> Value {
+pub fn app_info(app: AppHandle) -> Value {
+    // 平台相关的一句自我描述（设置页「关于」直接展示）
+    let description = if cfg!(target_os = "macos") {
+        "macOS 动态壁纸引擎 —— 浏览/下载并应用 Steam 创意工坊壁纸"
+    } else {
+        "跨平台动态壁纸引擎 —— 浏览/下载并应用 Steam 创意工坊壁纸"
+    };
+    // 版本以 Tauri 包信息为准（来自 tauri.conf.json，与发版 tag / 安装包一致）
     json!({
         "name": "WallpaperEM",
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": app.package_info().version.to_string(),
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
-        "description": "macOS 动态壁纸引擎 —— 浏览/下载并应用 Steam 创意工坊壁纸",
+        "description": description,
     })
 }
 

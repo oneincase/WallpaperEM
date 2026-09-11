@@ -7,11 +7,12 @@
 // 重排一次，视觉抖动比覆盖更扰人。半透明 + 背景模糊让下层壁纸仍隐约可见，
 // 不至于失去上下文。
 import { useEffect, useState, type ReactNode } from "react";
+import { tr } from "../lib/i18n";
 
 export function FilterDrawer({
   open,
   onClose,
-  title = "筛选",
+  title,
   /** 标题右侧的附加信息（如结果总数） */
   meta,
   activeCount = 0,
@@ -20,12 +21,15 @@ export function FilterDrawer({
 }: {
   open: boolean;
   onClose: () => void;
+  /** 标题，不给则用通用词「筛选」 */
   title?: string;
   meta?: ReactNode;
   activeCount?: number;
   onReset?: () => void;
   children: ReactNode;
 }) {
+  // 默认值在渲染时取词：写成默认参数会在模块加载时冻结成中文
+  const heading = title ?? tr("筛选");
   // 进场动画：挂载后下一帧才切到终态，否则 transition 不会被触发
   const [shown, setShown] = useState(false);
   useEffect(() => {
@@ -60,28 +64,28 @@ export function FilterDrawer({
         }`}
       />
       <div
-        className={`absolute inset-y-0 left-0 z-30 flex w-64 max-w-[85%] flex-col border-r border-[var(--separator)] bg-[var(--content)]/92 shadow-2xl backdrop-blur-2xl backdrop-saturate-150 transition-transform duration-300 ease-out ${
+        className={`absolute inset-y-0 left-0 z-30 flex w-64 max-w-[85%] flex-col border-r border-[var(--separator)] bg-[var(--card)]/92 shadow-2xl backdrop-blur-2xl backdrop-saturate-150 transition-transform duration-300 ease-out ${
           shown ? "translate-x-0" : "-translate-x-full"
         }`}
       >
         <div className="flex shrink-0 items-center gap-2 border-b border-[var(--separator)] px-4 py-3">
-          <span className="shrink-0 text-[13.5px] font-semibold">{title}</span>
+          <span className="shrink-0 text-[13.5px] font-semibold">{heading}</span>
           {meta && (
             <span className="truncate text-[11.5px] text-[var(--text-2)]">{meta}</span>
           )}
           <div className="ml-auto flex shrink-0 items-center gap-2">
             {onReset && activeCount > 0 && (
               <button
-                className="text-[11.5px] text-[var(--text-2)] transition-colors hover:text-[var(--accent)]"
+                className="text-[11.5px] text-[var(--text-2)] transition-colors hover:text-[var(--accent-strong)]"
                 onClick={onReset}
               >
-                重置 {activeCount}
+                {tr("重置 {n}", { n: activeCount })}
               </button>
             )}
             <button
               className="rounded p-0.5 text-[var(--text-2)] transition-colors hover:text-[var(--text-1)]"
               onClick={onClose}
-              aria-label="关闭筛选"
+              aria-label={tr("关闭筛选")}
             >
               <svg
                 width="15"
@@ -115,7 +119,7 @@ export function FilterButton({
     <button
       className={`relative flex shrink-0 items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-[12.5px] font-medium transition-colors ${
         activeCount > 0
-          ? "border-[var(--accent)] bg-[var(--accent)]/10 text-[var(--accent)]"
+          ? "border-[var(--accent-strong)] bg-[var(--accent)] text-[var(--accent-strong)]"
           : "border-[var(--separator)] text-[var(--text-2)] hover:bg-black/5 dark:hover:bg-white/10"
       }`}
       onClick={onClick}
@@ -135,9 +139,9 @@ export function FilterButton({
         <path d="M7.4 12h9.2" />
         <path d="M10.2 17.8h3.6" />
       </svg>
-      筛选
+      {tr("筛选")}
       {activeCount > 0 && (
-        <span className="rounded-full bg-[var(--accent)] px-1.5 text-[10px] font-bold text-white">
+        <span className="rounded-full bg-[var(--accent-strong)] px-1.5 text-[10px] font-bold text-[var(--content)]">
           {activeCount}
         </span>
       )}
@@ -176,7 +180,7 @@ export function FilterSection({
         </svg>
         {label}
         {count > 0 && (
-          <span className="rounded bg-[var(--accent)]/12 px-1.5 text-[10px] font-semibold text-[var(--accent)]">
+          <span className="rounded border border-[var(--separator)] bg-[var(--accent)] px-1.5 text-[10px] font-semibold text-[var(--accent-strong)]">
             {count}
           </span>
         )}
@@ -186,7 +190,7 @@ export function FilterSection({
   );
 }
 
-/** 标签胶囊：三态（未选 / 选中 / 排除） */
+/** 标签胶囊：两态（未选 / 选中） */
 export function TagChip({
   label,
   state,
@@ -194,16 +198,14 @@ export function TagChip({
   title,
 }: {
   label: string;
-  state: "off" | "on" | "excluded";
+  state: "off" | "on";
   onClick: () => void;
   title?: string;
 }) {
   const cls =
     state === "on"
-      ? "border-[var(--accent)] bg-[var(--accent)] text-white"
-      : state === "excluded"
-        ? "border-red-500/50 bg-red-500/12 text-red-500 line-through"
-        : "border-[var(--separator)] text-[var(--text-2)] hover:bg-black/5 dark:hover:bg-white/10";
+      ? "border-[var(--accent-strong)] bg-[var(--accent)] text-[var(--accent-fg)]"
+      : "border-[var(--separator)] text-[var(--text-2)] hover:bg-black/5 dark:hover:bg-white/10";
   return (
     <button
       className={`rounded-lg border px-2 py-[3px] text-[11.5px] transition-colors ${cls}`}

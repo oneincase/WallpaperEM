@@ -16,6 +16,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { tr, trMsg } from "../lib/i18n";
 
 type MessageKind = "success" | "error" | "info";
 
@@ -42,7 +43,7 @@ const Ctx = createContext<MessageApi | null>(null);
 
 export function useMessage(): MessageApi {
   const api = useContext(Ctx);
-  if (!api) throw new Error("useMessage 必须在 <MessageProvider> 内使用");
+  if (!api) throw new Error(tr("useMessage 必须在 <MessageProvider> 内使用"));
   return api;
 }
 
@@ -55,10 +56,12 @@ export function MessageProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const show = useCallback((kind: MessageKind, text: string) => {
-    const t = text.trim();
-    if (!t) return;
+    // 后端消息（Rust 的 Err(String)）在这里统一过一遍翻译表：所有调用点都写
+    // `msg.error(String(e))`，把翻译放在唯一的出口比在每个调用点包一层可靠
+    const translated = trMsg(text).trim();
+    if (!translated) return;
     const id = ++seq.current;
-    setItems((prev) => [...prev, { id, kind, text: t }].slice(-MAX_STACK));
+    setItems((prev) => [...prev, { id, kind, text: translated }].slice(-MAX_STACK));
   }, []);
 
   const api = useMemo<MessageApi>(
@@ -86,7 +89,7 @@ export function MessageProvider({ children }: { children: ReactNode }) {
 const TONE: Record<MessageKind, { bar: string; icon: string }> = {
   success: { bar: "bg-green-500", icon: "text-green-500" },
   error: { bar: "bg-red-500", icon: "text-red-500" },
-  info: { bar: "bg-[var(--accent)]", icon: "text-[var(--accent)]" },
+  info: { bar: "bg-[var(--accent-strong)]", icon: "text-[var(--accent-strong)]" },
 };
 
 function Toast({ item, onDismiss }: { item: MessageItem; onDismiss: () => void }) {
@@ -132,7 +135,7 @@ function Toast({ item, onDismiss }: { item: MessageItem; onDismiss: () => void }
       <button
         className="mt-[7px] shrink-0 rounded p-0.5 text-[var(--text-2)] transition-colors hover:text-[var(--text-1)]"
         onClick={close}
-        aria-label="关闭"
+        aria-label={tr("关闭")}
       >
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.2} strokeLinecap="round">
           <path d="M6 6l12 12M18 6L6 18" />

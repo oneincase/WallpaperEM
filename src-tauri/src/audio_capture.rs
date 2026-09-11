@@ -19,13 +19,6 @@ use tauri::Manager;
 use crate::db;
 
 pub const BANDS: usize = 64;
-// 以下常量只被 macOS 捕获实现（FFT 窗口/发布节拍）使用
-#[cfg(target_os = "macos")]
-const WINDOW: usize = 2048;
-#[cfg(target_os = "macos")]
-const SAMPLE_RATE: f32 = 48_000.0;
-#[cfg(target_os = "macos")]
-const PUBLISH_INTERVAL: Duration = Duration::from_millis(33);
 
 /// 捕获生命周期相位（AudioShared.phase）
 pub const PHASE_IDLE: u8 = 0; // 未启动（开关关闭或已停止）
@@ -72,8 +65,8 @@ impl AudioShared {
         (self.seq.load(Ordering::Relaxed), bands)
     }
 
-    /// 写入新频谱帧（仅 macOS 捕获回调使用；桩实现不产生数据）
-    #[cfg(target_os = "macos")]
+    /// 写入新频谱帧（仅真实捕获实现使用；桩实现不产生数据）
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub(crate) fn publish(&self, bands: [f32; BANDS]) {
         if let Ok(mut b) = self.bands.lock() {
             *b = bands;
@@ -94,9 +87,18 @@ pub struct AudioCaptureState {
 #[path = "audio_capture/macos.rs"]
 mod imp;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+#[path = "audio_capture/windows.rs"]
+mod imp;
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[path = "audio_capture/other.rs"]
 mod imp;
+
+/// 平台无关的 FFT/分箱（macOS 与 Windows 共用，见 spectrum.rs）
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[path = "audio_capture/spectrum.rs"]
+mod spectrum;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -107,7 +109,7 @@ pub struct AudioStatus {
     pub running: bool,
     /// 屏幕录制权限是否已授予（非 macOS 恒 false）
     pub granted: bool,
-    /// 当前平台是否支持系统音频捕获（macOS 支持；Linux 待接入 PipeWire）
+    /// 当前平台是否支持系统音频捕获（macOS/Windows 支持；Linux 待接入 PipeWire）
     pub supported: bool,
 }
 

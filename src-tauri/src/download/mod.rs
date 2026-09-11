@@ -12,6 +12,7 @@ pub mod steamcmd_install;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -32,6 +33,12 @@ pub const APP_ID: &str = "431960";
 const GUARD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// steamcmd 无进度输出，用产物目录大小估算进度的轮询间隔
 const SIZE_POLL_INTERVAL: Duration = Duration::from_millis(1000);
+/// 密码登录开始后，超过该时长仍未成功就推测在等待手机 App 确认。
+///
+/// 新版 steamcmd 等待手机确认时不打印任何提示（console_log.txt 实测：
+/// "Logging in user..." 之后静默 27 秒直到用户确认），无法靠输出文案检测，
+/// 只能用「密码登录 + 长时间未完成」推测。缓存登录通常 4 秒内完成，8 秒不会误伤。
+const MOBILE_HINT_DELAY: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -220,8 +227,14 @@ impl DownloadService {
             })
         };
 
+        // 登录验证任务：只 +login +quit，不下载任何内容
+        let is_verify = item_id == backend::VERIFY_ITEM_ID;
         let mut cmd = Command::new(&bin);
-        cmd.args(dl.build_args(&item_id, &workdir, &cred));
+        if is_verify {
+            cmd.args(dl.build_login_args(&workdir, &cred));
+        } else {
+            cmd.args(dl.build_args(&item_id, &workdir, &cred));
+        }
         for (k, v) in dl.extra_env() {
             cmd.env(k, v);
         }
@@ -232,50 +245,51 @@ impl DownloadService {
                 .env("HTTPS_PROXY", p);
         }
 
-        // 交互通道：steamcmd 的 stdin 必须是 TTY（管道会让它直接
-        // "cannot read from the console" 退出）。PTY 下 stdout/stderr 合流到 master。
+        // 交互通道：*nix 上 steamcmd 的 stdin 必须是 TTY（管道会让它直接
+        // "cannot read from the console" 退出）；Windows 走匿名管道（详见 pty.rs）。
         let (mut writer, mut out_rx) = {
-            let pty = match pty::Pty::open() {
+            let mut pty = match pty::Pty::open() {
                 Ok(p) => p,
                 Err(e) => {
-                    self.fail(task_id, "SPAWN_FAILED", &format!("分配 PTY 失败: {e}"));
+                    self.fail(task_id, "SPAWN_FAILED", &format!("分配交互通道失败: {e}"));
                     return;
                 }
             };
             pty.attach(&mut cmd);
-            let child = match cmd.spawn() {
+            let mut child = match cmd.spawn() {
                 Ok(c) => c,
                 Err(e) => {
                     self.fail(task_id, "SPAWN_FAILED", &format!("启动下载工具失败: {e}"));
                     return;
                 }
             };
+            // 交互通道必须在 spawn 之后取：Windows 上管道句柄来自 Child 本身
+            let (writer, rx) = match pty.channel(&mut child, backend::is_prompt).await {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = child.start_kill();
+                    self.fail(task_id, "SPAWN_FAILED", &format!("建立交互通道失败: {e}"));
+                    return;
+                }
+            };
             *self.current_child.lock().await = Some(child);
-            let master = match pty.into_async_file() {
-                Ok(f) => f,
-                Err(e) => {
-                    self.fail(task_id, "SPAWN_FAILED", &format!("PTY 句柄转换失败: {e}"));
-                    return;
-                }
-            };
-            // master 是双工的：读子进程输出，写用户输入
-            let reader = match master.try_clone().await {
-                Ok(r) => r,
-                Err(e) => {
-                    self.fail(task_id, "SPAWN_FAILED", &format!("PTY 句柄复制失败: {e}"));
-                    return;
-                }
-            };
-            let rx = pty::spawn_byte_reader(reader, backend::is_prompt);
-            (master, rx)
+            (writer, rx)
         };
 
-        // steamcmd 下载期间零进度输出：轮询产物目录大小估算进度
-        let progress_poll = self.spawn_size_poller(
-            task_id,
-            dl.artifact_dir(&workdir, &item_id),
-            item_id.clone(),
-        );
+        // steamcmd 下载期间零进度输出：轮询产物目录大小估算进度。
+        // 登录验证任务没有产物，用 -1 的不确定态进度即可。
+        // 注意状态必须保持 authenticating：误报 downloading 会让前端把验证任务
+        // 显示成「下载中」，还会触发「登录已推进」逻辑提前收起手机确认弹窗。
+        let progress_poll = if is_verify {
+            self.emit_progress(task_id, "authenticating", -1.0);
+            tauri::async_runtime::spawn(std::future::pending::<()>())
+        } else {
+            self.spawn_size_poller(
+                task_id,
+                dl.artifact_dir(&workdir, &item_id),
+                item_id.clone(),
+            )
+        };
 
         let mut st = TaskState {
             success: false,
@@ -283,7 +297,9 @@ impl DownloadService {
             recent: Vec::new(),
             guard_rx: None,
             exit_code: None,
-            mobile_confirm_notified: false,
+            mobile_confirm_notified: Arc::new(AtomicBool::new(false)),
+            mobile_hint_armed: false,
+            mobile_hint_cancel: Arc::new(AtomicBool::new(false)),
         };
         let watchdog = backend::WATCHDOG;
         let task_deadline = tokio::time::sleep(watchdog);
@@ -294,7 +310,7 @@ impl DownloadService {
                 ev = out_rx.recv() => {
                     if let Some(ev) = ev {
                         task_deadline.as_mut().reset(tokio::time::Instant::now() + watchdog);
-                        self.handle_event(ev, task_id, &dl, &mut st);
+                        self.handle_event(ev, task_id, &dl, &mut st, is_verify);
                     }
                 }
                 code = async {
@@ -352,13 +368,19 @@ impl DownloadService {
             }
         }
         progress_poll.abort();
+        // 任务结束，解除「等待手机确认」推测定时器（若尚未触发）
+        st.mobile_hint_cancel.store(true, Ordering::SeqCst);
         *self.current_child.lock().await = None;
 
-        // 成功判定：以「成功行 + 产物真实存在」为准。
+        // 成功判定：以「成功行 + 产物真实存在」为准（登录验证任务无产物，只看成功行）。
         // 退出码不可信 —— macOS 上 steamcmd 下载成功后常卡在拆卸阶段被我们主动杀掉。
-        let artifact = dl.artifact_dir(&workdir, &item_id);
-        let files_ok = artifact.is_dir() && backend::dir_size(&artifact) > 0;
-        let real_success = st.success && files_ok && st.error_msg.is_none();
+        let real_success = if is_verify {
+            st.success && st.error_msg.is_none()
+        } else {
+            let artifact = dl.artifact_dir(&workdir, &item_id);
+            let files_ok = artifact.is_dir() && backend::dir_size(&artifact) > 0;
+            st.success && files_ok && st.error_msg.is_none()
+        };
 
         if st.error_msg.is_none() && !real_success {
             if st.recent.is_empty() {
@@ -386,7 +408,23 @@ impl DownloadService {
             return;
         }
         if !real_success {
-            self.fail(task_id, "DOWNLOAD_FAILED", "下载未完成");
+            self.fail(
+                task_id,
+                "DOWNLOAD_FAILED",
+                if is_verify { "登录验证未完成" } else { "下载未完成" },
+            );
+            return;
+        }
+
+        // 登录验证任务：登录成功即完成，无需安装
+        if is_verify {
+            if let Ok(conn) = self.db.lock() {
+                let _ = db::set_setting(&conn, "download_has_token", "true");
+                let _ = db::set_setting(&conn, steamcmd_install::SETTING_LOGGED_IN, "true");
+            }
+            self.update(task_id, "done", 100.0, None, None, false);
+            self.emit_progress(task_id, "done", 100.0);
+            tracing::info!("login verify done (task {task_id})");
             return;
         }
 
@@ -506,7 +544,14 @@ impl DownloadService {
     }
 
     /// 处理子进程一个输出事件（完整行 / 未换行的输入提示）
-    fn handle_event(&self, ev: pty::OutEvent, task_id: i64, dl: &SteamCmd, st: &mut TaskState) {
+    fn handle_event(
+        &self,
+        ev: pty::OutEvent,
+        task_id: i64,
+        dl: &SteamCmd,
+        st: &mut TaskState,
+        is_verify: bool,
+    ) {
         let text = match &ev {
             pty::OutEvent::Line(l) => l.clone(),
             pty::OutEvent::Prompt(p) => p.clone(),
@@ -514,6 +559,12 @@ impl DownloadService {
         let line = text.trim();
         if line.is_empty() {
             return;
+        }
+
+        // 密码登录开始：启动「静默等待手机确认」推测定时器。
+        // Prompt（"Logging in user..." 的无换行尾部）和 Line 都要检查。
+        if dl.match_login_start(line) {
+            self.arm_mobile_hint(task_id, st);
         }
 
         // 提示类事件：仅用于尽早弹出输入框，不进日志缓冲
@@ -526,8 +577,18 @@ impl DownloadService {
         if st.recent.len() > 25 {
             st.recent.remove(0);
         }
+        // 登录成功行：对验证任务是完成标志；对普通下载任务至少说明登录阶段
+        // 已结束，必须解除手机确认推测（match_success 要等下载结束才出现，
+        // 靠它解除的话，用户 8 秒内确认完、下载刚开始时会误弹提示）。
+        if dl.match_login_success(line) {
+            st.mobile_hint_cancel.store(true, Ordering::SeqCst);
+            if is_verify {
+                st.success = true;
+            }
+        }
         if dl.match_success(line) {
             st.success = true;
+            st.mobile_hint_cancel.store(true, Ordering::SeqCst);
         }
         self.request_guard(task_id, dl, line, st);
         if st.error_msg.is_none() {
@@ -541,20 +602,24 @@ impl DownloadService {
     /// 手机确认类提示只做日志，不弹输入框。
     fn request_guard(&self, task_id: i64, dl: &SteamCmd, line: &str, st: &mut TaskState) {
         let Some(kind) = dl.match_guard_prompt(line) else {
+            // 诊断：含有 confirm 字样却没匹配上的行打出来，方便发现 steamcmd
+            // 又改了提示文案（之前已经改过一次：新版干脆不打印了）
+            if line.to_ascii_lowercase().contains("confirm") {
+                tracing::warn!("task {task_id}: 疑似确认提示但未匹配: {line}");
+            }
             return;
         };
+        tracing::info!("task {task_id}: 检测到交互请求 {kind:?}: {line}");
         match kind {
             GuardKind::MobileConfirm => {
-                // 只提示一次：steamcmd 在等待期间会反复刷这句提示
-                if !st.mobile_confirm_notified {
-                    st.mobile_confirm_notified = true;
-                    tracing::info!("task {task_id}: 等待手机端确认登录");
-                    self.emit("download:mobile-confirm", json!({ "taskId": task_id }));
-                }
+                // 只提示一次：steamcmd 在等待期间会反复刷这句提示。
+                // 与静默推测定时器抢同一个标志，谁先谁发。
+                self.notify_mobile_confirm(task_id, st, "steamcmd 输出了确认提示");
             }
             GuardKind::Password => {
                 // 令牌失效时后端会重新索要密码。这里不弹框，直接标记失败让用户重新登录，
                 // 否则进程会一直阻塞在密码提示上直到看门狗超时。
+                st.mobile_hint_cancel.store(true, Ordering::SeqCst);
                 if st.error_msg.is_none() {
                     st.error_msg = Some(
                         "登录态已失效（工具正在索要密码），请到「设置 → 账号」重新登录".into(),
@@ -562,6 +627,8 @@ impl DownloadService {
                 }
             }
             GuardKind::Code => {
+                // 改要验证码了：手机确认推测已无意义，避免验证码弹窗和手机提示互相打架
+                st.mobile_hint_cancel.store(true, Ordering::SeqCst);
                 if st.guard_rx.is_none() {
                     let (tx, rx) = oneshot::channel();
                     self.guard_waiters.lock().unwrap().insert(task_id, tx);
@@ -572,6 +639,49 @@ impl DownloadService {
                 }
             }
         }
+    }
+
+    /// 通知前端「请在手机 App 确认登录」，全程只发一次。
+    fn notify_mobile_confirm(&self, task_id: i64, st: &TaskState, reason: &str) {
+        if st
+            .mobile_confirm_notified
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            tracing::info!("task {task_id}: 等待手机端确认登录（{reason}）");
+            self.emit("download:mobile-confirm", json!({ "taskId": task_id }));
+        }
+    }
+
+    /// 密码登录已开始：启动静默推测定时器。
+    ///
+    /// 新版 steamcmd 等待手机确认时不打印任何提示，用户在手机上收到推送，
+    /// 应用里却毫无反馈。这里在密码登录 MOBILE_HINT_DELAY 秒后仍无进展时，
+    /// 主动提示用户去手机上确认。每个任务只武装一次；登录完成/失败/改要
+    /// 验证码/任务结束都会通过 mobile_hint_cancel 解除。
+    fn arm_mobile_hint(&self, task_id: i64, st: &mut TaskState) {
+        if st.mobile_hint_armed || st.mobile_confirm_notified.load(Ordering::SeqCst) {
+            return;
+        }
+        st.mobile_hint_armed = true;
+        let notified = st.mobile_confirm_notified.clone();
+        let cancel = st.mobile_hint_cancel.clone();
+        let app = self.app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(MOBILE_HINT_DELAY).await;
+            if cancel.load(Ordering::SeqCst) {
+                return;
+            }
+            if notified
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                tracing::info!(
+                    "task {task_id}: 密码登录 {MOBILE_HINT_DELAY:?} 未完成，推测在等待手机确认"
+                );
+                let _ = app.emit("download:mobile-confirm", json!({ "taskId": task_id }));
+            }
+        });
     }
 
     /// 解析下载凭据。返回 (username, password, has_token)：
@@ -961,8 +1071,14 @@ struct TaskState {
     recent: Vec<String>,
     guard_rx: Option<oneshot::Receiver<String>>,
     exit_code: Option<i32>,
-    /// 「等待手机端确认」提示已通知前端（steamcmd 会反复刷该提示，只报一次）
-    mobile_confirm_notified: bool,
+    /// 「等待手机端确认」提示已通知前端。
+    /// 两个触发源（steamcmd 打印确认文案 / 静默超时推测）共享该标志做去重，
+    /// 所以必须是 Arc<AtomicBool> 让推测定时器也能原子地抢这一次机会。
+    mobile_confirm_notified: Arc<AtomicBool>,
+    /// 静默推测定时器是否已启动（每次任务只启动一次）
+    mobile_hint_armed: bool,
+    /// 置位后推测定时器放弃发提示（登录已成功/失败/改要验证码/任务结束）
+    mobile_hint_cancel: Arc<AtomicBool>,
 }
 
 fn copy_recursive(
@@ -1139,6 +1255,18 @@ pub fn is_busy(app: &AppHandle) -> bool {
     .unwrap_or(false)
 }
 
+/// 用户配置的下载代理（手动代理优先，其次 Steam 专用代理），空闲时返回 None。
+///
+/// 各条「运行时下载」链路共用：steamcmd 引导包、托管 ffmpeg 静态包。
+/// 挂在 download 模块下是因为代理本来就是这个页面的设置。
+pub(crate) fn read_proxy(app: &AppHandle) -> Option<String> {
+    let db = app.try_state::<Arc<Mutex<Connection>>>()?;
+    let conn = db.lock().ok()?;
+    db::get_setting(&conn, "download_proxy")
+        .or_else(|| db::get_setting(&conn, "steam_proxy"))
+        .filter(|s| !s.trim().is_empty())
+}
+
 /// 下载工具（steamcmd）安装状态，供设置页展示。
 #[tauri::command]
 pub fn download_tool_status(app: AppHandle) -> serde_json::Value {
@@ -1181,6 +1309,8 @@ pub fn download_credentials_set(
             [],
         );
     }
+    // 订阅同步的网页会话同样作废（绑的是旧账号/旧密码）
+    secure_store::clear_session(&dir);
     Ok(json!({ "ok": true, "username": username }))
 }
 
@@ -1203,6 +1333,31 @@ pub fn download_credentials_status(app: AppHandle) -> Result<serde_json::Value, 
         "configured": username.is_some() && (has_pw || has_token),
         "username": username,
     }))
+}
+
+/// 入队一个「登录验证」任务：只跑 steamcmd +login +quit，
+/// 用于「保存凭据时立即验证」——验证码/手机确认走与下载相同的全局弹框。
+/// 已有进行中的验证/下载任务在跑时直接复用，不重复入队
+#[tauri::command]
+pub fn download_verify_login(app: AppHandle) -> Result<i64, String> {
+    let db = app.state::<Arc<Mutex<Connection>>>();
+    let conn = db.lock().map_err(|e| e.to_string())?;
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM downloads WHERE item_id = ?1 AND status IN ('queued','authenticating','downloading','installing') LIMIT 1",
+            [backend::VERIFY_ITEM_ID],
+            |r| r.get::<_, i64>(0),
+        )
+        .ok();
+    if let Some(id) = exists {
+        return Ok(id);
+    }
+    conn.execute(
+        "INSERT INTO downloads(item_id, status, progress, created_at) VALUES (?1, 'queued', 0, unixepoch())",
+        [backend::VERIFY_ITEM_ID],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(conn.last_insert_rowid())
 }
 
 #[tauri::command]
@@ -1296,6 +1451,8 @@ pub fn download_credentials_clear(app: AppHandle) -> Result<(), String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     // 清本地加密存储的账号密码（逐个已知账号尝试）
     let _ = secure_store::clear_all(&dir);
+    // 连同订阅同步的网页会话一起清：账号都退了，会话不该残留
+    secure_store::clear_session(&dir);
     // 清 steamcmd 登录态：它把 config.vdf 写在被重定向的 HOME 下
     if let Ok(home) = steamcmd_install::home_dir(&app) {
         let _ = std::fs::remove_dir_all(home);

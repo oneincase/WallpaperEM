@@ -2,15 +2,18 @@
 //! 静态壁纸 —— 锁屏、登录窗口、壁纸引擎未运行时与桌面视觉一致。
 //!
 //! 平台实现：macOS 用 AVFoundation 抽帧 + NSWorkspace 设置；
-//! Linux 用 ffmpeg 抽帧（需用户安装），按 XDG_CURRENT_DESKTOP 分发到
-//! GNOME/Cinnamon/MATE/XFCE/KDE/swww/feh 等设置途径（见文件末尾 imp）。
+//! Linux / Windows 用 ffmpeg 抽帧（应用内可一键安装托管副本，见 `crate::ffmpeg`），
+//! 前者按 XDG_CURRENT_DESKTOP 分发到 GNOME/Cinnamon/MATE/XFCE/KDE/swww/feh 等设置途径，
+//! 后者用 SystemParametersInfoW(SPI_SETDESKWALLPAPER)（见文件末尾各平台 imp）。
 //!
 //! 默认开启（设置页「自动设置系统壁纸」可关，键 wallpaper_auto_system_static）。
 //! 抽帧方式按类型：video → AVAssetImageGenerator 首帧；gif → 首帧转 PNG；
 //! image → 原图直用；scene/web → 等渲染器挂载成功后对壁纸窗口 WKWebView
 //! 实拍截图（工坊预览图与实际渲染差距太大，弃用）。
-//! video/gif/image 在主线程同步完成（AVAssetImageGenerator 硬件解码一帧是
-//! 十毫秒级）；scene/web 必须等渲染完成，走 tokio 异步编排，不阻塞 apply。
+//! video/gif/image 的抽帧 + PNG 编码放后台线程（解码是一帧十毫秒级，但 PNG deflate
+//! 在 4K 下可到几百 ms，压在主线程会冻 UI 并被监控探测判成事件循环卡死），
+//! 只有「设为桌面」那一步回主线程（NSWorkspace 有主线程要求）；
+//! scene/web 必须等渲染完成，走 tokio 异步编排，不阻塞 apply。
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -48,17 +51,38 @@ pub fn sync_after_apply(
         spawn_snapshot_sync(app, cfg_type, &item_id, &dir);
         return;
     }
-    match poster_frame(&dir, &item_id, cfg_type) {
-        Ok(img) => {
-            if let Err(e) = set_all_screens(&img) {
-                tracing::warn!("system wallpaper: set failed: {e}");
-            } else {
-                tracing::info!("system wallpaper: synced ({}, {})", cfg_type, img.display());
+    // video/gif/image：抽帧是硬件解码（十毫秒级），但 poster_frame 里还包含 **PNG 编码**
+    // （4K 一帧的 deflate 可到几百 ms）。本函数由 apply_on_main 在主线程调用，编码压在
+    // 主线程上会冻住 UI 与壁纸动画，也会被壁纸监控的「事件循环是否卡死」探测抓成
+    // `UI event loop wedged?`（与截图那条同源）。所以抽帧整体丢后台线程，
+    // 只有「设为桌面」那一步回主线程 —— NSWorkspace 那条路有主线程要求（见 set_all_screens）。
+    let app = app.clone();
+    let ty = cfg_type.to_string();
+    std::thread::spawn(move || {
+        let img = {
+            // 抽帧产物写的是同一个路径，且 write_png 是 fs::write 直写：两个 apply 撞在
+            // 一起会互相截断。只锁抽帧这一段 —— 回主线程的 hop 不持锁，否则后来的 apply
+            // 会白白排队等一次 UI 往返。
+            let _guard = POSTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            match poster_frame(&dir, &item_id, &ty) {
+                Ok(img) => img,
+                Err(e) => {
+                    tracing::warn!("system wallpaper: poster frame failed: {e}");
+                    return;
+                }
             }
+        };
+        if let Err(e) = app.run_on_main_thread(move || match set_all_screens(&img) {
+            Ok(()) => tracing::info!("system wallpaper: synced ({}, {})", ty, img.display()),
+            Err(e) => tracing::warn!("system wallpaper: set failed: {e}"),
+        }) {
+            tracing::warn!("system wallpaper: 派发设壁纸到主线程失败: {e}");
         }
-        Err(e) => tracing::warn!("system wallpaper: poster frame failed: {e}"),
-    }
+    });
 }
+
+/// 抽帧缓存的写盘串行化锁（理由见 sync_after_apply 里那段注释）
+static POSTER_LOCK: Mutex<()> = Mutex::new(());
 
 /// 设置开关：默认开启（键未写入过 = true）
 fn enabled(app: &AppHandle) -> bool {
@@ -204,7 +228,7 @@ fn poster_frame(dir: &Path, item_id: &str, ty: &str) -> Result<PathBuf, String> 
 /// 抽帧产物的缓存路径（新鲜度判断在 cache_fresh，由抽帧函数自己短路）
 /// 供库导入复用：视频抽首帧写 PNG（本地库卡片封面）。
 /// macOS = AVFoundation（mp4/mov/m4v 等系统可解码格式；mkv/avi/webm 可能失败）；
-/// Linux = 系统 ffmpeg（未安装则 Err）；其余平台不支持。失败由调用方自行降级
+/// Linux / Windows = 系统 ffmpeg（未安装则 Err）；其余平台不支持。失败由调用方自行降级
 /// （导入不该因没有封面而失败）。
 pub(crate) fn video_poster_png(video: &Path, out: &Path) -> Result<(), String> {
     extract_video_frame(video, out)
@@ -334,8 +358,32 @@ mod imp {
             let config: objc2::rc::Retained<AnyObject> = msg_send![config_cls, new];
             let bounds: NSRect = msg_send![webview, bounds];
             let _: () = msg_send![&*config, setRect: bounds];
+            // completion 只在主线程回调，而 3024×1964 的 PNG deflate 实测 >100ms：
+            // 压在主线程上会冻住 UI 与壁纸动画，还会被壁纸监控的「事件循环是否卡死」
+            // 探测抓成 `UI event loop wedged?`（实测就是本函数引起的）。所以主线程只
+            // 取位图，压缩丢给后台线程。
+            // block2 要求闭包是 Fn（不能把 tx 直接 move 出去），用 Option 包一层取走。
+            let tx = std::sync::Mutex::new(Some(tx));
             let block = block2::RcBlock::new(move |image: *mut AnyObject, error: *mut NSError| {
-                let _ = tx.send(snapshot_png_bytes(image, error));
+                let Some(tx) = tx.lock().ok().and_then(|mut g| g.take()) else {
+                    return; // WebKit 只回调一次；重复回调时 channel 已交出，忽略
+                };
+                let started = std::time::Instant::now();
+                let tiff = snapshot_tiff_bytes(image, error);
+                tracing::debug!(
+                    "snapshot: 位图抽取耗时 {}ms（主线程）",
+                    started.elapsed().as_millis()
+                );
+                match tiff {
+                    Ok(bytes) => {
+                        std::thread::spawn(move || {
+                            let _ = tx.send(encode_png_from_tiff(&bytes));
+                        });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                    }
+                }
             });
             let _: () = msg_send![
                 webview,
@@ -345,9 +393,11 @@ mod imp {
         }
     }
 
-    /// 截图 completion 主体：NSImage（+0，仅回调内有效）→ TIFF → PNG 字节。
-    /// WebKit 异步 completion 会 copy block，堆块内的 channel 随 completion 存活
-    unsafe fn snapshot_png_bytes(
+    /// 主线程侧：NSImage（+0，仅回调内有效）→ TIFF 字节。
+    ///
+    /// 只做这一层：NSImage 不是线程安全的，必须在回调里就地取；而 TIFF 只是
+    /// 「原始位图 + 头」的拷贝，比 PNG deflate 便宜一个量级。
+    unsafe fn snapshot_tiff_bytes(
         image: *mut AnyObject,
         error: *mut NSError,
     ) -> Result<Vec<u8>, String> {
@@ -365,7 +415,18 @@ mod imp {
             if tiff.is_null() {
                 return Err("截图 TIFF 表示为空".into());
             }
-            let Some(rep) = NSBitmapImageRep::initWithData(NSBitmapImageRep::alloc(), &*tiff)
+            // 拷成 Vec 再跨线程：NSData 是 autorelease 的临时对象，出不了回调作用域
+            Ok((*tiff).to_vec())
+        }
+    }
+
+    /// 后台线程侧：TIFF 字节 → PNG 字节。
+    /// NSBitmapImageRep 的解码/编码不依赖主线程（依赖主线程的是 NSImage），
+    /// 放后台跑掉这段 deflate。
+    fn encode_png_from_tiff(tiff: &[u8]) -> Result<Vec<u8>, String> {
+        unsafe {
+            let data = NSData::with_bytes(tiff);
+            let Some(rep) = NSBitmapImageRep::initWithData(NSBitmapImageRep::alloc(), &data)
             else {
                 return Err("截图位图解码失败".into());
             };
@@ -420,10 +481,10 @@ mod imp {
     use super::*;
     use std::process::Command;
 
-    /// video/gif → 首帧 PNG。依赖系统 ffmpeg（大多数发行版仓库都有；
-    /// 不内置是为了不带几十 MB 的二进制与编解码许可问题）。
+    /// video/gif → 首帧 PNG。命令由 `crate::ffmpeg` 决定：应用内装的托管副本优先，
+    /// 其次是 PATH 上的系统 ffmpeg（发行版仓库大多有；不想装就点设置页的「安装」）。
     fn ffmpeg_first_frame(input: &Path, out: &Path) -> Result<(), String> {
-        let r = Command::new("ffmpeg")
+        let r = crate::ffmpeg::command()
             .args(["-hide_banner", "-loglevel", "error", "-y"])
             .arg("-i")
             .arg(input)
@@ -436,9 +497,7 @@ mod imp {
                 "ffmpeg 抽帧失败: {}",
                 String::from_utf8_lossy(&o.stderr).trim()
             )),
-            Err(_) => Err(
-                "未找到 ffmpeg：请先安装（如 sudo apt install ffmpeg）再开启系统壁纸同步".into(),
-            ),
+            Err(_) => Err(format!("未找到 ffmpeg：{}", crate::ffmpeg::MISSING_HINT)),
         }
     }
 
@@ -593,17 +652,193 @@ mod imp {
 #[cfg(target_os = "linux")]
 use imp::{extract_image_frame, extract_video_frame, set_all_screens};
 
+// ---------- Windows：ffmpeg 抽帧 + SystemParametersInfo 设置 ----------
+
+#[cfg(target_os = "windows")]
+mod imp {
+    use super::*;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SystemParametersInfoW, SPIF_SENDCHANGE, SPIF_UPDATEINIFILE, SPI_SETDESKWALLPAPER,
+    };
+
+    /// video/gif → 首帧 PNG。命令由 `crate::ffmpeg` 决定：应用内装的托管副本优先，
+    /// 其次是 PATH 上的系统 ffmpeg。未安装时返回可操作的提示。
+    fn ffmpeg_first_frame(input: &Path, out: &Path) -> Result<(), String> {
+        let r = crate::ffmpeg::command()
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .arg("-i")
+            .arg(input)
+            .args(["-frames:v", "1"])
+            .arg(out)
+            .output();
+        match r {
+            Ok(o) if o.status.success() && out.is_file() => Ok(()),
+            Ok(o) => Err(format!(
+                "ffmpeg 抽帧失败: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            )),
+            Err(_) => Err(format!("未找到 ffmpeg：{}", crate::ffmpeg::MISSING_HINT)),
+        }
+    }
+
+    pub fn extract_video_frame(input: &Path, out: &Path) -> Result<(), String> {
+        ffmpeg_first_frame(input, out)
+    }
+
+    /// GIF 走 ffmpeg；其余交给通用路径
+    pub fn extract_image_frame(input: &Path, out: &Path) -> Result<(), String> {
+        ffmpeg_first_frame(input, out)
+    }
+
+    /// 设为桌面静态壁纸（SPI_SETDESKWALLPAPER）。
+    ///
+    /// 该系统调用是全局的：一次设置应用到所有显示器（Windows 的按屏壁纸要走
+    /// IDesktopWallpaper COM，且只在 Win8+ 可用）—— 对「引擎未运行时保持视觉
+    /// 一致」这个用途，全局同图已经达到目的，不额外引入 COM 依赖。
+    ///
+    /// 路径必须是绝对路径 + 反斜杠 + UTF-16 NUL 结尾；PNG/JPG 自 Windows 8 起
+    /// 原生支持，所以我们写出的 PNG 可以直接用。
+    pub fn set_all_screens(img: &Path) -> Result<(), String> {
+        let abs = std::fs::canonicalize(img)
+            .map_err(|e| format!("壁纸路径不可用（{}）: {e}", img.display()))?;
+        // canonicalize 在 Windows 上返回 \\?\ 前缀的 verbatim 路径，
+        // SystemParametersInfo 不认这个前缀，需要去掉
+        let s = abs.to_string_lossy();
+        let cleaned = s.strip_prefix(r"\\?\").unwrap_or(&s).to_string();
+        let mut wide: Vec<u16> = std::ffi::OsStr::new(&cleaned)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            SystemParametersInfoW(
+                SPI_SETDESKWALLPAPER,
+                0,
+                Some(wide.as_mut_ptr() as *mut std::ffi::c_void),
+                SPIF_UPDATEINIFILE | SPIF_SENDCHANGE,
+            )
+            .map_err(|e| format!("设置系统壁纸失败: {e}"))?;
+        }
+        Ok(())
+    }
+
+}
+
+#[cfg(target_os = "windows")]
+use imp::{extract_image_frame, extract_video_frame, set_all_screens};
+
 // ---------- 其余平台：桩 ----------
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn extract_video_frame(_: &Path, _: &Path) -> Result<(), String> {
     Err("当前平台不支持".into())
 }
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn extract_image_frame(_: &Path, _: &Path) -> Result<(), String> {
     Err("当前平台不支持".into())
 }
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn set_all_screens(_: &Path) -> Result<(), String> {
     Err("当前平台不支持".into())
+}
+
+// ---------- 壁纸窗口截图（MCP 自检用） ----------
+
+/// 当前渲染器的「ready」时间戳（epoch millis）。调用方在**应用壁纸之前**读一次，
+/// 之后拿它等新一次 ready —— 否则可能立刻读到上一张壁纸留下的旧时间戳。
+pub fn ready_stamp(app: &AppHandle) -> u64 {
+    app.try_state::<crate::content_server::ContentServerState>()
+        .map(|s| s.wallpaper_ready_ms.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+/// 挑一面当前挂着壁纸的窗口 label（优先 scene/web：截图自检针对的就是它们）
+// Linux 下 capture_wallpaper_png 走「不支持」分支，这个挑窗口的辅助函数只被 macOS 用
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn pick_wallpaper_window(app: &AppHandle) -> Option<String> {
+    let engine = app.try_state::<crate::wallpaper::WallpaperEngineState>()?;
+    let windows = engine.windows.lock().ok()?;
+    windows
+        .iter()
+        .find(|(_, c)| matches!(c.r#type.as_str(), "scene" | "web"))
+        .or_else(|| windows.iter().next())
+        .map(|(label, _)| label.clone())
+}
+
+/// 等渲染器就绪 → 再等一拍 → 对壁纸窗口实拍 PNG。
+///
+/// `t0` 必须是应用壁纸**之前**读到的 `ready_stamp`；`settle_ms` 是首帧上屏后
+/// 额外等待的时间（场景要几帧才稳定，截太早会拍到半成品）。
+#[cfg(target_os = "macos")]
+pub async fn capture_wallpaper_png(
+    app: &AppHandle,
+    t0: u64,
+    settle_ms: u64,
+    timeout_ms: u64,
+) -> Result<Vec<u8>, String> {
+    use std::sync::atomic::Ordering;
+
+    let ready_ms = app
+        .try_state::<crate::content_server::ContentServerState>()
+        .ok_or("内容服务器未就绪")?
+        .wallpaper_ready_ms
+        .clone();
+
+    let limit = timeout_ms.max(1000);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(limit);
+    // 窗口在等待期间**反复探测**而不是开头探一次：应用新壁纸时会先建窗再挂载，
+    // 建窗本身要几十到几百毫秒；开头探一次会在建窗完成前就报「没有壁纸窗口」。
+    let mut label: Option<String> = None;
+    loop {
+        if label.is_none() {
+            label = pick_wallpaper_window(app);
+        }
+        if ready_ms.load(Ordering::Relaxed) > t0 {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            // 超时原因必须可读：渲染器自报过失败就直接引用，否则给最近一条诊断
+            // （常见是停在 "mount start"，说明大 scene.pkg 还在解析，重试或加大
+            // timeoutMs 即可，而不是「壁纸页加载失败」）
+            let hint = crate::content_server::renderer_diag_hint(app);
+            return Err(match &label {
+                Some(l) => format!(
+                    "等待渲染器就绪超时（{limit}ms，窗口 {l}）。{hint}；可加大 timeoutMs 重试"
+                ),
+                None => format!("等待渲染器就绪超时（{limit}ms）：未找到正在显示的壁纸窗口。{hint}"),
+            });
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    let Some(label) = label.or_else(|| pick_wallpaper_window(app)) else {
+        return Err("当前没有正在显示的壁纸窗口".into());
+    };
+    if settle_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
+    }
+
+    let window = app
+        .get_webview_window(&label)
+        .ok_or_else(|| format!("壁纸窗口 {label} 已不存在"))?;
+    let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
+    window
+        .with_webview(move |wv| imp::snapshot_webview(&wv, tx))
+        .map_err(|e| format!("派发截图失败: {e}"))?;
+    // WebContent 僵死时不能无限等：completion 走主线程回调
+    tauri::async_runtime::spawn_blocking(move || {
+        rx.recv_timeout(std::time::Duration::from_secs(20))
+            .map_err(|_| "截图超时（WebContent 无响应）".to_string())?
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[cfg(not(target_os = "macos"))]
+pub async fn capture_wallpaper_png(
+    _app: &AppHandle,
+    _t0: u64,
+    _settle_ms: u64,
+    _timeout_ms: u64,
+) -> Result<Vec<u8>, String> {
+    Err("壁纸截图自检目前仅支持 macOS（Linux/Windows 请用应用内预览或自行截图）".into())
 }

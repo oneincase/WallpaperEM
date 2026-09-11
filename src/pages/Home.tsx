@@ -10,6 +10,7 @@ import { useItemProps } from "../hooks/useItemProps";
 import { WallpaperPropsModal } from "../components/WallpaperPropsModal";
 import { IconSliders } from "../components/icons";
 import { useMessage } from "../components/Message";
+import { tr, trMsg } from "../lib/i18n";
 import { useWorkshopFilter } from "../hooks/useWorkshopFilter";
 import { readSnapshot, writeSnapshot, SNAPSHOT_KEYS } from "../lib/cache-snapshots";
 
@@ -30,9 +31,9 @@ type HomeSnapshot = {
 
 export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void }) {
   // 与工坊页共用的筛选条件。放在最前面：下面的初始 state 要用它算条件指纹
-  const { sort, days, tags, excludedTags } = useWorkshopFilter();
+  const { sort, days, tagGroups } = useWorkshopFilter();
   // 筛选条件的指纹：变了就说明用户在工坊页调过条件，快照里的推荐已不符合预期
-  const filterKey = JSON.stringify([sort, days, tags, excludedTags]);
+  const filterKey = JSON.stringify([sort, days, tagGroups]);
 
   // useState 的惰性初始化：readSnapshot 只在首次渲染跑一次。
   // 直接写在函数体里会每次渲染都读一遍 localStorage 并 JSON.parse 整个列表。
@@ -71,12 +72,11 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
       const res = await api.workshopRandom({
         sort,
         days: sort === "trend" && days > 0 ? days : undefined,
-        tags,
-        excludedTags,
+        tagGroups,
       });
       const list = res.items;
       if (list.length === 0) {
-        setError("没有获取到壁纸，请重试");
+      setError(tr("没有获取到壁纸，请重试"));
         return;
       }
       setItems(list);
@@ -89,7 +89,7 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
       setRefreshing(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sort, days, tags, excludedTags, filterKey]);
+  }, [sort, days, tagGroups, filterKey]);
 
   // 快照可用时首帧已经渲染了正确内容 —— 跳过挂载时这次请求
   const skipFirstFetch = useRef(usable);
@@ -165,7 +165,7 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
     setEnqueuing(true);
     try {
       await api.downloadEnqueue(current.id);
-      msg.success("已加入下载队列");
+      msg.success(tr("已加入下载队列"));
     } catch (e) {
       msg.error(String(e));
     } finally {
@@ -188,19 +188,19 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
     <div className="h-full flex flex-col gap-3 min-h-0 px-7 py-5">
       <div className="flex items-center justify-between shrink-0">
         <div>
-          <h1 className="text-[22px] font-bold tracking-tight">发现</h1>
+          <h1 className="text-[22px] font-bold tracking-tight">{tr("发现")}</h1>
           <p className="text-[13px] text-[var(--text-2)] mt-0.5">
-            随机壁纸推荐，点击下方列表或箭头切换
+            {tr("随机壁纸推荐，点击下方列表或箭头切换")}
           </p>
         </div>
         <button className="btn" disabled={refreshing} onClick={() => load(true)}>
-          {refreshing ? "刷新中…" : "↻ 换一批"}
+          {refreshing ? tr("刷新中…") : `↻ ${tr("换一批")}`}
         </button>
       </div>
 
       {error && (
         <div className="rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-[13px] text-red-500 shrink-0">
-          {error} —— 请检查网络/代理（设置 → 网络 → 代理）
+          {trMsg(error)} —— {tr("请检查网络/代理（设置 → 网络 → 代理）")}
         </div>
       )}
 
@@ -213,7 +213,6 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
             </div>
             <div className="flex items-center gap-2 px-5 py-3 shrink-0">
               <div className="h-[30px] w-[130px] animate-pulse rounded-lg" style={{ background: "var(--separator)" }} />
-              <div className="h-[30px] w-[90px] animate-pulse rounded-lg" style={{ background: "var(--separator)" }} />
               <div className="h-[30px] w-[90px] animate-pulse rounded-lg" style={{ background: "var(--separator)" }} />
             </div>
           </div>
@@ -237,10 +236,10 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
       {!loading && current && (
         <div className="card overflow-hidden flex flex-col min-h-0 flex-1">
           <div className="relative flex-1 min-h-0 bg-black/10">
-            <button className="absolute left-3 top-1/2 -translate-y-1/2 btn !p-1.5 !rounded-full opacity-80 hover:opacity-100" onClick={() => go(-1)} title="上一张">
+            <button className="absolute left-3 top-1/2 -translate-y-1/2 btn !p-1.5 !rounded-full opacity-80 hover:opacity-100" onClick={() => go(-1)} title={tr("上一张")}>
               ‹
             </button>
-            <button className="absolute right-3 top-1/2 -translate-y-1/2 btn !p-1.5 !rounded-full opacity-80 hover:opacity-100" onClick={() => go(1)} title="下一张">
+            <button className="absolute right-3 top-1/2 -translate-y-1/2 btn !p-1.5 !rounded-full opacity-80 hover:opacity-100" onClick={() => go(1)} title={tr("下一张")}>
               ›
             </button>
             {current.previewUrl ? (
@@ -251,17 +250,19 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
                 className="h-full w-full object-cover"
               />
             ) : (
-              <div className="flex h-full items-center justify-center text-[var(--text-2)]">无预览</div>
+              <div className="flex h-full items-center justify-center text-[var(--text-2)]">
+                {tr("无预览")}
+              </div>
             )}
             <div className="absolute left-3 top-3 flex gap-1.5 z-10">
               {currentApplied && (
                 <span className="rounded-full bg-green-500/85 px-2 py-0.5 text-[10.5px] font-semibold text-white">
-                  已应用
+                  {tr("已应用")}
                 </span>
               )}
               {currentDownloaded && (
                 <span className="rounded-full bg-sky-500/85 px-2 py-0.5 text-[10.5px] font-semibold text-white">
-                  已下载
+                  {tr("已下载")}
                 </span>
               )}
             </div>
@@ -269,11 +270,11 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
               <h2 className="text-[20px] font-bold text-white truncate">{current.title}</h2>
               <div className="mt-2 flex items-center gap-2 flex-wrap">
                 <span className="rounded-full bg-white/20 px-2.5 py-0.5 text-[11.5px] font-medium text-white">
-                  {TYPE_LABELS[current.type]}
+                  {tr(TYPE_LABELS[current.type])}
                 </span>
                 {current.subscriptions !== undefined && current.subscriptions > 0 && (
                   <span className="text-[11.5px] text-white/85">
-                    ⬇ {current.subscriptions.toLocaleString()} 订阅
+                    ⬇ {current.subscriptions.toLocaleString()} {tr("订阅")}
                   </span>
                 )}
                 {current.favorited !== undefined && current.favorited > 0 && (
@@ -287,47 +288,50 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
 
           {/* 操作条 */}
           <div className="flex items-center gap-2 px-5 py-3 flex-wrap shrink-0">
+            {/* 应用与下载合成一个按钮：本地库里有了就没什么可下的，直接给「应用」；
+                没有才显示「下载」。已应用的条目保留只读态，避免重复下发同一张壁纸 */}
             {currentApplied ? (
               <button
                 className="btn !bg-green-500/15 !text-green-600 dark:!text-green-400 !border-green-500/30 cursor-default disabled:opacity-75"
                 disabled
-                title="已应用到桌面"
+                title={tr("已应用到桌面")}
               >
-                已应用
+                {tr("已应用")}
               </button>
-            ) : (
-              <button className="btn btn-primary" disabled={applying} onClick={apply}>
-                {applying ? "…" : "🖥 应用到桌面"}
-              </button>
-            )}
-            {currentDownloaded ? (
+            ) : currentDownloaded ? (
               <button
-                className="btn !bg-sky-500/15 !text-sky-600 dark:!text-sky-400 !border-sky-500/30 cursor-default disabled:opacity-75"
-                disabled
-                title="已下载到本地库"
+                className="btn btn-primary"
+                disabled={applying}
+                onClick={apply}
+                title={tr("已下载到本地库，直接应用到桌面")}
               >
-                已下载
+                {applying ? "…" : `🖥 ${tr("应用到桌面")}`}
               </button>
             ) : (
-              <button className="btn" disabled={enqueuing} onClick={enqueue}>
-                {enqueuing ? "…" : "⬇ 下载"}
+              <button
+                className="btn"
+                disabled={enqueuing}
+                onClick={enqueue}
+                title={tr("尚未下载，先加入下载队列")}
+              >
+                {enqueuing ? "…" : `⬇ ${tr("下载")}`}
               </button>
             )}
             {currentDownloaded && currentCustomizable && (
               <button
                 className="btn"
                 onClick={() => current && setPropsItemId(current.id)}
-                title="壁纸配置"
+                title={tr("壁纸配置")}
               >
                 <IconSliders size={14} />
-                壁纸配置
+                {tr("壁纸配置")}
               </button>
             )}
             <button className={`btn ${faved ? "btn-danger" : ""}`} onClick={toggleFav}>
-              {faved ? "★ 已收藏" : "☆ 收藏"}
+              {faved ? `★ ${tr("已收藏")}` : `☆ ${tr("收藏")}`}
             </button>
             <button className="btn" onClick={() => onOpenDetail(current.id)}>
-              查看详情 ↗
+              {tr("查看详情")} ↗
             </button>
           </div>
         </div>
@@ -345,7 +349,7 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
       {/* 下方直排壁纸列表 */}
       {!loading && items.length > 0 && (
         <div className="flex items-center gap-2 shrink-0">
-          <button className="btn shrink-0 !px-2.5" onClick={() => scrollRow(-1)} title="向左滚动">
+          <button className="btn shrink-0 !px-2.5" onClick={() => scrollRow(-1)} title={tr("向左滚动")}>
             ‹
           </button>
           <div
@@ -361,7 +365,7 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
                   onClick={() => select(i)}
                   className={`group relative w-[136px] shrink-0 overflow-hidden rounded-lg border text-left transition-all ${
                     i === index
-                      ? "border-[var(--accent)] ring-2 ring-[var(--accent)]/40"
+                      ? "border-[var(--accent-strong)] ring-2 ring-[var(--accent-strong)]/30"
                       : "border-transparent hover:border-[var(--separator)]"
                   }`}
                 >
@@ -369,18 +373,20 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
                     {item.previewUrl ? (
                       <img src={item.previewUrl} alt={item.title} loading="lazy" className="h-full w-full object-cover" />
                     ) : (
-                      <div className="flex h-full items-center justify-center text-[var(--text-2)] text-[10px]">无</div>
+                      <div className="flex h-full items-center justify-center text-[var(--text-2)] text-[10px]">
+                        {tr("无")}
+                      </div>
                     )}
                     {(appliedItems.has(item.id) || downloadedItems.has(item.id)) && (
                       <div className="absolute left-1 top-1 z-10 flex flex-col gap-1">
                         {appliedItems.has(item.id) && (
                           <span className="rounded bg-green-500/90 px-1 py-0.5 text-[8.5px] font-semibold text-white">
-                            已应用
+                            {tr("已应用")}
                           </span>
                         )}
                         {downloadedItems.has(item.id) && (
                           <span className="rounded bg-sky-500/90 px-1 py-0.5 text-[8.5px] font-semibold text-white">
-                            已下载
+                            {tr("已下载")}
                           </span>
                         )}
                       </div>
@@ -393,7 +399,7 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
               ))}
             </div>
           </div>
-          <button className="btn shrink-0 !px-2.5" onClick={() => scrollRow(1)} title="向右滚动">
+          <button className="btn shrink-0 !px-2.5" onClick={() => scrollRow(1)} title={tr("向右滚动")}>
             ›
           </button>
         </div>

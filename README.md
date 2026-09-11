@@ -1,64 +1,82 @@
 # WallpaperEM
 
-**WallpaperEM** 是一款开源的 macOS / Linux 动态壁纸引擎 —— 浏览并下载 Steam 创意工坊（Wallpaper Engine）壁纸，并把它们应用到桌面。视频 / GIF / 网页 / 场景（WebGL）/ 图片壁纸都支持，多显示器，带托盘与全局快捷键。
-
-**WallpaperEM** is an open-source dynamic wallpaper engine for macOS and Linux — browse and download Wallpaper Engine workshop wallpapers, then apply them to your desktop. It supports video / GIF / web / scene (WebGL) / image wallpapers across multiple displays, with a tray icon and global shortcuts.
-
----
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-0.4.0-informational)](CHANGELOG.md)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue)](#平台说明--platform-notes)
+[![Tauri](https://img.shields.io/badge/Tauri-2.x-24C8DB?logo=tauri&logoColor=white)](https://tauri.app/)
+[![Renderer](https://img.shields.io/badge/renderer-webwallgl-8A2BE2)](https://github.com/oneincase/webwallgl)
 
 <p align="center">
   <img src="public/icon/icon_512x512.png" width="120" alt="WallpaperEM logo"/>
 </p>
 
+**WallpaperEM** 是一款开源的动态壁纸引擎：浏览并下载 Steam 创意工坊（Wallpaper Engine）壁纸，一键应用到桌面。支持 **视频 / GIF / 网页 / 场景（WebGL）/ 图片** 五类壁纸、多显示器、托盘与全局快捷键；内置 MCP 服务，可以用 AI 直接创作壁纸工程。
+
+**WallpaperEM** is an open-source dynamic wallpaper engine: browse and download Wallpaper Engine workshop wallpapers, then apply them to your desktop. It supports **video / GIF / web / scene (WebGL) / image** wallpapers across multiple displays, with a tray icon and global shortcuts — plus a built-in MCP server so AI agents can author wallpaper projects directly.
+
 ---
 
 ## ✨ 功能特性 / Features
 
-- 🖼️ **多类型壁纸**：视频（mp4/webm/mov）、GIF、网页（HTML）、场景（`webwallgl` WebGL 渲染器）、静态图片。
-- 🌐 **Steam 创意工坊**：搜索 / 排序（趋势 / 最多订阅 / 最多收藏 / 最新）/ 类型筛选 / 分页浏览。
-- ⬇️ **下载**：通过 Valve 官方 **steamcmd** 下载工坊内容（首次使用时自动安装）；支持 Steam Guard 验证码、串行队列、失败重试，账号密码**本地加密存储**（不依赖系统钥匙串授权）。
-- 🗂️ **本地库**：管理已下载壁纸（预览 / 应用到桌面 / 打开目录 / 删除），收藏。
-- 🖥️ **多显示器**：每屏一个桌面级窗口，置底到桌面图标之下（可切换「交互模式」让壁纸在图标之上并接收鼠标）。
-- 🎨 **内置默认壁纸**：未下载任何壁纸时展示精美观感的内置 HTML 壁纸。
-- 🎞️ **轮播播放列表**：定时在本地库壁纸间切换。
-- 🔔 **托盘 + 全局快捷键**：⌘⇧P 暂停/恢复、⌘⇧N 下一张（轮播）。
-- ⚙️ **设置**：开机自启、下载账号、代理、壁纸显示模式（填充 / 适应 / 拉伸 / 平铺）、壁纸交互开关。
-- 🧱 **macOS 原生**：透明无边框桌面级窗口、桌面层合成、系统感知。
-- 🐧 **Linux 支持**：X11 桌面层窗口、MPRIS 正在播放、按桌面环境同步静态壁纸（GNOME/KDE/Cinnamon/MATE/XFCE/swww/feh）。
+### 中文
 
-- 🖼️ **Multiple wallpaper types**: video (mp4/webm/mov), GIF, web (HTML), scene (`webwallgl` WebGL renderer), and static images.
-- 🌐 **Steam Workshop**: search, sort (Trend / Most Subscribed / Most Favorited / Newest), type filter, paginated browsing.
-- ⬇️ **Download**: workshop content is fetched with Valve's official **steamcmd** (installed on first use), with Steam Guard support, a serial queue, retry, and **locally-encrypted** account credentials (no dependency on the macOS Keychain auth prompt).
-- 🗂️ **Local library**: manage downloaded wallpapers (preview / apply to desktop / open folder / delete), favorites.
-- 🖥️ **Multi-display**: one desktop-level window per screen, placed below the desktop icons (with an optional "interactive" mode that sits above the icons and accepts mouse).
-- 🎨 **Built-in default wallpaper**: a polished built-in HTML wallpaper when nothing is downloaded yet.
-- 🎞️ **Playlist / rotation**: rotate between local-library wallpapers on a timer.
-- 🔔 **Tray + global shortcuts**: ⌘⇧P pause/resume, ⌘⇧N next (rotation).
-- ⚙️ **Settings**: launch at login, download account, proxy, wallpaper display mode (fill / fit / stretch / tile), wallpaper-interactivity toggle.
-- 🧱 **macOS native**: transparent borderless desktop-level windows, desktop-level compositing, display-aware.
-- 🐧 **Linux support**: X11 desktop-level windows, MPRIS Now Playing, per-DE static wallpaper sync (GNOME/KDE/Cinnamon/MATE/XFCE/swww/feh).
+- 🖼️ **五类壁纸**：视频（mp4/webm/mov）、GIF、网页（HTML/JS）、场景（WE 原生 `scene.pkg`，由 [`webwallgl`](https://github.com/oneincase/webwallgl) WebGL 渲染）、静态图片。
+- 🌐 **Steam 创意工坊**：搜索、排序（趋势 / 最多订阅 / 最多收藏 / 最新）、类型与题材筛选、分页浏览。
+- ⬇️ **下载**：使用 Valve 官方 **steamcmd**（应用内一键安装），支持 Steam Guard 验证码、串行队列与失败重试；账号密码**本地加密存储**，不弹系统钥匙串授权。
+- 🗂️ **本地库与收藏**：预览、应用、打开目录、删除；属性可自定义的壁纸带可视化属性面板（滑块/开关/配色/下拉/文件）。
+- 🖥️ **多显示器**：每屏一个桌面级窗口，默认置于桌面图标之下（图标仍可点击）；可开启「交互模式」把壁纸提到图标之上以接收鼠标。
+- 🎞️ **轮播播放列表**：按间隔在本地库壁纸间自动切换。
+- 🎚️ **性能可调**：**帧率上限 24 / 30 / 45 / 60 / 120（默认 24）**；**清晰度 省电 / 标准 / 高清（默认高清）**；可对单张壁纸单独覆盖。
+- 🎛️ **滤镜效果**：高斯模糊 / 黑白 / 怀旧 / 鲜艳 / 暖色 / 冷色 / 反色 / 提亮 / 压暗 / 高对比。
+- 🔊 **系统音频可视化**：捕获系统输出做实时 FFT，壁纸跟着音乐律动（macOS 需屏幕录制权限，Windows 免权限）。
+- 🎵 **系统「正在播放」**：歌名 / 歌手 / 专辑 / 进度 / 封面推送给壁纸（macOS MediaRemote、Windows GSMTC、Linux MPRIS）。
+- ⏸️ **自动暂停**：切到别的应用时暂停渲染、回到桌面自动恢复（省电，可开关）。
+- 🖼️ **系统静态壁纸同步**：把当前壁纸的代表帧设为系统静态壁纸，锁屏 / 引擎未运行时观感一致。
+- 🔔 **托盘 + 全局快捷键**：`Cmd/Ctrl+Shift+P` 暂停/恢复、`Cmd/Ctrl+Shift+N` 下一张；托盘内可切显示模式、清晰度、帧率、滤镜。
+- 🌍 **界面语言**：中文 / English 一键切换（界面、托盘菜单、原生文案、后端提示一起变）。
+- 🤖 **AI / MCP 创作**：内置 MCP 服务（默认 `127.0.0.1:7411`），30+ 工具覆盖「建工程 → 写素材 → 校验 → 冻结版本 → 安装 → 应用 → 截图」全流程（详见 [MCP 服务](#mcp-服务--mcp-server)）。
+- 🧹 **首次安装不打扰**：从未应用过壁纸时不创建任何壁纸窗口，桌面保持系统壁纸；壁纸缺失/加载失败时只显示简洁的 SVG 提示。
+- 🧱 **原生集成**：macOS 桌面层窗口、Linux X11 桌面层、Windows WorkerW 父子化，全部无边框透明、系统级置底。
+
+### English
+
+- 🖼️ **Five wallpaper types**: video (mp4/webm/mov), GIF, web (HTML/JS), scene (native WE `scene.pkg`, rendered in WebGL by [`webwallgl`](https://github.com/oneincase/webwallgl)), and static images.
+- 🌐 **Steam Workshop**: search, sort (Trend / Most Subscribed / Most Favorited / Newest), type & genre filters, paginated browsing.
+- ⬇️ **Downloads**: Valve's official **steamcmd** (installed from inside the app), with Steam Guard codes, a serial queue and retries; credentials are **encrypted locally** — no Keychain auth prompt.
+- 🗂️ **Local library & favorites**: preview, apply, open folder, delete; wallpapers with customizable properties get a visual property panel (slider / toggle / color / combo / file).
+- 🖥️ **Multi-display**: one desktop-level window per screen, sitting below the desktop icons by default (icons stay clickable); an optional "interactive" mode raises it above the icons to receive mouse input.
+- 🎞️ **Playlist rotation**: automatically cycle through local-library wallpapers on a timer.
+- 🎚️ **Tunable performance**: **frame-rate cap 24 / 30 / 45 / 60 / 120 (default 24)**; **quality 省电 / 标准 / 高清 (default High)**; both can be overridden per wallpaper.
+- 🎛️ **Filters**: Gaussian blur / monochrome / sepia / vivid / warm / cool / invert / brighten / darken / high contrast.
+- 🔊 **System audio visualisation**: real-time FFT of the system output, so wallpapers react to your music (Screen Recording permission on macOS; none needed on Windows).
+- 🎵 **System Now Playing**: title / artist / album / progress / cover art delivered to wallpapers (MediaRemote on macOS, GSMTC on Windows, MPRIS on Linux).
+- ⏸️ **Auto-pause**: pause rendering when you switch to another app, resume when you return to the desktop (toggleable).
+- 🖼️ **System static wallpaper sync**: use a representative frame of the current wallpaper as the system wallpaper, so the lock screen and the engine-off state look consistent.
+- 🔔 **Tray + global shortcuts**: `Cmd/Ctrl+Shift+P` pause/resume, `Cmd/Ctrl+Shift+N` next; display mode, quality, frame rate and filter are switchable from the tray.
+- 🌍 **UI language**: one-click switch between 中文 and English (UI, tray menu, native strings and backend messages all follow).
+- 🤖 **AI / MCP authoring**: a built-in MCP server (default `127.0.0.1:7411`) exposes 30+ tools covering "create project → write assets → validate → snapshot → install → apply → screenshot" (see [MCP Server](#mcp-服务--mcp-server)).
+- 🧹 **Non-intrusive first run**: no wallpaper window is created until you apply one, so the desktop keeps your system wallpaper; when a wallpaper is missing or fails to load, only a minimal SVG notice is shown.
+- 🧱 **Native integration**: macOS desktop-level windows, Linux X11 desktop layer, Windows WorkerW parent-child overlay — all borderless, transparent and system-level.
 
 ---
 
 ## 🛠️ 技术栈 / Tech Stack
 
-| 层 | 技术 |
+| 层 / Layer | 技术 / Tech |
 | --- | --- |
-| 前端 | React 19 · TypeScript · Vite 6 · Tailwind CSS 4 |
-| 桌面壳 | Tauri 2.11 · Rust |
-| 渲染器 | WKWebView 渲染页 + [`webwallgl`](https://www.npmjs.com/package/webwallgl)（WebGL 场景渲染，MIT，npm 依赖） |
-| 存储 | SQLite（rusqlite）· 本地加密凭据 |
-| 下载 | steamcmd（Valve 官方，运行时安装）· 串行队列 + Steam Guard |
-| 系统集成 | macOS 桌面层窗口 · X11 桌面层窗口（Linux）· 自启 · 托盘 · 全局快捷键 · MPRIS（Linux 正在播放） |
+| 前端 / Frontend | React 19 · TypeScript · Vite 6 · Tailwind CSS 4 |
+| 桌面壳 / Shell | Tauri 2 · Rust |
+| 壁纸渲染 / Renderer | WKWebView / WebView2 / WebKitGTK 渲染页 + [`webwallgl`](https://github.com/oneincase/webwallgl)（WebGL 场景渲染器） |
+| 存储 / Storage | SQLite（rusqlite）· 本地加密凭据 |
+| 下载 / Download | steamcmd（Valve 官方，运行时安装）· 串行队列 + Steam Guard |
+| 媒体 / Media | ffmpeg（抽帧，可选）· MediaRemote / GSMTC / MPRIS（正在播放）· ScreenCaptureKit / WASAPI（音频频谱） |
+| 扩展 / Extension | 内置 MCP 服务（axum，JSON-RPC over HTTP） |
 
-| Layer | Tech |
-| --- | --- |
-| Frontend | React 19 · TypeScript · Vite 6 · Tailwind CSS 4 |
-| Shell | Tauri 2.11 · Rust |
-| Renderer | WKWebView page + [`webwallgl`](https://www.npmjs.com/package/webwallgl) (WebGL scene renderer, MIT, npm dependency) |
-| Storage | SQLite (rusqlite) · locally-encrypted credentials |
-| Download | steamcmd (official Valve, installed at runtime) · serial queue + Steam Guard |
-| System | macOS desktop-level windows · X11 desktop-level windows (Linux) · autostart · tray · global shortcuts · MPRIS (Linux Now Playing) |
+| 平台 / Platform | 桌面层 / Desktop layer | 正在播放 / Now Playing | 音频频谱 / Audio spectrum |
+| --- | --- | --- | --- |
+| macOS 13+ | 原生桌面层窗口（图标之下 / 之上两档） | MediaRemote（经 [mediaremote-adapter](https://github.com/ungive/mediaremote-adapter)） | ScreenCaptureKit loopback（需屏幕录制权限） |
+| Linux（X11） | X11 桌面层窗口 | MPRIS（D-Bus） | 暂未接入（待 PipeWire） |
+| Windows 10/11 | `WorkerW` 父子化 / Z 序置底 | GSMTC（`Windows.Media.Control`） | WASAPI loopback（免权限） |
 
 ---
 
@@ -66,32 +84,33 @@
 
 ### 环境要求 / Prerequisites
 
-**macOS**：
+**通用 / Common**
 
-- **macOS 13+**（Apple Silicon）
-- **Node.js + pnpm**
+- **Node.js 20+ 与 pnpm**
 - **Rust toolchain**（rustup）
+
+**macOS**
+
+- **macOS 13+（Apple Silicon）**
 - **Xcode Command Line Tools**
 
-**Linux**（主路径：X11 会话 + GNOME/KDE/Cinnamon/MATE/XFCE）：
+**Linux**（主路径：X11 会话 + GNOME / KDE / Cinnamon / MATE / XFCE）
 
-- 桌面 Linux（x86_64，glibc 发行版）
-- **Node.js + pnpm**、**Rust toolchain**（rustup）
-- Tauri 系统依赖（Debian/Ubuntu 示例）：
+```bash
+# Debian / Ubuntu 示例
+sudo apt install libwebkit2gtk-4.1-dev build-essential curl wget file \
+  libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev
+```
 
-  ```bash
-  sudo apt install libwebkit2gtk-4.1-dev build-essential curl wget file     libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev
-  ```
+- 可选 **ffmpeg**（系统静态壁纸抽帧；应用内也可一键安装）。
+- 下载功能需要 **32 位 multilib**（steamcmd 官方 Linux 引导程序是 32 位）：
+  `sudo dpkg --add-architecture i386 && sudo apt install libc6:i386 libstdc++6:i386`。
+  应用内安装 steamcmd 时会自动检测并提示。
 
-- 可选：**ffmpeg**（系统壁纸同步抽帧用）；**32 位 multilib**（steamcmd 官方 Linux
-  引导程序是 32 位，下载功能需要：`sudo dpkg --add-architecture i386 && sudo apt install libc6:i386 libstdc++6:i386`，应用内安装 steamcmd 时会自动检测并提示）
+**Windows 10/11**
 
-> **关于 steamcmd / About steamcmd**
-> 下载工坊内容使用 Valve 官方 steamcmd，首次在「设置 → 账号」点「安装」即可（从官方源下载约 2.5 MB 引导包，初始化后约 85 MB，装在应用数据目录，不随包分发）。
-> 注意其官方引导程序是 x86_64 版本，Apple Silicon 上**首次启动需要 Rosetta 2**（`softwareupdate --install-rosetta --agree-to-license`）；首次自更新后即以原生 arm64 运行。
->
-> Workshop downloads use Valve's official steamcmd. Install it once from Settings → Download (a ~2.5 MB bootstrap from the official source, ~85 MB after init, kept in the app data directory — not bundled).
-> Its official bootstrap binary is x86_64, so the **first launch on Apple Silicon needs Rosetta 2** (`softwareupdate --install-rosetta --agree-to-license`); it self-updates to a native arm64 build immediately after.
+- **Visual Studio Build Tools**（MSVC + Windows SDK）
+- **WebView2 Runtime**（Win11 自带；Win10 安装包会自动带上引导器）
 
 ### 安装依赖 / Install dependencies
 
@@ -113,25 +132,34 @@ pnpm tauri dev
 pnpm tauri build
 ```
 
-> macOS 产物在 `src-tauri/target/release/bundle/macos/WallpaperEM.app`（或 `.dmg`）；
-> Linux 产物在 `src-tauri/target/release/bundle/deb/*.deb` 与 `bundle/appimage/*.AppImage`。
-> On macOS the bundle is produced at `src-tauri/target/release/bundle/macos/WallpaperEM.app` (or `.dmg`);
-> on Linux at `src-tauri/target/release/bundle/deb/*.deb` and `bundle/appimage/*.AppImage`.
+> 产物 / Bundles：
+> - macOS：`src-tauri/target/release/bundle/macos/WallpaperEM.app`、`bundle/dmg/*.dmg`
+> - Linux：`bundle/deb/*.deb`、`bundle/appimage/*.AppImage`
+> - Windows：`bundle/nsis/*.exe`、`bundle/msi/*.msi`（见 `.github/workflows/build-windows.yml`）
 
-### 🐧 Linux 平台说明 / Linux notes
+> **关于 steamcmd / About steamcmd**
+> 下载工坊内容使用 Valve 官方 steamcmd，首次在「设置 → 账号」点「安装」即可（约 2.5 MB 引导包，初始化后约 85 MB，装在应用数据目录，不随安装包分发）。
+> 其官方引导程序是 x86_64，Apple Silicon 上**首次启动需要 Rosetta 2**（`softwareupdate --install-rosetta --agree-to-license`），自更新后即以原生 arm64 运行。
+>
+> Workshop downloads use Valve's official steamcmd, installed once from Settings → Account (a ~2.5 MB bootstrap; ~85 MB after init; kept in the app data directory, not bundled).
+> Its bootstrap is x86_64, so the **first launch on Apple Silicon needs Rosetta 2**; it self-updates to a native arm64 build afterwards.
 
-- **会话类型**：主路径是 **X11**（任意 DE/WM）。Wayland 下壁纸窗口退化为「置底 +
-  全工作区」的普通无边框窗口（wlroots 系后续版本再接 layer-shell）；
-  **GNOME Wayland 不支持桌面层窗口**（上游协议限制），建议使用 X11 会话。
-- **功能差异**（相对 macOS）：系统音频捕获（音频可视化）暂未支持（待接入 PipeWire）；
-  「自动暂停」（前台应用切换时暂停壁纸）暂无实现；指针按压跟随效果不可用
-  （Wayland 下指针注入整体不可用，协议限制）。
-- **托盘**：GNOME 需要 AppIndicator 扩展（如 `gnome-shell-extension-appindicator`）；
-  KDE/Cinnamon/XFCE 自带托盘协议支持。
-- **视频壁纸编解码（必装）**：WebKitGTK 的音视频播放完全依赖系统 GStreamer 插件，
-  缺失时视频壁纸**黑屏/无声**（日志里会出现 `GStreamer element appsink/autoaudiosink
-  not found`）。deb 包已把这些写入 Depends 会自动装好；AppImage 无法捆绑系统插件，
-  需手动安装：
+---
+
+## 🐧 平台说明 / Platform Notes
+
+### macOS
+
+- 壁纸窗口默认位于**桌面图标之下**（图标可点击）—— 鼠标事件由宿主轮询并注入，因此视差/网页交互仍然有效。
+- 开启「壁纸交互（图标上方）」后壁纸会盖住桌面图标以直接接收鼠标。
+- 系统音频可视化需要**屏幕录制**权限；「正在播放」依赖私有框架 MediaRemote（借 Apple 签名进程加载 adapter，无需额外授权）。
+
+### Linux
+
+- 主路径是 **X11**。Wayland 下壁纸窗口退化为「置底 + 全工作区」的普通无边框窗口；**GNOME Wayland 不支持桌面层窗口**（上游协议限制），建议使用 X11 会话。
+- 相较 macOS：**系统音频可视化暂未接入**（待 PipeWire）；**自动暂停**尚未实现；指针注入不可用。
+- **托盘**：GNOME 需要 AppIndicator 扩展（如 `gnome-shell-extension-appindicator`）；KDE / Cinnamon / XFCE 自带。
+- **视频编解码（必装）**：WebKitGTK 的音视频播放依赖系统 GStreamer 插件，缺失会**黑屏/无声**（日志出现 `GStreamer element appsink/autoaudiosink not found`）。deb 包已声明依赖自动安装；AppImage 需手动装：
 
   ```bash
   # Debian / Ubuntu
@@ -144,8 +172,13 @@ pnpm tauri build
   sudo pacman -S gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav
   ```
 
-  应用启动时会自动体检关键 element（appsink / autoaudiosink / H.264 解码器），
-  缺什么会把对应的安装命令写进日志。webm/VP9 开箱即用。
+  启动时会自动体检关键 element，缺什么会给出对应安装命令。
+
+### Windows
+
+- 桌面层通过把窗口 `SetParent` 到资源管理器的 `WorkerW` 实现；「交互模式」下脱离 `WorkerW` 并压到 Z 序最底、盖住桌面图标。
+- 音频可视化走 **WASAPI 共享模式 loopback**（抓默认渲染端点混音），**不需要任何权限**。
+- 需要 **WebView2 Runtime**（Win11 自带）。
 
 ---
 
@@ -153,12 +186,45 @@ pnpm tauri build
 
 1. **安装下载工具**：打开 设置 → 账号，点「安装」一次性装好 steamcmd。
    *(Install steamcmd once from Settings → Account.)*
-2. **登录下载账号**：填入你的 Steam 账号与密码（需要拥有 Wallpaper Engine）。密码本地加密存储，不会要求 macOS 钥匙串授权。
-   *(Set your Steam account + password. You must own Wallpaper Engine. Credentials are stored locally-encrypted.)*
-3. **浏览工坊**：在「工坊」页搜索、筛选、排序，看到喜欢的点「下载」。
-4. **应用到桌面**：壁纸入库后，在「本地库 / 详情」页点「应用到桌面」；也可在「发现」页快速应用。
-5. **开机自启 / 托盘 / 轮播**：在设置里可选，托盘与 ⌘⇧P / ⌘⇧N 快速控制。
-6. **壁纸交互（可选）**：设置 → 通用 →「壁纸交互（图标上方）」开启后，场景视差与网页壁纸可接收鼠标；注意这会盖住桌面图标。
+2. **登录下载账号**：填入 Steam 账号与密码（需要拥有 Wallpaper Engine）。凭据本地加密存储，不会请求系统钥匙串授权。
+   *(Enter your Steam account and password — you must own Wallpaper Engine. Credentials are encrypted locally.)*
+3. **浏览工坊**：在「工坊」页搜索、筛选、排序，点「下载」入队。
+   *(Browse the Workshop page; search, filter and sort, then queue a download.)*
+4. **应用到桌面**：在「本地库」或详情页点「应用到桌面」；多屏会一起生效。
+   *(Apply from the Library or the item detail page; all displays follow.)*
+5. **调优**：设置 → 通用 可调 **帧率上限** 与 **清晰度**（省电优先就选 24 FPS + 省电）；单张壁纸可在「壁纸设置」里单独覆盖。
+   *(Tune frame rate cap and quality under Settings → General; each wallpaper can override them in Wallpaper Settings.)*
+6. **托盘与快捷键**：托盘可切显示模式 / 清晰度 / 帧率 / 滤镜；`Cmd/Ctrl+Shift+P` 暂停/恢复，`Cmd/Ctrl+Shift+N` 下一张。
+   *(Switch display mode / quality / frame rate / filter from the tray; Cmd/Ctrl+Shift+P pauses, Cmd/Ctrl+Shift+N skips.)*
+7. **壁纸交互（可选）**：设置 → 通用 → 开启「壁纸交互」后，场景视差与网页壁纸可接收鼠标（会盖住桌面图标）。
+   *(Enable "Wallpaper interaction" for scene parallax and web wallpaper mouse input — it covers the desktop icons.)*
+
+---
+
+## 🤖 MCP 服务 / MCP Server
+
+应用内置 MCP（Model Context Protocol）服务，让 AI 客户端（Claude Code / Cursor / Codex CLI 等）直接创作与调试壁纸工程。
+
+The app ships an MCP (Model Context Protocol) server so AI clients (Claude Code, Cursor, Codex CLI, …) can create and debug wallpaper projects directly.
+
+- **开启**：设置 → **AI / MCP** → 打开开关；页面会给出端口（默认 `7411`）、令牌与「复制带令牌地址」。
+- **接入**：把 `http://127.0.0.1:<port>/mcp?token=<token>` 作为 MCP 服务器地址加入客户端：
+
+```jsonc
+// Claude Desktop / Cursor 的 mcpServers 配置
+{
+  "mcpServers": {
+    "wallpaperem": { "url": "http://127.0.0.1:7411/mcp?token=<你的令牌>" }
+  }
+}
+```
+
+- **能力**：项目 CRUD 与版本冻结/回滚、文件读写、静态校验、`scene` 打包、安装到本地库、应用到桌面、壁纸截图（实拍当前窗口）、属性读写、工坊搜索与下载等 30+ 工具，另有 resources / prompts。
+- **工程位置**：`<系统文稿目录>/WallpaperEM/Projects/<工程名>/`，用户可见可改；MCP 的文件工具只能读写该工作区内的文件。
+
+> 详见 [`docs/mcp-authoring-web.md`](docs/mcp-authoring-web.md)（网页壁纸）与 [`docs/mcp-authoring-scene.md`](docs/mcp-authoring-scene.md)（场景壁纸）。
+
+> See [`docs/mcp-authoring-web.md`](docs/mcp-authoring-web.md) (web wallpapers) and [`docs/mcp-authoring-scene.md`](docs/mcp-authoring-scene.md) (scene wallpapers).
 
 ---
 
@@ -166,26 +232,37 @@ pnpm tauri build
 
 ```
 WallpaperEM/
-├─ public/
-│  ├─ icon/                    # 应用图标（抠图、透明）
-│  └─ default-wallpaper/       # 内置默认 HTML 壁纸
-├─ renderer/                   # 壁纸渲染器页（视频/GIF/网页/场景/图片）
-├─ src/                        # Tauri 前端主界面（发现/工坊/下载/本地库/收藏/设置）
+├─ public/icon/                 # 应用图标（含多倍图）
+├─ renderer/                    # 壁纸渲染器页（视频 / GIF / 网页 / 场景 / 图片）
+├─ src/                         # Tauri 前端主界面（发现 / 工坊 / 下载 / 本地库 / 收藏 / 设置）
+│  ├─ locales/                  # 中→英文案表（中文原文当键）
+│  └─ lib/i18n.ts               # 运行时取词（tr / trMsg / useLocale）
+├─ docs/
+│  ├─ mcp-authoring-web.md      # 网页壁纸工程规范（面向 AI agent）
+│  ├─ mcp-authoring-scene.md    # 场景壁纸工程规范（面向 AI agent）
+│  ├─ cross-platform-research.md
+│  └─ img/                      # 赞助码（支付宝 / 微信）
 ├─ src-tauri/
 │  ├─ src/
-│  │  ├─ steam/                # Steam 客户端：工坊浏览/详情/类型
-│  │  ├─ workshop.rs           # 工坊搜索/随机/详情（含缓存）
-│  │  ├─ download/             # 下载引擎：steamcmd + 队列 + Guard
-│  │  │  ├─ backend.rs         #   steamcmd 命令行拼装与输出解析
-│  │  │  ├─ pty.rs             #   伪终端（steamcmd 的 stdin 必须是 TTY）
-│  │  │  └─ steamcmd_install.rs#   steamcmd 运行时安装（下载/解压/预热）
-│  │  ├─ wallpaper/            # 壁纸引擎：多屏桌面窗口 + 会话持久化 + 轮播
-│  │  ├─ content_server.rs     # 本地内容服务器（渲染器/媒体/默认壁纸同源）
-│  │  ├─ library.rs            # 本地库
-│  │  ├─ db.rs                 # SQLite 初始化/迁移
-│  │  └─ secure_store.rs       # 本地加密凭据
-│  ├─ icons/                   # 应用图标（icns/png）
+│  │  ├─ wallpaper/             # 壁纸引擎：多屏桌面窗口 / 会话持久化 / 轮播 / 指针注入
+│  │  │  ├─ macos.rs · linux.rs · windows.rs   # 各平台桌面层实现
+│  │  │  └─ pointer.rs          # 外部指针轮询注入
+│  │  ├─ content_server.rs      # 本地内容服务器（渲染器 / 媒体 / 属性 / SSE）
+│  │  ├─ audio_capture/         # 系统音频频谱（macOS ScreenCaptureKit · Windows WASAPI）
+│  │  ├─ now_playing/           # 正在播放（macOS MediaRemote · Windows GSMTC · Linux MPRIS）
+│  │  ├─ download/              # steamcmd 下载引擎（队列 / Guard / 安装）
+│  │  ├─ mcp/                   # 内置 MCP 服务（tools / resources / prompts）
+│  │  ├─ steam/                 # Steam 客户端：工坊浏览 / 详情 / 类型
+│  │  ├─ library.rs             # 本地库
+│  │  ├─ we_props.rs            # WE 用户属性解析与下发
+│  │  ├─ we_shim.js             # WE 网页壁纸兼容 shim（注入壁纸 HTML）
+│  │  ├─ system_wallpaper.rs    # 系统静态壁纸同步
+│  │  ├─ db.rs · secure_store.rs# SQLite / 本地加密凭据
+│  │  └─ i18n.rs                # 原生文案（托盘 / 窗口标题）
+│  ├─ vendor/mediaremote-adapter# 第三方：系统「正在播放」数据源（BSD-3-Clause）
 │  └─ tauri.conf.json
+├─ scripts/                     # 构建 / 同步 / 校验脚本
+├─ CHANGELOG.md · LICENSE
 └─ package.json
 ```
 
@@ -195,22 +272,40 @@ WallpaperEM/
 
 - **Wallpaper Engine 授权**：下载工坊内容需要你的 Steam 账号拥有《Wallpaper Engine》。
   *(Downloading workshop content requires owning *Wallpaper Engine* on your Steam account.)*
-- **macOS 局限**：壁纸窗口默认位于桌面图标之下（图标可点击）。开启「壁纸交互」会把壁纸提到图标之上以接收鼠标，但会盖住图标；受 macOS 桌面窗口机制限制，交互体验有限。
-  *(macOS limitation: wallpapers sit below the desktop icons by default. The optional "interactive" mode raises the wallpaper above the icons to receive mouse input, at the cost of covering them. Interaction is limited by macOS's desktop-window handling.)*
-- **地区/网络**：国内访问 Steam 建议在 设置 → 网络 配置代理。
-  *(For restricted networks, configure a proxy under Settings → Network.)*
-- **steamcmd 会挤掉 Steam 客户端**：同一账号在 Steam 图形客户端与 steamcmd 中同时只能登录一处，下载时会断开你正在运行的 Steam 客户端（这是 steamcmd 的固有行为，无法规避）。
-  *(A Steam account can only be logged in once at a time across the GUI client and steamcmd — downloading will disconnect your running Steam client. This is inherent to steamcmd.)*
-- **steamcmd 无下载百分比**：Valve 的 `workshop_download_item` 在下载期间不输出进度，应用改用「已下载体积 ÷ 条目总大小」估算；总大小拿不到时进度条显示为不确定态。
-  *(steamcmd emits no progress during `workshop_download_item`; the app estimates it from on-disk size versus the item's reported size, falling back to an indeterminate bar.)*
+- **steamcmd 会挤掉 Steam 客户端**：同一账号在 Steam 图形客户端与 steamcmd 中同时只能登录一处，下载时会断开你正在运行的 Steam 客户端（steamcmd 固有行为，无法规避）。
+  *(An account can only be signed in once across the GUI client and steamcmd — downloading will disconnect your running Steam client. This is inherent to steamcmd.)*
+- **steamcmd 无下载百分比**：`workshop_download_item` 期间不输出进度，应用用「已下载体积 ÷ 条目总大小」估算；总大小未知时显示不确定进度条。
+  *(steamcmd emits no progress during `workshop_download_item`; the app estimates it from on-disk size and falls back to an indeterminate bar.)*
+- **macOS 交互局限**：默认壁纸在图标之下以保证图标可点；交互模式会盖住图标，且受 macOS 桌面窗口机制限制，体验有限。
+  *(On macOS the wallpaper sits below the icons so they stay clickable; interactive mode covers them and remains limited by macOS desktop-window handling.)*
+- **地区 / 网络**：访问 Steam 受限时，请在 设置 → 网络 配置代理。
+  *(Behind a restricted network, configure a proxy under Settings → Network.)*
+
+---
+
+## 💖 赞助 / Sponsor
+
+如果 WallpaperEM 对你有帮助，欢迎请作者喝杯咖啡 —— 你的支持会让它持续更新。
+
+If WallpaperEM is useful to you, consider buying the author a coffee — your support keeps it going.
+
+<p align="center">
+  <img src="docs/img/alipay.png" width="220" alt="支付宝 / Alipay"/>
+  &nbsp;&nbsp;&nbsp;
+  <img src="docs/img/wechat.png" width="220" alt="微信 / WeChat"/>
+</p>
+
+<p align="center">
+  <sub>支付宝 / Alipay &nbsp;·&nbsp; 微信 / WeChat</sub>
+</p>
 
 ---
 
 ## 📄 许可 / License
 
-本项目目前以 **MIT** 许可证开源（请以仓库实际 LICENSE 文件为准）。
+本项目以 **MIT** 许可证开源，详见 [LICENSE](LICENSE)。
 
-This project is open-sourced under the **MIT** license (see the actual `LICENSE` file in the repository).
+This project is released under the **MIT** license — see [LICENSE](LICENSE).
 
 本项目内含第三方组件 `src-tauri/vendor/mediaremote-adapter`
 （[mediaremote-adapter](https://github.com/ungive/mediaremote-adapter)，BSD-3-Clause，
@@ -218,16 +313,17 @@ Copyright (c) 2025 Jonas van den Berg and contributors），用于读取系统�
 完整许可见该目录下的 `LICENSE`。
 
 This project bundles the third-party component `src-tauri/vendor/mediaremote-adapter`
-([mediaremote-adapter](https://github.com/ungive/mediaremote-adapter), BSD-3-Clause)
-for reading system Now Playing information; see the `LICENSE` file in that directory.
+([mediaremote-adapter](https://github.com/ungive/mediaremote-adapter), BSD-3-Clause) for reading
+system Now Playing information; see the `LICENSE` file in that directory.
 
 ---
 
 ## 🙏 致谢 / Acknowledgements
 
-- [Tauri](https://tauri.app/) · [React](https://react.dev/) · [webwallgl](https://github.com/oneincase/webwallgl)（MIT 场景渲染器）
-- [Steam Workshop](https://steamcommunity.com/workshop/) · Wallpaper Engine 及其作者
-- [SteamCMD](https://developer.valvesoftware.com/wiki/SteamCMD)（Valve）
+- [Tauri](https://tauri.app/) · [React](https://react.dev/) · [Vite](https://vite.dev/) · [Tailwind CSS](https://tailwindcss.com/)
+- [webwallgl](https://github.com/oneincase/webwallgl) —— WE 场景壁纸的 WebGL 渲染库
+- [SteamCMD](https://developer.valvesoftware.com/wiki/SteamCMD)（Valve）与 [Steam 创意工坊](https://steamcommunity.com/workshop/)
+- [Wallpaper Engine](https://www.wallpaperengine.io/) 及其壁纸作者
 - [mediaremote-adapter](https://github.com/ungive/mediaremote-adapter)（BSD-3-Clause，系统「正在播放」数据源）
 
 ---

@@ -35,11 +35,31 @@ pub enum GuardKind {
 
 /// 成功行：`Success. Downloaded item 12345 to "/path" (123 bytes)`
 const SUCCESS_RE: &str = r"(?i)Success\.\s*Downloaded item\s+\d+";
+/// 登录成功行（仅登录验证任务用）：Logging in user 'x' to Steam Public...OK
+const LOGIN_SUCCESS_RE: &str = r"(?i)Logging in user .+ to Steam Public\.\.\.OK";
+
+/// 登录验证任务专用的 item_id（不对应任何工坊条目，前端按此显示「账号登录验证」）
+pub const VERIFY_ITEM_ID: &str = "verify:login";
 /// 验证码提示（均不带换行，靠字节级读取器捕获）
 const CODE_RE: &str =
     r"(?i)steam ?guard code\s*:|two-factor code\s*:|enter the current code from your steam guard";
 const PASSWORD_RE: &str = r"(?i)^password\s*:|\bpassword\s*:\s*$";
-const MOBILE_RE: &str = r"(?i)confirm the login in the steam mobile app|waiting for confirmation";
+const MOBILE_RE: &str =
+    r"(?i)confirm (the|this) login|steam mobile app|waiting for confirmation|please approve";
+
+/// 密码登录开始的标记。
+///
+/// 新版 steamcmd（实测 client 1788292693）在等待手机 App 确认时**不打印任何提示**，
+/// 控制台日志里只有 "Logging in user ..." 之后长达几十秒的静默（OK 出现的时间差
+/// 就是用户在手机上确认的时间）。因此「等待手机确认」不能靠匹配确认文案，只能靠
+/// 「密码登录已开始 + 长时间未完成」推测——本正则就是前半段的探测器。
+///
+/// 两个信号（console_log.txt 实测）：
+/// - "Logging in using username/password."（密码登录才会打印；缓存登录是另一句）
+/// - "Logging in user 'x' [U:1:0] to Steam Public..."（密码登录时 steamid 恒为 U:1:0，
+///   缓存登录会带上真实 steamid 如 [U:1:351868315]）
+const LOGIN_START_RE: &str =
+    r"(?i)logging in using username/password|logging in user .*\[u:1:0\]";
 
 /// 工坊大件常见，且 steamcmd 下载期间完全静默，看门狗必须给足时间
 pub const WATCHDOG: std::time::Duration = std::time::Duration::from_secs(30 * 60);
@@ -79,13 +99,45 @@ impl SteamCmd {
         args
     }
 
+    /// 仅登录验证的命令行参数（不下载任何内容，登录成功后直接退出）
+    pub fn build_login_args(&self, workdir: &Path, cred: &Credentials) -> Vec<OsString> {
+        let mut args: Vec<OsString> = vec![
+            "+@ShutdownOnFailedCommand".into(),
+            "1".into(),
+            "+force_install_dir".into(),
+            workdir.into(),
+            "+login".into(),
+            cred.username.as_str().into(),
+        ];
+        if !cred.has_token {
+            args.push(cred.password.as_str().into());
+        }
+        args.push("+quit".into());
+        args
+    }
+
+    /// 该行输出是否表示登录成功（仅登录验证任务用）
+    pub fn match_login_success(&self, s: &str) -> bool {
+        re(LOGIN_SUCCESS_RE).is_match(s)
+    }
+
+    /// 该行（或无换行的提示尾部）是否表示一次密码登录刚刚开始。
+    /// 见 LOGIN_START_RE 的注释：用于推测后续可能进入「静默等待手机确认」阶段。
+    pub fn match_login_start(&self, s: &str) -> bool {
+        re(LOGIN_START_RE).is_match(s)
+    }
+
     /// 需要注入的环境变量。
     ///
-    /// steamcmd 没有 configdir 参数，登录态固定写在
-    /// `$HOME/Library/Application Support/Steam/config/config.vdf`。
-    /// 覆盖 HOME 即可把它关进应用自己的目录。
+    /// steamcmd 没有 configdir 参数，登录态固定写在用户主目录下
+    /// （macOS: `~/Library/Application Support/Steam/config/config.vdf`；
+    /// Windows: `%USERPROFILE%\AppData\Local\Steam`）。
+    /// 覆盖对应的家目录变量即可把它关进应用自己的目录。
     pub fn extra_env(&self) -> Vec<(String, OsString)> {
-        vec![("HOME".to_string(), self.home.as_os_str().into())]
+        vec![(
+            crate::download::steamcmd_install::home_env_key().to_string(),
+            self.home.as_os_str().into(),
+        )]
     }
 
     /// 产物落地目录（相对 workdir）。
@@ -193,7 +245,13 @@ impl SteamCmd {
 
 /// 无需构造实例的提示判定，供字节级读取器的 'static 闭包使用。
 pub fn is_prompt(tail: &str) -> bool {
-    re(CODE_RE).is_match(tail) || re(MOBILE_RE).is_match(tail) || re(PASSWORD_RE).is_match(tail)
+    // "Logging in user..." 也算提示：steamcmd 打印该句后不带换行地阻塞等待，
+    // 不把这类尾部文本抛出来，就永远探测不到「密码登录已开始」（LOGIN_START_RE
+    // 的第二个信号 [U:1:0] 正藏在这行里）。
+    re(CODE_RE).is_match(tail)
+        || re(MOBILE_RE).is_match(tail)
+        || re(PASSWORD_RE).is_match(tail)
+        || re(LOGIN_START_RE).is_match(tail)
 }
 
 /// 编译并缓存正则。按模式缓存，避免每行输出现场编译。
@@ -317,6 +375,28 @@ mod tests {
     }
 
     #[test]
+    fn login_start_detects_password_login_only() {
+        let b = sc();
+        // console_log.txt 实测：密码登录的两个信号
+        assert!(b.match_login_start("Logging in using username/password."));
+        assert!(
+            b.match_login_start("Logging in user 'xiaojian520520' [U:1:0] to Steam Public...")
+        );
+        // 缓存登录不触发：否则每次秒登录都会误弹「等待手机确认」
+        assert!(!b.match_login_start("Logging in using cached credentials."));
+        assert!(!b
+            .match_login_start("Logging in user 'xiaojian520520' [U:1:351868315] to Steam Public..."));
+        assert!(!b.match_login_start("Loading Steam API...OK"));
+    }
+
+    #[test]
+    fn logging_in_user_tail_is_treated_as_prompt() {
+        // steamcmd 打印该句后不带换行地阻塞等待确认，必须能从尾部文本里探测到
+        assert!(is_prompt("Logging in user 'x' [U:1:0] to Steam Public..."));
+        assert!(!is_prompt("Waiting for client config..."));
+    }
+
+    #[test]
     fn no_connection_mentions_both_causes() {
         let msg = sc()
             .parse_failure("ERROR! Download item 123 failed (No Connection).")
@@ -329,7 +409,7 @@ mod tests {
     fn overrides_home_only() {
         let env = sc().extra_env();
         assert_eq!(env.len(), 1);
-        assert_eq!(env[0].0, "HOME");
+        assert_eq!(env[0].0, crate::download::steamcmd_install::home_env_key());
         assert_eq!(env[0].1, OsString::from("/tmp/steamcmd-home"));
     }
 

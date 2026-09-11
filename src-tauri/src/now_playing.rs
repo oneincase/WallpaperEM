@@ -130,7 +130,11 @@ mod imp;
 #[path = "now_playing/linux.rs"]
 mod imp;
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(target_os = "windows")]
+#[path = "now_playing/windows.rs"]
+mod imp;
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 #[path = "now_playing/other.rs"]
 mod imp;
 

@@ -15,11 +15,14 @@ pub use super::macos::*;
 #[cfg(target_os = "linux")]
 pub use super::linux::*;
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(target_os = "windows")]
+pub use super::windows::*;
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub use fallback::*;
 
 /// 其他平台的编译兜底：桌面层级/屏幕枚举未实现，壁纸以全屏普通窗口呈现
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 mod fallback {
     use tauri::{LogicalPosition, LogicalSize, Runtime, WebviewWindow};
 

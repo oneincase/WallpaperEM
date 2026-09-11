@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "WallpaperEM"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -51,6 +51,7 @@ dependencies = [
  "wayland-client",
  "wayland-protocols-plasma",
  "window-vibrancy 0.8.0",
+ "windows",
  "x11rb",
  "zip",
 ]

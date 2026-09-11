@@ -26,12 +26,29 @@ const TARBALL_URLS: [&str; 2] = [
     "https://media.steampowered.com/client/installer/steamcmd_linux.tar.gz",
     "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz",
 ];
+#[cfg(target_os = "windows")]
+const TARBALL_URLS: [&str; 2] = [
+    "https://media.steampowered.com/client/installer/steamcmd.zip",
+    "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip",
+];
 
 /// 下载包落盘文件名（仅日志/排障可读性用）
 #[cfg(target_os = "macos")]
 const TARBALL_NAME: &str = "steamcmd_osx.tar.gz";
 #[cfg(target_os = "linux")]
 const TARBALL_NAME: &str = "steamcmd_linux.tar.gz";
+#[cfg(target_os = "windows")]
+const TARBALL_NAME: &str = "steamcmd.zip";
+
+/// 引导可执行文件名（*nix 是 steamcmd.sh 包装脚本，Windows 是 steamcmd.exe）
+#[cfg(target_os = "windows")]
+fn script_file_name() -> &'static str {
+    "steamcmd.exe"
+}
+#[cfg(not(target_os = "windows"))]
+fn script_file_name() -> &'static str {
+    "steamcmd.sh"
+}
 
 /// 自更新写下的版本 manifest 名（平台各一份）
 #[cfg(target_os = "macos")]
@@ -41,6 +58,10 @@ fn manifest_file_name() -> &'static str {
 #[cfg(target_os = "linux")]
 fn manifest_file_name() -> &'static str {
     "steam_cmd_linux.manifest"
+}
+#[cfg(target_os = "windows")]
+fn manifest_file_name() -> &'static str {
+    "steam_cmd_win.manifest"
 }
 /// 预热（首次自更新）超时：需要下载约 85MB 的运行时组件
 const WARMUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
@@ -68,7 +89,20 @@ pub fn home_dir(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 pub fn script_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(install_dir(app)?.join("steamcmd.sh"))
+    Ok(install_dir(app)?.join(script_file_name()))
+}
+
+/// 子进程「家目录」环境变量名。
+///
+/// steamcmd 没有 configdir 参数，登录态固定写在用户主目录下
+/// （macOS/Linux：`$HOME/.steam` 等；Windows：`%USERPROFILE%\AppData\Local\Steam`），
+/// 覆盖对应的家目录变量即可把它关进应用自己的目录。
+pub fn home_env_key() -> &'static str {
+    if cfg!(windows) {
+        "USERPROFILE"
+    } else {
+        "HOME"
+    }
 }
 
 pub fn is_installed(app: &AppHandle) -> bool {
@@ -154,13 +188,16 @@ pub async fn install(app: AppHandle, force: bool) -> Result<serde_json::Value, S
     extract(&tarball, &dir).await?;
     let _ = std::fs::remove_file(&tarball);
 
-    let script = dir.join("steamcmd.sh");
+    let script = dir.join(script_file_name());
     if !script.is_file() {
-        return Err("解压后未找到 steamcmd.sh，安装包可能损坏".into());
+        return Err(format!(
+            "解压后未找到 {}，安装包可能损坏",
+            script_file_name()
+        ));
     }
-    make_executable(&script)?;
     #[cfg(target_os = "macos")]
     {
+        make_executable(&script)?;
         make_executable(&dir.join("steamcmd"))?;
         // 去掉下载隔离属性，否则 Gatekeeper 会拦截执行
         let _ = tokio::process::Command::new("/usr/bin/xattr")
@@ -172,6 +209,7 @@ pub async fn install(app: AppHandle, force: bool) -> Result<serde_json::Value, S
     }
     #[cfg(target_os = "linux")]
     {
+        make_executable(&script)?;
         // Linux 引导包的真实二进制在 linux32/ 下
         make_executable(&dir.join("linux32").join("steamcmd"))?;
         // 官方 Linux 引导程序仍是 32 位 x86：纯 64 位系统需要 multilib 运行时，
@@ -206,7 +244,7 @@ pub async fn install(app: AppHandle, force: bool) -> Result<serde_json::Value, S
 }
 
 async fn download_tarball(app: &AppHandle) -> Result<Vec<u8>, String> {
-    let proxy = read_proxy(app);
+    let proxy = super::read_proxy(app);
     let mut last_err = String::new();
     for (i, url) in TARBALL_URLS.iter().enumerate() {
         if i > 0 {
@@ -237,14 +275,8 @@ async fn fetch(url: &str, proxy: Option<&str>) -> Result<Vec<u8>, String> {
     Ok(resp.bytes().await.map_err(|e| e.to_string())?.to_vec())
 }
 
-fn read_proxy(app: &AppHandle) -> Option<String> {
-    let db = app.try_state::<std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>>()?;
-    let conn = db.lock().ok()?;
-    crate::db::get_setting(&conn, "download_proxy")
-        .or_else(|| crate::db::get_setting(&conn, "steam_proxy"))
-        .filter(|s| !s.trim().is_empty())
-}
-
+/// *nix：用系统 bsdtar，省掉 flate2 + tar 两个依赖
+#[cfg(not(target_os = "windows"))]
 async fn extract(tarball: &Path, dest: &Path) -> Result<(), String> {
     let out = tokio::process::Command::new("/usr/bin/tar")
         .arg("-xzf")
@@ -263,6 +295,26 @@ async fn extract(tarball: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Windows：官方包是 zip，用已在依赖里的 zip crate 解压（不再引外部工具）
+#[cfg(target_os = "windows")]
+async fn extract(zip_path: &Path, dest: &Path) -> Result<(), String> {
+    let zip_path = zip_path.to_path_buf();
+    let dest = dest.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let file = std::fs::File::open(&zip_path).map_err(|e| format!("打开安装包失败: {e}"))?;
+        let mut archive =
+            zip::ZipArchive::new(file).map_err(|e| format!("解析安装包失败: {e}"))?;
+        // extract() 内部用 enclosed_name 做路径穿越防护
+        archive
+            .extract(&dest)
+            .map_err(|e| format!("解压失败: {e}"))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("解压任务失败: {e}"))?
+}
+
+#[cfg(unix)]
 fn make_executable(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     if !path.exists() {
@@ -307,13 +359,12 @@ fn multilib_missing_hint(dir: &Path) -> Option<String> {
 /// steamcmd 会在自更新后以退出码 42（MAGIC_RESTART_EXITCODE）重启自己，
 /// steamcmd.sh 内部处理了重启，所以这里只需等脚本整体结束。
 async fn warmup(app: &AppHandle, script: &Path, home: &Path) -> Result<(), String> {
-    use tokio::io::AsyncReadExt;
-
-    // 预热也需要 PTY：无 TTY 时 steamcmd 可能提前判定为非交互模式而异常退出
-    let pty = crate::download::pty::Pty::open().map_err(|e| format!("分配 PTY 失败: {e}"))?;
+    // 预热也需要交互通道：*nix 上无 TTY 时 steamcmd 可能提前判定为非交互模式而异常退出
+    let mut pty =
+        crate::download::pty::Pty::open().map_err(|e| format!("分配交互通道失败: {e}"))?;
     let mut cmd = tokio::process::Command::new(script);
-    cmd.arg("+quit").env("HOME", home);
-    if let Some(p) = read_proxy(app) {
+    cmd.arg("+quit").env(home_env_key(), home);
+    if let Some(p) = super::read_proxy(app) {
         cmd.env("http_proxy", &p)
             .env("https_proxy", &p)
             .env("HTTP_PROXY", &p)
@@ -331,33 +382,30 @@ async fn warmup(app: &AppHandle, script: &Path, home: &Path) -> Result<(), Strin
         }
         base
     })?;
-    let mut master = pty
-        .into_async_file()
-        .map_err(|e| format!("PTY 句柄转换失败: {e}"))?;
+    // 预热不需要写入（+quit 已在命令行上），但写出端必须活到子进程结束：
+    // *nix 上它就是 PTY master，提前 drop 等于关掉终端，会把 steamcmd 挂断
+    let (_writer, mut out_rx) = pty
+        .channel(&mut child, crate::download::backend::is_prompt)
+        .await
+        .map_err(|e| format!("建立交互通道失败: {e}"))?;
 
     let pump = async {
-        let mut buf = [0u8; 4096];
         let mut tail = String::new();
-        loop {
-            match master.read(&mut buf).await {
-                Ok(0) => break,
-                Err(_) => break, // 子进程退出时 PTY 返回 EIO
-                Ok(n) => {
-                    let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
-                    tail.push_str(&chunk);
-                    if tail.len() > 4096 {
-                        let cut = tail.len() - 2048;
-                        tail = tail[cut..].to_string();
-                    }
-                    // 自更新阶段 steamcmd 会打印下载百分比，转发给前端做进度提示
-                    for line in chunk.lines() {
-                        let l = line.trim();
-                        if l.is_empty() {
-                            continue;
-                        }
-                        emit(app, Phase::Warmup, 50.0, l);
-                    }
-                }
+        while let Some(ev) = out_rx.recv().await {
+            let line = match ev {
+                crate::download::pty::OutEvent::Line(l) => l,
+                crate::download::pty::OutEvent::Prompt(p) => p,
+            };
+            tail.push_str(&line);
+            tail.push('\n');
+            if tail.len() > 4096 {
+                let cut = tail.len() - 2048;
+                tail = tail[cut..].to_string();
+            }
+            // 自更新阶段 steamcmd 会打印下载百分比，转发给前端做进度提示
+            let l = line.trim();
+            if !l.is_empty() {
+                emit(app, Phase::Warmup, 50.0, l);
             }
         }
         tail
@@ -399,6 +447,12 @@ fn is_warmed_dir(dir: &Path) -> bool {
     dir.join("linux32").join("steamclient.so").exists()
         || dir.join("linux64").join("steamclient.so").exists()
         || dir.join("steamclient.so").exists()
+}
+
+/// Windows 预热产物：自更新解出的 steamclient(dll)（64 位包为主，两套任一出现即算完成）
+#[cfg(target_os = "windows")]
+fn is_warmed_dir(dir: &Path) -> bool {
+    dir.join("steamclient.dll").exists() || dir.join("steamclient64.dll").exists()
 }
 
 /// 从自更新写下的 manifest 里读版本号

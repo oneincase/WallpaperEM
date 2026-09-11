@@ -41,7 +41,12 @@ pub struct LibraryFilter {
     /// 标题模糊搜索
     #[serde(default)]
     pub query: Option<String>,
-    /// 必需标签（AND，语义与工坊一致）
+    /// 分组标签：组内并集（OR）、组间交集（AND），空 = 不约束（都显示）。
+    /// 特殊值 `"$local"` 匹配本地导入条目（item_id 为 custom-*），
+    /// 对应筛选面板的「本地导入」分类标签；优先于旧版平面 tags
+    #[serde(default)]
+    pub tag_groups: Vec<Vec<String>>,
+    /// 旧版平面必需标签（AND，语义与工坊一致），等价于每个标签自成一组
     #[serde(default)]
     pub tags: Vec<String>,
     /// 排除标签（命中任一即排除）
@@ -136,10 +141,49 @@ pub fn library_list(
             CASE WHEN json_valid(w.tags) THEN w.tags ELSE '[]' END
          ) WHERE value = ?
        )";
-    for t in f.tags.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
-        where_parts.push(format!("({tag_exists})"));
-        binds.push(Value::Text(t.to_string()));
-        binds.push(Value::Text(t.to_string()));
+    // 「本地导入」标签：匹配本地导入条目（custom-* id），不走标签列
+    const LOCAL_IMPORT_TAG: &str = "$local";
+    let local_import_cond = "l.item_id LIKE 'custom-%'";
+    // 单个标签的 SQL 片段 + 绑定值
+    let tag_cond = |t: &str| -> (String, Vec<Value>) {
+        if t == LOCAL_IMPORT_TAG {
+            (local_import_cond.to_string(), Vec::new())
+        } else {
+            (
+                format!("({tag_exists})"),
+                vec![Value::Text(t.to_string()), Value::Text(t.to_string())],
+            )
+        }
+    };
+    // 分组标签：组内并集（OR）、组间交集（AND）。tag_groups 缺省时退回旧版
+    // 平面 tags（每个标签自成一组 = 旧的全 AND 行为，兼容旧调用方）
+    let groups: Vec<Vec<String>> = if !f.tag_groups.is_empty() {
+        f.tag_groups
+            .iter()
+            .map(|g| {
+                g.iter()
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|g| !g.is_empty())
+            .collect()
+    } else {
+        f.tags
+            .iter()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .map(|t| vec![t])
+            .collect()
+    };
+    for g in &groups {
+        let mut parts: Vec<String> = Vec::new();
+        for t in g {
+            let (cond, mut vals) = tag_cond(t);
+            parts.push(cond);
+            binds.append(&mut vals);
+        }
+        where_parts.push(format!("({})", parts.join(" OR ")));
     }
     for t in f
         .excluded_tags
@@ -616,6 +660,11 @@ fn copy_dir_filtered(from: &Path, to: &Path, stats: &mut CopyStats) -> Result<()
     std::fs::create_dir_all(to).map_err(|e| e.to_string())?;
     for entry in std::fs::read_dir(from).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
+        // 工程的版本历史不进本地库：装的是「发布出来的这一版」，历史只会在库里
+        // 占成倍空间（每个版本都是完整副本）
+        if entry.file_name().to_string_lossy() == crate::workspace::VERSION_DIR {
+            continue;
+        }
         // file_type 不跟随符号链接，能识别出 symlink 本身
         let ft = entry.file_type().map_err(|e| e.to_string())?;
         if ft.is_symlink() {
@@ -648,6 +697,10 @@ fn measure_dir(dir: &Path) -> u64 {
     let mut total = 0u64;
     if let Ok(entries) = std::fs::read_dir(dir) {
         for e in entries.flatten() {
+            // 与 copy_dir_filtered 同口径：版本历史不算进预检体积
+            if e.file_name().to_string_lossy() == crate::workspace::VERSION_DIR {
+                continue;
+            }
             match e.file_type() {
                 Ok(ft) if ft.is_dir() => total += measure_dir(&e.path()),
                 Ok(ft) if ft.is_file() => {
@@ -903,14 +956,46 @@ fn import_dir_into(
 
 /// library_items  upsert：导入（自定义/Web）与重复命中共用一条写路径
 fn upsert_library_item(conn: &Connection, core: &ImportCore) -> Result<(), String> {
+    // 类型标签必须随条目一起落库：本地导入的条目在工坊元数据缓存里不存在，
+    // 筛选面板的「类型」组（Scene/Video/Web…）读的就是 l.tags ∪ w.tags，
+    // 不写这一笔，本地导入的视频按「视频」筛永远筛不到（历史 bug）。
+    // 名称与工坊标签完全一致（大小写敏感），否则标签筛选对不上。
+    let tags = match type_tag_of(&core.wtype) {
+        Some(t) => serde_json::to_string(&[t]).unwrap_or_else(|_| "[]".into()),
+        None => "[]".to_string(),
+    };
     conn.execute(
-        "INSERT INTO library_items(item_id, title, type, size_bytes, file_count, downloaded_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, unixepoch())
-         ON CONFLICT(item_id) DO UPDATE SET title = ?2, type = ?3, size_bytes = ?4, file_count = ?5",
-        rusqlite::params![core.item_id, core.title, core.wtype, core.size_bytes, core.file_count],
+        "INSERT INTO library_items(item_id, title, type, size_bytes, file_count, downloaded_at, tags)
+         VALUES (?1, ?2, ?3, ?4, ?5, unixepoch(), ?6)
+         ON CONFLICT(item_id) DO UPDATE SET
+           title = ?2, type = ?3, size_bytes = ?4, file_count = ?5,
+           -- 已有标签（工坊缓存回填的、或上一次导入写的）不动，
+           -- 只为「从来没有过标签」的条目补上类型标签
+           tags = CASE WHEN tags IS NULL OR tags = '' OR tags = '[]' THEN ?6 ELSE tags END",
+        rusqlite::params![
+            core.item_id,
+            core.title,
+            core.wtype,
+            core.size_bytes,
+            core.file_count,
+            tags
+        ],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// 本地类型 → 工坊类型标签（与 workshop.rs 的 TYPE_TAG 同口径）。
+/// 本地库筛选面板按工坊标签名匹配，两处必须一致。
+fn type_tag_of(wtype: &str) -> Option<&'static str> {
+    match wtype {
+        "video" => Some("Video"),
+        "scene" => Some("Scene"),
+        "web" => Some("Web"),
+        "gif" => Some("GIF"),
+        "application" => Some("Application"),
+        _ => None,
+    }
 }
 
 /// 一键导入 Web 版数据（壁纸文件 + 工坊元数据）。
@@ -1040,7 +1125,7 @@ pub async fn library_import_custom_pick(app: AppHandle) -> Result<serde_json::Va
         app_pick
             .dialog()
             .file()
-            .add_filter("壁纸", PICK_FILTER_EXTS)
+            .add_filter(crate::i18n::tr("壁纸"), PICK_FILTER_EXTS)
             .blocking_pick_files()
             .map(|fs| {
                 fs.iter()
@@ -1198,6 +1283,74 @@ fn import_one(app: &AppHandle, src: &Path) -> Result<ImportOne, String> {
     Ok(ImportOne { core })
 }
 
+/// MCP 工程安装入口：复用单条导入链路，返回 `(item_id, title, type)`。
+///
+/// 与用户在 UI 里「导入文件夹」完全同路径（拷贝过滤、去重、写库、视频抽帧都一致），
+/// 差别只是调用方是 MCP 而不是文件选择器。
+pub(crate) fn import_project_dir(
+    app: &AppHandle,
+    src: &Path,
+    extra_tags: &[String],
+) -> Result<(String, String, String), String> {
+    let one = import_one(app, src)?;
+    // 导入链路只会写上类型标签；工程自带的分类标签（含年龄分级）只有 project.json
+    // 里有，不补这一笔，本地库按「年龄分级」筛选就永远看不到 AI 造的壁纸。
+    if let Err(e) = merge_item_tags(app, &one.core.item_id, extra_tags) {
+        tracing::warn!("合并工程标签失败（不影响安装）: {e}");
+    }
+    Ok((one.core.item_id, one.core.title, one.core.wtype))
+}
+
+/// 给库内条目追加标签：保留原有标签与顺序，只补没有的
+fn merge_item_tags(app: &AppHandle, item_id: &str, extra: &[String]) -> Result<(), String> {
+    if extra.is_empty() {
+        return Ok(());
+    }
+    let db = app.state::<Arc<Mutex<Connection>>>();
+    let conn = db.lock().map_err(|e| e.to_string())?;
+    merge_item_tags_in(&conn, item_id, extra)
+}
+
+fn merge_item_tags_in(conn: &Connection, item_id: &str, extra: &[String]) -> Result<(), String> {
+    if extra.is_empty() {
+        return Ok(());
+    }
+    let cur: String = conn
+        .query_row(
+            "SELECT CASE WHEN json_valid(tags) THEN tags ELSE '[]' END
+             FROM library_items WHERE item_id = ?1",
+            [item_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let mut list: Vec<String> = serde_json::from_str(&cur).unwrap_or_default();
+    let before = list.len();
+    for t in extra {
+        if !list.iter().any(|x| x == t) {
+            list.push(t.clone());
+        }
+    }
+    if list.len() == before {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE library_items SET tags = ?2 WHERE item_id = ?1",
+        rusqlite::params![
+            item_id,
+            serde_json::to_string(&list).unwrap_or_else(|_| "[]".into())
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 工程目录名 → 本地库 item_id（与导入时同一套清洗规则）。
+/// 只做名字映射、不查磁盘：目录名不变则重复导入得到的 id 不变，
+/// 用户改过的属性覆盖（settings 表按 item_id 存）因此不会丢。
+pub(crate) fn project_item_id_for(name: &str) -> String {
+    sanitize_id_stem(name)
+}
+
 /// 目录内是否已有预览图（扩展名清单与 local_preview_url 保持一致）
 fn has_preview_file(dir: &Path) -> bool {
     ["gif", "png", "jpg", "webp"]
@@ -1310,9 +1463,30 @@ pub(crate) fn wallpapers_dir(app: &AppHandle) -> Result<std::path::PathBuf, Stri
         .map_err(|e| e.to_string())
 }
 
+/// item_id 必须是一层普通目录名。
+///
+/// `library_delete` / `library_open_folder` / `project_update` 现在都被 MCP 直接暴露给
+/// 外部 agent，item_id 来自模型而不是数据库，只能当**不可信输入**：`Path::join` 碰到绝对
+/// 路径会整体替换前面的前缀，`..` 也能一路爬出库根，两者都会让下游的 `remove_dir_all`
+/// 删到库外（用户文档、应用数据目录）。真实 id 由 `sanitize_id_stem` 生成，只含
+/// `[A-Za-z0-9_-]` 且不以 `.` 开头，所以下面的规则不会误伤。
+fn check_item_id(item_id: &str) -> Result<(), String> {
+    let id = item_id.trim();
+    if id.is_empty() || id.starts_with('.') {
+        return Err(format!("非法 itemId: `{item_id}`"));
+    }
+    if id.contains('/') || id.contains('\\') || id.contains('\0') || id.contains("..") {
+        return Err(format!(
+            "itemId 不能包含路径分隔符或 `..`（收到: `{item_id}`）"
+        ));
+    }
+    Ok(())
+}
+
 /// 单个壁纸的目录 `<app_data>/wallpapers/<item_id>`
 pub(crate) fn item_dir(app: &AppHandle, item_id: &str) -> Result<std::path::PathBuf, String> {
-    Ok(wallpapers_dir(app)?.join(item_id))
+    check_item_id(item_id)?;
+    Ok(wallpapers_dir(app)?.join(item_id.trim()))
 }
 
 /// 壁纸文件是否真实存在。
@@ -1415,7 +1589,7 @@ pub async fn set_item_prop_file(
             dialog.blocking_pick_folder()
         } else {
             dialog
-                .add_filter("文件", file_filter(file_type.as_deref()))
+                .add_filter(crate::i18n::tr("文件"), file_filter(file_type.as_deref()))
                 .blocking_pick_file()
         };
         picked.and_then(|f| f.as_path().map(|p| p.to_path_buf()))
@@ -1557,7 +1731,8 @@ mod tests {
              INSERT INTO library_items VALUES
                ('a','Anime Girl','scene','[\"Scene\",\"Anime\",\"Everyone\"]',1000,3,100),
                ('b','Landscape 4K','video','[\"Video\",\"Landscape\",\"Mature\"]',5000,1,200),
-               ('c','100% Custom','web','[]',300,2,300);
+               ('c','100% Custom','web','[]',300,2,300),
+               ('custom-abcd1234','My Import','video','[]',800,1,400);
              INSERT INTO workshop_items VALUES
                ('c','','[\"Web\",\"Abstract\"]','web');",
         )
@@ -1591,6 +1766,50 @@ mod tests {
        )";
 
     #[test]
+    fn upsert_writes_type_tag_so_local_imports_are_filterable() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE library_items(item_id TEXT PRIMARY KEY, title TEXT, type TEXT,
+                 size_bytes INTEGER, file_count INTEGER, downloaded_at INTEGER, tags TEXT);",
+        )
+        .unwrap();
+        let core = |item_id: &str, ty: &str| ImportCore {
+            item_id: item_id.into(),
+            title: item_id.into(),
+            wtype: ty.into(),
+            size_bytes: 1,
+            file_count: 1,
+            duplicate: false,
+        };
+        let tags_of = |id: &str| -> String {
+            conn.query_row(
+                "SELECT tags FROM library_items WHERE item_id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        // 导入的视频要带上工坊口径的类型标签，否则按「视频」筛不到
+        upsert_library_item(&conn, &core("custom-v", "video")).unwrap();
+        assert_eq!(tags_of("custom-v"), r#"["Video"]"#);
+        upsert_library_item(&conn, &core("custom-s", "scene")).unwrap();
+        assert_eq!(tags_of("custom-s"), r#"["Scene"]"#);
+        // 无对应工坊标签的类型（image）保持空数组，不硬造标签
+        upsert_library_item(&conn, &core("custom-i", "image")).unwrap();
+        assert_eq!(tags_of("custom-i"), "[]");
+
+        // 重复导入（幂等路径）不能把已有标签抹掉，但空标签要补上
+        conn.execute(
+            "UPDATE library_items SET tags = '[\"Anime\"]' WHERE item_id = 'custom-v'",
+            [],
+        )
+        .unwrap();
+        upsert_library_item(&conn, &core("custom-v", "video")).unwrap();
+        assert_eq!(tags_of("custom-v"), r#"["Anime"]"#);
+    }
+
+    #[test]
     fn tag_filter_matches_local_or_workshop_tags() {
         let conn = filter_db();
         // 本地 tags 命中
@@ -1618,11 +1837,50 @@ mod tests {
         assert!(run_filter(&conn, &two, &["Anime", "Anime", "Landscape", "Landscape"]).is_empty());
     }
 
+    /// 分组标签：组内并集（OR）、组间交集（AND）；全不选 = 不约束
+    #[test]
+    fn tag_groups_are_or_within_and_across() {
+        let conn = filter_db();
+        // 组内 OR：Anime 或 Landscape → 命中 a、b
+        let or_group = format!("(({TAG_EXISTS}) OR ({TAG_EXISTS}))");
+        assert_eq!(
+            run_filter(&conn, &or_group, &["Anime", "Anime", "Landscape", "Landscape"]),
+            vec!["a", "b"]
+        );
+        // 组间 AND：[Anime OR Landscape] AND [Video] → 只剩 b
+        let two_groups = format!("{or_group} AND ({TAG_EXISTS})");
+        assert_eq!(
+            run_filter(
+                &conn,
+                &two_groups,
+                &["Anime", "Anime", "Landscape", "Landscape", "Video", "Video"],
+            ),
+            vec!["b"]
+        );
+    }
+
+    /// 「本地导入」分类标签：匹配 custom-* id 的本地导入条目，可与普通标签并集
+    #[test]
+    fn local_import_tag_matches_custom_items() {
+        let conn = filter_db();
+        // 单选本地导入 → 只有 custom-*
+        assert_eq!(
+            run_filter(&conn, "l.item_id LIKE 'custom-%'", &[]),
+            vec!["custom-abcd1234"]
+        );
+        // 本地导入 OR Anime → custom-* + a
+        let or_group = format!("(l.item_id LIKE 'custom-%' OR ({TAG_EXISTS}))");
+        assert_eq!(
+            run_filter(&conn, &or_group, &["Anime", "Anime"]),
+            vec!["a", "custom-abcd1234"]
+        );
+    }
+
     #[test]
     fn excluded_tag_removes_matching_items() {
         let conn = filter_db();
         let out = run_filter(&conn, &format!("NOT ({TAG_EXISTS})"), &["Mature", "Mature"]);
-        assert_eq!(out, vec!["a", "c"], "带 Mature 的 b 应被排除");
+        assert_eq!(out, vec!["a", "c", "custom-abcd1234"], "带 Mature 的 b 应被排除");
     }
 
     #[test]
@@ -1821,6 +2079,32 @@ mod tests {
         assert_ne!(a, "custom");
     }
 
+    /// MCP 让外部 agent 直接传 itemId，路径穿越必须挡在 item_dir 这一层
+    #[test]
+    fn check_item_id_rejects_traversal_and_separators() {
+        for ok in ["My-Wallpaper_01", "custom-1a2b3c4d", "e2e-scene-abc123", "900000000"] {
+            assert!(check_item_id(ok).is_ok(), "{ok} 应当放行");
+        }
+        for bad in [
+            "",
+            "   ",
+            ".",
+            "..",
+            "../x",
+            "a/b",
+            "/etc",
+            "/Users/oneincase/Documents",
+            "a\\b",
+            ".hidden",
+            "a..b",
+            "a\0b",
+        ] {
+            assert!(check_item_id(bad).is_err(), "{bad:?} 必须拒绝");
+        }
+        // 前后空白不该让合法 id 失效（trim 后放行）
+        assert!(check_item_id(" My-Wallpaper ").is_ok());
+    }
+
     #[test]
     fn overlap_check_rejects_self_and_ancestor() {
         let (root, dest_root, src_root) = import_fixture("overlap");
@@ -1964,6 +2248,64 @@ mod tests {
         assert!(!dir.join("linked.txt").exists(), "符号链接不得被拷贝进库");
         assert_eq!(core.file_count, 1);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 工程的版本历史（`.version/`）不进本地库：装的是「发布出来的这一版」，
+    /// 每个历史版本都是完整副本，跟着进库会让体积按版本数翻倍。
+    #[test]
+    fn import_dir_skips_version_history() {
+        let (root, dest_root, src_root) = import_fixture("version-dir");
+        let proj = src_root.join("wp-versioned");
+        std::fs::create_dir_all(proj.join(".version/1/materials")).unwrap();
+        std::fs::write(proj.join("project.json"), r#"{"type":"scene","title":"v"}"#).unwrap();
+        std::fs::write(proj.join("scene.json"), r#"{"objects":[]}"#).unwrap();
+        std::fs::write(proj.join(".version/1/scene.json"), b"old-copy").unwrap();
+        std::fs::write(proj.join(".version/1/materials/old.png"), b"old").unwrap();
+
+        // 预检体积（measure_dir）与拷贝（copy_dir_filtered）必须同口径，
+        // 否则磁盘预检会把历史算进去、拷完却对不上
+        let live: u64 = ["project.json", "scene.json"]
+            .iter()
+            .map(|f| std::fs::metadata(proj.join(f)).unwrap().len())
+            .sum();
+        assert_eq!(measure_dir(&proj), live, "历史目录不该计入预检体积");
+
+        let core = import_into_library(&dest_root, &proj).unwrap();
+        let dir = dest_root.join(&core.item_id);
+        assert!(dir.join("scene.json").is_file());
+        assert!(!dir.join(".version").exists(), "历史目录不该进库");
+        assert_eq!(core.file_count, 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 工程自带的分类标签（含年龄分级）要补进库内条目，且不能冲掉已有标签
+    #[test]
+    fn merge_item_tags_appends_without_clobbering() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE library_items(item_id TEXT PRIMARY KEY, tags TEXT);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO library_items(item_id, tags) VALUES ('custom-1','[\"Scene\"]')",
+            [],
+        )
+        .unwrap();
+        let tags_of = |id: &str| -> String {
+            conn.query_row("SELECT tags FROM library_items WHERE item_id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+
+        merge_item_tags_in(&conn, "custom-1", &["Everyone".into()]).unwrap();
+        assert_eq!(tags_of("custom-1"), r#"["Scene","Everyone"]"#);
+        // 幂等：已有的标签不再重复追加
+        merge_item_tags_in(&conn, "custom-1", &["Everyone".into(), "Scene".into()]).unwrap();
+        assert_eq!(tags_of("custom-1"), r#"["Scene","Everyone"]"#);
+        // 坏 JSON 当空数组处理，不让整条安装失败
+        conn.execute("UPDATE library_items SET tags='not-json' WHERE item_id='custom-1'", [])
+            .unwrap();
+        merge_item_tags_in(&conn, "custom-1", &["Mature".into()]).unwrap();
+        assert_eq!(tags_of("custom-1"), r#"["Mature"]"#);
     }
 
     #[test]

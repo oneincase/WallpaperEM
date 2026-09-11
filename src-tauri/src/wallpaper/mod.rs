@@ -8,6 +8,8 @@
 pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg(target_os = "windows")]
+pub mod windows;
 pub mod platform;
 pub mod pointer;
 
@@ -32,9 +34,35 @@ pub const DEFAULT_FIT: &str = "cover";
 /// 缩放模式下 WebKit 自己把 dpr 报成 1，也不需要更高的 cap 去补。
 pub const RENDER_DPR_MIN: f32 = 0.8;
 pub const RENDER_DPR_MAX: f32 = 2.0;
-pub const DEFAULT_RENDER_DPR: f32 = 1.0;
-/// 场景壁纸帧率上限（帧/秒）：越低 GPU 占用越低。可选 30 / 60 / 120，默认 60。
-pub const DEFAULT_SCENE_FPS: u32 = 60;
+pub const DEFAULT_RENDER_DPR: f32 = 2.0;
+/// 场景壁纸帧率上限（帧/秒）：越低 GPU 占用越低。
+/// 可选 24 / 30 / 45 / 60 / 120，默认 24（最省电，且多数场景 24fps 观感足够）。
+pub const DEFAULT_SCENE_FPS: u32 = 24;
+/// 允许的全局帧率档位（托盘、设置页、`wallpaper_set_scene_fps` 共用同一份白名单）
+pub const SCENE_FPS_CHOICES: [u32; 5] = [24, 30, 45, 60, 120];
+
+/// 全局滤镜（帧率上限下面的那组）。**id 白名单本身就是契约**：
+/// 托盘菜单、设置项、URL query、`__wp.setFilter` 传的都只是这份 id，
+/// CSS filter 表达式只存在于渲染器里 —— 不让任意字符串流进 `style.filter`
+/// 是刻意的（`url()` 能外链资源），也让宿主与渲染器共用同一套取值。
+/// 顺序 = 托盘菜单顺序；`none` 必须存在且为默认。
+/// 中文名与上游独立测试台（webwallgl bench）的 i18n 文案保持一致，
+/// 两边调同一个效果时看到的是同一个词。
+pub const WALLPAPER_FILTERS: &[(&str, &str)] = &[
+    ("none", "无"),
+    ("blur", "高斯模糊"),
+    ("grayscale", "黑白"),
+    ("sepia", "怀旧"),
+    ("vivid", "鲜艳"),
+    ("warm", "暖色"),
+    ("cool", "冷色"),
+    ("invert", "反色"),
+    ("brighten", "提亮"),
+    ("darken", "压暗"),
+    ("contrast", "高对比"),
+];
+/// 默认滤镜 id（= 不套任何 CSS filter）
+pub const DEFAULT_FILTER: &str = "none";
 
 fn default_type() -> String {
     "canvas".into()
@@ -47,6 +75,9 @@ fn default_render_dpr() -> f32 {
 }
 fn default_scene_fps() -> u32 {
     DEFAULT_SCENE_FPS
+}
+fn default_filter() -> String {
+    DEFAULT_FILTER.into()
 }
 
 /// 全局壁纸显示模式（覆盖到每次应用/恢复），非法值回退到默认 cover。
@@ -70,16 +101,31 @@ fn global_render_dpr(conn: Option<&Connection>) -> f32 {
     parsed.clamp(RENDER_DPR_MIN, RENDER_DPR_MAX)
 }
 
-/// 全局场景帧率上限（读设置 `wallpaper_scene_fps`），只允许 30/60/120，非法值回退 60。
+/// 全局场景帧率上限（读设置 `wallpaper_scene_fps`），只允许 [`SCENE_FPS_CHOICES`]，
+/// 非法值回退默认。
 pub(crate) fn global_scene_fps(conn: Option<&Connection>) -> u32 {
     let raw = conn.and_then(|c| db::get_setting(c, "wallpaper_scene_fps"));
     let parsed = raw
         .as_deref()
         .and_then(|s| s.trim().parse::<u32>().ok())
         .unwrap_or(DEFAULT_SCENE_FPS);
-    match parsed {
-        30 | 60 | 120 => parsed,
-        _ => DEFAULT_SCENE_FPS,
+    if SCENE_FPS_CHOICES.contains(&parsed) {
+        parsed
+    } else {
+        DEFAULT_SCENE_FPS
+    }
+}
+
+/// 全局滤镜 id（读设置 `wallpaper_filter`）。不在白名单内（旧值/手改 DB）回退默认。
+///
+/// 作用范围是**桌面壁纸窗口**（label = wallpaper-*）：托盘菜单的下发走
+/// `eval_all`，只遍历这批窗口；本地库预览是主窗口里的 iframe、走独立配置，
+/// 不读这个设置 —— 这也是需求里「壁纸预览除外」的落地方式。
+pub(crate) fn global_filter(conn: Option<&Connection>) -> String {
+    let raw = conn.and_then(|c| db::get_setting(c, "wallpaper_filter"));
+    match raw.as_deref() {
+        Some(id) if WALLPAPER_FILTERS.iter().any(|(k, _)| *k == id) => id.to_string(),
+        _ => DEFAULT_FILTER.into(),
     }
 }
 
@@ -161,18 +207,21 @@ fn apply_play_config(app: &AppHandle, cfg: &mut WallpaperConfig, item_id: Option
         cfg.fit = DEFAULT_FIT.into();
         cfg.render_dpr = DEFAULT_RENDER_DPR;
         cfg.scene_fps = DEFAULT_SCENE_FPS;
+        cfg.filter = DEFAULT_FILTER.into();
         return;
     };
     let Ok(conn) = state.lock() else {
         cfg.fit = DEFAULT_FIT.into();
         cfg.render_dpr = DEFAULT_RENDER_DPR;
         cfg.scene_fps = DEFAULT_SCENE_FPS;
+        cfg.filter = DEFAULT_FILTER.into();
         return;
     };
     // 先铺全局
     cfg.fit = global_fit(Some(&conn));
     cfg.render_dpr = global_render_dpr(Some(&conn));
     cfg.scene_fps = global_scene_fps(Some(&conn));
+    cfg.filter = global_filter(Some(&conn));
     // 再叠本壁纸覆盖
     if let Some(id) = item_id {
         let ov = item_play_config(&conn, id);
@@ -185,7 +234,7 @@ fn apply_play_config(app: &AppHandle, cfg: &mut WallpaperConfig, item_id: Option
             cfg.render_dpr = d.clamp(RENDER_DPR_MIN, RENDER_DPR_MAX);
         }
         if let Some(f) = ov.scene_fps {
-            if matches!(f, 30 | 60 | 120) {
+            if SCENE_FPS_CHOICES.contains(&f) {
                 cfg.scene_fps = f;
             }
         }
@@ -284,9 +333,12 @@ pub struct WallpaperConfig {
     /// 渲染分辨率上限（有效 dpr 封顶），越低越省内存
     #[serde(default = "default_render_dpr")]
     pub render_dpr: f32,
-    /// 场景壁纸帧率上限（30/60/120），越低 GPU 占用越低
+    /// 场景壁纸帧率上限（24/30/45/60/120），越低 GPU 占用越低
     #[serde(default = "default_scene_fps")]
     pub scene_fps: u32,
+    /// 全局滤镜 id（见 WALLPAPER_FILTERS 白名单）
+    #[serde(default = "default_filter")]
+    pub filter: String,
     #[serde(default = "default_muted")]
     pub muted: bool,
     #[serde(default = "default_loop")]
@@ -304,6 +356,7 @@ impl Default for WallpaperConfig {
             fit: default_fit(),
             render_dpr: default_render_dpr(),
             scene_fps: default_scene_fps(),
+            filter: default_filter(),
             muted: default_muted(),
             r#loop: default_loop(),
             media_base: None,
@@ -361,8 +414,8 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
     ensure_windows(app);
     start_monitor(app);
     // 自动暂停（默认关）：监听前台应用切换，切到非桌面暂停、回桌面恢复
-    // （仅 macOS 有前台应用观察者；Linux 后端是空实现，开关暂不生效果详见 linux.rs）
-    #[cfg(target_os = "linux")]
+    // （macOS/Windows 有前台应用观察者；Linux 后端是空实现，开关暂不生效果详见 linux.rs）
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     platform::store_app_handle(app);
     platform::start_auto_pause_observer(app);
     // 交互态下点桌面不一定触发前台切换（壁纸窗无边框不能成为 key），
@@ -470,13 +523,14 @@ fn ensure_windows_inner(app: &AppHandle, display_asleep: bool) {
         }
     }
 
-    // 创建/缩放窗口
+    // 创建/缩放窗口。
+    // 没有任何壁纸配置（首次安装、从未应用过）时不建窗：桌面保持系统壁纸，
+    // 不要弹出一个「降级提示页」占着桌面。用户应用第一张壁纸时再由
+    // apply_on_main 按需建窗。
     for (label, (id, x, y, w, h)) in &desired {
-        let cfg = configs
-            .get(label)
-            .cloned()
-            .or_else(|| default_cfg.clone())
-            .unwrap_or_default();
+        let Some(cfg) = configs.get(label).cloned().or_else(|| default_cfg.clone()) else {
+            continue;
+        };
         match app.get_webview_window(label) {
             Some(win) => {
                 platform::set_frame(&win, *x, *y, *w, *h);
@@ -559,7 +613,7 @@ fn refresh_src(app: &AppHandle, cfg: &mut WallpaperConfig) {
 ///   web / 媒体 → `http://127.0.0.1:<port>/<web|media>/<token>/<item_id>/...`
 /// 拿不到（外部 URL、原型面板的相对路径、canvas 演示）时返回 None，
 /// 调用方退化为"只用全局默认"，与加这个特性之前的行为一致。
-fn item_id_of(cfg: &WallpaperConfig) -> Option<String> {
+pub(crate) fn item_id_of(cfg: &WallpaperConfig) -> Option<String> {
     let src = cfg.src.as_deref()?;
     if cfg.r#type == "scene" {
         // 库形态的 scene src 就是 item_id（纯数字或本地导入的目录名）
@@ -584,6 +638,19 @@ fn item_id_of(cfg: &WallpaperConfig) -> Option<String> {
         return None;
     }
     Some(id.to_string())
+}
+
+/// 两次配置是否指向同一张壁纸。用于 decide「热更新还是销毁重建窗口」：
+/// item 能从 src 解析出来时按 item 比（src 里的 token 会随运行期刷新，
+/// 直接比 src 会把同一条目误判成切换）；解析不出时退回比 type + src。
+fn same_wallpaper(a: &WallpaperConfig, b: &WallpaperConfig) -> bool {
+    if a.r#type != b.r#type {
+        return false;
+    }
+    match (item_id_of(a), item_id_of(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => a.src == b.src,
+    }
 }
 
 fn create_desktop_window(
@@ -643,6 +710,104 @@ fn create_desktop_window(
     Ok(window)
 }
 
+/// 正在重建窗口的 label 集合。每个 label 同时只允许一个重建任务在跑 ——
+/// 快速连切时后一次 apply 只更新 `state.windows`，由这个唯一任务收敛到最后一张，
+/// 不会出现两个任务抢建同一 label（一个建成功后另一个报 already exists，最终
+/// 停在中间某张的错误画面上）。
+static RECREATING: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+/// 换壁纸后的窗口重建：**防抖 + 单飞**。
+///
+/// - 防抖：连切时不重建，等目标稳定 `DEBOUNCE` 后再动手一次。重建整块 WebView
+///   意味着新建 GL 上下文、重编 shader、重传全部纹理，逐张都做会把 GPU 顶成
+///   连续尖峰；合并成一次只付一次代价。
+/// - 单飞：每个 label 同时只有一个任务；它每次都读 `state.windows` 的最新配置，
+///   所以连切自然收敛到最后一张，不会两个任务抢建同一 label。
+/// - 跨轮次：`destroy()` 走的是 `proxy.send_event(Message::Window(.., Destroy))`
+///   （不像其它窗口操作走 `send_user_message` 的「主线程内联」快路径），**总是
+///   异步投递**；同一主线程轮次里重建必撞 `WebviewLabelAlreadyExists`，主线程
+///   sleep 也等不到（事件循环正被占着）。所以这里先等 label 从注册表消失，再回
+///   主线程 create。
+fn schedule_window_recreate(app: &AppHandle, label: &str, frame: (f64, f64, f64, f64)) {
+    use std::time::Duration;
+    /// 连切合并窗口：目标稳定这么久才动手
+    const DEBOUNCE: Duration = Duration::from_millis(350);
+
+    let set = RECREATING.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    {
+        let mut g = set.lock().unwrap();
+        if !g.insert(label.to_string()) {
+            return; // 已有任务在跑，它会读到最新配置
+        }
+    }
+    let app = app.clone();
+    let label = label.to_string();
+    tauri::async_runtime::spawn(async move {
+        let done = || {
+            if let Some(set) = RECREATING.get() {
+                set.lock().unwrap().remove(&label);
+            }
+        };
+        let current = |app: &AppHandle| {
+            app.try_state::<WallpaperEngineState>()
+                .and_then(|st| st.windows.lock().unwrap().get(&label).cloned())
+        };
+
+        // 防抖：目标还在变就继续等，稳定 DEBOUNCE 后才开工
+        let mut last: Option<WallpaperConfig> = None;
+        loop {
+            let Some(cur) = current(&app) else {
+                done();
+                return; // 会话已清（stop/退出）
+            };
+            if last.as_ref().is_some_and(|p| same_wallpaper(p, &cur)) {
+                break;
+            }
+            last = Some(cur);
+            tokio::time::sleep(DEBOUNCE).await;
+        }
+        let Some(target) = last else {
+            done();
+            return;
+        };
+        let target_item = item_id_of(&target);
+
+        for _ in 0..20 {
+            // 销毁旧窗口并等注册表释放 label
+            if let Some(w) = app.get_webview_window(&label) {
+                let _ = w.destroy();
+                for _ in 0..30 {
+                    if app.get_webview_window(&label).is_none() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+            let app2 = app.clone();
+            let label2 = label.clone();
+            let target2 = target.clone();
+            let _ = app.run_on_main_thread(move || {
+                if let Err(e) = create_desktop_window(&app2, &label2, &target2, frame) {
+                    tracing::debug!("wallpaper window {label2} recreate attempt failed: {e}");
+                }
+            });
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            if app.get_webview_window(&label).is_none() {
+                continue; // 没建起来，重试
+            }
+            // 建好了；若期间又切了壁纸，重读目标再来一轮
+            if current(&app).as_ref().and_then(item_id_of) == target_item {
+                tracing::info!("wallpaper window {label} recreated");
+                done();
+                return;
+            }
+        }
+        tracing::error!("wallpaper window {label} recreate failed after retries");
+        done();
+    });
+}
+
 fn apply_on_main(
     app: &AppHandle,
     display_id: Option<String>,
@@ -670,26 +835,58 @@ fn apply_on_main(
         .ok_or("DB 未就绪")?;
 
     for (label, frame) in &targets {
-        let window = match app.get_webview_window(label) {
-            Some(w) => w,
-            None => create_desktop_window(app, label, &cfg, *frame).map_err(|e| e.to_string())?,
-        };
-        platform::apply_desktop_window(&window, *frame, current_interactive(app));
-
         let mut cfg2 = cfg.clone();
         cfg2.media_base = media_base(app);
         let item2 = item_id_of(&cfg2);
         apply_play_config(app, &mut cfg2, item2.as_deref());
-        let js = format!(
-            "window.__wp && window.__wp.setWallpaper({})",
-            serde_json::to_string(&cfg2).map_err(|e| e.to_string())?
-        );
-        window.eval(&js).map_err(|e| e.to_string())?;
-        state
+
+        // 换了壁纸就**销毁重建整块 WebView**，而不是复用旧窗口热更新。
+        //
+        // 复用的 WKWebView 会把上一张壁纸的 JS 堆与 GPU 资源一直攥着：实测同一
+        // 窗口逐张切换，Activity Monitor 的 footprint 从 ~300MB 单调涨到 4GB+
+        // （复现 6 张场景 305M→3085M），切到轻量视频也不回落；只有销毁窗口、
+        // 连带终止其 WebContent 进程才会释放（stop() 后重新 apply 回到 ~350MB）。
+        // 同一条目改 fit / dpr / fps / 属性时 item 不变 → 仍走热更新，不重建。
+        let switched = state
             .windows
             .lock()
             .unwrap()
-            .insert(label.clone(), cfg2.clone());
+            .get(label)
+            .map(|old| !same_wallpaper(old, &cfg2))
+            .unwrap_or(false);
+
+        if switched {
+            // 只登记新配置，销毁+重建交给防抖的单飞任务：连切时旧窗口继续显示，
+            // 等停下来再重建一次 —— 避免「每次切换都重建 GL 上下文/重传纹理」把
+            // GPU 顶成连续尖峰。销毁是投递到事件循环的异步消息，必须在后续轮次
+            // 重建（同轮次必撞 already exists），所以整体都在那个任务里做。
+            state
+                .windows
+                .lock()
+                .unwrap()
+                .insert(label.clone(), cfg2.clone());
+            schedule_window_recreate(app, label, *frame);
+        } else {
+            let window = match app.get_webview_window(label) {
+                Some(w) => w,
+                None => {
+                    create_desktop_window(app, label, &cfg, *frame).map_err(|e| e.to_string())?
+                }
+            };
+            platform::apply_desktop_window(&window, *frame, current_interactive(app));
+            // 复用旧窗口：下发 setWallpaper 热更新（新建窗口的 URL 已带配置，
+            // 但这里 UI 变更也会走到，eval 一次无副作用）。
+            let js = format!(
+                "window.__wp && window.__wp.setWallpaper({})",
+                serde_json::to_string(&cfg2).map_err(|e| e.to_string())?
+            );
+            window.eval(&js).map_err(|e| e.to_string())?;
+            state
+                .windows
+                .lock()
+                .unwrap()
+                .insert(label.clone(), cfg2.clone());
+        }
 
         // 会话持久化（item_id 供「已应用」标识 + 未来按条目恢复）
         if let Ok(conn) = db.lock() {
@@ -1037,6 +1234,7 @@ fn config_query_with_audio(cfg: &WallpaperConfig, audio_token: Option<&str>) -> 
     parts.push(format!("fit={}", url_encode(&cfg.fit)));
     parts.push(format!("renderDpr={}", cfg.render_dpr));
     parts.push(format!("sceneFps={}", cfg.scene_fps));
+    parts.push(format!("filter={}", url_encode(&cfg.filter)));
     parts.push(format!("muted={}", cfg.muted));
     parts.push(format!("loop={}", cfg.r#loop));
     if let Some(base) = &cfg.media_base {
@@ -1128,6 +1326,12 @@ pub fn stop(app: AppHandle, display_id: Option<String>) -> Result<(), String> {
                     );
                 }
             }
+        }
+        // 全停：连「最近一次配置」也清掉。否则监控的 ensure_windows 会拿
+        // default 把窗口重新建回来，stop 等于没停 —— 清空壁纸后桌面应保持
+        // 系统壁纸（与「首次安装不设壁纸」一致）。
+        if display_id.is_none() {
+            *state.default.lock().unwrap() = None;
         }
         let _ = tx.send(Ok(()));
     })
@@ -1264,11 +1468,18 @@ pub fn set_language(app: AppHandle, language: String) -> Result<(), String> {
     Ok(())
 }
 
-/// 设置全局场景帧率上限（30/60/120），持久化并对所有壁纸窗口实时生效。
+/// 设置全局场景帧率上限（24/30/45/60/120），持久化并对所有壁纸窗口实时生效。
 #[tauri::command(rename = "wallpaper_set_scene_fps")]
 pub fn set_scene_fps(app: AppHandle, fps: u32) -> Result<(), String> {
-    if !matches!(fps, 30 | 60 | 120) {
-        return Err(format!("场景帧率仅支持 30/60/120（收到 {fps}）"));
+    if !SCENE_FPS_CHOICES.contains(&fps) {
+        return Err(format!(
+            "场景帧率仅支持 {}（收到 {fps}）",
+            SCENE_FPS_CHOICES
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join("/")
+        ));
     }
     if let Some(db) = app.try_state::<Arc<Mutex<Connection>>>() {
         if let Ok(conn) = db.lock() {
@@ -1278,6 +1489,39 @@ pub fn set_scene_fps(app: AppHandle, fps: u32) -> Result<(), String> {
     eval_all(
         &app,
         &format!("window.__wp && window.__wp.setSceneFps({fps})"),
+    );
+    Ok(())
+}
+
+/// 设置全局滤镜（托盘「滤镜效果」子菜单），持久化并对所有桌面壁纸窗口实时生效。
+///
+/// 与显示模式/清晰度/帧率一样是「热切」：渲染器把白名单 id 翻成 CSS filter
+/// 挂在渲染容器上，不重挂壁纸、不重新解析 pkg。**只下发到壁纸窗口**
+/// （eval_all 遍历的都是 label = wallpaper-* 的窗口），本地库预览不受影响。
+#[tauri::command(rename = "wallpaper_set_filter")]
+pub fn set_filter(app: AppHandle, filter: String) -> Result<(), String> {
+    if !WALLPAPER_FILTERS.iter().any(|(k, _)| *k == filter) {
+        return Err(format!(
+            "未知的滤镜: {filter}（可选 {}）",
+            WALLPAPER_FILTERS
+                .iter()
+                .map(|(k, _)| *k)
+                .collect::<Vec<_>>()
+                .join("/")
+        ));
+    }
+    if let Some(db) = app.try_state::<Arc<Mutex<Connection>>>() {
+        if let Ok(conn) = db.lock() {
+            let _ = db::set_setting(&conn, "wallpaper_filter", &filter);
+        }
+    }
+    tracing::info!("wallpaper filter set: {filter}");
+    eval_all(
+        &app,
+        &format!(
+            "window.__wp && window.__wp.setFilter({})",
+            serde_json::json!(filter)
+        ),
     );
     Ok(())
 }
@@ -1801,6 +2045,38 @@ mod tests {
         );
         assert_eq!(item_id_of(&mk("web", None)), None);
         assert_eq!(item_id_of(&mk("canvas", Some("/test-media/x"))), None);
+    }
+
+    /// 「同一张壁纸」判定：决定切换时是热更新还是销毁重建窗口。
+    #[test]
+    fn same_wallpaper_ignores_token_and_detects_switch() {
+        let mk = |t: &str, src: &str| WallpaperConfig {
+            r#type: t.into(),
+            src: Some(src.into()),
+            ..Default::default()
+        };
+        // 同一条目、token 刷新（src 变了）→ 仍算同一张，热更新即可
+        assert!(same_wallpaper(
+            &mk("web", "http://127.0.0.1:1/web/oldtok/3406740580/index.html"),
+            &mk("web", "http://127.0.0.1:1/web/newtok/3406740580/index.html"),
+        ));
+        // scene 的 src 就是 item_id
+        assert!(same_wallpaper(&mk("scene", "42"), &mk("scene", "42")));
+        assert!(!same_wallpaper(&mk("scene", "42"), &mk("scene", "43")));
+        // 类型不同必重建（否则容器/渲染路径不对）
+        assert!(!same_wallpaper(
+            &mk("scene", "42"),
+            &mk("video", "http://127.0.0.1:1/media/tok/42/a.mp4")
+        ));
+        // item 解析不出时退回比 src
+        assert!(same_wallpaper(
+            &mk("web", "https://example.com/a.html"),
+            &mk("web", "https://example.com/a.html")
+        ));
+        assert!(!same_wallpaper(
+            &mk("web", "https://example.com/a.html"),
+            &mk("web", "https://example.com/b.html")
+        ));
     }
 
     fn fixture(tag: &str) -> std::path::PathBuf {

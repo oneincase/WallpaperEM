@@ -35,12 +35,105 @@ pub struct ContentServerState {
     /// 渲染器「ready」信号时间戳（epoch millis）：壁纸挂载成功后经 /diag 回流。
     /// system_wallpaper 的场景/网页截图等它，避免截到未渲染完成的黑屏
     pub wallpaper_ready_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// 渲染器诊断快照：截图超时时用来说明「到底卡在哪一步」，
+    /// 也用来判断「同一张壁纸是不是已经挂好了」（免掉重复挂载的整轮解析）
+    pub renderer_diag: Arc<Mutex<RendererDiag>>,
+}
+
+/// 渲染器最近一次诊断的汇总快照（`/diag` 每次上报都会更新）
+#[derive(Default)]
+pub struct RendererDiag {
+    /// 最近一条诊断原文，如 `[scene 123] mount start`
+    pub last: String,
+    /// 最近一条 `failed: …` 的原因（空串表示本次运行还没报过失败）
+    pub fail_reason: String,
+    /// 最近一次 `failed:` 的时间戳（epoch millis），0 表示没失败过
+    pub fail_ms: u64,
+    /// 最近一次 `ready` 对应的本地库条目 id（解析自诊断文本的 src 段）
+    pub ready_item: String,
 }
 
 impl ContentServerState {
     /// 当前存活的 SSE 客户端数（壁纸引擎唤醒后检测页面僵死用）
     pub fn sse_client_count(&self) -> usize {
         self.sse_clients.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// 从渲染器诊断文本里抽本地库条目 id。
+///
+/// 诊断前缀是 `[<type> <src>] <msg>`（见 renderer/src/main.ts 的 reportDiag）：
+///   - scene：`src` 就是 itemId                       → `[scene 1948961570] ready`
+///   - web  ：`src` 是 `/web/<token>/<itemId>/…` 的 URL → 取 `<itemId>` 段
+/// 解析失败返回 None（比如原本就没有 src 的 canvas 类型）。
+fn diag_item_id(msg: &str) -> Option<String> {
+    let inner = msg.strip_prefix('[')?.split_once(']')?.0;
+    let (_ty, src) = inner.split_once(' ')?;
+    if let Some(rest) = src.split("/web/").nth(1).or_else(|| src.split("/media/").nth(1)) {
+        // rest = "<token>/<itemId>/…"
+        let item = rest.split('/').nth(1).unwrap_or_default();
+        return (!item.is_empty()).then(|| item.to_string());
+    }
+    let src = src.trim();
+    (!src.is_empty() && !src.contains(' ') && !src.contains('/')).then(|| src.to_string())
+}
+
+/// 渲染器最近一次就绪的条目 id（没有 ready 过则 None）。
+/// MCP 截图用它判断「这张壁纸已经挂在屏上了」，重复截图时不必再挂一次。
+pub fn ready_item(app: &tauri::AppHandle) -> Option<String> {
+    let state = app.try_state::<ContentServerState>()?;
+    let d = state.renderer_diag.lock().ok()?;
+    let ms = state
+        .wallpaper_ready_ms
+        .load(std::sync::atomic::Ordering::Relaxed);
+    (ms > 0 && !d.ready_item.is_empty()).then(|| d.ready_item.clone())
+}
+
+/// 记一条渲染器诊断：ready 记时间戳（供截图等待）+ 条目 id（供重复截图免重挂），
+/// `failed: …` 记原因（供超时报错引用），其余只留最近一条原文。
+fn record_renderer_diag(state: &ContentServerState, msg: &str) {
+    let now_ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    };
+    if msg.ends_with("] ready") {
+        state
+            .wallpaper_ready_ms
+            .store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Ok(mut d) = state.renderer_diag.lock() {
+        d.last = msg.to_string();
+        if msg.ends_with("] ready") {
+            if let Some(id) = diag_item_id(msg) {
+                d.ready_item = id;
+            }
+        }
+        if let Some((_, reason)) = msg.split_once("] failed: ") {
+            d.fail_reason = reason.to_string();
+            d.fail_ms = now_ms();
+        }
+    }
+}
+
+/// 给「等待渲染器就绪超时」类错误配一句人能看懂的原因（渲染器自报失败优先，
+/// 否则给最近一条诊断 —— 常见是停在 `mount start`，说明还在解析大 scene.pkg）
+// 目前只有 macOS 的壁纸截图自检（system_wallpaper::capture_wallpaper_png）会用到
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn renderer_diag_hint(app: &tauri::AppHandle) -> String {
+    let Some(state) = app.try_state::<ContentServerState>() else {
+        return String::new();
+    };
+    let Ok(d) = state.renderer_diag.lock() else {
+        return String::new();
+    };
+    if !d.fail_reason.is_empty() {
+        format!("渲染器自报失败：{}", d.fail_reason)
+    } else if !d.last.is_empty() {
+        format!("渲染器最近诊断：{}", d.last)
+    } else {
+        "渲染器未上报任何诊断（壁纸页可能根本没加载）".into()
     }
 }
 
@@ -76,6 +169,7 @@ pub fn init(app: &AppHandle) -> Result<(), String> {
         media: crate::now_playing::shared(),
         sse_clients: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         wallpaper_ready_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        renderer_diag: Default::default(),
     };
     app.manage(state.clone());
 
@@ -174,82 +268,6 @@ async fn proxy_renderer(
         let res = state
             .renderer_dir
             .join(path.trim_start_matches("/renderer/"));
-        let file = if res.is_dir() {
-            res.join("index.html")
-        } else {
-            res
-        };
-        if !file.is_file() {
-            return respond(stream, 404, "Not Found", "text/plain", b"", None).await;
-        }
-        let data = tokio::fs::read(&file).await.map_err(|e| e.to_string())?;
-        let mime = mime_for(&file);
-        return respond(
-            stream,
-            200,
-            "OK",
-            mime,
-            &data,
-            Some(&format!("Content-Length: {}", data.len())),
-        )
-        .await;
-    }
-    #[allow(unreachable_code)]
-    Ok(())
-}
-
-/// 默认壁纸页（无壁纸时的默认 HTML 壁纸）：dev → 代理 vite；prod → 资源目录
-#[allow(unused_variables)]
-async fn proxy_default_wallpaper(
-    stream: &mut tokio::net::TcpStream,
-    path: &str,
-    state: &ContentServerState,
-) -> Result<(), String> {
-    #[cfg(debug_assertions)]
-    {
-        // dev：代理到 vite dev server（public/default-wallpaper）
-        let vite_path = path.trim_start_matches('/');
-        let upstream = format!("http://localhost:1420/{vite_path}");
-        // 本地 vite 直连，绝不走系统代理
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .map_err(|e| e.to_string())?;
-        match client.get(&upstream).send().await {
-            Ok(resp) => {
-                let status = resp.status().as_u16();
-                let reason = resp.status().canonical_reason().unwrap_or("OK");
-                let ct = resp
-                    .headers()
-                    .get(reqwest::header::CONTENT_TYPE)
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("application/octet-stream")
-                    .to_string();
-                let body = resp.bytes().await.unwrap_or_default();
-                return respond(stream, status, reason, &ct, &body, None).await;
-            }
-            Err(e) => {
-                return respond(
-                    stream,
-                    502,
-                    "Bad Gateway",
-                    "text/plain",
-                    format!("vite proxy error: {e}").as_bytes(),
-                    None,
-                )
-                .await;
-            }
-        }
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        // prod：服务打包进资源目录的 default-wallpaper
-        let base = state
-            .renderer_dir
-            .parent()
-            .unwrap_or(&state.renderer_dir)
-            .join("default-wallpaper");
-        let res = base.join(path.trim_start_matches("/default-wallpaper/"));
         let file = if res.is_dir() {
             res.join("index.html")
         } else {
@@ -415,11 +433,6 @@ async fn handle_conn(
         return proxy_renderer(stream, path, query, state).await;
     }
 
-    // 默认壁纸页（无壁纸时的默认 HTML 壁纸）
-    if path.starts_with("/default-wallpaper") {
-        return proxy_default_wallpaper(stream, path, state).await;
-    }
-
     // 渲染器/网页壁纸引用的顶层静态资源（assets / test-media）
     if path.starts_with("/assets") {
         return proxy_static(stream, path, state, "assets").await;
@@ -434,16 +447,7 @@ async fn handle_conn(
             .strip_prefix("msg=")
             .map(|m| percent_decode(m))
             .unwrap_or_default();
-        // 渲染器挂载成功信号（"[type src] ready"）：记时间戳供场景/网页截图等待
-        if msg.ends_with("] ready") {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            state
-                .wallpaper_ready_ms
-                .store(now, std::sync::atomic::Ordering::Relaxed);
-        }
+        record_renderer_diag(&state, &msg);
         tracing::warn!("[renderer diag] {msg}");
         return respond(stream, 200, "OK", "text/plain", b"ok", None).await;
     }
@@ -960,6 +964,7 @@ mod tests {
             media: crate::now_playing::shared(),
             sse_clients: Default::default(),
             wallpaper_ready_ms: Default::default(),
+            renderer_diag: Default::default(),
         };
 
         let items: Vec<String> = {
@@ -1064,6 +1069,80 @@ mod tests {
         std::env::var("HOME")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+    }
+
+    /// 构造一个只读用途的 ContentServerState（诊断快照测试用）
+    fn diag_test_state() -> ContentServerState {
+        ContentServerState {
+            port: 0,
+            token: "t".into(),
+            db: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            wallpapers_dir: std::env::temp_dir(),
+            renderer_dir: Default::default(),
+            audio: std::sync::Arc::new(crate::audio_capture::AudioShared::new()),
+            media: crate::now_playing::shared(),
+            sse_clients: Default::default(),
+            wallpaper_ready_ms: Default::default(),
+            renderer_diag: Default::default(),
+        }
+    }
+
+    /// 诊断前缀 `[<type> <src>] <msg>` 里抽条目 id：
+    /// scene 的 src 直接是 itemId；web 的 src 是 /web/<token>/<itemId>/… 的 URL
+    #[test]
+    fn diag_item_id_parses_scene_and_web_sources() {
+        assert_eq!(
+            diag_item_id("[scene 1948961570] ready").as_deref(),
+            Some("1948961570")
+        );
+        assert_eq!(
+            diag_item_id("[web http://127.0.0.1:8080/web/tok123/abc456/index.html] ready").as_deref(),
+            Some("abc456")
+        );
+        assert_eq!(
+            diag_item_id("[media http://127.0.0.1:8080/media/tok123/abc456/a.mp4] ready")
+                .as_deref(),
+            Some("abc456")
+        );
+        // canvas 没有 src；带路径的非 web 形态也不硬猜，一律 None
+        assert_eq!(diag_item_id("[canvas] ready"), None);
+        assert_eq!(diag_item_id("没有前缀"), None);
+    }
+
+    /// ready → 记时间戳 + 条目 id；failed: → 记原因（截图超时报错要引用它）
+    #[test]
+    fn record_renderer_diag_tracks_ready_and_failure() {
+        let state = diag_test_state();
+        assert_eq!(
+            state.wallpaper_ready_ms.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+
+        record_renderer_diag(&state, "[scene 111] mount start");
+        assert_eq!(
+            state.wallpaper_ready_ms.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "mount start 不是 ready，不该动时间戳"
+        );
+
+        record_renderer_diag(&state, "[scene 111] ready");
+        assert!(
+            state.wallpaper_ready_ms.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "ready 必须记时间戳"
+        );
+        {
+            let d = state.renderer_diag.lock().unwrap();
+            assert_eq!(d.ready_item, "111");
+            assert!(d.last.ends_with("ready"));
+            assert!(d.fail_reason.is_empty());
+        }
+
+        record_renderer_diag(&state, "[scene 111] failed: scene.pkg 加载失败");
+        let d = state.renderer_diag.lock().unwrap();
+        assert_eq!(d.fail_reason, "scene.pkg 加载失败");
+        assert!(d.fail_ms > 0);
+        // 失败不该把「已就绪的条目」清掉（重试同一张时仍可跳过重复挂载）
+        assert_eq!(d.ready_item, "111");
     }
 
     /// 随机文件端点的目录挑选逻辑：只挑普通文件、路径相对壁纸根、空目录 None
@@ -1249,6 +1328,7 @@ mod tests {
             media: crate::now_playing::shared(),
             sse_clients: Default::default(),
             wallpaper_ready_ms: Default::default(),
+            renderer_diag: Default::default(),
         };
         let html =
             b"<!DOCTYPE html><html><head><meta charset=utf-8></head><body></body></html>".to_vec();

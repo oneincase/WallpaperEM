@@ -58,22 +58,48 @@ impl WorkshopService {
         }
     }
 
-    /// 把筛选参数归一成 Steam 的 (requiredtags, excludedtags)。
+    /// 并集查询的组合数上限：组间笛卡尔积，超出时截断（防爆查询量）。
+    /// 每个组合是一次独立的 Steam 浏览请求（组内并集只能这么拆），所以上限
+    /// 同时是并发数上限；16 覆盖得住正常用法（各组选 1~2 个），也确实拦得住
+    /// 全面多选。截断时结果会漏，必须让用户看见 —— 见 `combos_of` 的返回值。
+    const MAX_COMBOS: usize = 16;
+
+    /// 把筛选参数归一成「标签组 + 排除标签」。
+    /// 组内并集（OR）、组间交集（AND）；type 入口自成一组参与交集。
     /// search 与 random 共用，保证两条路径的筛选语义完全一致。
-    fn resolve_tags(params: &WorkshopSearchParams) -> (Vec<String>, Vec<String>) {
-        let mut required: Vec<String> = Vec::new();
+    fn resolve_groups(params: &WorkshopSearchParams) -> (Vec<Vec<String>>, Vec<String>) {
+        let mut groups: Vec<Vec<String>> = Vec::new();
         if let Some(t) = params.r#type.as_deref() {
             if !t.is_empty() && t != "unknown" {
                 if let Some(tag) = TYPE_TAG.iter().find(|(k, _)| *k == t).map(|(_, v)| *v) {
-                    required.push(tag.to_string());
+                    groups.push(vec![tag.to_string()]);
                 }
             }
         }
-        for tag in &params.tags {
-            let t = tag.trim();
-            // 类型入口与标签面板可能选到同一个标签（如都选了 Scene），去重避免重复参数
-            if !t.is_empty() && !required.iter().any(|x| x == t) {
-                required.push(t.to_string());
+        if !params.tag_groups.is_empty() {
+            // 新协议：组内 OR、组间 AND
+            for g in &params.tag_groups {
+                let cleaned: Vec<String> = g
+                    .iter()
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                    .collect();
+                if cleaned.is_empty() {
+                    continue;
+                }
+                // 与已有组完全同集则跳过（类型入口与标签面板选到同一标签时不多发查询）
+                if groups.iter().any(|e| e == &cleaned) {
+                    continue;
+                }
+                groups.push(cleaned);
+            }
+        } else {
+            // 旧协议：平面 tags 严格 AND，等价于每个标签自成一组
+            for tag in &params.tags {
+                let t = tag.trim();
+                if !t.is_empty() && !groups.iter().any(|g| g.len() == 1 && g[0] == t) {
+                    groups.push(vec![t.to_string()]);
+                }
             }
         }
         let excluded: Vec<String> = params
@@ -82,7 +108,39 @@ impl WorkshopService {
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty())
             .collect();
-        (required, excluded)
+        (groups, excluded)
+    }
+
+    /// 标签组 → 查询组合（组间笛卡尔积，每个组合 = 每组取一个标签的 AND）。
+    /// 空条件得到一个空组合（不约束）；组合数超上限时截断并告警。
+    ///
+    /// 返回 `(组合, 是否被截断)`：截断意味着只查了一部分组合，结果不完整，
+    /// 调用方（`search`）要把这个事实透给前端，不能假装结果是对的。
+    fn combos_of(groups: &[Vec<String>]) -> (Vec<Vec<String>>, bool) {
+        let mut combos: Vec<Vec<String>> = vec![Vec::new()];
+        let mut truncated = false;
+        for g in groups {
+            let mut next: Vec<Vec<String>> = Vec::new();
+            for prefix in &combos {
+                for tag in g {
+                    let mut c = prefix.clone();
+                    c.push(tag.clone());
+                    next.push(c);
+                }
+            }
+            combos = next;
+            if combos.len() > Self::MAX_COMBOS {
+                tracing::warn!(
+                    "标签组合数超过 {}（{} 组），截断多余组合",
+                    Self::MAX_COMBOS,
+                    groups.len()
+                );
+                combos.truncate(Self::MAX_COMBOS);
+                truncated = true;
+                break;
+            }
+        }
+        (combos, truncated)
     }
 
     /// 搜索/筛选工坊列表（SSR 解析 + 详情批量补齐 + 二次过滤 + 5min 缓存）
@@ -95,7 +153,19 @@ impl WorkshopService {
             return serde_json::from_value(v).map_err(|e| e.to_string());
         }
 
-        let (required_tags, excluded_tags) = Self::resolve_tags(&params);
+        let (groups, excluded_tags) = Self::resolve_groups(&params);
+        let (combos, truncated) = Self::combos_of(&groups);
+
+        if combos.len() > 1 {
+            // 组内并集：拆成多次 AND 查询再合并去重（Steam 原生只支持严格 AND）
+            let result = self
+                .search_union(&params, &combos, &excluded_tags, truncated)
+                .await?;
+            self.cache_set(&key, &result);
+            return Ok(result);
+        }
+
+        let required_tags = combos.into_iter().next().unwrap_or_default();
 
         let raw = browse_workshop_raw(
             &self.client,
@@ -149,9 +219,122 @@ impl WorkshopService {
             page,
             page_size: crate::steam::browse::PAGE_SIZE,
             has_more,
+            // 单组合路径不存在截断（组合数 ≤ 1）
+            truncated: false,
         };
         self.cache_set(&key, &result);
         Ok(result)
+    }
+
+    /// 并集搜索：每个标签组合一次独立查询（抓第 1..=page 页），合并去重后统一
+    /// 过滤/排序/分页。组合间并行；组合内页码必须顺序（第 N 页依赖前 N-1 页都抓过
+    /// 才能拼出正确的并集第 N 页）。
+    async fn search_union(
+        &self,
+        params: &WorkshopSearchParams,
+        combos: &[Vec<String>],
+        excluded_tags: &[String],
+        truncated: bool,
+    ) -> Result<WorkshopSearchResult, String> {
+        const PAGE_SIZE: usize = crate::steam::browse::PAGE_SIZE;
+        // 并集查询的成本随页码线性增长（组合数 × 页数），封顶防深翻页打爆 Steam
+        const MAX_UNION_PAGE: u32 = 20;
+        let page = params.page.unwrap_or(1).clamp(1, MAX_UNION_PAGE);
+
+        let mut set = tokio::task::JoinSet::new();
+        for combo in combos {
+            let client = self.client.clone();
+            let params = params.clone();
+            let combo = combo.clone();
+            let excluded = excluded_tags.to_vec();
+            set.spawn(async move {
+                let mut items: Vec<BrowseRawItem> = Vec::new();
+                let mut total = 0usize;
+                let mut more = false;
+                for pg in 1..=page {
+                    let raw = browse_workshop_raw(
+                        &client,
+                        &BrowseQuery {
+                            query: params.query.clone(),
+                            sort: params.sort.clone(),
+                            page: Some(pg),
+                            required_tags: combo.clone(),
+                            excluded_tags: excluded.clone(),
+                            days: params.days,
+                            created_after: params.created_after,
+                            created_before: params.created_before,
+                            updated_after: params.updated_after,
+                            updated_before: params.updated_before,
+                        },
+                    )
+                    .await?;
+                    let empty = raw.items.is_empty();
+                    if pg == 1 {
+                        total = raw.total;
+                    }
+                    more = if raw.total > 0 {
+                        (pg as usize) * PAGE_SIZE < raw.total
+                    } else {
+                        raw.has_more
+                    };
+                    items.extend(raw.items);
+                    if empty {
+                        break;
+                    }
+                }
+                Ok::<_, String>((items, total, more))
+            });
+        }
+
+        let mut merged: Vec<BrowseRawItem> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut total = 0usize;
+        let mut any_more = false;
+        while let Some(res) = set.join_next().await {
+            let (items, t, more) = res.map_err(|e| e.to_string())??;
+            total += t;
+            any_more |= more;
+            for it in items {
+                if seen.insert(it.id.clone()) {
+                    merged.push(it);
+                }
+            }
+        }
+
+        let items = self.enrich(&merged).await?;
+
+        // 本地二次过滤：命中**任一组合**即保留（组内并集语义），排除标签照旧
+        let items = items
+            .into_iter()
+            .filter(|i| {
+                let ok_type = match params.r#type.as_deref() {
+                    Some(t) if !t.is_empty() => i.r#type == t,
+                    _ => true,
+                };
+                let ok_any = combos
+                    .iter()
+                    .any(|c| c.iter().all(|t| i.tags.iter().any(|x| x == t)));
+                let ok_excluded = !excluded_tags.iter().any(|t| i.tags.iter().any(|x| x == t));
+                ok_type && ok_any && ok_excluded
+            })
+            .collect::<Vec<_>>();
+
+        let items = Self::sort_items(items, params.sort.as_deref());
+
+        // 统一分页切片（合并结果可能超过一页）
+        let start = (page as usize - 1) * PAGE_SIZE;
+        let has_more = any_more || items.len() > start + PAGE_SIZE;
+        let items = items.into_iter().skip(start).take(PAGE_SIZE).collect();
+
+        Ok(WorkshopSearchResult {
+            items,
+            // 各组合总数之和：重叠条目被重复计数，是近似值（去重只在已抓页内做）
+            total,
+            page,
+            page_size: PAGE_SIZE,
+            has_more,
+            truncated,
+        })
     }
 
     /// 随机壁纸推荐：先取第 1 页解析总数，再随机选一页（绕过缓存，保证每次不同）。
@@ -162,7 +345,17 @@ impl WorkshopService {
         &self,
         params: WorkshopSearchParams,
     ) -> Result<WorkshopSearchResult, String> {
-        let (required_tags, excluded_tags) = Self::resolve_tags(&params);
+        let (groups, excluded_tags) = Self::resolve_groups(&params);
+        // 随机推荐：只从组合里挑一个，截断与否都不影响本次结果，忽略标志
+        let (combos, _) = Self::combos_of(&groups);
+        // 并集语义：随机推荐从任一组合里取即可 —— 随机选一个组合，再按原逻辑
+        // 随机页取条目，天然满足「任一命中」。均匀选组合对小组有偏，但推荐场景
+        // 不需要严格按结果数加权
+        let required_tags = {
+            use rand::Rng;
+            let idx = rand::thread_rng().gen_range(0..combos.len());
+            combos[idx].clone()
+        };
         let mk = |page: u32| BrowseQuery {
             query: params.query.clone(),
             sort: params.sort.clone(),
@@ -190,6 +383,8 @@ impl WorkshopService {
                 page: 1,
                 page_size,
                 has_more,
+                // 随机推荐只取一个组合，与截断无关
+                truncated: false,
             });
         }
 
@@ -206,6 +401,7 @@ impl WorkshopService {
             page,
             page_size,
             has_more,
+            truncated: false,
         })
     }
 
@@ -325,4 +521,58 @@ pub async fn workshop_item(
     id: String,
 ) -> Result<Option<WorkshopItem>, String> {
     svc.detail(&id).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn groups(v: &[&[&str]]) -> Vec<Vec<String>> {
+        v.iter()
+            .map(|g| g.iter().map(|s| s.to_string()).collect())
+            .collect()
+    }
+
+    /// 组间笛卡尔积：每组取一个标签组成一次 AND 查询
+    #[test]
+    fn combos_are_cartesian_product_of_groups() {
+        let (combos, truncated) =
+            WorkshopService::combos_of(&groups(&[&["Scene", "Video"], &["Anime"]]));
+        assert!(!truncated);
+        assert_eq!(
+            combos,
+            vec![
+                vec!["Scene".to_string(), "Anime".to_string()],
+                vec!["Video".to_string(), "Anime".to_string()],
+            ]
+        );
+    }
+
+    /// 无筛选 = 一个空组合（不约束），不是零个组合
+    #[test]
+    fn empty_groups_yield_single_empty_combo() {
+        let (combos, truncated) = WorkshopService::combos_of(&[]);
+        assert!(!truncated);
+        assert_eq!(combos, vec![Vec::<String>::new()]);
+    }
+
+    /// 正好顶到上限不算截断
+    #[test]
+    fn exactly_at_cap_is_not_truncated() {
+        let g = groups(&[&["a1", "a2", "a3", "a4"], &["b1", "b2", "b3", "b4"]]);
+        let (combos, truncated) = WorkshopService::combos_of(&g);
+        assert_eq!(combos.len(), WorkshopService::MAX_COMBOS);
+        assert!(!truncated);
+    }
+
+    /// 超上限：截到上限并打标志（结果会漏，前端据此提示用户）
+    #[test]
+    fn oversized_product_is_truncated_and_flagged() {
+        let g = groups(&[&["a1", "a2", "a3"], &["b1", "b2", "b3"], &["c1", "c2", "c3"]]);
+        let (combos, truncated) = WorkshopService::combos_of(&g);
+        assert!(truncated);
+        assert_eq!(combos.len(), WorkshopService::MAX_COMBOS);
+        // 截断后剩下的组合仍是合法组合（每组取一个）
+        assert!(combos.iter().all(|c| c.len() == 3));
+    }
 }

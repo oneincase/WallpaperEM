@@ -3,14 +3,25 @@
 /* 默认浅色 */
 :root {
   color-scheme: light;
-  --sidebar-alpha: 0.5;
-  --content: rgba(248, 248, 250, 0.82);
-  --sidebar: rgba(238, 238, 242, var(--sidebar-alpha));
-  --card: rgba(255, 255, 255, 0.72);
+  --sidebar-alpha: 0.78;
+  --content: #ffffff;
+  /* 活动栏（左侧导航）两级：底色用「浮动灰」，选中项再用更浅的一层浮上去。
+     和深色主题方向一致 —— 深色下也是选中项比栏底色亮（30,30,32 → #343434），
+     选中项才立得起来。 */
+  --sidebar: rgba(240, 240, 240, var(--sidebar-alpha));
+  --sidebar-sel: #ffffff;
+  /* 浮动面（卡片 / 弹层 / 抽屉 / 吐司）——比内容区亮或暗取决于主题，
+     浅色下用浅灰从纯白内容区里“浮”出来 */
+  --card: #f0f0f0;
   --separator: rgba(0, 0, 0, 0.09);
   --text-1: #1d1d1f;
   --text-2: #6e6e73;
-  --accent: #0a84ff;
+  /* 主题色：中性石墨。--accent 是「填充色」，用在选中背景、浮动面、徽标底；
+     叠字用 --accent-fg；需要在浅底上自己可见的前景（文字/图标/描边/控件填充/
+     聚焦环）用 --accent-strong —— 纯填充色当文字用会直接看不见。 */
+  --accent: #f0f0f0;
+  --accent-fg: #1d1d1f;
+  --accent-strong: #48484a;
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.06), 0 4px 16px rgba(0, 0, 0, 0.08);
 }
 /* 跟随系统：系统深色 → 深色 */
@@ -20,16 +31,19 @@
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]):not([data-theme="dark"]) {
     /* 深色下的明度关系：侧边栏（导航，最沉） < 内容区 < 卡片（最浅，浮在内容上）。
-       侧边栏基色要压得比内容区更暗，否则遇到浅色壁纸时透色会把它冲得比内容区还亮，
-       主次就反了。alpha 默认 0.72 也是为此 —— 0.55 时浅色壁纸几乎整片透上来。 */
-    --sidebar-alpha: 0.72;
-    --content: rgba(52, 52, 55, 0.9);
+       内容区已改为不透明纯色，只有侧边栏透桌面壁纸；alpha 默认 0.78 ——
+       过低（0.55 档）浅色壁纸会几乎整片透上来，把导航冲得比内容区还亮。 */
+    --sidebar-alpha: 0.78;
+    --content: #181818;
     --sidebar: rgba(30, 30, 32, var(--sidebar-alpha));
-    --card: rgba(64, 64, 68, 0.8);
+    --sidebar-sel: #343434;
+    --card: #343434;
     --separator: rgba(255, 255, 255, 0.1);
     --text-1: #f5f5f7;
     --text-2: #98989d;
-    --accent: #0a84ff;
+    --accent: #343434;
+    --accent-fg: #f5f5f7;
+    --accent-strong: #aeaeb2;
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 6px 20px rgba(0, 0, 0, 0.45);
   }
 }
@@ -37,14 +51,17 @@
 :root[data-theme="dark"] {
   color-scheme: dark;
   /* 同上：侧边栏最沉 < 内容区 < 卡片最浅 */
-  --sidebar-alpha: 0.72;
-  --content: rgba(52, 52, 55, 0.9);
+  --sidebar-alpha: 0.78;
+  --content: #181818;
   --sidebar: rgba(30, 30, 32, var(--sidebar-alpha));
-  --card: rgba(64, 64, 68, 0.8);
+  --sidebar-sel: #343434;
+  --card: #343434;
   --separator: rgba(255, 255, 255, 0.1);
   --text-1: #f5f5f7;
   --text-2: #98989d;
-  --accent: #0a84ff;
+  --accent: #343434;
+  --accent-fg: #f5f5f7;
+  --accent-strong: #aeaeb2;
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 6px 20px rgba(0, 0, 0, 0.45);
 }
 /* 强制浅色 */
@@ -70,19 +87,34 @@ body {
   cursor: default;
 }
 
-/* 独立「壁纸设置」窗口：高 alpha 半透明底色 = 磨砂质感（太透会看不清文字）。
+/* 独立「壁纸设置」窗口：半透明底色 + 原生窗口材质 = 磨砂质感。
    不要用 backdrop-filter 磨砂——透明 WKWebView 里 backdrop 层不稳定，
-   内容绘制一两次后会被 WebKit 丢弃，表现为"刚开是磨砂、一两秒后变纯半透明"。 */
+   内容绘制一两次后会被 WebKit 丢弃，表现为"刚开是磨砂、一两秒后变纯半透明"。
+   macOS 的真模糊由原生 vibrancy 提供（props_window.rs），CSS 只需把 alpha
+   降到与主界面侧边栏一致的 0.78 让材质透出来；其他平台没有窗口材质，
+   保持 0.88 高 alpha 兜底可读性（props-main.tsx 会给 <html> 标 data-os）。 */
 .props-tint {
-  background: rgba(248, 248, 250, 0.88);
+  background: rgba(240, 240, 240, 0.88);
+}
+:root[data-os="macos"] .props-tint,
+:root[data-os="windows"] .props-tint {
+  background: rgba(240, 240, 240, 0.78);
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) .props-tint {
-    background: rgba(30, 30, 32, 0.88);
+    background: rgba(52, 52, 52, 0.88);
+  }
+  :root:not([data-theme="light"])[data-os="macos"] .props-tint,
+  :root:not([data-theme="light"])[data-os="windows"] .props-tint {
+    background: rgba(52, 52, 52, 0.78);
   }
 }
 :root[data-theme="dark"] .props-tint {
-  background: rgba(30, 30, 32, 0.88);
+  background: rgba(52, 52, 52, 0.88);
+}
+:root[data-theme="dark"][data-os="macos"] .props-tint,
+:root[data-theme="dark"][data-os="windows"] .props-tint {
+  background: rgba(52, 52, 52, 0.78);
 }
 
 /* 系统风按钮 */
@@ -107,12 +139,53 @@ body {
   transform: scale(0.97);
 }
 .btn-primary {
-  background: var(--accent);
+  /* 主按钮要能同时立在内容区（--content）和浮动面（--card）上：用 --accent-strong
+     填充（纯 --accent 在浅色下与卡片同色、按钮会“消失”），文字取内容区底色 ——
+     浅色下白字压深灰、深色下深字压浅灰，两个主题都够对比 */
+  background: var(--accent-strong);
   border-color: transparent;
-  color: #fff;
+  color: var(--content);
 }
 .btn-danger {
   color: #ff453a;
+}
+
+/* 键盘聚焦反馈（鼠标点击不触发，:focus-visible 只在键盘导航时出现） */
+:focus-visible {
+  outline: 2px solid var(--accent-strong);
+  outline-offset: 1px;
+}
+
+/* 弹层入场动效：遮罩淡入 + 面板轻弹（缩放回弹 + 轻微上浮） */
+@keyframes overlay-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes modal-pop-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+.animate-overlay {
+  animation: overlay-fade-in 0.18s ease-out;
+}
+.animate-modal-pop {
+  animation: modal-pop-in 0.24s cubic-bezier(0.22, 1, 0.36, 1);
+}
+@media (prefers-reduced-motion: reduce) {
+  .animate-overlay,
+  .animate-modal-pop {
+    animation: none;
+  }
 }
 
 /* 卡片 */

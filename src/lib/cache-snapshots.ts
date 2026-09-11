@@ -84,3 +84,23 @@ export function writeState<T>(key: string, value: T): void {
     /* ignore */
   }
 }
+
+/**
+ * 清除内容快照（工坊/发现的列表缓存 —— 设置页「清除缓存」的浏览器侧那半）。
+ *
+ * 只删 `we.cache.` 前缀的键：同前缀之外还有界面状态（导航位置、筛选条件、
+ * 侧边栏透明度等，见 STATE_PREFIX），那些是用户的设置不是缓存，清掉会让
+ * 用户「清个缓存把调好的筛选也弄丢了」。
+ */
+export function clearSnapshotCaches(): void {
+  try {
+    const keys: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith(PREFIX)) keys.push(k);
+    }
+    for (const k of keys) localStorage.removeItem(k);
+  } catch {
+    /* 无痕模式禁用 storage 等情况：没有缓存可清，忽略 */
+  }
+}

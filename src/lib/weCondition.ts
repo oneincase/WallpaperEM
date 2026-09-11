@@ -1,4 +1,6 @@
 // Wallpaper Engine 属性显隐条件（project.json `condition`）求值器。
+import { tr } from "./i18n";
+
 //
 // 真实壁纸里 86% 的属性带 condition，形如：
 //   clock_enable.value
@@ -41,7 +43,7 @@ function tokenize(src: string): Token[] {
     // 字符串：单/双引号，不支持转义（真实数据里没有）
     if (c === "'" || c === '"') {
       const end = src.indexOf(c, i + 1);
-      if (end < 0) throw new Error("未闭合的字符串");
+      if (end < 0) throw new Error(tr("未闭合的字符串"));
       out.push({ k: "str", v: src.slice(i + 1, end) });
       i = end + 1;
       continue;
@@ -61,7 +63,7 @@ function tokenize(src: string): Token[] {
       continue;
     }
     const op = OPS.find((o) => src.startsWith(o, i));
-    if (!op) throw new Error(`无法识别的字符 ${c}`);
+    if (!op) throw new Error(tr("无法识别的字符 {c}", { c }));
     out.push({ k: "op", v: op });
     i += op.length;
   }
@@ -106,7 +108,7 @@ function parse(tokens: Token[]): Node {
   const peek = () => tokens[pos];
   const eat = (v: string) => {
     const t = peek();
-    if (!t || t.k !== "op" || t.v !== v) throw new Error(`期望 ${v}`);
+    if (!t || t.k !== "op" || t.v !== v) throw new Error(tr("期望 {v}", { v }));
     pos++;
   };
 
@@ -166,7 +168,7 @@ function parse(tokens: Token[]): Node {
 
   function primary(): Node {
     const t = peek();
-    if (!t) throw new Error("表达式意外结束");
+    if (!t) throw new Error(tr("表达式意外结束"));
     if (t.k === "op" && t.v === "(") {
       pos++;
       const inner = or();
@@ -176,7 +178,7 @@ function parse(tokens: Token[]): Node {
     if (t.k === "num") {
       pos++;
       const n = Number(t.v);
-      if (Number.isNaN(n)) throw new Error(`非法数字 ${t.v}`);
+      if (Number.isNaN(n)) throw new Error(tr("非法数字 {v}", { v: t.v }));
       return () => n;
     }
     if (t.k === "str") {
@@ -193,16 +195,16 @@ function parse(tokens: Token[]): Node {
       if (peek()?.k === "op" && peek().v === ".") {
         pos++;
         const m = peek();
-        if (!m || m.k !== "id" || m.v !== "value") throw new Error("仅支持 .value");
+        if (!m || m.k !== "id" || m.v !== "value") throw new Error(tr("仅支持 .value"));
         pos++;
       }
       return (v) => v[name];
     }
-    throw new Error(`意外的 ${t.v}`);
+    throw new Error(tr("意外的 {v}", { v: t.v }));
   }
 
   const root = or();
-  if (pos !== tokens.length) throw new Error("表达式有多余内容"); // 三元/赋值等落到这里
+  if (pos !== tokens.length) throw new Error(tr("表达式有多余内容")); // 三元/赋值等落到这里
   return root;
 }
 

@@ -1,0 +1,27 @@
+{
+  "type": "scene",
+  "title": "{{TITLE}}",
+  "file": "scene.json",
+  "version": 1,
+  "tags": ["Everyone"],
+  "general": {
+    "properties": {
+      "schemecolor": {
+        "order": 0,
+        "text": "ui_browse_properties_scheme_color",
+        "type": "color",
+        "value": "0.28 0.62 1"
+      },
+      "glow": {
+        "order": 1,
+        "text": "辉光强度",
+        "type": "slider",
+        "value": 0.55,
+        "min": 0,
+        "max": 1,
+        "step": 0.05,
+        "precision": 2
+      }
+    }
+  }
+}

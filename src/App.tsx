@@ -20,7 +20,9 @@ import {
   IconAuto,
 } from "./components/icons";
 import { applySidebarAlpha, getSidebarAlpha } from "./lib/sidebar";
+import { GuardDialogs } from "./components/GuardDialogs";
 import { readState, writeState } from "./lib/cache-snapshots";
+import { applyDocumentLang, pushLocaleToBackend, tr, useLocale } from "./lib/i18n";
 
 type PageId = "home" | "workshop" | "downloads" | "library" | "favorites" | "settings";
 type Theme = "system" | "light" | "dark";
@@ -73,6 +75,9 @@ export default function App() {
 }
 
 function Shell() {
+  // 界面语言：**只在根组件订阅一次** —— 根重渲染会带整棵树一起重渲染，页面里的
+  // tr() 才会重新取词。子组件因此不必各自订阅语言（本项目没有 React.memo 截断渲染）。
+  useLocale();
   const [page, setPage] = useState<PageId>(readInitialPage);
   // 详情抽屉：detailId 非 null 时抽屉挂载；shown 控制滑入/滑出（关闭时先滑出、
   // 动画结束再卸载，保证「向右滑动隐藏」可见）
@@ -107,6 +112,11 @@ function Shell() {
   // 应用侧边栏透明度
   useEffect(() => {
     applySidebarAlpha(getSidebarAlpha());
+  }, []);
+
+  // 启动时把语言推给后端一次：后端默认跟随系统语言，可能与用户上次的选择不同
+  useEffect(() => {
+    pushLocaleToBackend();
   }, []);
 
   // 冻结自检：系统睡眠/合盖后 WebKit 可能恢复出一个「卡死」的页面（定时器全部
@@ -212,9 +222,9 @@ function Shell() {
           {collapsed ? (
             <button
               onClick={toggleCollapsed}
-              title="展开侧边栏"
-              aria-label="展开侧边栏"
-              className="group relative flex h-8 w-8 items-center justify-center rounded-[8px] overflow-hidden text-[var(--text-2)] transition-colors hover:bg-black/5 hover:text-[var(--text-1)] dark:hover:bg-white/8"
+              title={tr("展开侧边栏")}
+              aria-label={tr("展开侧边栏")}
+              className="group relative flex h-8 w-8 items-center justify-center rounded-[8px] overflow-hidden text-[var(--text-2)] transition-all duration-150 active:scale-90 hover:bg-black/5 hover:text-[var(--text-1)] dark:hover:bg-white/8"
             >
               <img
                 src="/icon/icon_32x32@2x.png"
@@ -233,9 +243,9 @@ function Shell() {
               <span className="text-[13.5px] font-semibold tracking-tight">WallpaperEM</span>
               <button
                 onClick={toggleCollapsed}
-                title="收起侧边栏"
-                aria-label="收起侧边栏"
-                className="ml-auto flex h-6 w-6 items-center justify-center rounded-[6px] text-[var(--text-2)] transition-colors hover:bg-black/5 hover:text-[var(--text-1)] dark:hover:bg-white/8"
+                title={tr("收起侧边栏")}
+                aria-label={tr("收起侧边栏")}
+                className="ml-auto flex h-6 w-6 items-center justify-center rounded-[6px] text-[var(--text-2)] transition-all duration-150 active:scale-90 hover:bg-black/5 hover:text-[var(--text-1)] dark:hover:bg-white/8"
               >
                 <IconSidebarCollapse />
               </button>
@@ -248,7 +258,7 @@ function Shell() {
             <div key={group}>
               {!collapsed && (
                 <div className="px-2 pb-1 text-[11px] font-semibold uppercase tracking-wide text-[var(--text-2)]/70">
-                  {group}
+                  {tr(group)}
                 </div>
               )}
               <div className="space-y-0.5">
@@ -256,17 +266,17 @@ function Shell() {
                   <button
                     key={item.id}
                     onClick={() => navigate(item.id)}
-                    title={collapsed ? item.label : undefined}
+                    title={collapsed ? tr(item.label) : undefined}
                     className={`${
                       collapsed ? "w-full justify-center" : "w-full justify-start gap-2.5 px-2.5"
-                    } flex items-center rounded-[7px] py-[5px] text-[13.5px] transition-colors ${
+                    } flex items-center rounded-[7px] py-[5px] text-[13.5px] transition-all duration-150 active:scale-[0.97] ${
                       page === item.id && !detailId
-                        ? "bg-[var(--accent)] text-white shadow-sm"
+                        ? "bg-[var(--sidebar-sel)] text-[var(--accent-fg)] shadow-sm"
                         : "text-[var(--text-1)] hover:bg-black/5 dark:hover:bg-white/8"
                     }`}
                   >
                     {item.icon}
-                    {!collapsed && item.label}
+                    {!collapsed && tr(item.label)}
                   </button>
                 ))}
               </div>
@@ -279,12 +289,16 @@ function Shell() {
           <button
             onClick={cycleTheme}
             data-tip={
-              theme === "system" ? "主题：跟随系统" : theme === "light" ? "主题：浅色" : "主题：深色"
+              theme === "system"
+                ? tr("主题：跟随系统")
+                : theme === "light"
+                  ? tr("主题：浅色")
+                  : tr("主题：深色")
             }
-            aria-label="切换主题"
+            aria-label={tr("切换主题")}
             className={`${
               collapsed ? "w-full justify-center" : "w-full justify-start gap-2.5 px-2.5"
-            } flex items-center rounded-[7px] py-[5px] text-[13.5px] transition-colors text-[var(--text-2)] hover:text-[var(--text-1)] hover:bg-black/5 dark:hover:bg-white/8`}
+            } flex items-center rounded-[7px] py-[5px] text-[13.5px] transition-all duration-150 text-[var(--text-2)] hover:text-[var(--text-1)] hover:bg-black/5 dark:hover:bg-white/8 active:scale-[0.97]`}
           >
             {theme === "system" ? (
               <IconAuto />
@@ -295,7 +309,7 @@ function Shell() {
             )}
             {!collapsed && (
               <span>
-                {theme === "system" ? "跟随系统" : theme === "light" ? "浅色" : "深色"}
+                {theme === "system" ? tr("跟随系统") : theme === "light" ? tr("浅色") : tr("深色")}
               </span>
             )}
           </button>
@@ -333,7 +347,7 @@ function Shell() {
                 }`}
               />
               <div
-                className={`absolute inset-y-0 right-0 z-30 w-[420px] max-w-[88%] border-l border-[var(--separator)] bg-[var(--content)] shadow-2xl transition-transform duration-300 ease-out ${
+                className={`absolute inset-y-0 right-0 z-30 w-[420px] max-w-[88%] border-l border-[var(--separator)] bg-[var(--card)] shadow-2xl transition-transform duration-300 ease-out ${
                   detailShown ? "translate-x-0" : "translate-x-full"
                 }`}
               >
@@ -343,6 +357,9 @@ function Shell() {
           )}
         </div>
       </main>
+
+      {/* 全局 Steam Guard 验证码 / 手机确认弹窗（不依附下载页） */}
+      <GuardDialogs />
     </div>
   );
 }

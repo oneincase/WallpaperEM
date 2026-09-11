@@ -1,6 +1,6 @@
 [package]
 name = "WallpaperEM"
-version = "0.4.0"
+version = "0.5.0"
 description = "WallpaperEM —— 跨平台动态壁纸引擎（Tauri 2.11.2），支持 Steam 工坊视频/场景/网页/图片壁纸"
 license = "MIT"
 edition = "2021"
@@ -83,4 +83,37 @@ wayland-backend = { version = "0.3", features = ["client_system"] }
 wayland-protocols-plasma = { version = "0.3", features = ["client"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+# Windows 凭据存储：Credential Manager（与 macOS apple-native / Linux linux-native 对齐；
+# 主凭据同样走 secure_store 本地加密文件，keychain.rs 仅为旧版回退/迁移来源）
 keyring = { version = "3", features = ["windows-native"] }
+# 桌面层窗口（WorkerW 父子化）、系统光标/按键、全局音频 loopback（WASAPI）、
+# 「正在播放」（GSMTC）、ConPTY（steamcmd 交互）都直调 Win32/WinRT。
+# 版本与 tauri 2.11 / tauri-plugin-desktop-underlay 保持一致（同一份 HWND 类型）。
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Accessibility",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+    "Win32_System_Pipes",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Power",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_Security",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Media",
+    "Media_Control",
+    "Foundation",
+    "Storage",
+    "Storage_Streams",
+] }

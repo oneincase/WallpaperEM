@@ -25,12 +25,13 @@ pub fn open(app: &AppHandle, item_id: &str) -> tauri::Result<()> {
     // 只加载 props.html，query 带 itemId（props-main.tsx 读取）
     let url = format!("props.html?item={}", urlencode(item_id));
     let builder = WebviewWindowBuilder::new(app, &label, WebviewUrl::App(url.into()))
-        .title("壁纸设置")
+        // 原生标题栏文案（页面里的 document.title 由 props-main.tsx 自己设）
+        .title(crate::i18n::tr("壁纸设置"))
         .inner_size(620.0, 640.0)
         .min_inner_size(480.0, 420.0)
         .center()
         .resizable(true)
-        // 透明窗口 + 面板的 rgba(--content) + backdrop-blur = 与主窗口一致的磨砂
+        // 透明窗口 + 面板 .props-tint 半透明底色 + 原生 vibrancy（下方）= 磨砂
         .transparent(true);
     // Overlay 标题栏/隐藏标题是 macOS-only API；Linux 下窗口带原生标题栏
     #[cfg(target_os = "macos")]
@@ -38,6 +39,22 @@ pub fn open(app: &AppHandle, item_id: &str) -> tauri::Result<()> {
         .title_bar_style(tauri::TitleBarStyle::Overlay)
         .hidden_title(true);
     let win = builder.build()?;
+
+    // 平台磨砂材质：与主窗口一致（macOS 侧栏 vibrancy / Windows Acrylic），
+    // 让 .props-tint 的半透明底色透出真模糊 —— CSS backdrop-filter 在透明
+    // WKWebView 里会被 WebKit 丢弃（见 index.css），只能靠原生材质。
+    // 材质只能在主线程调用（同 main_window.rs 的重建路径），
+    // 统一走 run_on_main_thread，避免托盘/命令入口所在线程不确定。
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        let app2 = app.clone();
+        let label2 = label.clone();
+        let _ = app.run_on_main_thread(move || {
+            if let Some(w) = app2.get_webview_window(&label2) {
+                crate::apply_backdrop(&w);
+            }
+        });
+    }
 
     // 背景拖动：WKWebView 的原生手势在非交互区域会吃掉鼠标事件，页面 JS 拖动
     // 与之冲突 = "时灵时不灵"。显式开启系统背景拖动（movableByWindowBackground），

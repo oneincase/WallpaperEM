@@ -48,9 +48,14 @@ export interface WorkshopItem extends WorkshopItemSummary {
 export interface WorkshopSearchParams {
   query?: string;
   type?: WallpaperType | "";
-  /** 必需标签。Steam 侧是**严格 AND**，多选只会让结果更少 */
+  /**
+   * 分组标签：组内并集（OR）、组间交集（AND），空数组/全空组 = 不约束。
+   * 后端按组的笛卡尔积拆成多次 Steam 查询再合并（Steam 原生只支持严格 AND）。
+   */
+  tagGroups?: string[][];
+  /** 旧版平面必需标签（严格 AND），等价于每个标签自成一组；新代码请用 tagGroups */
   tags?: string[];
-  /** 排除标签（命中任一即排除） */
+  /** 排除标签（命中任一即排除）。两态筛选 UI 已不下发，仅为兼容保留 */
   excludedTags?: string[];
   sort?: string;
   /** 趋势时间范围（天）。仅 sort=trend 时生效 */
@@ -67,6 +72,9 @@ export interface LibraryFilter {
   type?: WallpaperType | "";
   /** 标题模糊搜索 */
   query?: string;
+  /** 分组标签：组内并集、组间交集；"$local" 匹配本地导入（custom-*）条目 */
+  tagGroups?: string[][];
+  /** 旧版平面必需标签（AND），新代码请用 tagGroups */
   tags?: string[];
   excludedTags?: string[];
   minSize?: number;
@@ -84,6 +92,11 @@ export interface WorkshopSearchResult {
   page: number;
   pageSize: number;
   hasMore: boolean;
+  /**
+   * 标签组合数超出后端上限：只查了一部分标签组合，结果不完整。
+   * 可选 —— 旧版本写入的页面快照里没有这个字段。
+   */
+  truncated?: boolean;
 }
 
 export type DownloadStatus =
@@ -140,6 +153,33 @@ export interface SteamcmdInstallProgress {
   message: string;
 }
 
+/** 抽帧组件（ffmpeg）状态：视频/GIF 壁纸抽首帧、本地库视频封面都依赖它 */
+export interface FfmpegStatus {
+  /** 当前平台是否提供托管 ffmpeg（macOS 走 AVFoundation 抽帧，恒 false） */
+  supported: boolean;
+  /** 应用内安装的托管副本已就绪 */
+  managed: boolean;
+  /** 系统 PATH 上检测到可用的 ffmpeg */
+  system: boolean;
+  /** 实际生效的来源（托管副本优先） */
+  active: "managed" | "system" | null;
+  version: string | null;
+  path: string | null;
+  /** 托管副本占用的字节数 */
+  sizeBytes: number;
+  /** 托管目录（应用数据目录下） */
+  dir: string | null;
+  /** 预计下载体积（平台不同，仅用于文案） */
+  expectedDownloadBytes: number;
+}
+
+/** ffmpeg 安装进度事件 `ffmpeg:install-progress` 的载荷 */
+export interface FfmpegInstallProgress {
+  phase: "download" | "extract";
+  progress: number;
+  message: string;
+}
+
 /** 批量导入结果（文件多选/文件夹/拖拽共用）：逐条容错 */
 export type ImportBatchResult = {
   cancelled?: boolean;
@@ -152,6 +192,19 @@ export type ImportBatchResult = {
 };
 
 export const api = {
+  // 关于 / 更新
+  /** 应用信息（名称/版本/平台/架构） */
+  appInfo: () =>
+    invoke<{ name: string; version: string; os: string; arch: string; description: string }>(
+      "app_info"
+    ),
+  /** 检查更新（读 GitHub Releases 最新版并与当前版本比对） */
+  appUpdateCheck: () => invoke<UpdateInfo>("app_update_check"),
+  /** 下载匹配当前平台的安装包到缓存目录，返回落地路径（进度走 update:progress 事件） */
+  appUpdateDownload: (url: string, name: string) =>
+    invoke<string>("app_update_download", { url, name }),
+  /** 打开已下载的安装包，返回给用户看的操作提示 */
+  appUpdateOpen: (path: string) => invoke<string>("app_update_open", { path }),
   // 工坊
   workshopSearch: (params: WorkshopSearchParams) =>
     invoke<WorkshopSearchResult>("workshop_search", { params }),
@@ -167,6 +220,14 @@ export const api = {
       { force }
     ),
   steamcmdUninstall: () => invoke<void>("steamcmd_uninstall_tool"),
+  // 抽帧组件（ffmpeg）：Linux/Windows 上「视频/GIF → 静态壁纸」与本地库视频封面要用
+  ffmpegStatus: () => invoke<FfmpegStatus>("ffmpeg_status"),
+  ffmpegInstall: (force?: boolean) =>
+    invoke<{ installed: boolean; skipped?: boolean; version?: string; path?: string }>(
+      "ffmpeg_install",
+      { force }
+    ),
+  ffmpegUninstall: () => invoke<void>("ffmpeg_uninstall"),
   downloadCredentialsSet: (username: string, password: string) =>
     invoke<{ ok: boolean; username: string }>("download_credentials_set", {
       username,
@@ -175,6 +236,10 @@ export const api = {
   downloadCredentialsStatus: () =>
     invoke<{ configured: boolean; username?: string }>("download_credentials_status"),
   downloadCredentialsClear: () => invoke<void>("download_credentials_clear"),
+  /** 入队「登录验证」任务（steamcmd +login +quit），交互走全局 Guard 弹窗 */
+  downloadVerifyLogin: () => invoke<number>("download_verify_login"),
+  /** 只建立网页会话（保存凭据时的双验证用），不拉订阅列表 */
+  accountWebLoginStart: () => invoke<AccountWebLoginResponse>("account_web_login_start"),
   downloadEnqueue: (itemId: string) => invoke<number>("download_enqueue", { itemId }),
   downloadList: () => invoke<DownloadTask[]>("download_list"),
   downloadCancel: (id: number) => invoke<boolean>("download_cancel", { id }),
@@ -260,9 +325,46 @@ export const api = {
     invoke<number>("playlist_create", { name, itemIds, intervalSec }),
   playlistDelete: (id: number) => invoke<boolean>("playlist_delete", { id }),
   playlistApply: (id: number) => invoke<Playlist>("playlist_apply", { id }),
+  // 订阅同步（网页会话登录 Steam → 拉取已订阅工坊列表）
+  subscriptionsStatus: () =>
+    invoke<{ configured: boolean; username?: string; hasSession: boolean }>(
+      "subscriptions_status",
+    ),
+  /** 拉取一页订阅（page 从 1 开始，每页 30 条；响应带 total 总数供懒加载判断） */
+  subscriptionsPage: (page: number) =>
+    invoke<SubscriptionsResponse>("subscriptions_page", { page }),
+  subscriptionsSubmitCode: (code: string) =>
+    invoke<SubscriptionsResponse>("subscriptions_submit_code", { code }),
+  subscriptionsLogout: () => invoke<void>("subscriptions_logout"),
+  /** 开启扫码登录，返回要渲染成二维码的 challengeUrl */
+  subscriptionsQrBegin: () => invoke<QrResponse>("subscriptions_qr_begin"),
+  /** 扫码轮询（单次最多阻塞 ~8s）：拿到订阅列表返回 ok，否则回传二维码继续等 */
+  subscriptionsQrPoll: () => invoke<QrResponse>("subscriptions_qr_poll"),
   networkProbe: () => invoke<{ results: NetcheckItem[]; allOk: boolean; hint: string }>("network_probe"),
   diagnosticsExport: () => invoke<string>("diagnostics_export"),
+  /** 当前缓存占用（预览图/网页缓存 + 壁纸首帧封面） */
+  cacheStats: () => invoke<CacheStats>("cache_stats"),
+  /** 清除缓存，返回实际释放的字节数 */
+  cacheClear: () => invoke<number>("cache_clear"),
+  // MCP（AI agent 接入，见 README「MCP 服务」）
+  mcpStatus: () => invoke<McpStatus>("mcp_status"),
+  mcpSetEnabled: (enabled: boolean) => invoke<McpStatus>("mcp_set_enabled", { enabled }),
+  mcpSetPort: (port: number) => invoke<McpStatus>("mcp_set_port", { port }),
+  mcpRotateToken: () => invoke<McpStatus>("mcp_rotate_token"),
+  mcpConfigSnippet: () => invoke<McpConfigSnippet>("mcp_config_snippet"),
 };
+
+export interface CacheEntry {
+  key: string;
+  label: string;
+  bytes: number;
+  path: string;
+}
+
+export interface CacheStats {
+  bytes: number;
+  entries: CacheEntry[];
+}
 
 export interface LibraryItem {
   itemId: string;
@@ -283,6 +385,8 @@ export interface FavoriteItem {
   previewUrl?: string;
   type: WallpaperType;
   createdAt: number;
+  /** 工坊订阅数（= 下载量）。元数据缓存里没有该条目时为 0 */
+  subscriptions: number;
 }
 
 export interface NetcheckItem {
@@ -379,14 +483,111 @@ export interface WebPropDef {
 
 export type WebPropValues = Record<string, string | number | boolean>;
 
+// ---------- 订阅同步 ----------
+
+export interface SubscriptionItem {
+  id: string;
+  title: string;
+  previewUrl: string;
+  type: WallpaperType;
+  subscriptions?: number;
+  /** 已在本地库（不必再下载） */
+  downloaded: boolean;
+}
+
+/**
+ * 订阅拉取结果：
+ * - ok：拿到列表
+ * - needCode：需要 Steam Guard 验证码（device=手机令牌 / email=邮箱码）
+ * - pendingConfirmation：等待手机 App 确认登录，前端应提示后重试 subscriptionsList
+ */
+export type SubscriptionsResponse =
+  | { status: "ok"; items: SubscriptionItem[]; total: number; page: number }
+  | { status: "needCode"; codeType: "device" | "email"; message: string }
+  | { status: "pendingConfirmation"; message: string }
+  /** 本地保存的账号密码被 Steam 拒绝（EResult 5），需要用户重新输入 */
+  | { status: "badCredentials"; message: string; username?: string }
+  /** 验证/扫码已成功且凭证已保存，前端应给出「登录成功」反馈后拉取第一页 */
+  | { status: "confirmed" };
+
+/** 网页会话建立结果（不含订阅数据）：ok=会话已建立 */
+export type AccountWebLoginResponse =
+  | { status: "ok" }
+  | { status: "needCode"; codeType: "device" | "email"; message: string }
+  | { status: "pendingConfirmation"; message: string }
+  | { status: "badCredentials"; message: string; username?: string };
+
+/** 扫码登录响应：qr=继续展示二维码等待确认；confirmed=已确认并保存凭证 */
+export type QrResponse =
+  | { status: "qr"; challengeUrl: string }
+  | { status: "confirmed" };
+
 /** 系统音频处理（音频可视化）状态 */
 export interface AudioProcessingStatus {
   /** 设置开关（持久化） */
   enabled: boolean;
   /** 捕获是否运行中 */
   running: boolean;
-  /** 屏幕录制权限是否已授予 */
+  /** 采集权限是否已授予（macOS = 屏幕录制 TCC；Windows WASAPI loopback 无需授权，恒为 true） */
   granted: boolean;
-  /** 当前平台是否支持系统音频捕获（macOS 支持；Linux 待接入 PipeWire） */
+  /** 当前平台是否支持系统音频捕获（macOS CoreAudio / Windows WASAPI 支持；Linux 待接入 PipeWire） */
   supported: boolean;
+}
+
+/** 一次 MCP 工具调用记录（内存环形缓冲，最多 50 条） */
+export interface McpCallLog {
+  tool: string;
+  ok: boolean;
+  ms: number;
+  summary: string;
+  /** unix 毫秒时间戳 */
+  at: number;
+}
+
+/** MCP 服务状态 */
+export interface McpStatus {
+  /** 应用内是否挂载了 MCP 子系统（未挂载时其余字段缺失） */
+  available: boolean;
+  enabled: boolean;
+  /** HTTP 监听是否真的起来了（端口被占用时为 false，原因见 lastError） */
+  running: boolean;
+  port: number;
+  token: string;
+  url: string;
+  urlWithToken: string;
+  /** 启动失败原因（端口占用等），成功时为 null */
+  lastError: string | null;
+  calls: McpCallLog[];
+}
+
+/** 客户端接入片段（设置页一键复制） */
+export interface McpConfigSnippet {
+  url: string;
+  /** mcpServers JSON 片段 */
+  json: string;
+  codexCli: string;
+  claudeCli: string;
+}
+
+/** 更新包（当前平台匹配到的那个） */
+export interface UpdateAsset {
+  name: string;
+  url: string;
+  /** 字节数；GitHub 未给时为 0 */
+  size: number;
+}
+
+/** 更新检查结果（对齐 Rust `UpdateInfo`） */
+export interface UpdateInfo {
+  current: string;
+  latest: string;
+  hasUpdate: boolean;
+  /** Release 标题 */
+  name: string;
+  /** Release 说明（Markdown 原文，界面按纯文本展示） */
+  notes: string;
+  publishedAt: string;
+  htmlUrl: string;
+  /** 没有匹配当前平台的安装包时为 null（仍可走 htmlUrl 手动下载） */
+  asset: UpdateAsset | null;
 }

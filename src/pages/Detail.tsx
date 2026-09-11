@@ -7,6 +7,8 @@ import { useItemProps } from "../hooks/useItemProps";
 import { WallpaperPropsModal } from "../components/WallpaperPropsModal";
 import { IconSliders } from "../components/icons";
 import { useMessage } from "../components/Message";
+import { tr, trMsg } from "../lib/i18n";
+import { tagLabel } from "../lib/tags";
 
 export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
   const [item, setItem] = useState<WorkshopItem | null>(null);
@@ -41,11 +43,11 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
     <div className="flex h-full flex-col">
       {/* 抽屉头部：标题栏 + 关闭 */}
       <div className="flex h-12 shrink-0 items-center gap-2 border-b border-[var(--separator)] px-4">
-        <span className="text-[13px] font-semibold tracking-tight">壁纸详情</span>
+        <span className="text-[13px] font-semibold tracking-tight">{tr("壁纸详情")}</span>
         <button
           onClick={onBack}
-          title="关闭"
-          aria-label="关闭详情"
+          title={tr("关闭")}
+          aria-label={tr("关闭详情")}
           className="ml-auto flex h-6 w-6 items-center justify-center rounded-[6px] text-[var(--text-2)] transition-colors hover:bg-black/5 hover:text-[var(--text-1)] dark:hover:bg-white/8"
         >
           <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
@@ -55,9 +57,13 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
       </div>
 
       <div className="flex-1 overflow-y-auto">
-        {loading && <div className="py-20 text-center text-[13px] text-[var(--text-2)]">加载中…</div>}
+        {loading && (
+          <div className="py-20 text-center text-[13px] text-[var(--text-2)]">{tr("加载中…")}</div>
+        )}
         {!loading && (error || !item) && (
-          <div className="py-20 text-center text-[13px] text-red-500">{error || "条目不存在"}</div>
+          <div className="py-20 text-center text-[13px] text-red-500">
+            {error ? trMsg(error) : tr("条目不存在")}
+          </div>
         )}
 
         {!loading && item && (
@@ -75,15 +81,15 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
               <div className="min-w-0">
                 <h1 className="text-[17px] font-bold leading-snug tracking-tight">{item.title}</h1>
                 <div className="mt-1.5 flex items-center gap-1.5 flex-wrap">
-                  <span className="rounded-full bg-[var(--accent)]/10 px-2 py-0.5 text-[11px] font-medium text-[var(--accent)]">
-                    {TYPE_LABELS[item.type]}
+                  <span className="rounded-full border border-[var(--separator)] bg-[var(--accent)] px-2 py-0.5 text-[11px] font-medium text-[var(--accent-strong)]">
+                    {tr(TYPE_LABELS[item.type])}
                   </span>
                   {item.tags.slice(0, 4).map((t) => (
                     <span
                       key={t}
                       className="rounded-full border border-[var(--separator)] px-2 py-0.5 text-[10.5px] text-[var(--text-2)]"
                     >
-                      {t}
+                      {tagLabel(t)}
                     </span>
                   ))}
                 </div>
@@ -92,13 +98,23 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
 
             <div className="mt-3 flex gap-4 text-[12px] text-[var(--text-2)] flex-wrap">
               {item.subscriptions !== undefined && (
-                <span>⬇ 订阅 {item.subscriptions.toLocaleString()}</span>
+                <span>
+                  ⬇ {tr("订阅")} {item.subscriptions.toLocaleString()}
+                </span>
               )}
-              {item.favorited !== undefined && <span>★ 收藏 {item.favorited.toLocaleString()}</span>}
+              {item.favorited !== undefined && (
+                <span>
+                  ★ {tr("收藏")} {item.favorited.toLocaleString()}
+                </span>
+              )}
               {item.fileSize !== undefined && (
                 <span>📦 {(item.fileSize / 1024 / 1024).toFixed(1)} MB</span>
               )}
-              {item.creator && <span>作者 {item.creator}</span>}
+              {item.creator && (
+                <span>
+                  {tr("作者")} {item.creator}
+                </span>
+              )}
             </div>
 
             {/* 操作区 */}
@@ -107,9 +123,9 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
                 <button
                   className="btn !bg-sky-500/15 !text-sky-600 dark:!text-sky-400 !border-sky-500/30 cursor-default disabled:opacity-75"
                   disabled
-                  title="已下载到本地库"
+                  title={tr("已下载到本地库")}
                 >
-                  已下载
+                  {tr("已下载")}
                 </button>
               ) : (
                 <button
@@ -119,7 +135,7 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
                     setEnqueuing(true);
                     try {
                       await api.downloadEnqueue(item.id);
-                      msg.success("已加入下载队列，请到「下载」页查看进度");
+                      msg.success(tr("已加入下载队列，请到「下载」页查看进度"));
                     } catch (e) {
                       msg.error(String(e));
                     } finally {
@@ -127,22 +143,22 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
                     }
                   }}
                 >
-                  {enqueuing ? "…" : "⬇ 下载"}
+                  {enqueuing ? "…" : `⬇ ${tr("下载")}`}
                 </button>
               )}
               {applied ? (
                 <button
                   className="btn !bg-green-500/15 !text-green-600 dark:!text-green-400 !border-green-500/30 cursor-default disabled:opacity-75"
                   disabled
-                  title="已应用到桌面"
+                  title={tr("已应用到桌面")}
                 >
-                  已应用
+                  {tr("已应用")}
                 </button>
               ) : (
                 <button
                   className="btn"
                   disabled={applying}
-                  title="需先下载到本地库"
+                  title={tr("需先下载到本地库")}
                   onClick={async () => {
                     setApplying(true);
                     try {
@@ -155,15 +171,15 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
                     }
                   }}
                 >
-                  {applying ? "…" : "🖥 应用到桌面"}
+                  {applying ? "…" : `🖥 ${tr("应用到桌面")}`}
                 </button>
               )}
               {downloaded && customizable && (
-                <button className="btn" onClick={() => setShowProps(true)} title="壁纸配置">
+                <button className="btn" onClick={() => setShowProps(true)} title={tr("壁纸配置")}>
                   <IconSliders size={14} />
-                  壁纸配置
+                  {tr("壁纸配置")}
                   {propDefs!.some((d) => d.overridden) && (
-                    <span className="text-[11px] text-[var(--accent)]">•</span>
+                    <span className="text-[11px] text-[var(--accent-strong)]">•</span>
                   )}
                 </button>
               )}
@@ -179,13 +195,13 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
                   }
                 }}
               >
-                {faved ? "★ 已收藏" : "☆ 收藏"}
+                {faved ? `★ ${tr("已收藏")}` : `☆ ${tr("收藏")}`}
               </button>
             </div>
 
             {item.description && (
               <div className="mt-5">
-                <div className="text-[13px] font-semibold mb-1.5">描述</div>
+                <div className="text-[13px] font-semibold mb-1.5">{tr("描述")}</div>
                 <p className="whitespace-pre-wrap text-[13px] leading-relaxed text-[var(--text-2)]">
                   {item.description}
                 </p>

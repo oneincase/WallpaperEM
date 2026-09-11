@@ -1,5 +1,6 @@
 //! 收藏 + 网络探测 + 诊断包（T4）
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
@@ -17,6 +18,10 @@ pub struct FavoriteItem {
     pub preview_url: Option<String>,
     pub r#type: String,
     pub created_at: i64,
+    /// 工坊订阅数（= 下载量，工坊就这么叫）。收藏页与工坊页一样把它常驻在
+    /// 封面右上角，所以列表接口直接带出来，不再让前端逐条补查。
+    /// 元数据缓存里没有该条目时为 0（列表里显示为不展示）。
+    pub subscriptions: i64,
 }
 
 #[tauri::command]
@@ -26,7 +31,8 @@ pub fn favorites_list(app: AppHandle) -> Result<Vec<FavoriteItem>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT f.item_id, COALESCE(w.title, f.item_id), COALESCE(w.preview_url, ''),
-                    COALESCE(w.type, 'unknown'), f.created_at, COALESCE(w.tags,'[]')
+                    COALESCE(w.type, 'unknown'), f.created_at, COALESCE(w.tags,'[]'),
+                    COALESCE(w.subscriptions, 0)
              FROM favorites f LEFT JOIN workshop_items w ON w.id = f.item_id
              ORDER BY f.created_at DESC",
         )
@@ -48,6 +54,7 @@ pub fn favorites_list(app: AppHandle) -> Result<Vec<FavoriteItem>, String> {
                     },
                     r#type: r.get(3)?,
                     created_at: r.get(4)?,
+                    subscriptions: r.get(6)?,
                 },
                 tags,
             ))
@@ -224,3 +231,148 @@ pub async fn diagnostics_export(app: AppHandle) -> Result<String, String> {
 }
 
 use std::io::Write;
+
+// ---------- 缓存（设置页「清除缓存」） ----------
+//
+// 「缓存」= 可以随时删掉、删了只会暂时变慢的东西。当前有两块：
+//   1. WebView 网络缓存（app_cache_dir）：工坊预览图、网页壁纸资源、渲染器页本身。
+//      实测会涨到数百 MB —— 预览图是唯一真正吃盘的一类，也是用户最想清的那块。
+//   2. 抽帧封面：系统壁纸同步时抽的首帧 PNG，落在各自的壁纸目录里
+//      （wallpapers/<item_id>/system-wallpaper-<item_id>.png），按需重建。
+// 刻意**不**包括：壁纸库本体（wallpapers/）、数据库（工坊元数据缓存删了会丢标题
+// 与预览图，属于「数据」不是「缓存」）、steamcmd 与下载工作目录（删了要重装/重下）。
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheEntry {
+    /// 稳定标识（前端只用于展示分组，不做逻辑判断）
+    pub key: String,
+    pub label: String,
+    pub bytes: u64,
+    pub path: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheStats {
+    pub bytes: u64,
+    pub entries: Vec<CacheEntry>,
+}
+
+/// 递归统计目录体积；读不到的条目按 0 计（统计不该因为一个坏文件失败）
+fn dir_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for e in entries.flatten() {
+        let Ok(meta) = e.metadata() else { continue };
+        if meta.is_dir() {
+            total += dir_bytes(&e.path());
+        } else {
+            total += meta.len();
+        }
+    }
+    total
+}
+
+/// 抽帧封面文件：`<data>/wallpapers/<item_id>/system-wallpaper-<item_id>.png`。
+/// 只按文件名精确匹配这一种，壁纸目录里的其它文件（preview.*、project.json、
+/// 真正的内容）一个都不碰。
+fn poster_files(data_dir: &Path) -> Vec<PathBuf> {
+    let Ok(items) = std::fs::read_dir(data_dir.join("wallpapers")) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in items.flatten() {
+        let Ok(files) = std::fs::read_dir(item.path()) else {
+            continue;
+        };
+        for f in files.flatten() {
+            let p = f.path();
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if p.is_file() && name.starts_with("system-wallpaper-") && name.ends_with(".png") {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+fn poster_bytes(data_dir: &Path) -> u64 {
+    poster_files(data_dir)
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum()
+}
+
+fn collect_cache_stats(app: &AppHandle) -> Result<CacheStats, String> {
+    let cache_dir = app.path().app_cache_dir().map_err(|e| e.to_string())?;
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let web_bytes = dir_bytes(&cache_dir);
+    let poster = poster_bytes(&data_dir);
+    let entries = vec![
+        CacheEntry {
+            key: "webview".into(),
+            label: "预览图与网页缓存".into(),
+            bytes: web_bytes,
+            path: cache_dir.display().to_string(),
+        },
+        CacheEntry {
+            key: "poster".into(),
+            label: "壁纸首帧封面".into(),
+            bytes: poster,
+            path: data_dir.join("wallpapers").display().to_string(),
+        },
+    ];
+    Ok(CacheStats {
+        bytes: entries.iter().map(|e| e.bytes).sum(),
+        entries,
+    })
+}
+
+/// 当前缓存占用（设置页展示）。递归统计耗时与大目录成正比，走阻塞线程。
+#[tauri::command]
+pub async fn cache_stats(app: AppHandle) -> Result<CacheStats, String> {
+    tauri::async_runtime::spawn_blocking(move || collect_cache_stats(&app))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// 清除缓存，返回实际释放的字节数。
+///
+/// 先统计再删，返回两者的差值 —— 删完再算只能得到 0，用户看不到「清了多少」。
+/// 删除失败（文件被占用、权限不足）不报错：尽力而清，剩余占用下次统计还会显示。
+#[tauri::command]
+pub async fn cache_clear(app: AppHandle) -> Result<u64, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<u64, String> {
+        let before = collect_cache_stats(&app)?.bytes;
+        let cache_dir = app.path().app_cache_dir().map_err(|e| e.to_string())?;
+        let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+
+        // WebView 缓存：只清目录**内容**，目录本身留着（WKWebView 在运行中，
+        // 有些子目录/文件正被打开；unlink 后它会自行重建，删掉根目录反而更容易
+        // 让 WebKit 报错）。清理无需停用 WebView。
+        if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+            for e in entries.flatten() {
+                let path = e.path();
+                let _ = if path.is_dir() {
+                    std::fs::remove_dir_all(&path)
+                } else {
+                    std::fs::remove_file(&path)
+                };
+            }
+        }
+        for p in poster_files(&data_dir) {
+            let _ = std::fs::remove_file(p);
+        }
+
+        let after = collect_cache_stats(&app)?.bytes;
+        let freed = before.saturating_sub(after);
+        tracing::info!("cache cleared: {} → {} bytes", before, after);
+        Ok(freed)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}

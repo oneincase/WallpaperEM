@@ -8,17 +8,23 @@ mod commands;
 mod content_server;
 mod db;
 mod download;
+mod ffmpeg;
+mod i18n;
 mod keychain;
 mod library;
 mod main_window;
+mod mcp;
 mod misc;
 mod now_playing;
 mod props_window;
 mod secure_store;
 mod steam;
+mod subscriptions;
 mod system_wallpaper;
+mod update;
 mod util;
 mod wallpaper;
+mod workspace;
 mod we_props;
 mod we_shim;
 mod workshop;
@@ -28,7 +34,7 @@ use std::sync::{Arc, Mutex};
 #[cfg(target_os = "macos")]
 use tauri::menu::MenuItemKind;
 use tauri::{
-    menu::{CheckMenuItemBuilder, Menu, MenuItem, PredefinedMenuItem, Submenu},
+    menu::{CheckMenuItem, CheckMenuItemBuilder, Menu, MenuItem, PredefinedMenuItem, Submenu},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Manager,
 };
@@ -91,6 +97,9 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            // 原生文案（托盘菜单 / 应用菜单 / 窗口标题）的语言兜底值要先定下来，
+            // 下面几步就会用到；前端的权威值随后由 app_set_locale 推过来。
+            i18n::init_from_system();
             init_logging(app.handle())?;
             // panic 钩子：tokio 任务与主线程回调里的 panic 会被各自的
             // catch_unwind 吞掉或仅在 stderr 打印（dev 终端不可见），统一落盘
@@ -110,6 +119,9 @@ pub fn run() {
             init_steam(app.handle())?;
             // 应用菜单改造：⌘H 从「隐藏应用」换成「最小化主窗口」
             // （壁纸窗口另有 canHide=false 兜底，双保险）
+            // 句柄留着：语言切换时要重写这项文案（见 retranslate_native_ui）
+            #[cfg(target_os = "macos")]
+            let mut minimize_main: Option<MenuItem<tauri::Wry>> = None;
             #[cfg(target_os = "macos")]
             {
                 let menu = Menu::default(app.handle())?;
@@ -123,21 +135,34 @@ pub fn run() {
                     let minimize = MenuItem::with_id(
                         app.handle(),
                         "minimize_main",
-                        "最小化主窗口",
+                        i18n::tr("最小化主窗口"),
                         true,
                         Some("Cmd+H"),
                     )?;
                     app_menu.insert(&minimize, 4usize)?;
+                    minimize_main = Some(minimize);
                 }
                 app.set_menu(menu)?;
             }
             // 托盘失败不致命：Linux 无托盘协议的环境（GNOME 未装 AppIndicator 扩展、
             // 容器/无头会话）里 TrayIconBuilder::build 会报错，不能让整个 setup 崩掉 ——
             // 退化为「无托盘常驻」，主窗口与壁纸功能照常（研究文档 §3.2 的降级策略）
-            if let Err(e) = build_tray(app.handle()) {
-                tracing::warn!("tray init failed, running without tray: {e}");
-            }
+            // 托盘菜单的句柄要留着（语言切换时原地改文字，不重建菜单，见 TrayMenu）
+            let tray = match build_tray(app.handle()) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    tracing::warn!("tray init failed, running without tray: {e}");
+                    None
+                }
+            };
+            app.manage(NativeMenuState {
+                tray,
+                #[cfg(target_os = "macos")]
+                minimize_main,
+            });
             register_shortcuts(app.handle())?;
+            // 抽帧组件（ffmpeg）的托管路径：抽帧入口拿不到 AppHandle，启动时缓存一份
+            ffmpeg::init(app.handle());
             // 音频捕获状态须先于内容服务器（SSE 端点读取其共享频谱帧）
             audio_capture::init(app.handle())?;
             // 「正在播放」订阅同理：/now-playing SSE 读它的共享快照。
@@ -149,6 +174,9 @@ pub fn run() {
             audio_capture::start_if_enabled(app.handle());
             wallpaper::init(app.handle())?;
             wallpaper::start_playlist_rotation(app.handle());
+            // MCP 服务（默认关闭；开启后只绑回环地址）。放在 DB/壁纸引擎之后：
+            // 工具全都依赖它们，早启动只会让首个请求撞上未就绪状态
+            mcp::init(app.handle()).map_err(|e| e.to_string())?;
             download::init(app.handle()).map_err(|e| e.to_string())?;
             apply_vibrancy(app.handle())?;
             // T1 验证钩子：WE_AUTO_WORKSHOP=1 时启动即搜索第一页并打日志
@@ -204,6 +232,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::ping,
+            i18n::app_set_locale,
             commands::app_info,
             commands::db_status,
             commands::settings_get,
@@ -223,6 +252,7 @@ pub fn run() {
             wallpaper::set_render_dpr,
             wallpaper::set_language,
             wallpaper::set_scene_fps,
+            wallpaper::set_filter,
             wallpaper::item_play_config_get,
             wallpaper::item_play_config_set,
             wallpaper::interactive_set,
@@ -234,13 +264,24 @@ pub fn run() {
             audio_capture::audio_processing_set,
             audio_capture::audio_processing_status,
             content_server::content_server_status,
+            subscriptions::subscriptions_status,
+            subscriptions::account_web_login_start,
+            subscriptions::subscriptions_page,
+            subscriptions::subscriptions_submit_code,
+            subscriptions::subscriptions_qr_begin,
+            subscriptions::subscriptions_qr_poll,
+            subscriptions::subscriptions_logout,
             workshop::workshop_search,
             workshop::workshop_random,
             workshop::workshop_item,
             download::download_tool_status,
+            ffmpeg::ffmpeg_status,
+            ffmpeg::ffmpeg_install,
+            ffmpeg::ffmpeg_uninstall,
             download::steamcmd_install_tool,
             download::steamcmd_uninstall_tool,
             download::download_credentials_set,
+            download::download_verify_login,
             download::download_credentials_status,
             download::download_enqueue,
             download::download_list,
@@ -270,6 +311,16 @@ pub fn run() {
             misc::favorite_status,
             misc::network_probe,
             misc::diagnostics_export,
+            misc::cache_stats,
+            misc::cache_clear,
+            update::app_update_check,
+            update::app_update_download,
+            update::app_update_open,
+            mcp::mcp_status,
+            mcp::mcp_set_enabled,
+            mcp::mcp_set_port,
+            mcp::mcp_rotate_token,
+            mcp::mcp_config_snippet,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -308,6 +359,7 @@ fn init_steam(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     };
     let client = steam::SteamClient::new(proxy, follow_system_proxy)?;
     app.manage(client.clone());
+    app.manage(subscriptions::SubscriptionsState(std::sync::Mutex::new(None)));
     let db = app.state::<Arc<Mutex<Connection>>>();
     app.manage(Arc::new(workshop::WorkshopService::new(
         client,
@@ -371,18 +423,120 @@ fn init_logging(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// 显示模式 / 清晰度 / 帧率上限的档位表：(id 后缀, 中文标签)。
+/// 档位值必须与设置页、wallpaper 侧的校验范围一致（Settings.tsx 同名三项）。
+const FIT_ITEMS: &[(&str, &str)] = &[
+    ("cover", "裁剪"),
+    ("contain", "缩放"),
+    ("stretch", "拉伸"),
+];
+const DPR_ITEMS: &[(&str, &str)] = &[("0.8", "省电"), ("1", "标准"), ("2", "高清")];
+const FPS_ITEMS: &[(&str, &str)] = &[
+    ("24", "24 FPS"),
+    ("30", "30 FPS"),
+    ("45", "45 FPS"),
+    ("60", "60 FPS"),
+    ("120", "120 FPS"),
+];
+
+/// 托盘菜单项的句柄集合。留着只为一件事：**切换语言时原地改文字**。
+/// 不重建菜单 —— 重建会让 on_menu_event 闭包里捕获的勾选句柄指向已脱离菜单的
+/// 旧对象，之后点「清晰度」就再没有勾选反馈了。
+pub struct TrayMenu {
+    show: MenuItem<tauri::Wry>,
+    item_props: MenuItem<tauri::Wry>,
+    auto_pause: CheckMenuItem<tauri::Wry>,
+    fit_menu: Submenu<tauri::Wry>,
+    fit_items: Vec<CheckMenuItem<tauri::Wry>>,
+    dpr_menu: Submenu<tauri::Wry>,
+    dpr_items: Vec<CheckMenuItem<tauri::Wry>>,
+    fps_menu: Submenu<tauri::Wry>,
+    fps_items: Vec<CheckMenuItem<tauri::Wry>>,
+    filter_menu: Submenu<tauri::Wry>,
+    filter_items: Vec<CheckMenuItem<tauri::Wry>>,
+    quit: MenuItem<tauri::Wry>,
+}
+
+impl TrayMenu {
+    fn retranslate(&self) -> tauri::Result<()> {
+        self.show.set_text(i18n::tr("显示主窗口"))?;
+        self.item_props.set_text(i18n::tr("壁纸设置"))?;
+        self.auto_pause.set_text(i18n::tr("自动暂停"))?;
+        self.quit.set_text(i18n::tr("退出"))?;
+        self.fit_menu.set_text(i18n::tr("显示模式"))?;
+        self.dpr_menu.set_text(i18n::tr("清晰度"))?;
+        self.fps_menu.set_text(i18n::tr("帧率上限"))?;
+        self.filter_menu.set_text(i18n::tr("滤镜效果"))?;
+        for (item, (_, label)) in self.fit_items.iter().zip(FIT_ITEMS) {
+            item.set_text(i18n::tr(label))?;
+        }
+        for (item, (_, label)) in self.dpr_items.iter().zip(DPR_ITEMS) {
+            item.set_text(i18n::tr(label))?;
+        }
+        for (item, (_, label)) in self.fps_items.iter().zip(FPS_ITEMS) {
+            item.set_text(i18n::tr(label))?;
+        }
+        for (item, (_, label)) in self.filter_items.iter().zip(wallpaper::WALLPAPER_FILTERS) {
+            item.set_text(i18n::tr(label))?;
+        }
+        Ok(())
+    }
+}
+
+/// 会被语言影响的原生菜单/标题。语言切换时由 retranslate_native_ui 整份重写
+pub struct NativeMenuState {
+    /// 托盘不可用的环境（Linux 无 AppIndicator 等）为 None，见 build_tray 的降级说明
+    tray: Option<TrayMenu>,
+    #[cfg(target_os = "macos")]
+    minimize_main: Option<MenuItem<tauri::Wry>>,
+}
+
+/// 语言变了：把**原生绘制**的文案重写一遍（托盘菜单、macOS 应用菜单、独立窗口标题）。
+/// 菜单只在打开的瞬间可见，所以效果是「下次打开就跟上」；这里不等用户操作，立即同步。
+pub(crate) fn retranslate_native_ui(app: &AppHandle) {
+    if let Some(state) = app.try_state::<NativeMenuState>() {
+        if let Some(tray) = &state.tray {
+            if let Err(e) = tray.retranslate() {
+                tracing::warn!("retranslate tray failed: {e}");
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(item) = &state.minimize_main {
+                let _ = item.set_text(i18n::tr("最小化主窗口"));
+            }
+        }
+    }
+    // 独立「壁纸设置」窗口的原生标题由 Rust 侧绘制（label 形如 props-<itemId>）
+    for (label, win) in app.webview_windows() {
+        if label.starts_with("props-") {
+            let _ = win.set_title(i18n::tr("壁纸设置"));
+        }
+    }
+}
+
+/// 勾选菜单项 → Submenu::with_items 要的借用切片（写成普通函数而非闭包，
+/// 闭包推断不出「返回值借用入参」的生命周期）
+fn as_refs(items: &[CheckMenuItem<tauri::Wry>]) -> Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> {
+    items
+        .iter()
+        .map(|i| i as &dyn tauri::menu::IsMenuItem<tauri::Wry>)
+        .collect()
+}
+
 /// 托盘：显示主窗口 / 壁纸设置 / 暂停播放 / 全局快速设置（显示模式·清晰度·帧率上限）/ 退出
-fn build_tray(app: &AppHandle) -> tauri::Result<()> {
-    let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
-    let item_props = MenuItem::with_id(app, "item_props", "壁纸设置", true, None::<&str>)?;
+fn build_tray(app: &AppHandle) -> tauri::Result<TrayMenu> {
+    let show = MenuItem::with_id(app, "show", i18n::tr("显示主窗口"), true, None::<&str>)?;
+    let item_props = MenuItem::with_id(app, "item_props", i18n::tr("壁纸设置"), true, None::<&str>)?;
 
     // 全局快速设置：与设置页同一份持久化（settings 表），初始勾选读当前值
     let cur_fit = tray_read_setting(app, "wallpaper_fit", "cover");
     let cur_dpr = tray_read_setting(app, "wallpaper_render_dpr", "1");
-    let cur_fps = tray_read_setting(app, "wallpaper_scene_fps", "60");
+    let cur_fps = tray_read_setting(app, "wallpaper_scene_fps", "24");
+    let cur_filter = tray_read_setting(app, "wallpaper_filter", wallpaper::DEFAULT_FILTER);
     let cur_auto_pause = tray_read_setting(app, "wallpaper_auto_pause", "false");
     // 自动暂停：切到非桌面应用自动暂停、回桌面自动播放（默认关，见 macos.rs 观察者）
-    let auto_pause_item = CheckMenuItemBuilder::with_id("auto_pause", "自动暂停")
+    let auto_pause_item = CheckMenuItemBuilder::with_id("auto_pause", i18n::tr("自动暂停"))
         .checked(cur_auto_pause == "true" || cur_auto_pause == "1")
         .build(app)?;
 
@@ -392,43 +546,34 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
             .build(app)
     };
     // 单选语义：CheckMenuItem 自身不做互斥，点击后在事件里手动同步整组勾选
-    let fit_items = [
-        mk_check("fit_cover", "裁剪", cur_fit == "cover")?,
-        mk_check("fit_contain", "缩放", cur_fit == "contain")?,
-        mk_check("fit_stretch", "拉伸", cur_fit == "stretch")?,
-    ];
-    let dpr_items = [
-        mk_check("dpr_0.8", "省电", cur_dpr == "0.8")?,
-        mk_check("dpr_1", "标准", cur_dpr == "1")?,
-        mk_check("dpr_2", "高清", cur_dpr == "2")?,
-    ];
-    let fps_items = [
-        mk_check("fps_30", "30 FPS", cur_fps == "30")?,
-        mk_check("fps_60", "60 FPS", cur_fps == "60")?,
-        mk_check("fps_120", "120 FPS", cur_fps == "120")?,
-    ];
-    let fit_menu = Submenu::with_items(
-        app,
-        "显示模式",
-        true,
-        &[&fit_items[0], &fit_items[1], &fit_items[2]],
-    )?;
-    let dpr_menu = Submenu::with_items(
-        app,
-        "清晰度",
-        true,
-        &[&dpr_items[0], &dpr_items[1], &dpr_items[2]],
-    )?;
-    let fps_menu = Submenu::with_items(
-        app,
-        "帧率上限",
-        true,
-        &[&fps_items[0], &fps_items[1], &fps_items[2]],
-    )?;
+    // 档位表是常量（FIT_ITEMS 等），构建与语言切换重写共用一份，避免两边走偏
+    let fit_items: Vec<CheckMenuItem<tauri::Wry>> = FIT_ITEMS
+        .iter()
+        .map(|(id, label)| mk_check(&format!("fit_{id}"), i18n::tr(label), cur_fit == *id))
+        .collect::<tauri::Result<Vec<_>>>()?;
+    let dpr_items: Vec<CheckMenuItem<tauri::Wry>> = DPR_ITEMS
+        .iter()
+        .map(|(id, label)| mk_check(&format!("dpr_{id}"), i18n::tr(label), cur_dpr == *id))
+        .collect::<tauri::Result<Vec<_>>>()?;
+    let fps_items: Vec<CheckMenuItem<tauri::Wry>> = FPS_ITEMS
+        .iter()
+        .map(|(id, label)| mk_check(&format!("fps_{id}"), i18n::tr(label), cur_fps == *id))
+        .collect::<tauri::Result<Vec<_>>>()?;
+    let fit_menu = Submenu::with_items(app, i18n::tr("显示模式"), true, &as_refs(&fit_items))?;
+    let dpr_menu = Submenu::with_items(app, i18n::tr("清晰度"), true, &as_refs(&dpr_items))?;
+    let fps_menu = Submenu::with_items(app, i18n::tr("帧率上限"), true, &as_refs(&fps_items))?;
+    // 全局滤镜：id 白名单与渲染器的 CSS filter 表一一对应（见
+    // wallpaper::WALLPAPER_FILTERS），这里只摆开关，表达式不经过原生侧。
+    // 作用范围是桌面壁纸窗口，壁纸预览（主窗口里的 iframe）不受影响。
+    let filter_items: Vec<tauri::menu::CheckMenuItem<tauri::Wry>> = wallpaper::WALLPAPER_FILTERS
+        .iter()
+        .map(|(id, label)| mk_check(&format!("filter_{id}"), i18n::tr(label), cur_filter == *id))
+        .collect::<tauri::Result<Vec<_>>>()?;
+    let filter_menu = Submenu::with_items(app, i18n::tr("滤镜效果"), true, &as_refs(&filter_items))?;
 
     let sep1 = PredefinedMenuItem::separator(app)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
-    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", i18n::tr("退出"), true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
         &[
@@ -439,10 +584,27 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
             &fit_menu,
             &dpr_menu,
             &fps_menu,
+            &filter_menu,
             &sep2,
             &quit,
         ],
     )?;
+
+    // 句柄副本留给 NativeMenuState（语言切换时改文字）；原件随 on_menu_event 闭包走
+    let state = TrayMenu {
+        show: show.clone(),
+        item_props: item_props.clone(),
+        auto_pause: auto_pause_item.clone(),
+        fit_menu: fit_menu.clone(),
+        fit_items: fit_items.clone(),
+        dpr_menu: dpr_menu.clone(),
+        dpr_items: dpr_items.clone(),
+        fps_menu: fps_menu.clone(),
+        fps_items: fps_items.clone(),
+        filter_menu: filter_menu.clone(),
+        filter_items: filter_items.clone(),
+        quit: quit.clone(),
+    };
 
     let mut builder = TrayIconBuilder::with_id("main-tray")
         .menu(&menu)
@@ -517,6 +679,14 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                                 let _ = item.set_checked(item.id() == &event.id);
                             }
                         }
+                    } else if let Some(filter) = id.strip_prefix("filter_") {
+                        // 白名单校验在 command 里；这里只负责持久化 + 实时下发 + 同步勾选
+                        if let Err(e) = wallpaper::set_filter(app.clone(), filter.to_string()) {
+                            tracing::warn!("tray set filter failed: {e}");
+                        }
+                        for item in &filter_items {
+                            let _ = item.set_checked(item.id() == &event.id);
+                        }
                     }
                 }
             }
@@ -557,7 +727,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     }
     builder.build(app)?;
     tracing::info!("tray icon built");
-    Ok(())
+    Ok(state)
 }
 
 /// 读 settings 表（托盘菜单初始勾选/事件处理共用；键不存在返回 default）
@@ -567,10 +737,17 @@ fn tray_read_setting(app: &AppHandle, key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
-/// 全局快捷键（骨架）：⌘⇧P 暂停/恢复、⌘⇧N 下一张（轮播占位）
+/// 全局快捷键：暂停/恢复、下一张（轮播）。
+///
+/// macOS 用 ⌘⇧P / ⌘⇧N；Windows / Linux 用 Ctrl+Shift+P / Ctrl+Shift+N
+/// （"cmd" 修饰键在非 macOS 平台上解析失败，会静默不注册）。
 fn register_shortcuts(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     use tauri_plugin_global_shortcut::GlobalShortcutExt;
-    for s in ["cmd+shift+p", "cmd+shift+n"] {
+    #[cfg(target_os = "macos")]
+    const SHORTCUTS: [&str; 2] = ["cmd+shift+p", "cmd+shift+n"];
+    #[cfg(not(target_os = "macos"))]
+    const SHORTCUTS: [&str; 2] = ["ctrl+shift+p", "ctrl+shift+n"];
+    for s in SHORTCUTS {
         match app.global_shortcut().register(s) {
             Ok(_) => tracing::info!("shortcut registered: {s}"),
             Err(e) => tracing::warn!("shortcut register failed {s}: {e}"),
@@ -580,27 +757,56 @@ fn register_shortcuts(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>>
 }
 
 /// 主窗口背景材质：macOS 侧栏 vibrancy（window-vibrancy，NSVisualEffectView）；
+/// Windows Acrylic（Win10 1809+，失败退回老 blur 通道）；
 /// Linux 合成器模糊（KDE KWin，见 blur.rs）。pub(crate)：main_window 重建窗口后需再次应用。
 pub(crate) fn apply_vibrancy(app: &AppHandle) -> tauri::Result<()> {
     #[cfg(target_os = "linux")]
     blur::apply(app);
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    if let Some(w) = app.get_webview_window("main") {
+        apply_backdrop(&w);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     let _ = app;
+    Ok(())
+}
+
+/// 给单个窗口套平台背景材质（主窗口与壁纸属性窗口共用）。
+///
+/// - macOS：侧栏 vibrancy（NSVisualEffectView）
+/// - Windows：Acrylic（DWM 系统背景，Win10 1809+）；不可用时退回 Win7/10 的 blur
+///   （Win11 22621 上 blur 有已知的拖动/缩放卡顿，只在 Acrylic 失败时才用）
+///
+/// 失败只记日志：材质是纯装饰，不影响功能。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(crate) fn apply_backdrop(window: &tauri::WebviewWindow) {
     #[cfg(target_os = "macos")]
+    match window_vibrancy::apply_vibrancy(
+        window,
+        window_vibrancy::NSVisualEffectMaterial::Sidebar,
+        None,
+        Some(16.0),
+    ) {
+        Ok(_) => tracing::info!("vibrancy applied to {}", window.label()),
+        Err(e) => tracing::warn!("vibrancy apply failed for {}: {e}", window.label()),
+    }
+    #[cfg(target_os = "windows")]
     {
-        if let Some(w) = app.get_webview_window("main") {
-            match window_vibrancy::apply_vibrancy(
-                &w,
-                window_vibrancy::NSVisualEffectMaterial::Sidebar,
-                None,
-                Some(16.0),
-            ) {
-                Ok(_) => tracing::info!("vibrancy applied to main window"),
-                Err(e) => tracing::warn!("vibrancy apply failed: {e}"),
+        // 深色半透明底：与 macOS 侧栏材质、KWin blur 的观感对齐
+        let tint = Some((28u8, 28u8, 32u8, 180u8));
+        match window_vibrancy::apply_acrylic(window, tint) {
+            Ok(_) => tracing::info!("acrylic applied to {}", window.label()),
+            Err(e) => {
+                tracing::debug!(
+                    "acrylic unavailable for {} ({e}); falling back to blur",
+                    window.label()
+                );
+                if let Err(e2) = window_vibrancy::apply_blur(window, tint) {
+                    tracing::warn!("blur apply failed for {}: {e2}", window.label());
+                }
             }
         }
     }
-    Ok(())
 }
 
 /// Linux 启动体检：WebKitGTK 的音视频播放完全依赖系统 GStreamer 插件，

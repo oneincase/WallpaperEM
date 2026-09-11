@@ -206,7 +206,12 @@ fn raw_props(project: &Value) -> Vec<(String, Value)> {
     };
     let mut out: Vec<(String, Value)> = props
         .iter()
-        .filter(|(_, v)| v.get("type").and_then(|t| t.as_str()).is_some())
+        // 空 type（真实语料里存在 "type": ""）没有可渲染控件，WE 不显示，一并跳过
+        .filter(|(_, v)| {
+            v.get("type")
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| !t.trim().is_empty())
+        })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     // order 按 f64 读（浮点细分序常见）；并列时按属性名兜底保证稳定
@@ -471,26 +476,40 @@ fn builtin_text(key: &str) -> Option<&'static str> {
     })
 }
 
-/// general.localization 查表：{lang: {key: text}}，语言标签大小写不敏感
+/// general.localization 查表：{lang: {key: text}}。
+/// - 语言标签大小写不敏感（en-us / EN-US 都出现过）
+/// - 键查找先精确、再大小写不敏感回退（同一壁纸里键名大小写不一致真实存在）
+/// - 首选语言（zh-chs/zh-cht/en-us）逐键回退后仍没有 → 任意语言兜底：
+///   显示其它语言的文案总比显示原始属性名/ui_ 键强
 fn localized(project: &Value, key: &str) -> Option<String> {
     let table = project
         .get("general")
         .and_then(|g| g.get("localization"))
         .and_then(|l| l.as_object())?;
+    fn lookup<'a>(entries: &'a Value, key: &str) -> Option<&'a str> {
+        let obj = entries.as_object()?;
+        if let Some(s) = obj.get(key).and_then(|v| v.as_str()) {
+            return Some(s);
+        }
+        obj.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            .and_then(|(_, v)| v.as_str())
+    }
+    let non_empty = |s: &str| (!s.trim().is_empty()).then(|| s.to_string());
     for want in TEXT_LANGS {
         let hit = table.iter().find_map(|(lang, entries)| {
             if !lang.eq_ignore_ascii_case(want) {
                 return None;
             }
-            entries.get(key).and_then(|v| v.as_str())
+            lookup(entries, key)
         });
-        if let Some(s) = hit {
-            if !s.trim().is_empty() {
-                return Some(s.to_string());
-            }
+        if let Some(s) = hit.and_then(non_empty) {
+            return Some(s);
         }
     }
-    None
+    table
+        .iter()
+        .find_map(|(_, entries)| lookup(entries, key).and_then(non_empty))
 }
 
 /// 剥离 HTML 标签、解码常见实体、折叠空白。
@@ -598,17 +617,23 @@ pub fn describe(conn: &Connection, wallpapers_dir: &Path, item_id: &str) -> Vec<
         .into_iter()
         .map(|(name, def)| {
             // checkbox 是 bool 的别名（真实语料里 2 处）：wire 语义完全相同，
-            // 归一化成 bool，避免前端为同一个开关写两套渲染
+            // 归一化成 bool，避免前端为同一个开关写两套渲染。
+            // 类型名统一小写：真实语料里存在 "Text" 这类大写写法
             let raw_type = def.get("type").and_then(|t| t.as_str()).unwrap_or("other");
-            let ptype = if raw_type == "checkbox" {
-                "bool"
+            let norm = raw_type.to_ascii_lowercase();
+            let ptype = if norm == "checkbox" {
+                "bool".to_string()
             } else {
-                raw_type
-            }
-            .to_string();
+                norm
+            };
             let default = wire_value(&ptype, &def);
             let value = overrides.get(&name).cloned().or_else(|| default.clone());
             let text_raw = def.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            // 分节标题（text/group）与可编辑属性的空 text 回退不同：
+            // 可编辑属性回退成属性名（与 WE 一致）；分节标题的空 text 是作者留的
+            // 空白间隔（kong10/fengexian3 这类间隔键在真实壁纸里很常见），
+            // 回退成属性名会把间隔键名直接显示在面板上，必须保留为空
+            let is_header = ptype == "text" || ptype == "group";
             let options = def
                 .get("options")
                 .and_then(|o| o.as_array())
@@ -633,7 +658,11 @@ pub fn describe(conn: &Connection, wallpapers_dir: &Path, item_id: &str) -> Vec<
                 .unwrap_or_default();
             WebPropDef {
                 name: name.clone(),
-                text: resolve_text(&project, text_raw, &name),
+                text: if is_header {
+                    resolve_text(&project, text_raw, "")
+                } else {
+                    resolve_text(&project, text_raw, &name)
+                },
                 ptype,
                 order: order_of(&def),
                 overridden: overrides.contains_key(&name),
@@ -900,6 +929,41 @@ mod tests {
         assert_eq!(text("html"), "定位城市 City", "剥离标签，边界补空格");
         assert_eq!(text("deco"), "deco", "纯 HTML 装饰清理后为空 → 回退属性名");
         assert_eq!(text("ent"), "A & B C", "实体解码");
+    }
+
+    /// WE 对齐的空/异形态过滤：空 type、大写类型名、空 text 分节标题
+    #[test]
+    fn empty_type_and_case_and_blank_headers_match_we() {
+        let conn = mem_db();
+        let dir = fixture_dir(
+            "shape",
+            "x8",
+            r#"{"type":"web","general":{
+                "localization": {
+                    "ru-ru": {"UI_WIDHT": "Ширина"},
+                    "en-us": {"ui_note": "Note"}
+                },
+                "properties": {
+                    "junk":   {"order": 1, "type": "", "value": 1},
+                    "header": {"order": 2, "type": "Text", "text": "ui_note"},
+                    "spacer": {"order": 3, "type": "text", "text": ""},
+                    "width":  {"order": 4, "type": "slider", "text": "ui_widht", "value": 5, "min": 0, "max": 10}
+                }
+            }}"#,
+        );
+        let defs = describe(&conn, &dir, "x8");
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(!names.contains(&"junk"), "空 type 不是可配置属性（WE 不显示）");
+        let header = defs.iter().find(|d| d.name == "header").unwrap();
+        assert_eq!(header.ptype, "text", "类型名大小写归一（Text → text）");
+        assert_eq!(header.text, "Note");
+        let spacer = defs.iter().find(|d| d.name == "spacer").unwrap();
+        assert_eq!(spacer.text, "", "空 text 分节标题不回退成属性名（保留空白间隔）");
+        let width = defs.iter().find(|d| d.name == "width").unwrap();
+        assert_eq!(
+            width.text, "Ширина",
+            "首选语言缺失 → 任意语言兜底 + 键大小写不敏感"
+        );
     }
 
     /// 实体解码：真实壁纸用 &ensp; 做选项标签对齐、&#x2030; 表千分号

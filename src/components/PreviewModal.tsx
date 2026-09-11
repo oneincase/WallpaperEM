@@ -6,6 +6,7 @@
 // 预览与实际观感会有差异（缺 fit 归一化、缺 WE shim 的属性与音频注入）。
 import { useEffect, useRef, useState } from "react";
 import { api, type LibraryItem, type WallpaperConfig } from "../api/steam";
+import { tr, trMsg } from "../lib/i18n";
 
 export function PreviewModal({
   item,
@@ -47,12 +48,14 @@ export function PreviewModal({
   }, []);
 
   const renderBody = () => {
-    if (err) return <div className="text-[13px] text-red-500 px-4">{err}</div>;
-    if (!cfg) return <div className="text-[13px] text-[var(--text-2)]">加载中…</div>;
+    if (err) return <div className="text-[13px] text-red-500 px-4">{trMsg(err)}</div>;
+    if (!cfg) return <div className="text-[13px] text-[var(--text-2)]">{tr("加载中…")}</div>;
     // mediaBase 由 Rust 的 resolve_item_config 对所有类型统一下发；
     // 缺它说明内容服务器没起来，渲染器页也拉不到资源
     if (!cfg.mediaBase) {
-      return <div className="text-[13px] text-[var(--text-2)]">内容服务器未就绪，无法预览</div>;
+      return (
+        <div className="text-[13px] text-[var(--text-2)]">{tr("内容服务器未就绪，无法预览")}</div>
+      );
     }
 
     const origin = new URL(cfg.mediaBase).origin;
@@ -79,17 +82,17 @@ export function PreviewModal({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-8"
+      className="animate-overlay fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-8"
       onClick={onClose}
     >
       <div
-        className="card flex h-[70vh] w-full max-w-4xl flex-col overflow-hidden"
+        className="card animate-modal-pop flex h-[70vh] w-full max-w-4xl flex-col overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between border-b border-[var(--separator)] px-4 py-2.5">
           <div className="truncate text-[14px] font-semibold">{item.title}</div>
           <button className="btn !py-1" onClick={onClose}>
-            关闭
+            {tr("关闭")}
           </button>
         </div>
         <div className="flex flex-1 items-center justify-center overflow-hidden bg-black/20">

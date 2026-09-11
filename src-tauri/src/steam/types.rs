@@ -53,7 +53,11 @@ pub struct WorkshopSearchParams {
     /// 保留是为了兼容旧调用方与类型按钮组。
     #[serde(default)]
     pub r#type: Option<String>,
-    /// 必需标签（Steam 侧严格 AND）
+    /// 分组标签：组内并集（OR）、组间交集（AND），空 = 不约束。
+    /// 优先于 tags；Steam 原生只支持严格 AND，多标签组由后端拆多查询合并
+    #[serde(default)]
+    pub tag_groups: Vec<Vec<String>>,
+    /// 旧版平面必需标签（Steam 侧严格 AND），等价于每个标签自成一组
     #[serde(default)]
     pub tags: Vec<String>,
     /// 排除标签
@@ -84,4 +88,8 @@ pub struct WorkshopSearchResult {
     pub page: u32,
     pub page_size: usize,
     pub has_more: bool,
+    /// 标签组合数超出后端上限、只查了一部分组合：结果不完整，UI 要提示用户
+    /// 少选几个标签。带 `serde(default)` 是为了兼容旧版前端快照/cache 反序列化。
+    #[serde(default)]
+    pub truncated: bool,
 }
