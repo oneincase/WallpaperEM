@@ -93,6 +93,29 @@ jobs:
         with:
           arch: ${{ matrix.msvc_arch }}
 
+      - name: 钉死 MSVC 的 ARM64 link.exe（仅 arm64 行）
+        # 只靠 PATH 不够稳：runner 的 `C:\Program Files\Git\usr\bin` 里也有一份
+        # link.exe（coreutils 的 link），rustc 会解析到它并报 `linking with link.exe
+        # failed`（v0.5.0 发布时 arm64 就挂在这，日志显示它调的是 Git 那份）。
+        # 改用 Rust 官方的 CARGO_TARGET_<TRIPLE>_LINKER 指到绝对路径。
+        if: matrix.msvc_arch
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "${env:ProgramFiles}\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Hostx64\arm64\link.exe",
+            "${env:ProgramFiles}\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Hostarm64\arm64\link.exe"
+          )
+          $link = $null
+          foreach ($c in $candidates) {
+            $link = Get-ChildItem -Path $c -ErrorAction SilentlyContinue |
+              Select-Object -First 1 -ExpandProperty FullName
+            if ($link) { break }
+          }
+          if (-not $link) { throw "找不到 MSVC ARM64 的 link.exe" }
+          Write-Host "MSVC ARM64 linker = $link"
+          "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER=$link" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: 构建 Tauri（.exe 安装器 + .msi）
         # beforeBuildCommand 会先跑 pnpm --filter @we/desktop build 生成前端 dist/，
         # 再编译 Rust release 并打包 nsis/msi（targets 见 tauri.windows.conf.json）。
