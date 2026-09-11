@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri_plugin_desktop_underlay::DesktopUnderlayExt;
 
 use crate::content_server::ContentServerState;
 
@@ -703,6 +704,20 @@ fn create_desktop_window(
         "create_window[{label}]: 窗口已建立（{}ms）",
         build_started.elapsed().as_millis()
     );
+
+    // ⚠️ tauri-plugin-desktop-underlay 只用**窗口 label**记录「是否已下沉到桌面层」，
+    // 且窗口销毁时它不会清理这条记录。同一个 label 的窗口销毁重建后（切壁纸走的就是
+    // 销毁重建），`is_desktop_underlay()` 会返回陈旧的 true，后面的
+    // `set_desktop_underlay(true)` 被判定为「已是 underlay」而 no-op —— 新 HWND/NSWindow
+    // 从未真正下沉，于是以普通顶层窗口 show 出来，全屏盖在一切之上（Windows 实测：
+    // 重启后自动恢复的那张正常，新设置的一张必然盖住全屏）。建窗是句柄唯一更替的时机，
+    // 先强制清掉陈旧记录，让紧随其后的 apply_desktop_window 真正执行分层。
+    if window.is_desktop_underlay() {
+        if let Err(e) = window.set_desktop_underlay(false) {
+            tracing::warn!("create_window[{label}]: 清理陈旧 underlay 状态失败: {e}");
+        }
+        tracing::info!("create_window[{label}]: 清掉同 label 遗留的 underlay 状态（重建窗口）");
+    }
 
     platform::apply_desktop_window(&window, frame, current_interactive(app));
     tracing::info!("create_window[{label}]: 桌面层/几何已应用");

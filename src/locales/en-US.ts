@@ -416,6 +416,7 @@ export const EN_US: Record<string, string> = {
   "运行中": "Running",
   "启动失败": "Failed to start",
   "启动中": "Starting",
+  "正在启动…": "Starting…",
   "下载账号": "Download account",
   "下载工具": "Download tool",
   "缺少 Rosetta 2：steamcmd 的官方引导程序是 x86_64，首次启动需要它。请在终端执行 softwareupdate --install-rosetta --agree-to-license 后重试（首次自更新后 steamcmd 即以原生 arm64 运行）":
@@ -506,6 +507,8 @@ export const EN_US: Record<string, string> = {
     "When on, wallpapers can react to sound from the whole system (e.g. a music player), matching WE's desktop app. macOS requires Screen Recording permission; Windows needs none. A wallpaper's own music is visualised regardless.",
   "当前平台暂不支持系统音频捕获（Linux 待接入 PipeWire）；壁纸自带的音乐无需此开关也会可视化":
     "System audio capture is not supported on this platform yet (Linux awaits PipeWire); a wallpaper's own music is visualised regardless.",
+  "当前平台暂不支持系统音频捕获（macOS CoreAudio / Windows WASAPI 已支持；Linux 待后续版本接入 PipeWire）":
+    "System audio capture is not supported on this platform yet (macOS CoreAudio and Windows WASAPI are supported; Linux will get PipeWire in a later release)",
   "自动设置系统壁纸": "Set the system wallpaper automatically",
   "应用动态壁纸后，自动抽首帧（scene/web 用工坊预览图）设为 macOS 静态壁纸：锁屏、登录窗口与壁纸引擎未运行时保持视觉一致":
     "After applying a dynamic wallpaper, extract its first frame (scene/web use the workshop preview) and set it as the macOS wallpaper, so the lock screen, login window and desktop stay consistent while the engine is not running",
