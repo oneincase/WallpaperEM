@@ -1,5 +1,7 @@
 # WallpaperEM
 
+**壁纸引擎魔法 · Wallpaper Engine Magic**
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.5.0-informational)](CHANGELOG.md)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue)](#平台说明--platform-notes)
@@ -37,6 +39,95 @@
 
 ---
 
+## 🪄 壁纸引擎魔法 / Wallpaper Engine Magic
+
+**WallpaperEM** = **Wallpaper Engine Magic**。
+
+### 中文
+
+**是什么。** 一个把「Wallpaper Engine 生态」接到你自己桌面上的开源引擎。它复用你的 Steam 账号，
+用 Valve 官方的 `steamcmd` 从创意工坊把壁纸**下载**到本地，再用自己的渲染器把
+**视频 / GIF / 网页 / 场景（WebGL）/ 图片** 画到桌面最底层 —— 于是你不必常年挂着一个 Steam
+客户端，也不被单一平台绑住：Windows / macOS / Linux 上共用同一套本地库。
+
+**「魔法」在哪。** 壁纸窗口不是普通窗口，它是**桌面层级的一个成员**：macOS 上是一扇位于桌面图标
+之下的原生桌面层窗口；Windows 上按系统版本挂进 `Progman` / `WorkerW` 桌面层（Win11 的
+raised-desktop 与 Win10 的经典结构都做了适配）；Linux 上走 X11 桌面层。桌面图标照常可点、
+其他应用照常置顶，而你看到的「桌面背景」已经是一段可以互动的实时画面。
+
+**一张壁纸的一生。**
+
+1. **找到它** —— 「工坊」页搜索 / 排序 / 按类型与题材筛选；本地文件也可以直接导入本地库。
+2. **拿回来** —— `steamcmd` 串行下载，支持 Steam Guard 验证码与失败重试；账号密码**本地加密
+   存储**，不弹系统钥匙串授权。工坊条目失效后会在本地库中被识别并清理。
+3. **渲染它** —— 应用时为每块屏启动一个渲染器页（与媒体同源的内容服务器，消除跨源限制）：
+   视频 / GIF 走媒体管线；网页壁纸直接跑它自己的 HTML/JS 并注入 WE 的 shim API；场景壁纸用
+   [`webwallgl`](https://github.com/oneincase/webwallgl) 解析 `scene.pkg` 做 WebGL 渲染。
+4. **贴到桌面** —— 各平台后端把窗口摆进桌面层，并跟随显示器布局、睡眠唤醒、分辨率与缩放变化。
+5. **让它跟着系统走** —— 系统「正在播放」（歌名 / 歌手 / 封面 / 进度）与系统音频频谱实时推送给
+   壁纸；切到别的应用自动暂停、回到桌面恢复；还能把代表帧同步为系统静态壁纸，锁屏与引擎未运行时
+   观感一致。
+6. **让 AI 也来做壁纸** —— 内置 MCP 服务把整条链路（建工程 → 写素材 → 校验 → 冻结版本 →
+   安装 → 应用 → 截图）开放给 AI 代理，壁纸工程可以被程序化地创作与迭代。
+
+**定位与边界。** 这是一个**独立的开源项目**，与 Wallpaper Engine 及其开发者、Valve 均无隶属关系；
+它不修改也不绕过 WE，创意工坊内容仍来自你自己的 Steam 账号，因此**需要账号拥有《Wallpaper
+Engine》**。下载走 Valve 官方工具，同一账号登录 steamcmd 会挤掉正在运行的 Steam 客户端
+（steamcmd 固有行为，无法规避）。
+
+**适合谁。** 想在 Windows / macOS / Linux 上用同一套引擎管理壁纸库的人；不想为了动态壁纸常年多开
+一个 Steam 客户端的人；以及想用 AI 批量生成、调整场景壁纸的人。想先从源码跑起来，见
+[从源码构建](#从源码构建--build-from-source)。
+
+### English
+
+**What it is.** An open-source engine that brings the Wallpaper Engine ecosystem to your own desktop.
+It reuses your Steam account to **download** wallpapers from the Workshop with Valve's official
+`steamcmd`, then renders them with its own engine — **video / GIF / web / scene (WebGL) / image** —
+onto the bottom layer of your desktop. So you don't have to keep a Steam client running all the time,
+and you're not tied to a single platform: the same local library serves Windows, macOS and Linux.
+
+**Where the "magic" is.** The wallpaper window is not an ordinary window — it is **a member of the
+desktop layer**: a native desktop-level window below the icons on macOS; a `Progman` / `WorkerW`
+desktop-layer child on Windows (both the Windows 11 raised-desktop layout and the classic Windows 10
+one are handled); an X11 desktop-layer window on Linux. Desktop icons stay clickable, other apps still
+sit on top, and what you see as the "desktop background" is a live, interactive scene.
+
+**The life of a wallpaper.**
+
+1. **Find it** — search, sort and filter by type and genre on the Workshop page; local files can be
+   imported straight into the library.
+2. **Fetch it** — serial downloads through `steamcmd`, with Steam Guard codes and retries;
+   credentials are **encrypted locally**, with no Keychain prompt. Entries that disappear from the
+   Workshop are detected and cleaned up in the library.
+3. **Render it** — applying a wallpaper starts one renderer page per display (served by the same
+   content server as the media, which removes cross-origin restrictions): video / GIF go through the
+   media pipeline; web wallpapers run their own HTML/JS with the WE shim API injected; scene
+   wallpapers are parsed from `scene.pkg` and rendered in WebGL by
+   [`webwallgl`](https://github.com/oneincase/webwallgl).
+4. **Put it on the desktop** — each platform backend places the window in the desktop layer and keeps
+   up with display layout, sleep/wake, resolution and scaling changes.
+5. **Let it follow the system** — the system Now Playing data (title / artist / cover / progress) and
+   the system audio spectrum are streamed to the wallpaper in real time; rendering pauses when you
+   switch to another app and resumes when you return to the desktop; a representative frame can be
+   synced as the system static wallpaper so the lock screen matches while the engine isn't running.
+6. **Let AI make wallpapers too** — the built-in MCP server opens the whole pipeline (create project →
+   write assets → validate → snapshot → install → apply → screenshot) to AI agents, so wallpaper
+   projects can be authored and iterated programmatically.
+
+**Positioning and boundaries.** This is an **independent open-source project**, not affiliated with
+Wallpaper Engine, its developers, or Valve. It neither modifies nor bypasses WE: Workshop content still
+comes from your own Steam account, so **the account must own *Wallpaper Engine***. Downloads use
+Valve's official tool, and signing steamcmd in with the same account disconnects your running Steam
+client (inherent to steamcmd, no way around it).
+
+**Who it's for.** People who want a single engine to manage their wallpaper library across
+Windows / macOS / Linux; people who'd rather not keep an extra Steam client running just for live
+wallpapers; and people who want to generate or tweak scene wallpapers with AI. To run it from source,
+see [Build from Source](#从源码构建--build-from-source).
+
+---
+
 ## ✨ 功能特性 / Features
 
 ### 中文
@@ -57,7 +148,7 @@
 - 🌍 **界面语言**：中文 / English 一键切换（界面、托盘菜单、原生文案、后端提示一起变）。
 - 🤖 **AI / MCP 创作**：内置 MCP 服务（默认 `127.0.0.1:7411`），30+ 工具覆盖「建工程 → 写素材 → 校验 → 冻结版本 → 安装 → 应用 → 截图」全流程（详见 [MCP 服务](#mcp-服务--mcp-server)）。
 - 🧹 **首次安装不打扰**：从未应用过壁纸时不创建任何壁纸窗口，桌面保持系统壁纸；壁纸缺失/加载失败时只显示简洁的 SVG 提示。
-- 🧱 **原生集成**：macOS 桌面层窗口、Linux X11 桌面层、Windows WorkerW 父子化，全部无边框透明、系统级置底。
+- 🧱 **原生集成**：macOS 桌面层窗口、Linux X11 桌面层、Windows `Progman` / `WorkerW` 桌面层（含 Win11 raised-desktop 适配），全部无边框透明、系统级置底。
 
 ### English
 
@@ -77,7 +168,7 @@
 - 🌍 **UI language**: one-click switch between 中文 and English (UI, tray menu, native strings and backend messages all follow).
 - 🤖 **AI / MCP authoring**: a built-in MCP server (default `127.0.0.1:7411`) exposes 30+ tools covering "create project → write assets → validate → snapshot → install → apply → screenshot" (see [MCP Server](#mcp-服务--mcp-server)).
 - 🧹 **Non-intrusive first run**: no wallpaper window is created until you apply one, so the desktop keeps your system wallpaper; when a wallpaper is missing or fails to load, only a minimal SVG notice is shown.
-- 🧱 **Native integration**: macOS desktop-level windows, Linux X11 desktop layer, Windows WorkerW parent-child overlay — all borderless, transparent and system-level.
+- 🧱 **Native integration**: macOS desktop-level windows, the Linux X11 desktop layer, and the Windows `Progman` / `WorkerW` desktop layer (including the Windows 11 raised-desktop layout) — all borderless, transparent and system-level.
 
 ---
 
