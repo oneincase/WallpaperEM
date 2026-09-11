@@ -41,10 +41,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, EnumWindows, FindWindowA, FindWindowExA,
     GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW, GetParent,
-    GetWindowThreadProcessId, RegisterClassW, SendMessageTimeoutA, SetParent, SetWindowPos,
-    TranslateMessage, EVENT_SYSTEM_FOREGROUND, HWND_BOTTOM, HWND_MESSAGE, MSG,
-    PBT_POWERSETTINGCHANGE, SMTO_NORMAL, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WINEVENT_OUTOFCONTEXT, WNDCLASSW, WM_POWERBROADCAST,
+    GetWindowLongPtrW, GetWindowThreadProcessId, RegisterClassW, SendMessageTimeoutA, SetParent,
+    SetWindowLongPtrW, SetWindowPos, TranslateMessage, EVENT_SYSTEM_FOREGROUND, GWL_EXSTYLE,
+    GWL_STYLE, HWND_BOTTOM, HWND_MESSAGE, MSG, PBT_POWERSETTINGCHANGE, SMTO_NORMAL,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WINEVENT_OUTOFCONTEXT, WNDCLASSW, WM_POWERBROADCAST, WS_CHILD,
+    WS_EX_NOREDIRECTIONBITMAP, WS_POPUP,
 };
 
 #[derive(Debug, Clone)]
@@ -80,6 +82,11 @@ const SCREENS_CACHE_TTL: Duration = Duration::from_millis(1500);
 
 /// 显示器是否处于关屏/睡眠（电源通知回调写入，`display_asleep` 读取）
 static DISPLAY_ASLEEP: AtomicBool = AtomicBool::new(false);
+
+/// 被我们改成 `WS_CHILD` 的窗口 → 它原来的 `GWL_STYLE`。
+/// Win11 的 raised-desktop 需要把壁纸窗口设成 Progman 的子窗口样式；切到交互态时要
+/// 脱离父子关系，必须把样式原样还原（带 `WS_CHILD` 又没有父窗口的窗口不会正常显示）。
+static ORIG_STYLE: Mutex<Vec<(isize, isize)>> = Mutex::new(Vec::new());
 
 /// 「显示器枚举为空」告警的限流时刻（指针线程会以 ~30Hz 调 active_screens，
 /// 过渡期可能连续为空，不能每次都打日志）
@@ -285,18 +292,18 @@ pub fn apply_desktop_window<R: Runtime>(
     };
 
     if interactive {
-        // 脱离桌面层（SetParent(None)），再压到 Z 序最底
+        // 脱离桌面层（SetParent(None) + 还原样式），再压到 Z 序最底
         unsafe { detach_from_parent(hwnd) };
         unsafe { place_top_level(hwnd, phys) };
     } else {
         match unsafe { parent_to_worker(hwnd) } {
-            Ok(worker) => {
-                tracing::info!("windows: 已父子化到壁纸 WorkerW {worker:?}");
+            Ok(parent) => {
+                tracing::info!("windows: 已挂到桌面层（parent={}）", parent.0 as isize);
                 unsafe { place_in_underlay(hwnd, phys) };
             }
             Err(e) => {
                 tracing::warn!(
-                    "windows: WorkerW 父子化失败（{e}）—— 退回 Z 序最底，避免全屏盖住桌面与应用"
+                    "windows: 挂到桌面层失败（{e}）—— 退回 Z 序最底，避免全屏盖住桌面与应用"
                 );
                 unsafe { place_top_level(hwnd, phys) };
             }
@@ -347,7 +354,7 @@ unsafe fn parent_to_worker(hwnd: HWND) -> Result<HWND, String> {
         Some(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE),
     ] {
         let prev = ctx.map(|c| unsafe { SetThreadDpiAwarenessContext(c) });
-        let r = unsafe { try_parent_to_worker(hwnd) };
+        let r = unsafe { desktop_attach_target().and_then(|t| attach_inner(hwnd, &t)) };
         if let Some(p) = prev {
             unsafe { SetThreadDpiAwarenessContext(p) };
         }
@@ -359,7 +366,27 @@ unsafe fn parent_to_worker(hwnd: HWND) -> Result<HWND, String> {
     Err(last)
 }
 
-unsafe fn try_parent_to_worker(hwnd: HWND) -> Result<HWND, String> {
+/// 桌面层的挂载目标（两种 Windows 桌面结构各一套）
+struct DesktopAttach {
+    /// `SetParent` 的目标
+    parent: HWND,
+    /// 挂好后紧贴到这个窗口的**下方**（z 序）—— Win11 的图标层 SHELLDLL_DefView
+    insert_after: Option<HWND>,
+    /// 静态壁纸所在的 WorkerW：需压到 Progman 子窗口 z 序最底
+    worker_bottom: Option<HWND>,
+    /// 是否需把窗口改成 `WS_CHILD`（Win11 raised-desktop 才需要）
+    child_style: bool,
+}
+
+/// 探测并返回当前桌面结构下的挂载目标。
+///
+/// Win11（近版本）把桌面拆成了「raised desktop」：Progman 自身带
+/// `WS_EX_NOREDIRECTIONBITMAP`（不画任何 GDI 内容），`SHELLDLL_DefView`（图标，几乎
+/// 全透明）与承载静态壁纸的 `WorkerW` 都成了 **Progman 的子窗口**。此时若还按老办法
+/// 挂到那个「兄弟 WorkerW」上，壁纸就落在静态壁纸**下面**，表现为「被原生壁纸盖住」
+/// —— 必须在 Progman 下建一个子窗口，并让它紧贴 `SHELLDLL_DefView` 之后（图标之下、
+/// 静态壁纸 WorkerW 之上），这也是微软给第三方壁纸程序的官方指引。
+unsafe fn desktop_attach_target() -> Result<DesktopAttach, String> {
     unsafe {
         let progman = FindWindowA(windows::core::s!("Progman"), None)
             .map_err(|e| format!("找不到 Progman: {e}"))?;
@@ -373,36 +400,113 @@ unsafe fn try_parent_to_worker(hwnd: HWND) -> Result<HWND, String> {
             1000,
             None,
         );
+
+        let ex = GetWindowLongPtrW(progman, GWL_EXSTYLE) as u32;
+        if ex & (WS_EX_NOREDIRECTIONBITMAP.0 as u32) != 0 {
+            let defview =
+                FindWindowExA(Some(progman), None, windows::core::s!("SHELLDLL_DefView"), None)
+                    .unwrap_or_default();
+            let worker = FindWindowExA(Some(progman), None, windows::core::s!("WorkerW"), None)
+                .unwrap_or_default();
+            if !defview.is_invalid() {
+                tracing::info!("windows: 检测到 Win11 raised desktop（Progman 带 WS_EX_NOREDIRECTIONBITMAP）");
+                return Ok(DesktopAttach {
+                    parent: progman,
+                    insert_after: Some(defview),
+                    worker_bottom: (!worker.is_invalid()).then_some(worker),
+                    child_style: true,
+                });
+            }
+        }
+
+        // 经典结构（Win10 / 旧版 Win11）：找「承载 SHELLDLL_DefView 的窗口」之后的
+        // WorkerW 兄弟，它就是图标之下那层
         let mut worker = HWND::default();
         let _ = EnumWindows(Some(enum_worker), LPARAM(&mut worker as *mut HWND as _));
         if worker.is_invalid() {
-            // 退回 Progman 直属的 WorkerW
             worker = FindWindowExA(Some(progman), None, windows::core::s!("WorkerW"), None)
                 .unwrap_or_default();
         }
         if worker.is_invalid() {
             return Err("未找到壁纸 WorkerW".into());
         }
-        // ⚠️ SetParent 返回的是「旧父窗口」：顶层窗口原本无父 ⇒ 返回 NULL，
-        // 而 windows-rs 会把 NULL 判成 Err（哪怕调用其实成功了）。故忽略返回值，
-        // 改用 GetParent 读回真实父窗口来校验。
-        let _ = SetParent(hwnd, Some(worker));
-        match GetParent(hwnd) {
-            Ok(p) if !p.is_invalid() && p == worker => Ok(worker),
-            Ok(p) => Err(format!(
-                "SetParent 后父窗口不是预期的 WorkerW（实际 parent={}, worker={}）",
-                p.0 as isize, worker.0 as isize
-            )),
-            Err(e) => Err(format!("SetParent 后读不到父窗口（{e}）")),
-        }
+        Ok(DesktopAttach {
+            parent: worker,
+            insert_after: None,
+            worker_bottom: None,
+            child_style: false,
+        })
     }
 }
 
-/// 解除与 WorkerW 的父子关系（回到顶层窗口）
+/// 按目标描述完成挂载 + z 序摆放，并校验父窗口真的是目标。
+unsafe fn attach_inner(hwnd: HWND, t: &DesktopAttach) -> Result<HWND, String> {
+    unsafe {
+        if t.child_style {
+            // 记录原始样式，交互态脱离时原样还原（带 WS_CHILD 却无父的窗口不会正常显示）
+            if let Ok(mut g) = ORIG_STYLE.lock() {
+                let key = hwnd.0 as isize;
+                if !g.iter().any(|(h, _)| *h == key) {
+                    g.push((key, GetWindowLongPtrW(hwnd, GWL_STYLE)));
+                }
+            }
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            let _ = SetWindowLongPtrW(
+                hwnd,
+                GWL_STYLE,
+                (style | WS_CHILD.0 as isize) & !(WS_POPUP.0 as isize),
+            );
+        }
+        // ⚠️ SetParent 返回的是「旧父窗口」：顶层窗口原本无父 ⇒ 返回 NULL，
+        // 而 windows-rs 会把 NULL 判成 Err（哪怕调用其实成功了）。故忽略返回值，
+        // 改用 GetParent 读回真实父窗口来校验。
+        let _ = SetParent(hwnd, Some(t.parent));
+        if GetParent(hwnd).ok().filter(|p| !p.is_invalid()) != Some(t.parent) {
+            return Err(format!(
+                "SetParent 后父窗口不是目标（target={}）",
+                t.parent.0 as isize
+            ));
+        }
+        if let Some(anchor) = t.insert_after {
+            // 紧贴锚点窗口的**下方**：SWP_NOMOVE|SWP_NOSIZE 只动 z 序
+            let _ = SetWindowPos(
+                hwnd,
+                Some(anchor),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+        if let Some(worker) = t.worker_bottom {
+            // 静态壁纸那层压到最底，别让它盖住我们
+            let _ = SetWindowPos(
+                worker,
+                Some(HWND_BOTTOM),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+        Ok(t.parent)
+    }
+}
+
+/// 解除父子关系（回到顶层窗口），并还原被我们改成 `WS_CHILD` 的样式
 unsafe fn detach_from_parent(hwnd: HWND) {
     unsafe {
-        // 同 parent_to_worker：返回值是旧父窗口，NULL 会被误判成 Err，忽略之
+        // 同 attach_inner：返回值是旧父窗口，NULL 会被误判成 Err，忽略之
         let _ = SetParent(hwnd, None);
+        if let Ok(mut g) = ORIG_STYLE.lock() {
+            let key = hwnd.0 as isize;
+            if let Some(i) = g.iter().position(|(h, _)| *h == key) {
+                let (_, style) = g.remove(i);
+                let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+            }
+        }
     }
 }
 
