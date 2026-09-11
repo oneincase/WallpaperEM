@@ -31,19 +31,23 @@ jobs:
       matrix:
         include:
           - os: macos-14
-            target: aarch64-apple-darwin
-            label: macOS-arm64
+            # universal：一个包同时含 arm64（Apple Silicon）与 x86_64（Intel）。
+            # 两个 rust target 都要装，Tauri 用 --target universal-apple-darwin 合并；
+            # 产物落在 target/universal-apple-darwin/... 而不是 target/release/...
+            targets: aarch64-apple-darwin,x86_64-apple-darwin
+            build_args: --target universal-apple-darwin
+            label: macOS-universal
             bundles: |
-              src-tauri/target/release/bundle/dmg/*.dmg
-              src-tauri/target/release/bundle/macos/*.app
+              src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+              src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app
           - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
+            targets: x86_64-unknown-linux-gnu
             label: Linux-x64
             bundles: |
               src-tauri/target/release/bundle/deb/*.deb
               src-tauri/target/release/bundle/appimage/*.AppImage
           - os: windows-latest
-            target: x86_64-pc-windows-msvc
+            targets: x86_64-pc-windows-msvc
             label: Windows-x64
             bundles: |
               src-tauri/target/release/bundle/nsis/*.exe
@@ -86,7 +90,7 @@ jobs:
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.targets }}
 
       - name: Rust 构建缓存
         uses: Swatinem/rust-cache@v2
@@ -131,7 +135,7 @@ jobs:
           APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY || '-' }}
           # 没有配置签名证书时不要去自动发现钥匙串身份（会浪费几十秒并报错）
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
-        run: pnpm tauri build
+        run: pnpm tauri build ${{ matrix.build_args }}
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4

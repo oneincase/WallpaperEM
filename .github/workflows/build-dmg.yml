@@ -18,7 +18,8 @@ concurrency:
 
 jobs:
   build-dmg:
-    # 构建目标是 aarch64-apple-darwin，需在 arm64 宿主机上构建。macos-14 是 ARM(M1/M2) 运行器。
+    # universal 包（arm64 + x86_64/Intel）必须在 arm64 宿主上构建 → macos-14 是 ARM 运行器。
+    # Tauri 会把两个 target 的产物 lipo 合并成一个 .app/.dmg。
     runs-on: macos-14
 
     steps:
@@ -28,7 +29,8 @@ jobs:
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin
+          # universal 需要两个 target 同时安装（Intel 切片由 x86_64 提供）
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
           components: clippy,rustfmt
 
       - name: Rust 构建缓存
@@ -64,15 +66,16 @@ jobs:
         env:
           APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY || '-' }}
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
-        run: pnpm tauri build
+        run: pnpm tauri build --target universal-apple-darwin
 
       - name: 上传构建产物（artifact）
         uses: actions/upload-artifact@v4
         with:
-          name: WallpaperEM-${{ github.ref_name }}
+          # universal 构建的产物在 target/universal-apple-darwin/ 下
+          name: WallpaperEM-macos-universal-${{ github.ref_name }}
           path: |
-            src-tauri/target/release/bundle/dmg/*.dmg
-            src-tauri/target/release/bundle/macos/*.app
+            src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app
           if-no-files-found: error
 
       - name: 把 DMG 附加到对应 tag 的 Release
@@ -82,6 +85,6 @@ jobs:
           # 标题取标签名（如 v0.1.0），自动创建/更新 tag 对应的 release
           name: ${{ github.ref_name }}
           files: |
-            src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
           draft: false
           prerelease: false
