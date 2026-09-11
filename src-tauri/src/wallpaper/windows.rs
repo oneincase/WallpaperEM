@@ -252,6 +252,7 @@ pub fn apply_desktop_window<R: Runtime>(
     if interactive {
         // 先脱离桌面层（SetParent(None)），再压到 Z 序最底
         if window.is_desktop_underlay() {
+            tracing::info!("windows: 交互态：脱离桌面层（set_desktop_underlay(false)）");
             if let Err(e) = window.set_desktop_underlay(false) {
                 tracing::warn!("windows: set_desktop_underlay(false) failed: {e}");
             }
@@ -259,11 +260,14 @@ pub fn apply_desktop_window<R: Runtime>(
         unsafe { place_top_level(hwnd, phys) };
     } else {
         if !window.is_desktop_underlay() {
+            tracing::info!("windows: 非交互态：父子化到 WorkerW（set_desktop_underlay(true)）");
             if let Err(e) = window.set_desktop_underlay(true) {
                 tracing::warn!("windows: set_desktop_underlay(true) failed: {e}");
             }
+            tracing::info!("windows: set_desktop_underlay(true) 返回");
         }
         unsafe { place_in_underlay(hwnd, phys) };
+        tracing::info!("windows: SetWindowPos 完成（phys={phys:?}）");
     }
     // 窗口是 visible(false) 创建的：几何/层级设置完再显示，避免闪现未定位的窗口
     let _ = window.show();

@@ -683,6 +683,8 @@ fn create_desktop_window(
     } else {
         WebviewUrl::App(format!("renderer/index.html{query}").into())
     };
+    tracing::info!("create_window[{label}]: 开始建窗（type={}）", cfg.r#type);
+    let build_started = std::time::Instant::now();
     let window = WebviewWindowBuilder::new(app, label, url)
         .title("")
         .decorations(false)
@@ -697,10 +699,16 @@ fn create_desktop_window(
         .focused(false)
         .build()
         .map_err(|e| e.to_string())?;
+    tracing::info!(
+        "create_window[{label}]: 窗口已建立（{}ms）",
+        build_started.elapsed().as_millis()
+    );
 
     platform::apply_desktop_window(&window, frame, current_interactive(app));
+    tracing::info!("create_window[{label}]: 桌面层/几何已应用");
 
     window.show().map_err(|e| e.to_string())?;
+    tracing::info!("create_window[{label}]: show() 完成");
     // 黑屏加固：窗口是 visible(false) 创建的，建窗瞬间 apply 时 occlusionState
     // 尚无 visible 位（实测 8192），WebKit 可能把页面判为不可见而停帧（黑屏）。
     // 按既有经验「show 之后重设层级 + orderFrontRegardless」，show 后再 apply
@@ -1765,12 +1773,31 @@ fn apply_item_inner(app: &AppHandle, item_id: &str) -> Result<(), String> {
     let (tx, rx) = std::sync::mpsc::channel();
     let app2 = app.clone();
     let item_id = item_id.to_string();
+    let tag = item_id.clone();
+    tracing::info!("apply[{tag}]: 派发到主线程（type={}）", cfg.r#type);
     app.run_on_main_thread(move || {
+        let t0 = std::time::Instant::now();
+        tracing::info!("apply[{item_id}]: 主线程处理器进入");
         let res = apply_on_main(&app2, None, cfg, Some(&item_id));
+        tracing::info!(
+            "apply[{item_id}]: 主线程处理器返回（{}ms, ok={}）",
+            t0.elapsed().as_millis(),
+            res.is_ok()
+        );
         let _ = tx.send(res);
     })
     .map_err(|e| e.to_string())?;
-    rx.recv().map_err(|e| format!("壁纸引擎未响应: {e}"))?
+    // 带上限等待：主线程若卡在建窗/桌面层放置，这里不再无限挂起（至少能返回错误、
+    // 让前端给出提示，日志里也能看到「派发了一条 apply 却没有返回」）。
+    match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+        Ok(r) => r,
+        Err(_) => {
+            tracing::error!(
+                "apply[{tag}]: 主线程处理器 20s 未返回 —— 卡在建窗或桌面层放置，详见上一条日志"
+            );
+            Err("应用壁纸超时：主线程在创建壁纸窗口时卡住（请把日志发给作者）".into())
+        }
+    }
 }
 
 /// 把本地库条目应用到桌面（用户显式点击；自动暂停态下立即恢复播放）
