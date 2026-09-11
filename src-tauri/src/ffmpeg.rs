@@ -59,10 +59,13 @@ static MANAGED_BIN: OnceLock<PathBuf> = OnceLock::new();
 /// 每次调用都判一次 `is_file()`：用户手动删掉托管副本后自动回落系统 ffmpeg，
 /// 不会拿着一个不存在的路径反复报「启动失败」。
 pub fn command() -> std::process::Command {
-    match MANAGED_BIN.get().filter(|p| p.is_file()) {
+    let mut cmd = match MANAGED_BIN.get().filter(|p| p.is_file()) {
         Some(p) => std::process::Command::new(p),
         None => std::process::Command::new("ffmpeg"),
-    }
+    };
+    // ffmpeg 是控制台程序：不加这个，Windows 上每次抽帧都会闪一个黑窗
+    crate::util::hide_console(&mut cmd);
+    cmd
 }
 
 /// 从 `ffmpeg -version` 首行取版本号：
@@ -101,11 +104,10 @@ async fn extract(archive: &std::path::Path, dest: &std::path::Path) -> Result<()
         .await
         .map_err(|e| format!("解压任务失败: {e}"))?;
     }
-    let out = tokio::process::Command::new("tar")
-        .arg("-xJf")
-        .arg(archive)
-        .arg("-C")
-        .arg(dest)
+    let mut tar = tokio::process::Command::new("tar");
+    tar.arg("-xJf").arg(archive).arg("-C").arg(dest);
+    crate::util::hide_console_tokio(&mut tar);
+    let out = tar
         .output()
         .await
         .map_err(|e| format!("调用 tar 失败: {e}"))?;
@@ -339,10 +341,10 @@ mod imp {
         if !path.is_file() {
             return None;
         }
-        let out = std::process::Command::new(path)
-            .arg("-version")
-            .output()
-            .ok()?;
+        let mut cmd = std::process::Command::new(path);
+        cmd.arg("-version");
+        crate::util::hide_console(&mut cmd);
+        let out = cmd.output().ok()?;
         if !out.status.success() {
             return None;
         }
@@ -353,11 +355,10 @@ mod imp {
         if !path.is_file() {
             return None;
         }
-        let out = tokio::process::Command::new(path)
-            .arg("-version")
-            .output()
-            .await
-            .ok()?;
+        let mut cmd = tokio::process::Command::new(path);
+        cmd.arg("-version");
+        crate::util::hide_console_tokio(&mut cmd);
+        let out = cmd.output().await.ok()?;
         if !out.status.success() {
             return None;
         }
@@ -366,10 +367,10 @@ mod imp {
 
     /// 系统 PATH 上的 ffmpeg（用户自己装的）
     fn system_version() -> Option<String> {
-        let out = std::process::Command::new("ffmpeg")
-            .arg("-version")
-            .output()
-            .ok()?;
+        let mut cmd = std::process::Command::new("ffmpeg");
+        cmd.arg("-version");
+        crate::util::hide_console(&mut cmd);
+        let out = cmd.output().ok()?;
         if !out.status.success() {
             return None;
         }

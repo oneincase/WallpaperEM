@@ -342,6 +342,9 @@ mod imp {
             cmd.stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+            // 不弹控制台窗口：steamcmd.exe 是控制台程序，默认每次 spawn 都会闪出一个
+            // 黑窗（下载/验证/预热都走这里，用户会看到频繁闪窗）。
+            crate::util::hide_console_tokio(cmd);
         }
 
         /// 子进程 spawn 之后取交互通道：写出端 +（stdout ∪ stderr）事件流。

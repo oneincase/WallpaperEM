@@ -297,12 +297,12 @@ pub fn app_update_open(path: String) -> Result<String, String> {
 
     #[cfg(target_os = "windows")]
     {
-        // cmd /C start "" <path>：第一个空引号是窗口标题占位，否则带空格路径会被当成标题
-        std::process::Command::new("cmd")
-            .args(["/C", "start", ""])
-            .arg(&p)
-            .spawn()
-            .map_err(|e| format!("启动安装程序失败: {e}"))?;
+        // cmd /C start "" <path>：第一个空引号是窗口标题占位，否则带空格路径会被当成标题。
+        // 加 CREATE_NO_WINDOW 避免 cmd 自己先闪一个控制台（安装器窗口照常弹出）。
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/C", "start", ""]).arg(&p);
+        crate::util::hide_console(&mut cmd);
+        cmd.spawn().map_err(|e| format!("启动安装程序失败: {e}"))?;
         return Ok("已启动安装程序，按提示完成更新".into());
     }
 
