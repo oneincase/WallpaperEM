@@ -1,7 +1,7 @@
 // 会话快照：把「上次看到的内容」落到 localStorage，跨窗口销毁/重建后立即还原。
 //
 // 为什么必须落盘、模块级变量不行：
-//  1. main_window.rs 的 RELEASE_AFTER 到点后走 webview.destroy()，重建时是
+//  1. main_window.rs 在系统内存压力下走 webview.destroy()，重建时是
 //     WebviewUrl::App("index.html") —— 全新 JS 上下文，模块级变量一律归零。
 //  2. 即使窗口没被销毁，App.tsx 的冻结自检发现时间跳变 >30s 会
 //     window.location.reload()，同样清空内存。

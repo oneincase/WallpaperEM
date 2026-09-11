@@ -14,7 +14,7 @@
 //! - Hyprland / wlroots：走合成器侧 windowrule/layerrule，由用户配置；
 //! - 无 KWin 模糊效果（X11 下被用户关闭）：属性无害残留，不生效。
 //!
-//! 触发点与 macOS vibrancy 共用：setup 一次 + 主窗口闲置释放重建后一次
+//! 触发点与 macOS vibrancy 共用：setup 一次 + 主窗口回收后重建的那一次
 //! （见 lib.rs apply_vibrancy）。
 
 use std::ffi::c_void;

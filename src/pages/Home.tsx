@@ -16,8 +16,8 @@ import { readSnapshot, writeSnapshot, SNAPSHOT_KEYS } from "../lib/cache-snapsho
 
 // 会话快照：首次成功获取后把随机壁纸列表与选中位置落到 localStorage。
 //
-// 之前这里用的是模块级变量，只能扛住「切页导致组件卸载」；窗口被释放后重建
-// （main_window.rs 的 RELEASE_AFTER）是全新 JS 上下文，模块级变量归零，
+// 之前这里用的是模块级变量，只能扛住「切页导致组件卸载」；窗口被回收后重建
+// （main_window.rs 的内存压力回收）是全新 JS 上下文，模块级变量归零，
 // 于是每次重开都要等三次串行网络请求（拉总数 → 拉随机页 → enrich 元数据）。
 //
 // 刻意不做 TTL、也不后台静默刷新：重开窗口直接显示上次那一批，只有点

@@ -1,16 +1,30 @@
-//! 主窗口生命周期：闲置释放 + 按需重建
+//! 主窗口生命周期：内存压力下回收 + 按需重建
 //!
-//! 应用主窗口（React UI，独立 WKWebView）在隐藏/最小化超过 [`RELEASE_AFTER`]
-//! 后销毁窗口，让 WebKit 回收其 WebContent 进程（通常是最大的"多余"内存占用，
-//! 含缩略图/预览等媒体资源）；桌面壁纸窗口（label = `wallpaper-*`）不受影响。
+//! 应用主窗口（React UI，独立 WKWebView）隐藏/最小化后**不再按时间回收** ——
+//! 只有系统真的报告内存压力（[`crate::mem_pressure`]）时才销毁窗口，让 WebKit
+//! 回收其 WebContent 进程；桌面壁纸窗口（label = `wallpaper-*`）不受影响。
+//!
+//! 为什么放弃「隐藏 X 秒就销毁」：那一步在 macOS 上**回收不了内存**。主窗口用的是
+//! 默认（共享）`WKWebsiteDataStore` —— 没有按标识删除的 API，`destroy()` 只是把
+//! WKWebView 从窗口上摘下来，WebContent 进程连页面一起留在 WebKit 的进程池里，
+//! 下次重建又落回同一个池子（壁纸窗口那边是同一个机制，靠「每窗口独占一份存储 +
+//! 销毁时删除」才绕开）。实测（2026-09-11 日志 + 活动监视器）「3s 闲置回收」的
+//! 收益接近于零，代价却是每次重开都付一次页面重载，外加隐藏瞬间的主线程停顿 ——
+//! 当天日志里 30 次 `UI event loop wedged?` 全部落在窗口被隐藏的那一刻（逐条对照
+//! 上下文可知是 WebKit 的百毫秒级抖动，不是卡死）。改成「压力下才回收」：这时把
+//! 几百 MB 还回去，才值得付一次重建。
 //!
 //! 隐藏判定覆盖三种用户路径：
 //! - 黄色按钮最小化（miniaturized 时 isVisible 仍为 true，故必须查 is_minimized）
 //! - 关闭按钮（CloseRequested -> hide，见 lib.rs setup）
 //! - ⌘H 隐藏整个应用（窗口 orderOut，is_visible 变 false）
 //!
-//! 释放后用户从 托盘菜单 / 托盘左键 / Dock 图标(Reopen) / 二次启动(single-instance)
+//! 回收后用户从 托盘菜单 / 托盘左键 / Dock 图标(Reopen) / 二次启动(single-instance)
 //! 唤起时，由 [`ensure_main_window`] 按 tauri.conf.json 原配置重建窗口。
+//!
+//! 已知边界：压力下若主窗口**可见**，我们不动它（销毁用户正在看的窗口更糟）。
+//! 此时 WebKit 自己也可能在压力下结束这个进程 → 界面变空白，关掉重开即可（走既有
+//! 重建路径）；这种情况会打一条 WARN 留痕。
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,14 +32,16 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 use crate::download;
+use crate::mem_pressure;
 
-/// 主窗口持续隐藏多久后释放（销毁窗口 -> 终止其 WebContent 进程）。
-/// 3s 的激进回收：主界面是纯管理面板，重建成本是一次页面加载（<1s），
-/// 常驻的 WebContent 进程（数百 MB）远比这个贵。下载/Guard/扫码登录期间
-/// 看门狗会跳过释放（on_tick 里的 is_busy 守卫），激进值不会打断流程。
-pub const RELEASE_AFTER: Duration = Duration::from_secs(3);
-/// 轮询周期（实际触发时延 = RELEASE_AFTER + 最多一次轮询间隔）
+/// 隐藏满这么久之后，才允许在内存压力下回收 —— 避免用户在两个应用间来回切时
+/// 被反复重建（一次重建 = 一次完整页面加载）。
+const MIN_HIDDEN: Duration = Duration::from_secs(5);
+/// 看门狗轮询周期（实际触发时延 = MIN_HIDDEN + 最多一次轮询间隔）
 const POLL: Duration = Duration::from_secs(1);
+/// 内存压力的复查间隔（拍数）：读一次 sysctl / `/proc/meminfo` 很便宜，
+/// 但压力是缓变量，没必要每秒读。
+const PRESSURE_POLL_TICKS: u32 = 5;
 
 #[derive(Default)]
 struct MainWindowState {
@@ -36,24 +52,70 @@ struct MainWindowState {
     /// 会拿到僵尸条目并对其 show()（静默失败），主窗口永远无法重建。该标志强制
     /// ensure_main_window 走清场重建路径。
     released: bool,
+    /// 本轮内存压力里是否已就「主窗口可见、不回收」提醒过一次（压力持续时不刷屏）
+    noted_visible: bool,
 }
 
-/// 启动闲置释放看门狗（setup 阶段调用一次）
+/// 启动回收看门狗（setup 阶段调用一次）
 pub fn start(app: &AppHandle) {
     app.manage(Arc::new(Mutex::new(MainWindowState::default())));
     let app2 = app.clone();
     tauri::async_runtime::spawn(async move {
+        let mut ticks: u32 = 0;
+        // 最近一次内存压力读数；None = 本平台读不到（按「无压力」处理 → 不回收）
+        let mut reading: Option<mem_pressure::Reading> = None;
+        // 连续读不到的次数；两条日志各自只记一次（见下面的日志说明）
+        let mut misses: u32 = 0;
+        let (mut ready_logged, mut missing_warned) = (false, false);
         loop {
             tokio::time::sleep(POLL).await;
+            if ticks.is_multiple_of(PRESSURE_POLL_TICKS) {
+                let next = mem_pressure::read();
+                // 这两条日志是「探测有没有生效」的唯一凭据：读不到读数时主窗口会**永远**
+                // 常驻，「一直没看到回收」既可能是没压力，也可能是信号一直是 None，必须
+                // 能从日志里区分开。首次读到记 INFO，连续 3 次读不到才记 WARN（躲开偶发）。
+                match next.as_ref() {
+                    Some(r) => {
+                        misses = 0;
+                        if !ready_logged {
+                            ready_logged = true;
+                            tracing::info!("内存压力探测就绪：{}", r.detail);
+                        }
+                    }
+                    None => {
+                        misses = misses.saturating_add(1);
+                        if misses >= 3 && !missing_warned {
+                            missing_warned = true;
+                            tracing::warn!(
+                                "连续 {} 次读不到内存压力读数：主窗口将常驻不回收（只是少了这条回收路径，\
+                                 壁纸窗口的销毁/回收不受影响）",
+                                misses
+                            );
+                        }
+                    }
+                }
+                let was = reading.as_ref().is_some_and(|r| r.pressure);
+                if next.as_ref().is_some_and(|r| r.pressure) && !was {
+                    tracing::warn!(
+                        "system memory pressure: {}（隐藏中的主窗口将被回收）",
+                        reading_detail(next.as_ref())
+                    );
+                }
+                reading = next;
+            }
+            ticks = ticks.wrapping_add(1);
             let app3 = app2.clone();
+            let reading = reading.clone();
             // AppKit 调用必须在主线程
-            let _ = app2.run_on_main_thread(move || on_tick(&app3));
+            let _ = app2.run_on_main_thread(move || on_tick(&app3, reading.as_ref()));
         }
     });
-    tracing::info!(
-        "main window idle release armed ({}s)",
-        RELEASE_AFTER.as_secs()
-    );
+    tracing::info!("main window release armed（仅在系统内存压力下回收）");
+}
+
+/// 读数的日志文本（读不到时给个占位）
+fn reading_detail(reading: Option<&mem_pressure::Reading>) -> &str {
+    reading.map(|r| r.detail.as_str()).unwrap_or("读数不可用")
 }
 
 /// 主窗口是否处于"用户不可见"状态（最小化/隐藏/应用隐藏）。
@@ -63,23 +125,36 @@ fn is_hidden(w: &WebviewWindow) -> bool {
 }
 
 /// 单次检查（在主线程执行，检查与销毁天然无竞态）
-fn on_tick(app: &AppHandle) {
-    let hidden = app
-        .get_webview_window("main")
-        .as_ref()
-        .map(is_hidden)
-        .unwrap_or(false);
+fn on_tick(app: &AppHandle, pressure: Option<&mem_pressure::Reading>) {
+    let window = app.get_webview_window("main");
+    let hidden = window.as_ref().map(is_hidden).unwrap_or(false);
+    let pressured = pressure.is_some_and(|r| r.pressure);
 
     let Some(st) = app.try_state::<Arc<Mutex<MainWindowState>>>() else {
         return;
     };
     let mut st = st.lock().unwrap();
+    // 没有内存压力就什么都不做：主窗口常驻（理由见文件头），计时也归零
+    if !pressured {
+        st.hidden_since = None;
+        st.noted_visible = false;
+        return;
+    }
     if !hidden {
         st.hidden_since = None;
+        if !st.noted_visible {
+            st.noted_visible = true;
+            tracing::warn!(
+                "memory pressure（{}）但主窗口可见：本次不回收 —— WebKit 也可能自行结束这个进程，\
+                 界面若变成空白，关掉重开即可（会走重建路径）",
+                reading_detail(pressure)
+            );
+        }
         return;
     }
     let since = *st.hidden_since.get_or_insert_with(Instant::now);
-    if since.elapsed() < RELEASE_AFTER {
+    let hidden_for = since.elapsed();
+    if hidden_for < MIN_HIDDEN {
         return;
     }
     // 到时：先重置计时（本次要么释放，要么因下载活动跳过后重新计满时长）
@@ -87,22 +162,23 @@ fn on_tick(app: &AppHandle) {
 
     // 下载/Guard/扫码登录进行中：跳过释放，避免打断 Steam Guard 输入与进度展示
     if download::is_busy(app) {
-        tracing::debug!("main window idle release skipped: download active");
+        tracing::debug!("main window memory-pressure release skipped: download active");
         return;
     }
 
     // 释放前再次确认仍隐藏（用户可能刚重新打开）
-    if let Some(w) = app.get_webview_window("main") {
+    if let Some(w) = window {
         if is_hidden(&w) {
             match w.destroy() {
                 Ok(_) => {
-                    // 注意：此处不可再 lock()——外层 guard（第 73 行）仍存活，
+                    // 注意：此处不可再 lock()——本函数开头拿到的 st guard 仍存活，
                     // std::sync::Mutex 不可重入，同线程二次 lock = 自死锁，
                     // 表现为「主窗口被回收的瞬间整个软件无响应」
                     st.released = true;
                     tracing::info!(
-                        "main window released after {}s hidden (WebContent 进程回收)",
-                        RELEASE_AFTER.as_secs()
+                        "main window released under memory pressure（{}，已隐藏 {}s；WebContent 进程回收）",
+                        reading_detail(pressure),
+                        hidden_for.as_secs()
                     );
                 }
                 Err(e) => tracing::warn!("main window release failed: {e}"),
@@ -111,7 +187,7 @@ fn on_tick(app: &AppHandle) {
     }
 }
 
-/// 显示主窗口；若已被闲置释放销毁，则按 tauri.conf.json 原配置重建。
+/// 显示主窗口；若已被内存压力回收销毁，则按 tauri.conf.json 原配置重建。
 /// 供托盘菜单/托盘左键/Dock Reopen/单实例聚焦调用；可在任意线程调用
 /// （窗口操作经 runtime 派发到主线程，主线程调用则同步执行）。
 pub fn ensure_main_window(app: &AppHandle) {

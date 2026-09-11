@@ -374,6 +374,17 @@ pub struct WallpaperEngineState {
     /// 「自动暂停」自己挂上的暂停（区别于用户手动暂停）：回到桌面时只恢复
     /// 这个标志置位的暂停，用户手动暂停不受前台切换影响
     pub auto_paused: Mutex<bool>,
+    /// macOS：label -> 该窗口**独占**的 WKWebsiteDataStore 标识。
+    ///
+    /// 窗口被销毁（stop / 显示器移除 / 换纸降级到重建）时按它
+    /// `removeDataStoreForIdentifier`，删成功则这份存储的进程池被销毁，压着整张
+    /// 壁纸的 WebContent 进程随之退出（见 [`destroy_wallpaper_window`]）。
+    /// 删成功**不是必然**：只要 UI 进程里还活着一个引用该存储的 `WKWebsiteDataStore`，
+    /// WebKit 就拒绝删除（实测 macOS 26 约七成如此），所以日常换壁纸走的是
+    /// 「同窗口换文档」（[`schedule_window_reload`]），不依赖这条。
+    /// 其它平台不用（WebView2 / WebKitGTK 的 destroy 会连带销毁渲染进程）。
+    #[cfg(target_os = "macos")]
+    pub data_stores: Mutex<HashMap<String, [u8; 16]>>,
 }
 
 impl Default for WallpaperEngineState {
@@ -383,6 +394,8 @@ impl Default for WallpaperEngineState {
             default: Mutex::new(None),
             paused: Mutex::new(false),
             auto_paused: Mutex::new(false),
+            #[cfg(target_os = "macos")]
+            data_stores: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -448,8 +461,61 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
     platform::start_desktop_click_monitor(app);
     // 指针注入：非交互态（壁纸在图标下方）收不到真实鼠标，靠轮询系统光标补上
     pointer::start(app, current_interactive(app));
+    // macOS：清掉上次运行退出时留下的独占数据存储（退出走的是 Tauri 统一销毁，
+    // 来不及回收进程/存储）。延迟一点做，别和启动抢 IO。
+    #[cfg(target_os = "macos")]
+    sweep_stale_data_stores(app, Duration::from_secs(3));
     tracing::info!("wallpaper engine ready");
     Ok(())
+}
+
+/// macOS：扫一遍并删掉「没人再用」的独占数据存储 —— 上次运行退出时留下的那些。
+///
+/// 换壁纸时会顺手删掉旧窗口那份（[`reap_data_store`]），但**应用退出**时窗口是
+/// Tauri 统一销毁的，来不及走回收，于是每次运行至少留下一份（WebKit 的磁盘缓存
+/// 也在这个存储目录里，攒起来不小）。这里按 `fetchAllDataStoreIdentifiers` 扫：
+/// 默认/非持久存储不在这个列表里（主窗口那套 UI 缓存不受影响），且当前仍登记在
+/// `state.data_stores` 里的一律跳过。
+///
+/// 除了启动时清上次的遗留（`delay=3s`，别和启动抢 IO），监控每 60s 也会再跑一次
+/// （`delay=0`）——[`reap_data_store`] 那 20s 窗口里没删掉的，等 WebKit 松开引用后
+/// 由这里补上；顺手也清掉崩溃/强杀留下的孤儿存储。
+#[cfg(target_os = "macos")]
+fn sweep_stale_data_stores(app: &AppHandle, delay: Duration) {
+    let app = app.clone();
+    if !custom_data_store_available() {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        let ids = match app.fetch_data_store_identifiers().await {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::debug!("data store sweep: 枚举失败（{e}）");
+                return;
+            }
+        };
+        let in_use: Vec<[u8; 16]> = app
+            .try_state::<WallpaperEngineState>()
+            .map(|st| st.data_stores.lock().unwrap().values().copied().collect())
+            .unwrap_or_default();
+        let mut removed = 0usize;
+        for id in ids {
+            if in_use.contains(&id) {
+                continue;
+            }
+            if app.remove_data_store(id).await.is_ok() {
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            tracing::info!(
+                "data store sweep: 清掉 {removed} 份没人用的壁纸数据存储（上次遗留 / 已销毁窗口）"
+            );
+        }
+    });
 }
 
 /// 从 wallpaper_sessions 表恢复各屏壁纸
@@ -520,8 +586,8 @@ static NO_CONFIG_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 fn ensure_windows_inner(app: &AppHandle, display_asleep: bool) {
     // 显示器睡眠/唤醒切换期间不做任何窗口增删：此时 CGGetActiveDisplayList
     // 可能返回空列表（显示器从「活动」列表暂时消失），若照常执行下方清理逻辑，
-    // 会把所有壁纸窗口误判为「已断开的显示器」全部销毁 —— 主窗口若也处于闲置
-    // 释放状态，最后一个窗口关闭就会触发 Tauri 默认行为退出整个进程
+    // 会把所有壁纸窗口误判为「已断开的显示器」全部销毁 —— 主窗口此时通常也是
+    // 关闭/隐藏状态，最后一个窗口关闭就会触发 Tauri 默认行为退出整个进程
     // （表现为「休眠后壁纸软件退出」）。醒来后由下一轮 tick 恢复同步。
     if display_asleep {
         return;
@@ -551,7 +617,7 @@ fn ensure_windows_inner(app: &AppHandle, display_asleep: bool) {
     for label in &existing_labels {
         if !desired.contains_key(label) {
             if let Some(w) = app.get_webview_window(label) {
-                let _ = w.destroy();
+                destroy_wallpaper_window(app, &w);
             }
             if let Ok(mut windows) = state.windows.lock() {
                 windows.remove(label);
@@ -588,30 +654,22 @@ fn ensure_windows_inner(app: &AppHandle, display_asleep: bool) {
     }
 }
 
+/// 内容服务器的实际监听端口。真实端口在本进程内的 `Arc<Mutex<u16>>` 里（服务器绑定后异步写入），
+/// `ContentServerState.port` 恒为占位 0；未就绪（启动早期）返回 None。
+fn content_port(app: &AppHandle) -> Option<u16> {
+    let port = *app.try_state::<Arc<Mutex<u16>>>()?.lock().ok()?;
+    (port > 0).then_some(port)
+}
+
 fn media_base(app: &AppHandle) -> Option<String> {
-    // 真实端口在 Arc<Mutex<u16>>（服务器绑定后异步写入）；ContentServerState.port 恒为占位 0
-    let port = app
-        .try_state::<Arc<Mutex<u16>>>()?
-        .lock()
-        .ok()
-        .map(|g| *g)?;
-    if port == 0 {
-        return None;
-    }
+    let port = content_port(app)?;
     let state = app.try_state::<ContentServerState>()?;
     Some(format!("http://127.0.0.1:{port}/media/{}", state.token))
 }
 
 /// web 壁纸站点根基址（绝对路径引用可解析）
 fn web_base(app: &AppHandle) -> Option<String> {
-    let port = app
-        .try_state::<Arc<Mutex<u16>>>()?
-        .lock()
-        .ok()
-        .map(|g| *g)?;
-    if port == 0 {
-        return None;
-    }
+    let port = content_port(app)?;
     let state = app.try_state::<ContentServerState>()?;
     Some(format!("http://127.0.0.1:{port}/web/{}", state.token))
 }
@@ -695,12 +753,12 @@ fn same_wallpaper(a: &WallpaperConfig, b: &WallpaperConfig) -> bool {
     }
 }
 
-fn create_desktop_window(
-    app: &AppHandle,
-    label: &str,
-    cfg: &WallpaperConfig,
-    frame: (f64, f64, f64, f64),
-) -> Result<WebviewWindow, String> {
+/// 装配一份「可以直接喂给渲染器」的配置：刷新媒体基址与 token、叠加
+/// 「全局默认 + 本壁纸覆盖」的播放设置。
+///
+/// 建窗（[`create_desktop_window`]）与换壁纸（就地导航 / 重建窗口两条路）共用
+/// 这一份，保证各条路径下发给渲染器的配置逐字段一致 —— 新增一个字段只改这里。
+fn prepare_cfg(app: &AppHandle, cfg: &WallpaperConfig) -> WallpaperConfig {
     let mut cfg = cfg.clone();
     cfg.media_base = media_base(app);
     // 会话恢复来的 src 可能带上次运行的过期 token，用当前基址重写
@@ -708,26 +766,92 @@ fn create_desktop_window(
     // 全局默认 + 本壁纸覆盖（WE 的播放设置是按壁纸记忆的）
     let item = item_id_of(&cfg);
     apply_play_config(app, &mut cfg, item.as_deref());
-    let query = config_query_with_audio(&cfg, content_token(app).as_deref());
+    cfg
+}
+
+/// 渲染器页的完整 URL（换壁纸时就导航到这里）。
+///
+/// 端口就绪（进程内绝大多数时刻）直接按当前端口拼；未就绪（启动早期，内容
+/// 服务器还没绑定）就沿用当前窗口的 scheme/host，只换路径与 query —— 那种
+/// 情况下窗口本身也是用 `WebviewUrl::App(..)` 建的，同源换页即可。
+fn renderer_url(
+    app: &AppHandle,
+    window: Option<&WebviewWindow>,
+    cfg: &WallpaperConfig,
+) -> Result<url::Url, String> {
+    if let Some(port) = content_port(app) {
+        return renderer_url_on(
+            &format!("http://127.0.0.1:{port}"),
+            cfg,
+            content_token(app).as_deref(),
+        );
+    }
+    let query = config_query_with_audio(cfg, content_token(app).as_deref());
+    let mut url = window
+        .ok_or("内容服务器端口未就绪")?
+        .url()
+        .map_err(|e| e.to_string())?;
+    url.set_path("/renderer/index.html");
+    url.set_query(Some(query.trim_start_matches('?')));
+    Ok(url)
+}
+
+/// 渲染器页 URL（给定内容服务器 origin）。
+///
+/// 建窗与换壁纸整页导航共用这一份，只差一个 origin：**query 必须逐字段一致**。
+/// 渲染器的全部壁纸配置都取自 URL query（`renderer/src/main.ts` 的 `initialCfg`），
+/// 少一个字段就是「换了壁纸但设置没跟着换」。
+fn renderer_url_on(
+    origin: &str,
+    cfg: &WallpaperConfig,
+    audio_token: Option<&str>,
+) -> Result<url::Url, String> {
+    let query = config_query_with_audio(cfg, audio_token);
+    format!("{origin}/renderer/index.html{query}")
+        .parse::<url::Url>()
+        .map_err(|e| format!("无效的渲染器 URL: {e}"))
+}
+
+/// 在既有壁纸窗口里**整页导航**到新配置（非 macOS 的换壁纸走这条路；macOS 的
+/// 取舍见 [`new_data_store_id`]）。与热更新 `setWallpaper` 的区别是
+/// 换的是文档：旧页面的 `pagehide` teardown 会跑完（销毁库实例、释放 pkg 缓存、
+/// `loseContext`、撤销 blob），WebKit 随文档销毁一并回收 GPU 侧资源。
+fn navigate_to_config(
+    app: &AppHandle,
+    window: &WebviewWindow,
+    cfg: &WallpaperConfig,
+) -> Result<(), String> {
+    let cfg = prepare_cfg(app, cfg);
+    let url = renderer_url(app, Some(window), &cfg)?;
+    window.navigate(url).map_err(|e| e.to_string())
+}
+
+fn create_desktop_window(
+    app: &AppHandle,
+    label: &str,
+    cfg: &WallpaperConfig,
+    frame: (f64, f64, f64, f64),
+) -> Result<WebviewWindow, String> {
+    let cfg = prepare_cfg(app, cfg);
     // 渲染器页与媒体同源（内容服务器），消除跨源 fetch 限制
-    let port: u16 = match app.try_state::<Arc<Mutex<u16>>>() {
-        Some(s) => match s.lock() {
-            Ok(g) => *g,
-            Err(_) => 0,
-        },
-        None => 0,
-    };
-    let url = if port > 0 {
-        let parsed: url::Url = format!("http://127.0.0.1:{port}/renderer/index.html{query}")
-            .parse()
-            .map_err(|e: url::ParseError| format!("无效的渲染器 URL: {e}"))?;
-        WebviewUrl::External(parsed)
+    let url = if let Some(port) = content_port(app) {
+        WebviewUrl::External(renderer_url_on(
+            &format!("http://127.0.0.1:{port}"),
+            &cfg,
+            content_token(app).as_deref(),
+        )?)
     } else {
+        let query = config_query_with_audio(&cfg, content_token(app).as_deref());
         WebviewUrl::App(format!("renderer/index.html{query}").into())
     };
     tracing::info!("create_window[{label}]: 开始建窗（type={}）", cfg.r#type);
     let build_started = std::time::Instant::now();
-    let window = WebviewWindowBuilder::new(app, label, url)
+    // macOS：每块壁纸窗口独占一份 WKWebsiteDataStore，窗口销毁时才有机会连带
+    // 回收它的 WebContent 进程，详见 [`new_data_store_id`]。其它平台该 builder
+    // 项被忽略（wry 里仅 Apple 生效）。
+    #[cfg(target_os = "macos")]
+    let data_store = custom_data_store_available().then(new_data_store_id);
+    let mut builder = WebviewWindowBuilder::new(app, label, url)
         .title("")
         .decorations(false)
         .transparent(true)
@@ -738,9 +862,26 @@ fn create_desktop_window(
         .maximizable(false)
         .closable(false)
         .skip_taskbar(true)
-        .focused(false)
-        .build()
-        .map_err(|e| e.to_string())?;
+        .focused(false);
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(id) = data_store {
+            builder = builder.data_store_identifier(id);
+        }
+    }
+    let window = builder.build().map_err(|e| e.to_string())?;
+    #[cfg(target_os = "macos")]
+    if let Some(id) = data_store {
+        if let Some(st) = app.try_state::<WallpaperEngineState>() {
+            st.data_stores.lock().unwrap().insert(label.to_string(), id);
+            // 标识打出来是为了和磁盘上的 `~/Library/WebKit/<app>/WebsiteDataStore/<uuid>`
+            // 对上：那条目录还在 = 这份存储没被回收成功（进程仍压着内存）。
+            tracing::info!(
+                "create_window[{label}]: 独占数据存储已登记（uuid={}，销毁窗口时回收）",
+                store_id_label(&id)
+            );
+        }
+    }
     tracing::info!(
         "create_window[{label}]: 窗口已建立（{}ms）",
         build_started.elapsed().as_millis()
@@ -813,7 +954,327 @@ fn create_desktop_window(
 static RECREATING: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
     std::sync::OnceLock::new();
 
+/// 正在就地重载的 label 集合（防抖 + 单飞，语义同 [`RECREATING`]）。
+static RELOADING: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+/// 换壁纸：在**同一块窗口里整页导航**到新的渲染器 URL（所有平台）。
+///
+/// macOS 一度改成「销毁窗口 + 重建」（[`schedule_window_recreate`]），指望靠删掉
+/// 窗口独占的 WKWebsiteDataStore（[`new_data_store_id`]）让旧 WebContent 进程退出。
+/// 实测（macOS 26，2026-09-11 日志）这条路**只有三成兑现**：11 次换壁纸里 7 次
+/// `removeDataStoreForIdentifier` 报 `Data store is in use` —— 只要 UI 进程里还活着
+/// 一个引用那份存储的 `WKWebsiteDataStore`（销毁后的 WKWebView 及其 configuration
+/// 仍被 WebKit 攥着），该 API 就拒绝删除 —— 40 行 ObjC 最小复现里，把 webview 与
+/// configuration 都置空后等 12s，那对象依旧活着、删除依旧被拒。于是每换一张壁纸就
+/// 多留一个几百 MB～1GB 的渲染进程。既然删存储这条路不可靠，就回到和其它平台一样
+/// 的做法：**换文档而不是换窗口**，每个显示器恒为 1 个渲染进程，内存不再随切换
+/// 次数累积。
+///
+/// 为什么曾经不选「销毁窗口 + 同名重建」（v0.5 之前一直那么做）：销毁并不能让那
+/// 份内存真的回来。`destroy()` 只是把 WKWebView 从窗口上摘下来；WebKit 随后
+/// 会把这个 WebContent 进程留进进程缓存（页面的 JS 堆、WebGL 上下文、解析好的
+/// scene.pkg、视频解码器都还压在里面），于是**每换一张壁纸就多留一个几百 MB
+/// ～1GB 的 `http://127.0.0.1:<port>` 进程**。用户侧看到的就是「应用了几张场景
+/// 壁纸后，活动监视器里挂着好几个壁纸渲染进程，旧的都不释放」。实测证据：
+/// `wallpaper_sessions` 里只有 1 条会话、桌面上只有 1 块壁纸窗口，却同时存在
+/// 3 个渲染器 WebContent 进程（= 最近 3 次切换留下的），且 PID 显示它们诞生于
+/// 很久以前 —— 不是「刚销毁还在回收中」。
+///
+/// 换成整页导航后，进程数不再随切换次数增长（每个显示器恒为 1 个）：换壁纸 =
+/// 换文档，旧文档连同它的 GPU 资源一起被 WebKit 销毁，新文档按新 query 重新挂载。
+/// 这条路能成立的前提是渲染器**配置全在 URL query 里**（渲染器 `initialCfg`），
+/// 并且 `pagehide` 里已经有完整 teardown —— 两件事本项目都具备
+/// （`spawn_force_reload` 早就用 `location.replace` 做过同样的事）。
+///
+/// 仍保留销毁重建那条路作为兜底（窗口不在了 / 导航连续报错），语义同样是
+/// 「防抖 + 单飞」：连切时只加载最后一张。
+fn schedule_window_reload(app: &AppHandle, label: &str, frame: (f64, f64, f64, f64)) {
+    use std::time::Duration;
+    /// 连切合并窗口：目标稳定这么久才动手
+    const DEBOUNCE: Duration = Duration::from_millis(350);
+
+    let set = RELOADING.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    {
+        let mut g = set.lock().unwrap();
+        if !g.insert(label.to_string()) {
+            return; // 已有任务在跑，它会读到最新配置
+        }
+    }
+    let app = app.clone();
+    let label = label.to_string();
+    tauri::async_runtime::spawn(async move {
+        let done = || {
+            if let Some(set) = RELOADING.get() {
+                set.lock().unwrap().remove(&label);
+            }
+        };
+        let current = |app: &AppHandle| {
+            app.try_state::<WallpaperEngineState>()
+                .and_then(|st| st.windows.lock().unwrap().get(&label).cloned())
+        };
+
+        // 防抖：目标还在变就继续等，稳定 DEBOUNCE 后才开工
+        let mut last: Option<WallpaperConfig> = None;
+        loop {
+            let Some(cur) = current(&app) else {
+                done();
+                return; // 会话已清（stop/退出）
+            };
+            if last.as_ref().is_some_and(|p| same_wallpaper(p, &cur)) {
+                break;
+            }
+            last = Some(cur);
+            tokio::time::sleep(DEBOUNCE).await;
+        }
+        let Some(target) = last else {
+            done();
+            return;
+        };
+
+        // 3 次机会：窗口刚被销毁（stop → 立刻重新应用）时头一次会扑空
+        for attempt in 0..3 {
+            if let Some(w) = app.get_webview_window(&label) {
+                match navigate_to_config(&app, &w, &target) {
+                    Ok(()) => {
+                        tracing::info!(
+                            "wallpaper window {label} 就地重载（type={}），复用原 WebContent 进程",
+                            target.r#type
+                        );
+                        done();
+                        return;
+                    }
+                    Err(e) => tracing::debug!(
+                        "wallpaper window {label} 就地重载失败（第 {} 次）：{e}",
+                        attempt + 1
+                    ),
+                }
+            } else {
+                tracing::debug!("wallpaper window {label} 不在（第 {} 次尝试）", attempt + 1);
+            }
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        }
+        tracing::warn!("wallpaper window {label} 就地重载未成功，回退销毁重建");
+        done();
+        schedule_window_recreate(&app, &label, frame);
+    });
+}
+
+/// 销毁壁纸窗口（壁纸窗口的所有销毁点统一走这里）。
+///
+/// macOS 上分三步，缺一不可：
+///
+/// 1. 先导航到 `about:blank` —— 页面跑完 `pagehide` 的 teardown（销毁库实例、
+///    释放 pkg 缓存、`loseContext`、撤销 blob），并关掉 SSE 等长连接。
+/// 2. 隔一拍 `destroy()` —— 把 WKWebView 从窗口上摘下来。
+/// 3. [`reap_data_store`] 删掉这块窗口独占的 WKWebsiteDataStore —— 删成功时这台
+///    WebContent 进程才会退出、压着的几百 MB～1GB 才还回去。前两步之后页面是空了，
+///    但进程仍被 WebKit 的进程池留着（实测切到视频 / 网页这类轻量壁纸后 footprint
+///    依旧不降）。**第 3 步不保证成功**（UI 进程里只要还活着一个引用该存储的
+///    `WKWebsiteDataStore`，WebKit 就报 `Data store is in use`），所以它只是尽力
+///    而为：失败交给 [`sweep_stale_data_stores`] 与下次启动的清理。
+///
+/// 注意：**日常换壁纸不走这里**（走 [`schedule_window_reload`] 的同窗口换文档，
+/// 不销毁窗口），只有 stop、显示器移除、以及导航失败降级到重建时才走到。
+///
+/// 其它平台不需要这一圈：WebView2 / WebKitGTK 的 destroy 会连带销毁渲染进程。
+#[cfg(target_os = "macos")]
+fn destroy_wallpaper_window(app: &AppHandle, window: &WebviewWindow) {
+    let w = window.clone();
+    let app = app.clone();
+    let label = w.label().to_string();
+    // 标识必须**在这一刻**取出并摘掉：紧接着的同名重建会往同一个 label 写入新
+    // 标识，异步回收再按 label 查就会拿到新窗口那份，把刚建好的壁纸的存储删掉。
+    let store = app
+        .try_state::<WallpaperEngineState>()
+        .and_then(|st| st.data_stores.lock().unwrap().remove(&label));
+    // 换页前的 URL：用来识别「等待期间有人又应用了新壁纸」
+    let original = w.url().ok();
+    let _ = w.eval("window.location.replace('about:blank')");
+    tauri::async_runtime::spawn(async move {
+        // 等 about:blank **真的换上**再销毁。原先固定 200ms 是抢跑：4K 场景页那几 MB
+        // 的文档换页 + teardown 常要几百 ms，导航还没提交就把 WKWebView 摘下来，
+        // WebKit 留在进程池里的那份进程便仍压着**整张壁纸**（实测活动监视器里
+        // 出现过以 `about:` 记名、常驻 1.39GB 的残留进程）；等提交后再销毁，池里
+        // 留下的是空页（实测同批残留里那几个只占 37~66MB）。页面僵死时导航可能永远
+        // 不提交，所以等待有上限 —— 到点照旧销毁，退回原来的行为。
+        let started = std::time::Instant::now();
+        let deadline = started + Duration::from_millis(2500);
+        let mut committed = false;
+        let mut reapplied = false;
+        while std::time::Instant::now() < deadline {
+            match w.url() {
+                Ok(u) if u.scheme() == "about" => {
+                    committed = true;
+                    break;
+                }
+                // 既不是原页、也不是 about: = 等待期间有人把这块窗口导航到新壁纸了
+                //（停止壁纸后立刻重新应用）。那就别销毁：留着它服务新壁纸。
+                Ok(u) if original.as_ref().is_some_and(|o| *o != u) => {
+                    reapplied = true;
+                    break;
+                }
+                _ => {}
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if reapplied {
+            // 标识放回登记表，回收与否仍按「一份窗口一份标识」走后续的销毁点
+            if let (Some(uuid), Some(st)) = (store, app.try_state::<WallpaperEngineState>()) {
+                st.data_stores
+                    .lock()
+                    .unwrap()
+                    .entry(label.clone())
+                    .or_insert(uuid);
+            }
+            tracing::debug!("wallpaper window {label}: 销毁前已换上新的壁纸，取消本次销毁");
+            return;
+        }
+        if committed {
+            // 提交即已跑完 pagehide 的 teardown，再给一拍让它收尾
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // 记下这次等待的结果：「抢跑」到底还发不发生、常发还是偶发，看这条日志说话
+        //（2.5s 到点 = 页面僵死，退回「不等就销毁」的旧行为，会留下压着整张壁纸的残留）
+        if committed {
+            tracing::info!(
+                "wallpaper window {label}: about:blank 已提交（等待 {}ms）→ 销毁并回收存储",
+                started.elapsed().as_millis()
+            );
+        } else {
+            tracing::warn!(
+                "wallpaper window {label}: 等 2.5s about:blank 仍未提交，按原行为销毁（本次残留进程可能仍压着旧壁纸）"
+            );
+        }
+        let _ = w.destroy();
+        if let Some(uuid) = store {
+            reap_data_store(&app, &label, uuid).await;
+        }
+    });
+}
+
+/// 非 macOS：直接销毁（见 [`destroy_wallpaper_window`] 的说明）
+#[cfg(not(target_os = "macos"))]
+fn destroy_wallpaper_window(_app: &AppHandle, window: &WebviewWindow) {
+    let _ = window.destroy();
+}
+
+/// macOS：按标识的 WKWebsiteDataStore 是 macOS 14（Darwin 23）才有的 API。
+///
+/// 更低版本 wry 会退回**共享**存储 —— 那就没有可回收的存储，这里直接判否：
+/// 既不挂标识（挂上也无效），也不去试删除（否则每次销毁窗口都白跑一轮删除重试并
+/// 留一条 warn，让人误以为回收失败）。
+#[cfg(target_os = "macos")]
+fn custom_data_store_available() -> bool {
+    let mut buf = std::mem::MaybeUninit::<libc::utsname>::uninit();
+    if unsafe { libc::uname(buf.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    let buf = unsafe { buf.assume_init() };
+    let release = unsafe { std::ffi::CStr::from_ptr(buf.release.as_ptr()) };
+    let major: u32 = release
+        .to_string_lossy()
+        .split('.')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    major >= 23
+}
+
+/// macOS：给一块壁纸窗口分配**独占**的 WKWebsiteDataStore 标识。
+///
+/// 背景（「换壁纸后旧壁纸的内存不释放」）：WebKit 把 WebContent 进程挂在数据
+/// 存储上 —— 默认（共享）存储下，`destroy()` 只是把 WKWebView 从窗口上摘下来，
+/// 进程连同它压着的整页（JS 堆 / WebGL 上下文 / 解析好的 `scene.pkg` / 视频
+/// 解码器）留在进程池里，之后新建的窗口又落回同一个池子，于是内存回不来：实测
+/// 活动监视器里那个 `http://127.0.0.1:<port>` 进程，切到视频/网页这种轻量壁纸
+/// 后仍是场景留下的几百 MB～1GB。给每块窗口一份独立存储，是为了在**销毁窗口**
+/// 时能按标识把这份存储删掉（[`reap_data_store`]），连带把它的进程池送走。
+///
+/// 但这条回收路不可靠（WebKit 只在 UI 进程已无 `WKWebsiteDataStore` 引用时才肯删，
+/// 实测约七成被拒），所以**换壁纸本身不销毁窗口**，走
+/// [`schedule_window_reload`] 的同窗口换文档；这里的独占存储只服务于 stop /
+/// 显示器移除 / 重建降级这些真正销毁窗口的场合，删不掉就留给
+/// [`sweep_stale_data_stores`] 与下次启动清理。
+///
+/// 代价：壁纸页的 localStorage / IndexedDB 每块窗口（每次重建）都是全新的。WE 的
+/// 用户属性走 project.json + `/props` 注入，不依赖它；网页壁纸自己写
+/// localStorage 的自定义状态会随重建丢失 —— 与「每切一张常驻几百 MB」相比这个
+/// 取舍是划算的。
+#[cfg(target_os = "macos")]
+fn new_data_store_id() -> [u8; 16] {
+    use rand::RngCore;
+    let mut id = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut id);
+    id
+}
+
+/// macOS：把数据存储标识打成 WebKit 在磁盘上用的那种 UUID 文本
+/// （`8-4-4-4-12`）——`NSUUID::from_bytes` 是逐字节映射，所以这里的十六进制顺序
+/// 和 `~/Library/WebKit/<app>/WebsiteDataStore/<uuid>` 的目录名一致，日志里的
+/// 标识可以直接拿去磁盘上查找残留。
+#[cfg(target_os = "macos")]
+fn store_id_label(id: &[u8; 16]) -> String {
+    let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// macOS：删除某块壁纸窗口的独占数据存储，回收它的 WebContent 进程。
+///
+/// `removeDataStoreForIdentifier` 在还有 WKWebView 引用这份存储时会失败
+/// （wry 映射为 `DataStoreInUse`）：`destroy()` 是异步投递的，且 Tauri 注册表里
+/// 的条目消失不等于 WKWebView 已经 dealloc（autorelease 池还要过一拍），
+/// 所以这里带退避重试。删成功 = 进程池销毁 = 那个几百 MB 的渲染进程退出；
+/// 反复失败只记 warn，不影响壁纸本身（下次切换还会再试）。
+///
+/// 注意这条路**不保证成功**（实测 macOS 26 上约七成失败，见
+/// [`schedule_window_reload`]）：失败说明 UI 进程里还活着一个引用这份存储的
+/// `WKWebsiteDataStore`（销毁后的 WKWebView 及其 configuration 还没 dealloc），
+/// 那就只能等它自己松开 —— 所以重试窗口给到 20s，失败后交给 60s 一轮的
+/// [`sweep_stale_data_stores`] 兜底（以及下次启动的清理）。
+#[cfg(target_os = "macos")]
+async fn reap_data_store(app: &AppHandle, label: &str, uuid: [u8; 16]) {
+    /// 重试次数 × 间隔 = 20s 的回收窗口
+    const ATTEMPTS: u32 = 40;
+    let started = std::time::Instant::now();
+    let id = store_id_label(&uuid);
+    for attempt in 0..ATTEMPTS {
+        match app.remove_data_store(uuid).await {
+            Ok(()) => {
+                let secs = started.elapsed().as_secs_f32();
+                tracing::info!(
+                    "wallpaper window {label}: 独占数据存储已删除（uuid={id}，耗时 {secs:.1}s，WebContent 进程随之退出）"
+                );
+                return;
+            }
+            Err(e) => {
+                if attempt + 1 == ATTEMPTS {
+                    // 失败只影响「内存回收干不干净」，壁纸本身照常工作：最可能的原因是
+                    // WKWebView 还没真的 dealloc（`DataStoreInUse`）。这条 warn 里带上
+                    // 标识，方便按 `~/Library/WebKit/<app>/WebsiteDataStore/<uuid>` 查残留。
+                    tracing::warn!(
+                        "wallpaper window {label}: 数据存储回收失败（uuid={id}，{e}），该进程可能仍被 WebKit 缓存"
+                    );
+                } else {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        }
+    }
+}
+
 /// 换壁纸后的窗口重建：**防抖 + 单飞**。
+///
+/// 唯一的入口是 [`schedule_window_reload`] 的就地导航兜底（窗口不在 / 导航连续
+/// 报错）—— macOS 曾经把这里当换壁纸主路径，实测靠「销毁窗口 + 删独占数据存储」
+/// 回收 WebContent 进程只有三成兑现（见 [`new_data_store_id`]），已改回同窗口换文档。
 ///
 /// - 防抖：连切时不重建，等目标稳定 `DEBOUNCE` 后再动手一次。重建整块 WebView
 ///   意味着新建 GL 上下文、重编 shader、重传全部纹理，逐张都做会把 GPU 顶成
@@ -870,9 +1331,9 @@ fn schedule_window_recreate(app: &AppHandle, label: &str, frame: (f64, f64, f64,
         let target_item = item_id_of(&target);
 
         for _ in 0..20 {
-            // 销毁旧窗口并等注册表释放 label
+            // 销毁旧窗口并等注册表释放 label（macOS 顺带回收它的 WebContent 进程）
             if let Some(w) = app.get_webview_window(&label) {
-                let _ = w.destroy();
+                destroy_wallpaper_window(&app, &w);
                 for _ in 0..30 {
                     if app.get_webview_window(&label).is_none() {
                         break;
@@ -931,18 +1392,22 @@ fn apply_on_main(
         .ok_or("DB 未就绪")?;
 
     for (label, frame) in &targets {
-        let mut cfg2 = cfg.clone();
-        cfg2.media_base = media_base(app);
-        let item2 = item_id_of(&cfg2);
-        apply_play_config(app, &mut cfg2, item2.as_deref());
+        let cfg2 = prepare_cfg(app, &cfg);
 
-        // 换了壁纸就**销毁重建整块 WebView**，而不是复用旧窗口热更新。
+        // 换了壁纸**不能**走 `setWallpaper` 热更新：同一文档里换实例实测会把
+        // 上一张壁纸的 JS 堆与 GPU 资源一直攥着 —— 同一窗口逐张切换，Activity
+        // Monitor 的 footprint 从 ~300MB 单调涨到 4GB+（复现 6 张场景
+        // 305M→3085M），切到轻量视频也不回落。热更新换的是实例不是文档，回收
+        // 全靠库自觉。
         //
-        // 复用的 WKWebView 会把上一张壁纸的 JS 堆与 GPU 资源一直攥着：实测同一
-        // 窗口逐张切换，Activity Monitor 的 footprint 从 ~300MB 单调涨到 4GB+
-        // （复现 6 张场景 305M→3085M），切到轻量视频也不回落；只有销毁窗口、
-        // 连带终止其 WebContent 进程才会释放（stop() 后重新 apply 回到 ~350MB）。
-        // 同一条目改 fit / dpr / fps / 属性时 item 不变 → 仍走热更新，不重建。
+        // 换文档有两条路，按平台分（见各自的注释）：
+        //   - 非 macOS：原地整页导航（[`schedule_window_reload`]）—— 换文档即可，
+        //     WebView2 / WebKitGTK 的 destroy 会连带销毁渲染进程。
+        //   - macOS：销毁 + 同名重建（[`schedule_window_recreate`]）—— 只有进程
+        //     **退出**才回收得掉内存，而让进程退出的开关是那块窗口独占的
+        //     WKWebsiteDataStore（[`new_data_store_id`]）。
+        //
+        // 同一条目改 fit / dpr / fps / 属性时 item 不变 → 仍走热更新，不换页。
         let switched = state
             .windows
             .lock()
@@ -952,16 +1417,20 @@ fn apply_on_main(
             .unwrap_or(false);
 
         if switched {
-            // 只登记新配置，销毁+重建交给防抖的单飞任务：连切时旧窗口继续显示，
-            // 等停下来再重建一次 —— 避免「每次切换都重建 GL 上下文/重传纹理」把
-            // GPU 顶成连续尖峰。销毁是投递到事件循环的异步消息，必须在后续轮次
-            // 重建（同轮次必撞 already exists），所以整体都在那个任务里做。
+            // 只登记新配置，真正的换页交给防抖的单飞任务：连切时等目标稳定后
+            // 只加载最后一张 —— 避免逐张都重建 GL 上下文、重传纹理把 GPU 顶成
+            // 连续尖峰。
             state
                 .windows
                 .lock()
                 .unwrap()
                 .insert(label.clone(), cfg2.clone());
-            schedule_window_recreate(app, label, *frame);
+            // 就地导航换文档：渲染器的全部配置都在 URL query 里（`initialCfg`），
+            // `pagehide` 里也有完整 teardown，所以换一张壁纸 = 换一个文档。
+            // macOS 曾经改用「销毁窗口 + 删独占数据存储」来回收 WebContent 进程，
+            // 但那条路不可靠（详见 [`schedule_window_reload`] 与
+            // [`new_data_store_id`] 的说明），最终统一回这条路。
+            schedule_window_reload(app, label, *frame);
         } else {
             let window = match app.get_webview_window(label) {
                 Some(w) => w,
@@ -970,13 +1439,20 @@ fn apply_on_main(
                 }
             };
             platform::apply_desktop_window(&window, *frame, current_interactive(app));
-            // 复用旧窗口：下发 setWallpaper 热更新（新建窗口的 URL 已带配置，
-            // 但这里 UI 变更也会走到，eval 一次无副作用）。
-            let js = format!(
-                "window.__wp && window.__wp.setWallpaper({})",
-                serde_json::to_string(&cfg2).map_err(|e| e.to_string())?
-            );
-            window.eval(&js).map_err(|e| e.to_string())?;
+            // 页面还是空白（stop → 立刻重新应用：销毁流程把页面置了空，窗口
+            // 200ms 后才真正销毁）：导航过去，别对着空页 eval setWallpaper。
+            let blank = window.url().map(|u| u.scheme() == "about").unwrap_or(false);
+            if blank {
+                navigate_to_config(app, &window, &cfg2)?;
+            } else {
+                // 复用旧窗口：下发 setWallpaper 热更新（新建窗口的 URL 已带配置，
+                // 但这里 UI 变更也会走到，eval 一次无副作用）。
+                let js = format!(
+                    "window.__wp && window.__wp.setWallpaper({})",
+                    serde_json::to_string(&cfg2).map_err(|e| e.to_string())?
+                );
+                window.eval(&js).map_err(|e| e.to_string())?;
+            }
             state
                 .windows
                 .lock()
@@ -1119,6 +1595,11 @@ fn start_monitor(app: &AppHandle) {
                     "wallpaper monitor alive (ticks={ticks}, display_asleep={})",
                     platform::display_asleep()
                 );
+                // macOS：每分钟补一次数据存储回收 —— [`reap_data_store`] 那 20s 窗口
+                // 没删掉的（销毁后的 WKWebView 还攥着 `WKWebsiteDataStore`），等它
+                // 松开后在这里删掉；顺手清掉崩溃/强杀留下的孤儿存储。
+                #[cfg(target_os = "macos")]
+                sweep_stale_data_stores(&app2, Duration::ZERO);
             }
         }
     });
@@ -1151,16 +1632,29 @@ fn monitor_tick(
             done_flag.store(true, std::sync::atomic::Ordering::Relaxed);
         });
         // 等主线程完成（通常 <10ms）；超时则退回用上一 tick 的状态。
-        // 长时间不完成 = 主线程事件循环被卡死（软件无响应的直接信号），告警留痕。
-        for _ in 0..50 {
+        // 判定阈值分两档，且**报出实测时延**：
+        // - 100ms~1s：WARN。主线程在 WebKit 重内容合成 / 系统壁纸截图 / 4K 视频
+        //   首帧解码期间偶发 100~300ms 停顿是正常的 —— 2026-09-11 日志里 30 次
+        //   「100ms 未接手」全部落在重壁纸挂载后的那 1~3s 内，界面并无卡顿，
+        //   一律报 ERROR 只会把排查引到错误方向（当天的排查就被它带偏过一次）。
+        // - >1s：ERROR，这才是「软件无响应」级别的信号，告警留痕。
+        let posted = std::time::Instant::now();
+        for _ in 0..200 {
             if done.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(2));
+            std::thread::sleep(Duration::from_millis(5));
         }
+        let lag = posted.elapsed();
         if !done.load(std::sync::atomic::Ordering::Relaxed) {
             tracing::error!(
-                "main thread did not process monitor dispatch within 100ms (UI event loop wedged?)"
+                "main thread did not process monitor dispatch within {}ms (UI event loop wedged?)",
+                lag.as_millis()
+            );
+        } else if lag > Duration::from_millis(100) {
+            tracing::warn!(
+                "main thread took {}ms to run the monitor dispatch（WebKit 重内容合成/截图期间常见）",
+                lag.as_millis()
             );
         }
     }
@@ -1412,7 +1906,7 @@ pub fn stop(app: AppHandle, display_id: Option<String>) -> Result<(), String> {
         let db = app2.try_state::<Arc<Mutex<rusqlite::Connection>>>();
         for label in &labels {
             if let Some(w) = app2.get_webview_window(label) {
-                let _ = w.destroy();
+                destroy_wallpaper_window(&app2, &w);
             }
             state.windows.lock().unwrap().remove(label);
             if let Some(db) = &db {
@@ -2169,7 +2663,7 @@ mod tests {
         assert_eq!(item_id_of(&mk("canvas", Some("/test-media/x"))), None);
     }
 
-    /// 「同一张壁纸」判定：决定切换时是热更新还是销毁重建窗口。
+    /// 「同一张壁纸」判定：决定切换时是热更新（同一文档换实例）还是整页换页。
     #[test]
     fn same_wallpaper_ignores_token_and_detects_switch() {
         let mk = |t: &str, src: &str| WallpaperConfig {
@@ -2199,6 +2693,58 @@ mod tests {
             &mk("web", "https://example.com/a.html"),
             &mk("web", "https://example.com/b.html")
         ));
+    }
+
+    /// 渲染器 URL 的契约：换壁纸走的就是「导航到这个 URL」，所以**渲染器的
+    /// 全部配置都必须落在 query 上**（渲染器只读 query，见 initialCfg）。
+    /// 少一个字段 = 换了壁纸但设置没跟着换，而建窗与换页两条路径必须一致。
+    #[test]
+    fn renderer_url_carries_every_config_field() {
+        let cfg = WallpaperConfig {
+            r#type: "scene".into(),
+            src: Some("3781035191".into()),
+            fit: "contain".into(),
+            render_dpr: 1.0,
+            scene_fps: 45,
+            filter: "blur".into(),
+            muted: false,
+            r#loop: true,
+            media_base: Some("http://127.0.0.1:1/media/tok".into()),
+        };
+        let url = renderer_url_on("http://127.0.0.1:57810", &cfg, Some("audiotok")).unwrap();
+        assert_eq!(
+            url[..url::Position::BeforePath].to_string(),
+            "http://127.0.0.1:57810",
+            "同源：渲染器页与媒体同源才能免跨源 fetch"
+        );
+        assert_eq!(url.path(), "/renderer/index.html");
+        let q = url.query().unwrap();
+        for expect in [
+            "type=scene",
+            "src=3781035191",
+            "fit=contain",
+            "renderDpr=1",
+            "sceneFps=45",
+            "filter=blur",
+            "muted=false",
+            "loop=true",
+            "mediaBase=http%3A%2F%2F127.0.0.1%3A1%2Fmedia%2Ftok",
+            "audioToken=audiotok",
+        ] {
+            assert!(q.split('&').any(|p| p == expect), "query 缺 {expect}：{q}");
+        }
+    }
+
+    /// macOS：数据存储标识必须每次都不一样。同 label 的窗口销毁重建时若复用同一
+    /// 份存储，删掉它就等于把新窗口的存储一起删了（或者删不掉旧进程），回收逻辑
+    /// 全靠「一份窗口一份标识」。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn data_store_ids_are_unique() {
+        let ids: std::collections::HashSet<[u8; 16]> =
+            (0..64).map(|_| new_data_store_id()).collect();
+        assert_eq!(ids.len(), 64, "数据存储标识重复了");
+        assert!(!ids.contains(&[0u8; 16]), "全零标识会被 WebKit 判为非法");
     }
 
     fn fixture(tag: &str) -> std::path::PathBuf {

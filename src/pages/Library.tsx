@@ -33,7 +33,7 @@ import { SubscriptionsModal } from "../components/SubscriptionsModal";
 import { VirtualGrid } from "../components/VirtualGrid";
 import { tr, trMsg } from "../lib/i18n";
 
-/** 筛选条件持久化：窗口闲置 3s 即被释放重建（全新 JS 上下文），不落盘的话
+/** 筛选条件持久化：窗口会在内存压力下被回收重建（全新 JS 上下文），不落盘的话
     用户调好的标签/排序会静默回到默认值（与工坊页 useWorkshopFilter 同一套
     做法与键约定） */
 const FILTER_STATE_KEY = "filter.library";

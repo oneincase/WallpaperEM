@@ -6,6 +6,67 @@
 
 _（暂无 / Nothing yet）_
 
+## [v0.5.1] - 2026-09-12
+
+### 🐛 修复 / Fixes
+
+- **换壁纸不再新建窗口、也不再累积渲染进程（含 macOS）**：原先每次换壁纸都是
+  「销毁窗口 + 同名重建」，每切一张都要付一次建窗代价（新渲染进程、重新挂载桌面层、
+  新建 GL 上下文并重传全部纹理，GPU 被顶成连续尖峰）。现在所有平台统一成**在同一块
+  窗口里整页导航**到新的渲染器 URL —— 换的是文档，渲染进程数不随切换次数增长
+  （每个显示器恒为 1 个）。渲染器的配置本来就全在 URL query 里（`initialCfg`），
+  `pagehide` 的 teardown 也早已齐全，换页等于「干干净净地重新挂载」；连切仍由
+  防抖 + 单飞收敛到最后一张。
+- **换壁纸后旧壁纸的内存不释放（macOS 实测，第三轮结论）**：第二轮让 macOS 换壁纸
+  走「销毁窗口 + 删掉该窗口独占的 `WKWebsiteDataStore`」，指望存储一删、压着旧壁纸
+  的 WebContent 进程就退出。实测（macOS 26，11 次换壁纸）**只有三成兑现**：其余 7 次
+  `removeDataStoreForIdentifier` 报 `Data store is in use`，旧的渲染进程（活动监视器
+  里 `about:` / `http://127.0.0.1:<port>`，单个几百 MB～1.4GB）连同它在
+  `~/Library/WebKit/<app>/WebsiteDataStore/<uuid>` 下的目录一起留下。最小复现确认了
+  机制：只要 UI 进程里还活着一个引用那份存储的 `WKWebsiteDataStore`（销毁后的
+  WKWebView 及其 configuration 仍被 WebKit 攥着，不随 `destroy()` 立刻 dealloc），
+  WebKit 就拒绝删除 —— 等 5s 也等不到，加长重试只是延缓。既然删存储这条路不可靠，
+  macOS 也回到「同窗口换文档」（见上一条），从根上不再制造多余的渲染进程。
+- **销毁窗口时的数据存储回收改为尽力而为 + 周期清扫**（仅 macOS，用于停止壁纸 /
+  拔显示器 / 导航失败降级重建）：销毁前先换到 `about:blank`，让页面跑完 `pagehide`
+  teardown（销毁库实例、释放 pkg 缓存、`loseContext`、撤销 blob）再 `destroy()`；
+  之后按标识 `removeDataStoreForIdentifier`，重试窗口从 4.8s 拉到 20s，失败后交给
+  每分钟一次的清扫任务，以及下次启动的清扫（清掉没登记在案的存储）。日志里带上
+  数据存储的 uuid，便于直接对照磁盘残留目录排查。副作用：壁纸页的 localStorage /
+  IndexedDB 每块窗口（每次重建）都是全新的（WE 的用户属性走 project.json + `/props`
+  注入，不依赖它）。
+- **销毁壁纸窗口前先等 `about:blank` 真的换上**（仅 macOS，停止壁纸 / 拔显示器 /
+  降级重建这三条路）：原先导航后固定等 200ms 就 `destroy()`，4K 场景页常常还没提交
+  换页就被摘掉 —— WebKit 留在进程池里的那份进程便仍压着**整张壁纸**：活动监视器
+  实测同一批残留里，提交成功的只占 37～66MB，没提交的以 `about:` 记名常驻 1.39GB。
+  改成轮询到 URL 真变成 `about:` 再销毁（上限 2.5s，页面僵死则到点照旧销毁），
+  并打出实际等待耗时（提交成功记 INFO，2.5s 到点记 WARN）—— 这条日志能直接回答
+  「抢跑还发不发生」。
+- **主线程停顿的判定改成两档、并报出实测时延**：原先「监控派发 100ms 未被主线程
+  接手」一律记 ERROR，而主线程在 WebKit 重内容合成 / 系统壁纸截图 / 4K 视频首帧
+  解码期间偶发 100～300ms 停顿是正常的 —— 2026-09-11 日志里 30 次触发全部落在重
+  壁纸挂载后的那 1～3s 内（界面并无卡顿），这类噪声还把人引偏过一次排查方向。现在
+  100ms～1s 记 WARN 并带上实测毫秒数，超过 1s（真正的无响应级别）才记 ERROR。
+- **主窗口不再「隐藏 3s 就回收」，改成只在系统内存压力下回收**（全平台）：那条
+  3s 闲置回收在 macOS 上**回收不了内存** —— 主窗口用的是默认（共享）
+  `WKWebsiteDataStore`，没有按标识删除的 API，`destroy()` 只是把 WKWebView 从窗口
+  上摘下来，WebContent 进程连页面一起留在 WebKit 的进程池里，重建时又落回同一个
+  池子。收益接近于零，代价却是每次重开一次页面重载，外加隐藏瞬间的主线程停顿
+  （同上一条：那 30 次「100ms 未接手」全部落在窗口被隐藏的那一刻）。现在：
+  隐藏满 5s **且**系统报告内存压力时才销毁窗口（新增 `src-tauri/src/mem_pressure.rs`
+  —— macOS 读 `kern.memorystatus_vm_pressure_level`、Windows 读
+  `GlobalMemoryStatusEx().dwMemoryLoad ≥ 90%`、Linux 读 `/proc/meminfo` 的
+  `MemAvailable < 8%`；读不到就按「无压力」处理，即不回收）；压力下窗口若正可见
+  则不动它，只打一条 WARN 留痕（那种情况下 WebKit 也可能自行结束该进程，界面变空白
+  时关掉重开即可）。探测本身也留痕：首次读到读数记一条 INFO（`内存压力探测就绪：…`），
+  连续 3 次读不到记一条 WARN —— 否则「一直没看到回收」到底是没压力还是信号失效，
+  日志里分不出来。
+- **构建报错直接指明该跑什么**：`dist/` 是 gitignore 的前端产物，直接 `cargo build` /
+  `cargo check`（不跑 beforeBuildCommand）时会以一句 `resource path "../dist/renderer"
+  doesn't exist` 收场，看不出该补什么。现在 `src-tauri/build.rs` 先检查该目录，缺失时
+  打出 `cargo:warning` 指明命令（`pnpm --filter @we/desktop build`；`pnpm tauri build` /
+  `pnpm tauri dev` 会自动构建，不必手动跑）。
+
 ## [v0.5.0] - 2026-09-12
 
 ### 🪟 多架构发布与 Windows 真机修复 / Multi-arch & Windows fixes

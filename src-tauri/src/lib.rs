@@ -14,6 +14,7 @@ mod keychain;
 mod library;
 mod main_window;
 mod mcp;
+mod mem_pressure;
 mod misc;
 mod now_playing;
 mod props_window;
@@ -41,7 +42,7 @@ use tauri::{
 
 pub fn run() {
     tauri::Builder::default()
-        // 单实例：二次启动聚焦主窗口（已被闲置释放则重建）
+        // 单实例：二次启动聚焦主窗口（已被内存压力回收则重建）
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             main_window::ensure_main_window(app);
         }))
@@ -219,8 +220,8 @@ pub fn run() {
                 // 关闭主窗口 = 隐藏（壁纸继续运行；点 Dock 图标重新显示）
                 main_window::register_close_to_hide(&w);
             }
-            // 主窗口闲置释放：隐藏/最小化持续 main_window::RELEASE_AFTER 后销毁窗口，
-            // 回收其 WebContent 进程（壁纸窗口不受影响）；唤起时按需重建
+            // 主窗口按需回收：只在系统内存压力下销毁隐藏中的窗口，回收它的
+            // WebContent 进程（壁纸窗口不受影响）；唤起时按需重建
             main_window::start(app.handle());
             // Linux 启动体检：GStreamer 插件缺失 = 视频壁纸黑屏/无声，
             // 缺啥把对应发行版的安装命令打进日志（首次运行 gst-inspect
@@ -328,8 +329,8 @@ pub fn run() {
             // macOS：点击 Dock 图标 / Finder 重开应用 → 显示主窗口
             #[cfg(target_os = "macos")]
             tauri::RunEvent::Reopen { .. } => main_window::ensure_main_window(_app),
-            // 最后一个窗口被销毁 ≠ 退出：本应用是常驻托盘的壁纸引擎，主窗口会被
-            // 闲置释放、壁纸窗口可能被 stop() 清空，此前放任默认行为会直接退出进程
+            // 最后一个窗口被销毁 ≠ 退出：本应用是常驻托盘的壁纸引擎，主窗口会在内存
+            // 压力下被回收、壁纸窗口可能被 stop() 清空，此前放任默认行为会直接退出进程
             // （睡眠时显示器列表异常触发的窗口清理即由此整进程退出）。
             // code = None 表示「窗口全关」而非主动退出；托盘「退出」走 app.exit(0)
             // （code = Some(0)），不受此拦截影响。

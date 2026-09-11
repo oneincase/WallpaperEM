@@ -1218,7 +1218,7 @@ pub fn init(app: &AppHandle) -> Result<(), String> {
 }
 
 /// 是否有下载相关活动进行中（队列任务 / Steam Guard 等待 / 扫码登录）。
-/// 主窗口闲置释放前查询：活动期间跳过释放，避免打断 Guard 输入与进度展示。
+/// 主窗口回收前查询：活动期间跳过释放，避免打断 Guard 输入与进度展示。
 pub fn is_busy(app: &AppHandle) -> bool {
     let Some(svc) = app.try_state::<Arc<DownloadService>>() else {
         return false;
