@@ -319,11 +319,12 @@ pub fn app_update_open(path: String) -> Result<String, String> {
         }
         let dir = p.parent().unwrap_or(std::path::Path::new("."));
         let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+        // 必须显式 return：本块是语句块，尾表达式的值会被丢弃（macOS 上该块被
+        // cfg 掉所以不报错，Linux 编译才会撞 E0308）
         if p.to_string_lossy().to_ascii_lowercase().ends_with(".appimage") {
-            Ok("AppImage 已下载并设为可执行，请用它替换旧文件".into())
-        } else {
-            Ok("已打开安装包所在目录，请按发行版方式安装".into())
+            return Ok("AppImage 已下载并设为可执行，请用它替换旧文件".into());
         }
+        return Ok("已打开安装包所在目录，请按发行版方式安装".into());
     }
 
     #[allow(unreachable_code)]
