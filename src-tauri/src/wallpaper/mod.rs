@@ -413,6 +413,30 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
         );
     }
     ensure_windows(app);
+    // 启动瞬间显示器枚举可能是空的（桌面/显示驱动还在就绪，Windows 实测首帧返回空），
+    // 这一轮建窗就会空转，只能干等监控的 2s tick —— 表现为「启动后要过两秒壁纸才出现」。
+    // 这里补一段有界短重试：一旦枚举到显示器立刻建窗，把首帧提前到 ~0.3s。
+    if platform::active_screens().is_empty() {
+        tracing::info!("启动时显示器枚举为空，进入短重试建窗");
+        let app2 = app.clone();
+        tauri::async_runtime::spawn(async move {
+            for _ in 0..8 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let (tx, rx) = std::sync::mpsc::channel();
+                let a = app2.clone();
+                let _ = app2.run_on_main_thread(move || {
+                    let has_screens = !platform::active_screens().is_empty();
+                    if has_screens {
+                        ensure_windows(&a);
+                    }
+                    let _ = tx.send(has_screens);
+                });
+                if matches!(rx.recv_timeout(Duration::from_secs(2)), Ok(true)) {
+                    break;
+                }
+            }
+        });
+    }
     start_monitor(app);
     // 自动暂停（默认关）：监听前台应用切换，切到非桌面暂停、回桌面恢复
     // （macOS/Windows 有前台应用观察者；Linux 后端是空实现，开关暂不生效果详见 linux.rs）
