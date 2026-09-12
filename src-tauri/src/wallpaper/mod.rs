@@ -1083,7 +1083,7 @@ enum KillPlan {
     /// 还没动手就发现这块窗口已被新壁纸接管 → 取消销毁
     Superseded,
     /// 拿到 WebContent 进程的 pid：销毁后按 pid 结束它
-    Pid(libc::pid_t),
+    Pid(i32),
     /// 没有独占进程（老系统共享存储）或取不到 pid → 走 about:blank 老路
     Fallback,
 }

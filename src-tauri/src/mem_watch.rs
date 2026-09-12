@@ -149,7 +149,7 @@ mod imp {
     }
 
     /// 这个 pid 现在是不是一个 WebKit 进程（进程名以 `com.apple.WebKit` 开头）
-    pub fn is_webkit_process(pid: libc::pid_t) -> bool {
+    pub fn is_webkit_process(pid: i32) -> bool {
         proc_name_of(pid).starts_with("com.apple.WebKit")
     }
 

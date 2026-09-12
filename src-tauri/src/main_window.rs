@@ -129,8 +129,11 @@ fn is_hidden(w: &WebviewWindow) -> bool {
 /// 例外：主窗口用的是默认（共享）存储，与 props-* 设置窗**可能是同一个 WebContent
 /// 进程**（同存储同进程），那种时候踢进程会把设置窗的页面一起打掉 —— 所以只有除了
 /// 壁纸窗口以外没有别的共享窗口时才返回 pid，其余情况返回 None，调用方退回原来的 destroy。
+///
+/// pid 用 `i32` 而不是 `libc::pid_t`：这个文件三平台都要编，而 `libc::pid_t` 只在
+/// Unix 上存在（Windows 上没有，CI 会直接编译失败）。macOS 上 `pid_t` 就是 `i32`。
 #[cfg(target_os = "macos")]
-fn own_web_content_pid(app: &AppHandle, w: &WebviewWindow) -> Option<libc::pid_t> {
+fn own_web_content_pid(app: &AppHandle, w: &WebviewWindow) -> Option<i32> {
     app.webview_windows()
         .keys()
         .all(|label| label == "main" || label.starts_with("wallpaper-"))
@@ -139,7 +142,7 @@ fn own_web_content_pid(app: &AppHandle, w: &WebviewWindow) -> Option<libc::pid_t
 }
 
 #[cfg(not(target_os = "macos"))]
-fn own_web_content_pid(_app: &AppHandle, _w: &WebviewWindow) -> Option<libc::pid_t> {
+fn own_web_content_pid(_app: &AppHandle, _w: &WebviewWindow) -> Option<i32> {
     None
 }
 
@@ -148,7 +151,7 @@ fn own_web_content_pid(_app: &AppHandle, _w: &WebviewWindow) -> Option<libc::pid
 /// 发信号 + 等进程从进程表消失是阻塞的（上限 500ms），而调用点在主线程上，所以整件事
 /// 交给后台任务；读数也放在进程真消失之后 —— 那一行读到的才是「回收后」的占用。
 /// 非 macOS 没有可结束的进程（[`own_web_content_pid`] 恒为 None），只有读数这一步。
-fn release_web_content(pid: Option<libc::pid_t>, tag: &'static str) {
+fn release_web_content(pid: Option<i32>, tag: &'static str) {
     tauri::async_runtime::spawn(async move {
         #[cfg(target_os = "macos")]
         if let Some(pid) = pid {

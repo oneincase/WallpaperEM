@@ -320,7 +320,7 @@ fn find_webview(view: *mut c_void) -> Option<*mut objc2::runtime::AnyObject> {
 ///
 /// 返回 None 的几种情况：选择器不可用（老系统）、视图树里没有 WKWebView、页面还没起
 /// 独立进程（`pid <= 0`）。此时调用方退回「导航到 about:blank 再销毁」的老路。
-pub fn web_content_pid<R: Runtime>(window: &WebviewWindow<R>) -> Option<libc::pid_t> {
+pub fn web_content_pid<R: Runtime>(window: &WebviewWindow<R>) -> Option<i32> {
     use objc2::msg_send;
     use objc2::runtime::NSObject;
     if objc2::MainThreadMarker::new().is_none() {
@@ -339,7 +339,7 @@ pub fn web_content_pid<R: Runtime>(window: &WebviewWindow<R>) -> Option<libc::pi
         tracing::warn!("web_content_pid: 这版 WebKit 没有 _webProcessIdentifier");
         return None;
     }
-    let pid: libc::pid_t = unsafe { msg_send![&*obj, _webProcessIdentifier] };
+    let pid: i32 = unsafe { msg_send![&*obj, _webProcessIdentifier] };
     (pid > 0).then_some(pid)
 }
 
@@ -360,7 +360,7 @@ pub fn web_content_pid<R: Runtime>(window: &WebviewWindow<R>) -> Option<libc::pi
 /// 从取 pid 到这里隔着一次窗口销毁，pid 可能已被系统回收给别人，那时再 SIGKILL 就是误杀。
 ///
 /// 会阻塞到确认进程消失为止（正常几毫秒，上限 [`KILL_WAIT`]），**不要在主线程调用**。
-pub fn kill_web_content_process(pid: libc::pid_t) -> bool {
+pub fn kill_web_content_process(pid: i32) -> bool {
     use std::time::{Duration, Instant};
     /// 等进程消失的上限。SIGKILL 是内核直接处理，正常几毫秒就没了；久等不来
     /// 说明它正卡在不可中断的退出流程里，再等也没意义。
