@@ -277,6 +277,138 @@ fn find_wry_webview_class(view: *mut c_void) -> Option<&'static objc2::runtime::
     }
 }
 
+/// 在视图树里找 WKWebView 本体（wry 在窗口里套了一层容器视图，它才是子视图）。
+fn find_webview(view: *mut c_void) -> Option<*mut objc2::runtime::AnyObject> {
+    use objc2::msg_send;
+    use objc2::runtime::{AnyClass, AnyObject};
+    if view.is_null() {
+        return None;
+    }
+    unsafe {
+        let mut stack: Vec<*mut c_void> = vec![view];
+        while let Some(v) = stack.pop() {
+            if v.is_null() {
+                continue;
+            }
+            let cls = objc2::ffi::object_getClass(v.cast());
+            let mut cur: Option<&AnyClass> = cls.as_ref();
+            while let Some(c) = cur {
+                if c.name() == c"WKWebView" {
+                    return Some(v.cast::<AnyObject>());
+                }
+                cur = c.superclass();
+            }
+            let subs: *mut AnyObject = msg_send![v.cast::<AnyObject>(), subviews];
+            if subs.is_null() {
+                continue;
+            }
+            let count: usize = msg_send![&*subs, count];
+            for i in 0..count {
+                let s: *mut AnyObject = msg_send![&*subs, objectAtIndex: i];
+                stack.push(s.cast::<c_void>());
+            }
+        }
+        None
+    }
+}
+
+/// 读这扇窗口的 WebContent 进程 pid（私有 API `_webProcessIdentifier`，WKWebViewPrivate.h）。
+///
+/// **必须在主线程调用**（取视图树、问 WKWebView 都只能在主线程），且必须在**窗口还活着**
+/// 的时候调用 —— 窗口一销毁 WKWebView 就没了，pid 再也问不到。所以调用方的顺序是
+/// 「主线程取 pid → `destroy()` → 按 pid 结束进程」。
+///
+/// 返回 None 的几种情况：选择器不可用（老系统）、视图树里没有 WKWebView、页面还没起
+/// 独立进程（`pid <= 0`）。此时调用方退回「导航到 about:blank 再销毁」的老路。
+pub fn web_content_pid<R: Runtime>(window: &WebviewWindow<R>) -> Option<libc::pid_t> {
+    use objc2::msg_send;
+    use objc2::runtime::NSObject;
+    if objc2::MainThreadMarker::new().is_none() {
+        tracing::warn!("web_content_pid 必须在主线程调用");
+        return None;
+    }
+    let view = window.ns_view().ok()?;
+    let Some(webview) = find_webview(view) else {
+        tracing::warn!("web_content_pid: 视图树里没找到 WKWebView");
+        return None;
+    };
+    let obj = webview.cast::<NSObject>();
+    let sel = objc2::sel!(_webProcessIdentifier);
+    let responds: bool = unsafe { msg_send![&*obj, respondsToSelector: sel] };
+    if !responds {
+        tracing::warn!("web_content_pid: 这版 WebKit 没有 _webProcessIdentifier");
+        return None;
+    }
+    let pid: libc::pid_t = unsafe { msg_send![&*obj, _webProcessIdentifier] };
+    (pid > 0).then_some(pid)
+}
+
+/// 结束一个 WebContent 进程：发 SIGKILL，再等它真的从进程表里消失。
+///
+/// 为什么是自己发信号，而不是调 WebKit 那两个私有选择器
+///（`_killWebContentProcess` / `_killWebContentProcessAndResetState`）：在 macOS 26
+/// 的 WebKit 上它们**调用有返回、进程却纹丝不动** —— 实测每换一次壁纸都"成功"结束一次，
+/// WebContent 进程数只增不减、内存一 MB 都不还（一路堆到 11 个进程 / 4.3GB），而同一批
+/// 进程用 `kill -9` 立刻归还（4.3GB → 1.4GB，以 `about:` 记名的 1.18GB 残留当场消失）。
+/// 既然 pid 已经在手上，直接发信号才是真能还内存的那条路。
+///
+/// 为什么不能用 `destroy()` 代替：它只是把 WKWebView 从窗口上摘下来，WebKit 把进程留在
+/// 进程池里且**不保证**还内存。进程真死了之后，按标识删数据存储也不会再撞
+/// `Data store is in use`（删不掉的原因正是还有活进程攥着那份存储）。
+///
+/// 发信号前会确认这个 pid 现在仍是 WebKit 的进程（[`crate::mem_watch::is_webkit_process`]）：
+/// 从取 pid 到这里隔着一次窗口销毁，pid 可能已被系统回收给别人，那时再 SIGKILL 就是误杀。
+///
+/// 会阻塞到确认进程消失为止（正常几毫秒，上限 [`KILL_WAIT`]），**不要在主线程调用**。
+pub fn kill_web_content_process(pid: libc::pid_t) -> bool {
+    use std::time::{Duration, Instant};
+    /// 等进程消失的上限。SIGKILL 是内核直接处理，正常几毫秒就没了；久等不来
+    /// 说明它正卡在不可中断的退出流程里，再等也没意义。
+    const KILL_WAIT: Duration = Duration::from_millis(500);
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: 只对正数 pid 发信号 / 探活，信号量是常量
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        // 已经没了：destroy() 之后 WebKit 自己把它收掉了。目的已经达到。
+        tracing::debug!("wallpaper window: WebContent 进程 {pid} 在发信号前已自行退出");
+        return true;
+    }
+    if !crate::mem_watch::is_webkit_process(pid) {
+        tracing::warn!(
+            "wallpaper window: pid {pid} 已不是 WebKit 进程，跳过结束（pid 可能已被回收）"
+        );
+        return false;
+    }
+    if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
+        let e = std::io::Error::last_os_error();
+        // 竞态：探活与发信号之间它自己退了
+        if e.raw_os_error() == Some(libc::ESRCH) {
+            tracing::debug!("wallpaper window: WebContent 进程 {pid} 已自行退出");
+            return true;
+        }
+        tracing::warn!("wallpaper window: 结束 WebContent 进程 {pid} 失败（{e}）");
+        return false;
+    }
+    let started = Instant::now();
+    while started.elapsed() < KILL_WAIT {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            tracing::info!(
+                "wallpaper window: WebContent 进程 {pid} 已结束（SIGKILL，{}ms 后消失）",
+                started.elapsed().as_millis()
+            );
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // 信号已经发出去了，内存会在这之后还回来；这里只如实报告没等到消失
+    tracing::warn!(
+        "wallpaper window: WebContent 进程 {pid} 收到 SIGKILL 后 {}ms 仍未从进程表消失",
+        KILL_WAIT.as_millis()
+    );
+    true
+}
+
 /// 屏蔽壁纸窗口的原生右键菜单（WKWebView 默认上下文菜单）。
 ///
 /// 背景：「隐藏图标」开启后壁纸窗口位于桌面图标之上、直接接收原生鼠标事件，

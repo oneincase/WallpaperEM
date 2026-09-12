@@ -15,6 +15,7 @@ mod library;
 mod main_window;
 mod mcp;
 mod mem_pressure;
+mod mem_watch;
 mod misc;
 mod now_playing;
 mod props_window;
@@ -223,6 +224,9 @@ pub fn run() {
             // 主窗口按需回收：只在系统内存压力下销毁隐藏中的窗口，回收它的
             // WebContent 进程（壁纸窗口不受影响）；唤起时按需重建
             main_window::start(app.handle());
+            // 内存观测：每 60s 记一行「本进程 + WebKit 子进程」占用（仅 macOS 有读数），
+            // 用来判断内存到底涨在我们自己的进程还是某个 WebContent 上
+            mem_watch::start_periodic_report();
             // Linux 启动体检：GStreamer 插件缺失 = 视频壁纸黑屏/无声，
             // 缺啥把对应发行版的安装命令打进日志（首次运行 gst-inspect
             // 要建注册表缓存，可能耗时一秒级，放阻塞线程）

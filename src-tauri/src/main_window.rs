@@ -124,6 +124,42 @@ fn is_hidden(w: &WebviewWindow) -> bool {
     w.is_minimized().unwrap_or(false) || !w.is_visible().unwrap_or(true)
 }
 
+/// 主窗口的 WebContent 进程 pid（不该动或拿不到时 None）。**必须在主线程、且在销毁前调用。**
+///
+/// 例外：主窗口用的是默认（共享）存储，与 props-* 设置窗**可能是同一个 WebContent
+/// 进程**（同存储同进程），那种时候踢进程会把设置窗的页面一起打掉 —— 所以只有除了
+/// 壁纸窗口以外没有别的共享窗口时才返回 pid，其余情况返回 None，调用方退回原来的 destroy。
+#[cfg(target_os = "macos")]
+fn own_web_content_pid(app: &AppHandle, w: &WebviewWindow) -> Option<libc::pid_t> {
+    app.webview_windows()
+        .keys()
+        .all(|label| label == "main" || label.starts_with("wallpaper-"))
+        .then(|| crate::wallpaper::macos::web_content_pid(w))
+        .flatten()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn own_web_content_pid(_app: &AppHandle, _w: &WebviewWindow) -> Option<libc::pid_t> {
+    None
+}
+
+/// 结束被回收窗口的 WebContent 进程，再记一行内存观测。
+///
+/// 发信号 + 等进程从进程表消失是阻塞的（上限 500ms），而调用点在主线程上，所以整件事
+/// 交给后台任务；读数也放在进程真消失之后 —— 那一行读到的才是「回收后」的占用。
+/// 非 macOS 没有可结束的进程（[`own_web_content_pid`] 恒为 None），只有读数这一步。
+fn release_web_content(pid: Option<libc::pid_t>, tag: &'static str) {
+    tauri::async_runtime::spawn(async move {
+        #[cfg(target_os = "macos")]
+        if let Some(pid) = pid {
+            crate::wallpaper::macos::kill_web_content_process(pid);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = pid;
+        crate::mem_watch::report(tag);
+    });
+}
+
 /// 单次检查（在主线程执行，检查与销毁天然无竞态）
 fn on_tick(app: &AppHandle, pressure: Option<&mem_pressure::Reading>) {
     let window = app.get_webview_window("main");
@@ -169,6 +205,11 @@ fn on_tick(app: &AppHandle, pressure: Option<&mem_pressure::Reading>) {
     // 释放前再次确认仍隐藏（用户可能刚重新打开）
     if let Some(w) = window {
         if is_hidden(&w) {
+            // 和壁纸窗口一样：destroy() 只是把 WKWebView 摘下来，WebKit 会把进程留在
+            // 池子里且不保证还内存 —— 而这一步的全部目的就是还内存，所以能踢就踢。
+            // pid 得**在销毁之前**问（窗口一没，WKWebView 就没了），销毁后再在后台
+            // 发 SIGKILL 并等它真消失。
+            let pid = own_web_content_pid(app, &w);
             match w.destroy() {
                 Ok(_) => {
                     // 注意：此处不可再 lock()——本函数开头拿到的 st guard 仍存活，
@@ -180,6 +221,9 @@ fn on_tick(app: &AppHandle, pressure: Option<&mem_pressure::Reading>) {
                         reading_detail(pressure),
                         hidden_for.as_secs()
                     );
+                    // 结束进程要发信号 + 等它消失，都在后台做（这里正是主线程），
+                    // 等它真结束了再量一次 —— 这一行读数才代表「回收后」的占用
+                    release_web_content(pid, "主窗口回收后");
                 }
                 Err(e) => tracing::warn!("main window release failed: {e}"),
             }

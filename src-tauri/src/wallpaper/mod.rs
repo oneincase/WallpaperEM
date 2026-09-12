@@ -471,15 +471,11 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
 
 /// macOS：扫一遍并删掉「没人再用」的独占数据存储 —— 上次运行退出时留下的那些。
 ///
-/// 换壁纸时会顺手删掉旧窗口那份（[`reap_data_store`]），但**应用退出**时窗口是
-/// Tauri 统一销毁的，来不及走回收，于是每次运行至少留下一份（WebKit 的磁盘缓存
-/// 也在这个存储目录里，攒起来不小）。这里按 `fetchAllDataStoreIdentifiers` 扫：
-/// 默认/非持久存储不在这个列表里（主窗口那套 UI 缓存不受影响），且当前仍登记在
-/// `state.data_stores` 里的一律跳过。
-///
-/// 除了启动时清上次的遗留（`delay=3s`，别和启动抢 IO），监控每 60s 也会再跑一次
-/// （`delay=0`）——[`reap_data_store`] 那 20s 窗口里没删掉的，等 WebKit 松开引用后
-/// 由这里补上；顺手也清掉崩溃/强杀留下的孤儿存储。
+/// 快路上结束 WebContent 进程之后那份存储就没人管了（[`reap_data_store`] 只在
+/// about:blank 老路上用，见那里的说明），所以**磁盘目录靠这里收**：`delay=3s`
+/// 清上次运行留下的，监控每 60s 再跑一次清这一轮销毁窗口留下的。按
+/// `fetchAllDataStoreIdentifiers` 扫：默认/非持久存储不在这个列表里（主窗口那套
+/// UI 缓存不受影响），当前仍登记在 `state.data_stores` 里的一律跳过。
 #[cfg(target_os = "macos")]
 fn sweep_stale_data_stores(app: &AppHandle, delay: Duration) {
     let app = app.clone();
@@ -910,6 +906,7 @@ fn create_desktop_window(
     // 一次（幂等），此时窗口已可见，遮挡态与合成层级都被矫正。
     platform::apply_desktop_window(&window, frame, current_interactive(app));
     tracing::info!("wallpaper window {label} created: {cfg:?}");
+    crate::mem_watch::report("新建壁纸窗口");
     // ⚠️ 只在 Windows 上做「延迟重挂」：新建的窗口是「从未显示过」的状态，此时直接
     // 挂到 Win11 的 raised-desktop 层实测不生效（壁纸被原生壁纸盖住）；而手动开一次
     // 「隐藏图标」再关掉 —— 也就是**先脱离、再挂回** —— 就正确。这里直接复刻这个
@@ -993,6 +990,11 @@ fn schedule_window_reload(app: &AppHandle, label: &str, frame: (f64, f64, f64, f
     use std::time::Duration;
     /// 连切合并窗口：目标稳定这么久才动手
     const DEBOUNCE: Duration = Duration::from_millis(350);
+    /// 复用进程的占用超过这个值，这次就改走「销毁 + 重建」把内存还回去。
+    /// 换文档只能让 WebKit 自己决定何时归还旧文档的内存（实测会长期停在峰值），
+    /// 而销毁这条路现在能显式结束旧进程（见 [`destroy_wallpaper_window`]）。
+    /// 1.2GB ≈ 一张 4K 场景 + 留量：正常换完壁纸应远低于此，只在失控时才付重建代价。
+    const MEM_BUDGET: u64 = 1200 * 1024 * 1024;
 
     let set = RELOADING.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
     {
@@ -1032,6 +1034,19 @@ fn schedule_window_reload(app: &AppHandle, label: &str, frame: (f64, f64, f64, f
             return;
         };
 
+        // 复用进程超预算：立刻转「销毁 + 重建」把内存实打实还回去（只影响这一次换壁纸）
+        let footprint = crate::mem_watch::webcontent_footprint();
+        if footprint > MEM_BUDGET {
+            tracing::info!(
+                "wallpaper window {label}: 复用进程已占 {}MB（预算 {}MB），改为销毁重建回收内存",
+                footprint / (1024 * 1024),
+                MEM_BUDGET / (1024 * 1024)
+            );
+            done();
+            schedule_window_recreate(&app, &label, frame);
+            return;
+        }
+
         // 3 次机会：窗口刚被销毁（stop → 立刻重新应用）时头一次会扑空
         for attempt in 0..3 {
             if let Some(w) = app.get_webview_window(&label) {
@@ -1041,6 +1056,8 @@ fn schedule_window_reload(app: &AppHandle, label: &str, frame: (f64, f64, f64, f
                             "wallpaper window {label} 就地重载（type={}），复用原 WebContent 进程",
                             target.r#type
                         );
+                        // 换完立刻量一次：是复用的那个 WebContent 涨了，还是没动
+                        crate::mem_watch::report("换壁纸（就地重载）");
                         done();
                         return;
                     }
@@ -1060,9 +1077,28 @@ fn schedule_window_reload(app: &AppHandle, label: &str, frame: (f64, f64, f64, f
     });
 }
 
+/// 销毁前那次主线程调用的结果（决定销毁后走哪条路）。
+#[cfg(target_os = "macos")]
+enum KillPlan {
+    /// 还没动手就发现这块窗口已被新壁纸接管 → 取消销毁
+    Superseded,
+    /// 拿到 WebContent 进程的 pid：销毁后按 pid 结束它
+    Pid(libc::pid_t),
+    /// 没有独占进程（老系统共享存储）或取不到 pid → 走 about:blank 老路
+    Fallback,
+}
+
 /// 销毁壁纸窗口（壁纸窗口的所有销毁点统一走这里）。
 ///
-/// macOS 上分三步，缺一不可：
+/// macOS 上首选**先取 pid、再销毁、再按 pid 结束进程**：主线程上从 WKWebView 问出
+/// WebContent 进程的 pid，`destroy()` 把窗口摘掉，然后向那个 pid 发 SIGKILL
+///（[`macos::kill_web_content_process`]）。内存这时是实打实还回去的 —— 不用赌 WebKit
+/// 的进程池会不会还、也不用再撞 `Data store is in use`（进程都死了，没谁攥着那份存储）。
+///
+/// 顺序不能反：pid 只能在窗口活着的时候问（销毁后 WKWebView 就没了）；而杀在销毁之后，
+/// WebKit 就没有机会再为这扇已经摘掉的窗口重启一个进程。
+///
+/// pid 取不到时退回原来的三步（缺一不可）：
 ///
 /// 1. 先导航到 `about:blank` —— 页面跑完 `pagehide` 的 teardown（销毁库实例、
 ///    释放 pkg 缓存、`loseContext`、撤销 blob），并关掉 SSE 等长连接。
@@ -1085,13 +1121,90 @@ fn destroy_wallpaper_window(app: &AppHandle, window: &WebviewWindow) {
     let label = w.label().to_string();
     // 标识必须**在这一刻**取出并摘掉：紧接着的同名重建会往同一个 label 写入新
     // 标识，异步回收再按 label 查就会拿到新窗口那份，把刚建好的壁纸的存储删掉。
-    let store = app
+    let mut store = app
         .try_state::<WallpaperEngineState>()
         .and_then(|st| st.data_stores.lock().unwrap().remove(&label));
     // 换页前的 URL：用来识别「等待期间有人又应用了新壁纸」
     let original = w.url().ok();
-    let _ = w.eval("window.location.replace('about:blank')");
+    // 有没有自己的 WebContent 进程 = 有没有独占数据存储（macOS 14+ 才有这 API）。
+    // 共享存储的窗口是**几个窗口共用一个进程**，杀进程会连累别人，所以那种情况不杀。
+    let owns_process = store.is_some();
     tauri::async_runtime::spawn(async move {
+        // 首选：在**主线程**上问出这个窗口的 WebContent 进程 pid，销毁后按 pid 结束它
+        //（[`macos::kill_web_content_process`]：为什么不能靠 WebKit 的两个私有选择器、
+        //  也不能只靠 destroy()，那里写了实测）。进程一死，后面的按标识删存储也不会再
+        // 撞 `Data store is in use`。pid 取不到时才退回下面那条老路。
+        //
+        // 动手之前必须和下面那条路一样先看 URL：停止壁纸后**立刻**重新应用（真实存在
+        // 的操作顺序）时，新壁纸的整页导航可能已经先落在这块窗口上，此刻动手就是杀掉
+        // 刚起来的那一页。检查与取 pid 放在同一次主线程调用里，两者之间不会有别的
+        // 导航插进来（取到的一定是这一页的进程）。
+        //
+        // 只在窗口有独占数据存储时才杀（`owns_process`）：那种窗口按 WebKit 的规则
+        // 必然独占一个 WebContent 进程（这正是前几轮拿独占存储换来的），杀它不会波及
+        // 别的窗口；老系统上退化成共享存储（几个窗口一个进程）时不杀，走下面那条路。
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let w_kill = w.clone();
+        let original_kill = original.clone();
+        let _ = app.run_on_main_thread(move || {
+            let superseded = match (&original_kill, w_kill.url()) {
+                (Some(before), Ok(now)) => *before != now && now.scheme() != "about",
+                _ => false,
+            };
+            // 「被接管」和「没有可杀的进程」必须是两个不同的值，不能都并成一句
+            //「不杀」—— 前者要取消整个销毁，后者只是退回 about:blank 老路。
+            let plan = if superseded {
+                KillPlan::Superseded
+            } else if owns_process {
+                match macos::web_content_pid(&w_kill) {
+                    Some(pid) => KillPlan::Pid(pid),
+                    None => KillPlan::Fallback,
+                }
+            } else {
+                KillPlan::Fallback
+            };
+            let _ = tx.send(plan);
+        });
+        match rx.await.unwrap_or(KillPlan::Fallback) {
+            KillPlan::Superseded => {
+                restore_data_store(&app, &label, store.take());
+                tracing::debug!("wallpaper window {label}: 销毁前已换上新的壁纸，取消本次销毁");
+                return;
+            }
+            KillPlan::Pid(pid) => {
+                let _ = w.destroy();
+                // 等窗口真的从注册表里消失再动手。`destroy()` 是**异步投递**的，刚调用完
+                // 的那一瞬间 WKWebView 还在，此时杀掉它的进程等于告诉 WebKit「这个还活着
+                // 的页面崩了」，它会立刻补一个新进程 —— 补出来的是空页、只有 ~9MB，但
+                // **每销毁一扇窗口就多一个**：实测 12 轮「应用→停止」之后池子里躺了 19 个
+                //（171MB），成了另一条慢漏。页面彻底没了再杀，池子不补人（实测单独杀掉
+                // 池中的空闲进程，WebKit 不会补）。
+                for _ in 0..40 {
+                    if app.get_webview_window(&label).is_none() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                // 杀进程要等它真消失（上限 500ms），别占着异步运行时的工作线程
+                let killed =
+                    tokio::task::spawn_blocking(move || macos::kill_web_content_process(pid))
+                        .await
+                        .unwrap_or(false);
+                // 这里**刻意不**去删这份独占数据存储：它当初的存在理由是「删掉它才能让
+                // WebContent 退出」，而进程现在已经显式结束了，剩下的只是一份磁盘目录
+                // —— 偏偏刚死的这一刻删一定撞 `DataStoreInUse`（销毁后的 WKWebView 还
+                // 没 dealloc），实测每次都要白等 20~30s 再记一条吓人的「回收失败」。
+                // 目录交给 [`sweep_stale_data_stores`]（60s 一轮）与下次启动清理。
+                crate::mem_watch::report(if killed {
+                    "销毁壁纸窗口（已结束 WebContent 进程）"
+                } else {
+                    "销毁壁纸窗口（结束 WebContent 进程失败）"
+                });
+                return;
+            }
+            KillPlan::Fallback => {}
+        }
+        let _ = w.eval("window.location.replace('about:blank')");
         // 等 about:blank **真的换上**再销毁。原先固定 200ms 是抢跑：4K 场景页那几 MB
         // 的文档换页 + teardown 常要几百 ms，导航还没提交就把 WKWebView 摘下来，
         // WebKit 留在进程池里的那份进程便仍压着**整张壁纸**（实测活动监视器里
@@ -1119,14 +1232,7 @@ fn destroy_wallpaper_window(app: &AppHandle, window: &WebviewWindow) {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         if reapplied {
-            // 标识放回登记表，回收与否仍按「一份窗口一份标识」走后续的销毁点
-            if let (Some(uuid), Some(st)) = (store, app.try_state::<WallpaperEngineState>()) {
-                st.data_stores
-                    .lock()
-                    .unwrap()
-                    .entry(label.clone())
-                    .or_insert(uuid);
-            }
+            restore_data_store(&app, &label, store.take());
             tracing::debug!("wallpaper window {label}: 销毁前已换上新的壁纸，取消本次销毁");
             return;
         }
@@ -1150,7 +1256,22 @@ fn destroy_wallpaper_window(app: &AppHandle, window: &WebviewWindow) {
         if let Some(uuid) = store {
             reap_data_store(&app, &label, uuid).await;
         }
+        crate::mem_watch::report("销毁壁纸窗口（about:blank 路径）");
     });
+}
+
+/// 销毁被取消时，把窗口的数据存储标识放回登记表 —— 窗口还在服务新壁纸，标识得跟着它，
+/// 否则后续销毁点会找不到这份存储，留下永远删不掉的残留目录。
+#[cfg(target_os = "macos")]
+fn restore_data_store(app: &AppHandle, label: &str, store: Option<[u8; 16]>) {
+    let (Some(uuid), Some(st)) = (store, app.try_state::<WallpaperEngineState>()) else {
+        return;
+    };
+    st.data_stores
+        .lock()
+        .unwrap()
+        .entry(label.to_string())
+        .or_insert(uuid);
 }
 
 /// 非 macOS：直接销毁（见 [`destroy_wallpaper_window`] 的说明）
@@ -1188,14 +1309,13 @@ fn custom_data_store_available() -> bool {
 /// 进程连同它压着的整页（JS 堆 / WebGL 上下文 / 解析好的 `scene.pkg` / 视频
 /// 解码器）留在进程池里，之后新建的窗口又落回同一个池子，于是内存回不来：实测
 /// 活动监视器里那个 `http://127.0.0.1:<port>` 进程，切到视频/网页这种轻量壁纸
-/// 后仍是场景留下的几百 MB～1GB。给每块窗口一份独立存储，是为了在**销毁窗口**
-/// 时能按标识把这份存储删掉（[`reap_data_store`]），连带把它的进程池送走。
+/// 后仍是场景留下的几百 MB～1GB。给每块窗口一份独立存储，就是让每块窗口**独占一个**
+/// WebContent 进程 —— 于是销毁窗口时可以直接结束它（[`destroy_wallpaper_window`]）：
+/// 独占意味着不会误伤别的窗口，也不必等 WebKit 哪天心情好才肯回收。删掉存储本身
+/// 只是顺带清磁盘（[`reap_data_store`] 那条老路 + [`sweep_stale_data_stores`]）。
 ///
-/// 但这条回收路不可靠（WebKit 只在 UI 进程已无 `WKWebsiteDataStore` 引用时才肯删，
-/// 实测约七成被拒），所以**换壁纸本身不销毁窗口**，走
-/// [`schedule_window_reload`] 的同窗口换文档；这里的独占存储只服务于 stop /
-/// 显示器移除 / 重建降级这些真正销毁窗口的场合，删不掉就留给
-/// [`sweep_stale_data_stores`] 与下次启动清理。
+/// 顺带一提，**换壁纸本身不销毁窗口**，走 [`schedule_window_reload`] 的同窗口换
+/// 文档 —— 独占存储只服务于 stop / 显示器移除 / 重建降级这些真正销毁窗口的场合。
 ///
 /// 代价：壁纸页的 localStorage / IndexedDB 每块窗口（每次重建）都是全新的。WE 的
 /// 用户属性走 project.json + `/props` 注入，不依赖它；网页壁纸自己写
@@ -1226,13 +1346,14 @@ fn store_id_label(id: &[u8; 16]) -> String {
     )
 }
 
-/// macOS：删除某块壁纸窗口的独占数据存储，回收它的 WebContent 进程。
+/// macOS：删除某块壁纸窗口的独占数据存储（**只在 [`destroy_wallpaper_window`] 的
+/// about:blank 老路上调用**；能拿到 pid 的那条快路直接结束进程，不再走这里）。
 ///
-/// `removeDataStoreForIdentifier` 在还有 WKWebView 引用这份存储时会失败
-/// （wry 映射为 `DataStoreInUse`）：`destroy()` 是异步投递的，且 Tauri 注册表里
-/// 的条目消失不等于 WKWebView 已经 dealloc（autorelease 池还要过一拍），
-/// 所以这里带退避重试。删成功 = 进程池销毁 = 那个几百 MB 的渲染进程退出；
-/// 反复失败只记 warn，不影响壁纸本身（下次切换还会再试）。
+/// 老路上这一步是**还内存的关键**：删成功 = WebKit 销毁这个存储的进程池 = 那个压着
+/// 整张壁纸的 WebContent 退出。而 `removeDataStoreForIdentifier` 在还有 WKWebView
+/// 引用这份存储时会失败（wry 映射为 `DataStoreInUse`）：`destroy()` 是异步投递的，
+/// Tauri 注册表里的条目消失也不等于 WKWebView 已经 dealloc（autorelease 池还要过
+/// 一拍），所以这里带退避重试。
 ///
 /// 注意这条路**不保证成功**（实测 macOS 26 上约七成失败，见
 /// [`schedule_window_reload`]）：失败说明 UI 进程里还活着一个引用这份存储的
@@ -1256,11 +1377,11 @@ async fn reap_data_store(app: &AppHandle, label: &str, uuid: [u8; 16]) {
             }
             Err(e) => {
                 if attempt + 1 == ATTEMPTS {
-                    // 失败只影响「内存回收干不干净」，壁纸本身照常工作：最可能的原因是
-                    // WKWebView 还没真的 dealloc（`DataStoreInUse`）。这条 warn 里带上
-                    // 标识，方便按 `~/Library/WebKit/<app>/WebsiteDataStore/<uuid>` 查残留。
+                    // 失败最可能的原因是 WKWebView 还没真的 dealloc（`DataStoreInUse`）。
+                    // 这条 warn 里带上标识，方便按
+                    // `~/Library/WebKit/<app>/WebsiteDataStore/<uuid>` 查残留目录。
                     tracing::warn!(
-                        "wallpaper window {label}: 数据存储回收失败（uuid={id}，{e}），该进程可能仍被 WebKit 缓存"
+                        "wallpaper window {label}: 独占数据存储删除失败（uuid={id}，{e}）；目录留给 sweep 与下次启动清理"
                     );
                 } else {
                     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1595,9 +1716,10 @@ fn start_monitor(app: &AppHandle) {
                     "wallpaper monitor alive (ticks={ticks}, display_asleep={})",
                     platform::display_asleep()
                 );
-                // macOS：每分钟补一次数据存储回收 —— [`reap_data_store`] 那 20s 窗口
-                // 没删掉的（销毁后的 WKWebView 还攥着 `WKWebsiteDataStore`），等它
-                // 松开后在这里删掉；顺手清掉崩溃/强杀留下的孤儿存储。
+                // macOS：每分钟扫一遍没人用的数据存储 —— 快路上销毁窗口之后留下的
+                // 那份（进程已结束，只是目录还占着盘），以及崩溃/强杀留下的孤儿存储，
+                // 都等这里删。删除要等销毁后的 WKWebView 松开引用，所以不放在销毁
+                // 那一刻做（实测那一瞬间必失败，见 [`reap_data_store`]）。
                 #[cfg(target_os = "macos")]
                 sweep_stale_data_stores(&app2, Duration::ZERO);
             }
