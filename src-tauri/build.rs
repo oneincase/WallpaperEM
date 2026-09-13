@@ -10,13 +10,15 @@ fn main() {
              用 `pnpm tauri build` / `pnpm tauri dev` 则不必（它们会自动构建前端）"
         );
     }
+    // 必须先于 tauri_build::build()：它会校验 resources 里引用的文件是否存在
+    //（Linux 的 bundled/libsteam_api.so 就是由这里生成的）
+    copy_steam_api_dylib();
     tauri_build::build();
     // 图标/配置变更时强制重跑 build.rs，否则 cargo 不会因 icon 文件变化而重新嵌入，
     // 导致 Dock/托盘图标仍是旧的（仅重启不生效）。
     println!("cargo:rerun-if-changed=icons");
     println!("cargo:rerun-if-changed=tauri.conf.json");
     println!("cargo:rerun-if-changed=capabilities");
-    copy_steam_api_dylib();
 }
 
 /// 把 Steam API 动态库复制到可执行文件旁边。
