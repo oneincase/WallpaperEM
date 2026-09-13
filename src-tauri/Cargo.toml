@@ -48,6 +48,10 @@ libc = "0.2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 rustfft = "6"
 base64 = "0.22"
+
+# Steamworks SDK 没有 ARM64 版的 Windows steam_api 库：Windows ARM64 上不编译
+# 工坊上传（steamworks / workshop_upload 模块整体关闭），其余平台照常
+[target.'cfg(not(all(target_os = "windows", target_arch = "aarch64")))'.dependencies]
 steamworks = "0.13.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]

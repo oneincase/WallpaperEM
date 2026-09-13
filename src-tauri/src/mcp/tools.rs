@@ -173,6 +173,7 @@ pub fn definitions() -> Vec<Value> {
             "description": "取某个工坊条目的详情（标题/描述/标签/预览图）。",
             "inputSchema": obj(json!({ "id": { "type": "string" } }), json!(["id"])),
         }),
+        #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
         json!({
             "name": "workshop_upload",
             "description": "把工程上传到 Steam 创意工坊（需要 Steam 客户端运行且账号拥有 Wallpaper Engine）。已有 workshop.fileId 的工程=更新原条目，否则新建。需要 preview 图（preview.png/jpg/gif）。注意版权/授权：上传他人制作的壁纸前必须确认已获得对方许可，并遵守 Steam 订阅者协议与工坊规则。",
@@ -185,6 +186,7 @@ pub fn definitions() -> Vec<Value> {
                 "changelog": { "type": "string", "description": "可选：更新说明（更新已有条目时显示）" },
             }), json!(["project"])),
         }),
+        #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
         json!({
             "name": "workshop_upload_status",
             "description": "查询工坊上传任务进度/结果（job_id 缺省 = 全部任务）。status=done 时含 workshopUrl 与 publishedfileid。",
@@ -428,6 +430,7 @@ async fn call_inner(app: &AppHandle, name: &str, args: &Value) -> Result<Value, 
             let r = svc.detail(&id).await?;
             Ok(serde_json::to_value(r).unwrap_or(json!(null)))
         }
+        #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
         "workshop_upload" => {
             let app = app.clone();
             let project = req_str(args, "project")?;
@@ -450,6 +453,7 @@ async fn call_inner(app: &AppHandle, name: &str, args: &Value) -> Result<Value, 
             .await?;
             Ok(serde_json::to_value(r).unwrap_or(json!({})))
         }
+        #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
         "workshop_upload_status" => {
             let app = app.clone();
             let job_id = opt_str(args, "jobId");

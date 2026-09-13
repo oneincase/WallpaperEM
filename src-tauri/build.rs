@@ -31,6 +31,10 @@ fn main() {
 /// - Linux 打包：resources + build.rs 加的 rpath（/usr/lib/<productName>）
 fn copy_steam_api_dylib() {
     let triple = std::env::var("TARGET").unwrap_or_default();
+    // Steam SDK 没有 ARM64 版的 Windows 库：该目标不编译工坊上传，也就无需复制
+    if triple.contains("windows") && triple.contains("aarch64") {
+        return;
+    }
     let (subdir, names): (&str, &[&str]) = if triple.contains("windows") {
         ("win64", &["steam_api64.dll"])
     } else if triple.contains("darwin") {

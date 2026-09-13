@@ -26,6 +26,7 @@ mod system_wallpaper;
 mod update;
 mod util;
 mod wallpaper;
+#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
 mod workshop_upload;
 mod workspace;
 mod we_props;
@@ -181,6 +182,7 @@ pub fn run() {
             app.manage(library::PosterFailState::default());
             library::spawn_poster_backfill(app.handle().clone());
             // 创意工坊上传：任务表 + Steam 客户端懒初始化（首次上传时才连 Steam）
+            #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
             app.manage(workshop_upload::UploadState::default());
             // 开启音频可视化时先启动系统音频捕获，壁纸引擎（wallpaper::init）会
             // 有界等待其就绪后再创建壁纸窗口：保证壁纸页加载时注入服务已可用
@@ -248,7 +250,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::ping,
+            #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
             workshop_upload::workshop_upload_start,
+            #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
             workshop_upload::workshop_upload_status,
             i18n::app_set_locale,
             commands::app_info,
