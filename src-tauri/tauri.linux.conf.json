@@ -9,7 +9,7 @@
       "../dist/renderer": "renderer",
       "../dist/assets": "assets",
       "vendor/mediaremote-adapter": "mediaremote-adapter",
-      "sdk/linux64/libsteam_api.so": "libsteam_api.so"
+      "bundled/libsteam_api.so": "libsteam_api.so"
     }
   }
 }

@@ -113,6 +113,25 @@ fn copy_steam_api_dylib() {
         }
     }
 
+    // Linux：把当前目标架构的库同步到 bundled/ 暂存目录，供打包资源引用
+    // （tauri.linux.conf.json 的 resources 指向它）。x64 与 ARM64 的构建共用同一份
+    // 配置，资源文件必须在各自构建时按目标架构生成。
+    if triple.contains("linux") {
+        if let Some(src) = candidates(subdir)
+            .iter()
+            .map(|d| d.join(names[0]))
+            .find(|p| p.is_file())
+        {
+            let bundled_dir =
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("bundled");
+            let _ = std::fs::create_dir_all(&bundled_dir);
+            let dest = bundled_dir.join(names[0]);
+            if let Err(e) = std::fs::copy(&src, &dest) {
+                eprintln!("warning: 复制 {name} 到 bundled/ 失败: {e}");
+            }
+        }
+    }
+
     // Linux：动态库查找不认 @loader_path（ELF 用 SONAME + rpath）。rpath 覆盖
     // dev（二进制同目录）与 deb 打包（资源目录 /usr/lib/<productName>）
     if triple.contains("linux") {

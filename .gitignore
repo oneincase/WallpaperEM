@@ -42,3 +42,6 @@ credentials.dat
 .video_agent/
 .zcode/
 dist-linux/
+
+# Linux 打包资源暂存（build.rs 按目标架构从 sdk/ 生成）
+src-tauri/bundled/
