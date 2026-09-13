@@ -4,6 +4,19 @@
 
 ## [Unreleased]
 
+_（暂无 / Nothing yet）_
+
+## [v0.5.3] - 2026-09-13
+
+### 🐛 修复 / Fixes
+
+- **Windows 安装后壁纸 404（renderer/index.html 找不到）**：平台配置里的 resources
+  写成数组，把主配置的 renderer / assets / mediaremote-adapter 资源整个覆盖掉了。
+  平台配置现携带完整资源清单。
+- **Linux 启动报 `libsteam_api.so: cannot open shared object file`**：同一根因的另一半——
+  steam 库随资源装进了 `sdk/` 子目录，而二进制 RUNPATH 指向资源根。现在库落在
+  `/usr/lib/WallpaperEM/`（与 RUNPATH 匹配），renderer/assets 也一并恢复。
+
 ### 🔧 变更 / Changed
 
 - **默认帧率上限由 15 FPS 调回 24 FPS**（15 档保留可选；从未手动改过帧率的用户生效）。
