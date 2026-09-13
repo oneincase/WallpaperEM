@@ -6,23 +6,7 @@
 
 _（暂无 / Nothing yet）_
 
-## [v0.5.3] - 2026-09-13
-
-### 🐛 修复 / Fixes
-
-- **Windows 安装后壁纸 404（renderer/index.html 找不到）**：平台配置里的 resources
-  写成数组，把主配置的 renderer / assets / mediaremote-adapter 资源整个覆盖掉了。
-  平台配置现携带完整资源清单。
-- **Linux 启动报 `libsteam_api.so: cannot open shared object file`**：同一根因的另一半——
-  steam 库随资源装进了 `sdk/` 子目录，而二进制 RUNPATH 指向资源根。现在库落在
-  `/usr/lib/WallpaperEM/`（与 RUNPATH 匹配），renderer/assets 也一并恢复。
-
-### 🔧 变更 / Changed
-
-- **默认帧率上限由 15 FPS 调回 24 FPS**（15 档保留可选；从未手动改过帧率的用户生效）。
-  Default FPS cap back to 24 (15 stays available as an option).
-
-## [v0.5.2] - 2026-09-13
+## [v0.5.2] - 2026-09-13（重发布，合并原 v0.5.3 全部修复）
 
 ### ✨ 新增 / Added
 
@@ -51,6 +35,12 @@ _（暂无 / Nothing yet）_
   每次构建都不同。CI 支持固定签名证书（Secrets：`MACOS_CERTIFICATE_P12` /
   `MACOS_CERTIFICATE_PWD`），同一把证书的更新包授权跨版本保留。
 - 音频频谱 AGC 目标值修正（0.7，留 0.3 余量防止普遍削顶），静音回落与快攻慢放行为不变。
+- **Windows 安装后壁纸 404（renderer/index.html 找不到）**：平台配置里的 resources
+  写成数组，把主配置的 renderer / assets / mediaremote-adapter 资源整个覆盖掉了。
+  平台配置现携带完整资源清单。
+- **Linux 启动报 `libsteam_api.so: cannot open shared object file`**：同一根因的另一半——
+  steam 库装进了 `sdk/` 子目录而二进制 RUNPATH 指向资源根，且 ARM64 包误装了 x64 的库
+  （两架构共用配置写死了 x64 路径）。现在库按目标架构生成并落在资源根。
 
 ### 🔧 变更 / Changed
 
@@ -61,6 +51,8 @@ _（暂无 / Nothing yet）_
 - **全局消息提示**统一右上角 3 秒自动消失（原成功类 2.6s、错误类需手动关闭）。
 - 本地库上传按钮移至卡片右上角，操作行保留原 4 按钮。
 - Steam API 动态库随应用分发（macOS `Contents/MacOS`、Windows 资源、Linux rpath）。
+- **默认帧率上限由 15 FPS 调回 24 FPS**（15 档保留可选；从未手动改过帧率的用户生效）。
+  Default FPS cap back to 24 (15 stays available as an option).
 
 ## [v0.5.1] - 2026-09-12
 
