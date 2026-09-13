@@ -855,7 +855,7 @@ const FIT_LABELS: Record<string, string> = {
   contain: "缩放",
   stretch: "拉伸",
 };
-const FPS_TIERS = [24, 30, 45, 60, 120];
+const FPS_TIERS = [15, 24, 30, 45, 60, 120];
 
 function PlayConfigPanel({
   play,
@@ -948,7 +948,7 @@ function PlayConfigPanel({
           </PlayRow>
 
           <PlayRow
-            label={tr("帧率限制")}
+            label={tr("帧率上限")}
             desc={tr("越低 GPU 占用越低")}
             isOverride={play.sceneFps !== undefined}
             onFollow={() => onChange({ sceneFps: undefined })}

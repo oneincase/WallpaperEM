@@ -2,6 +2,7 @@
 //!
 //! 另含 WE 网页壁纸用户属性命令（读取/保存/重置，保存后对已应用窗口热更新）。
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -24,6 +25,12 @@ pub struct LibraryItem {
     pub size_bytes: i64,
     pub file_count: i64,
     pub downloaded_at: i64,
+    /// 引用模式条目的源目录（批量导入不拷贝，壁纸内容留在原地）；常规条目为 null
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    /// 已发布/已更新的创意工坊条目 id（上传成功后回写）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub published_file_id: Option<String>,
     /// 磁盘上的壁纸文件已丢失（目录不存在或为空），条目仅剩数据库记录。
     ///
     /// 刻意只标记、不自动删记录：删除不可撤销，且会连带丢掉用户的属性覆盖；
@@ -83,7 +90,21 @@ fn order_by_clause(sort: Option<&str>) -> &'static str {
 }
 
 #[tauri::command]
-pub fn library_list(
+pub async fn library_list(
+    app: AppHandle,
+    r#type: Option<String>,
+    filter: Option<LibraryFilter>,
+) -> Result<Vec<LibraryItem>, String> {
+    // 列表要对全库做磁盘对账（每条一次 read_dir），必须跑在阻塞线程池 ——
+    // 同步命令在主线程上执行，库一大（或缺封面视频反复抽帧）就把整个 UI
+    // 连同壁纸窗口宿主一起冻死（历史卡死 bug 的根因，勿改回同步）。
+    tauri::async_runtime::spawn_blocking(move || library_list_impl(app, r#type, filter))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// 实际查询逻辑（MCP 的 library_list 工具也直接调这份，与 UI 完全同源）。
+pub(crate) fn library_list_impl(
     app: AppHandle,
     r#type: Option<String>,
     filter: Option<LibraryFilter>,
@@ -141,9 +162,9 @@ pub fn library_list(
             CASE WHEN json_valid(w.tags) THEN w.tags ELSE '[]' END
          ) WHERE value = ?
        )";
-    // 「本地导入」标签：匹配本地导入条目（custom-* id），不走标签列
+    // 「本地导入」标签：匹配本地导入条目（custom-* id 与引用模式条目），不走标签列
     const LOCAL_IMPORT_TAG: &str = "$local";
-    let local_import_cond = "l.item_id LIKE 'custom-%'";
+    let local_import_cond = "(l.item_id LIKE 'custom-%' OR l.source_path IS NOT NULL)";
     // 单个标签的 SQL 片段 + 绑定值
     let tag_cond = |t: &str| -> (String, Vec<Value>) {
         if t == LOCAL_IMPORT_TAG {
@@ -198,7 +219,8 @@ pub fn library_list(
 
     let mut sql = String::from(
         "SELECT l.item_id, l.title, l.type, COALESCE(w.preview_url, ''), COALESCE(w.tags,'[]'),
-                l.size_bytes, l.file_count, l.downloaded_at, COALESCE(w.type, ''), COALESCE(l.tags,'[]')
+                l.size_bytes, l.file_count, l.downloaded_at, COALESCE(w.type, ''), COALESCE(l.tags,'[]'),
+                COALESCE(l.source_path, ''), COALESCE(l.publishedfileid, '')
          FROM library_items l LEFT JOIN workshop_items w ON w.id = l.item_id",
     );
     if !where_parts.is_empty() {
@@ -247,6 +269,22 @@ pub fn library_list(
                         size_bytes: r.get(5)?,
                         file_count: r.get(6)?,
                         downloaded_at: r.get(7)?,
+                        source_path: {
+                            let s: String = r.get(10)?;
+                            if s.is_empty() {
+                                None
+                            } else {
+                                Some(s)
+                            }
+                        },
+                        published_file_id: {
+                            let s: String = r.get(11)?;
+                            if s.is_empty() {
+                                None
+                            } else {
+                                Some(s)
+                            }
+                        },
                         // 占位，出 SQL 作用域后统一按磁盘实际情况回填
                         missing: false,
                     },
@@ -272,17 +310,24 @@ pub fn library_list(
     let mut items = items.into_iter().map(|(it, _)| it).collect::<Vec<_>>();
 
     // 与磁盘对账：标记文件已丢失的条目（不在此处删记录，理由见 LibraryItem::missing）。
+    // 引用模式条目对账的是源目录本身，与库根是否可读无关。
     //
-    // 安全闸：只有当壁纸库根目录本身可读时才逐条判定。根目录不存在/读不了
+    // 安全闸：常规条目只有当壁纸库根目录本身可读时才逐条判定。根目录不存在/读不了
     // （首次启动、数据目录被清空、TCC 权限未授予）时全部按「存在」处理 ——
     // 否则会把整个库一次性标成失效，用户一点「清理」就全没了。
-    let root_ok = wallpapers_dir(&app).map(|d| d.is_dir()).unwrap_or(false);
-    if root_ok {
-        for it in items.iter_mut() {
-            if let Ok(dir) = item_dir(&app, &it.item_id) {
-                it.missing = !item_files_exist(&dir);
+    let root = wallpapers_dir(&app)?;
+    let root_ok = root.is_dir();
+    for it in items.iter_mut() {
+        let dir = match it.source_path.as_deref() {
+            Some(src) if !src.is_empty() => std::path::PathBuf::from(src),
+            _ => {
+                if !root_ok {
+                    continue;
+                }
+                root.join(&it.item_id)
             }
-        }
+        };
+        it.missing = !item_files_exist(&dir);
     }
     // 「只看失效条目」只能在对账之后过滤 —— missing 不是数据库里的列，
     // 是刚刚按磁盘实际情况算出来的
@@ -290,39 +335,28 @@ pub fn library_list(
         items.retain(|it| it.missing);
     }
 
-    // 无工坊元数据的条目：回退到本地 preview.*（经内容服务器）
+    // 无工坊元数据的条目：回退到本地 preview.*（经内容服务器）。
+    // 注意这里**不做**视频抽帧 —— 历史版本的惰性抽帧跑在列表路径里，视频解不动
+    // （mkv/avi）时每次刷新都重试一遍，库一大就冻死 UI。补封面统一走后台任务
+    // `backfill_posters`（启动后延迟执行，失败条目记账不再重试）。
     for it in items.iter_mut() {
         if it.preview_url.is_some() {
             continue;
         }
-        if let Some(url) = local_preview_url(&app, &it.item_id) {
+        let dir = match it.source_path.as_deref() {
+            Some(src) if !src.is_empty() => std::path::PathBuf::from(src),
+            _ => root.join(&it.item_id),
+        };
+        if let Some(url) = local_preview_url(&app, &it.item_id, &dir) {
             it.preview_url = Some(url);
-            continue;
-        }
-        // 历史导入（本功能上线前）的视频没有 preview.*：惰性抽首帧补齐封面。
-        // 一次成型 —— 生成后下一轮列表直接命中 preview.png，不再走这里。
-        // 抽帧失败（mkv/avi 等系统解不了的格式）只记日志，条目保持无封面。
-        if it.r#type == "video" {
-            if let Ok(dir) = item_dir(&app, &it.item_id) {
-                if let Some(video) = first_video_file(&dir) {
-                    let out = dir.join("preview.png");
-                    match crate::system_wallpaper::video_poster_png(&video, &out) {
-                        Ok(()) => {
-                            it.preview_url = local_preview_url(&app, &it.item_id);
-                        }
-                        Err(e) => {
-                            tracing::warn!("视频封面惰性抽帧失败（{}）: {e}", it.item_id);
-                        }
-                    }
-                }
-            }
         }
     }
     Ok(items)
 }
 
-/// 壁纸目录内 preview.gif → 内容服务器 URL
-fn local_preview_url(app: &AppHandle, item_id: &str) -> Option<String> {
+/// 壁纸目录内 preview.gif → 内容服务器 URL（`dir` 为该条目已解析的内容目录，
+/// 引用模式条目传源目录）
+fn local_preview_url(app: &AppHandle, item_id: &str, dir: &Path) -> Option<String> {
     let port = app
         .try_state::<Arc<Mutex<u16>>>()?
         .lock()
@@ -331,12 +365,6 @@ fn local_preview_url(app: &AppHandle, item_id: &str) -> Option<String> {
     if port == 0 {
         return None;
     }
-    let dir = app
-        .path()
-        .app_data_dir()
-        .ok()?
-        .join("wallpapers")
-        .join(item_id);
     // 与导入侧的 preview.<ext> 命名一一对应；优先级固定，与目录枚举顺序无关
     let ext = ["gif", "png", "jpg", "webp"]
         .iter()
@@ -425,6 +453,8 @@ fn remove_from_playlists(conn: &Connection, item_id: &str) {
 #[tauri::command]
 pub fn library_delete(app: AppHandle, item_id: String) -> Result<bool, String> {
     let db = app.state::<Arc<Mutex<Connection>>>();
+    // 引用模式条目的内容目录是用户的源目录：只删库记录，绝不碰磁盘文件
+    let linked = item_source_path(&app, &item_id).is_some();
     let dir = item_dir(&app, &item_id)?;
 
     // 只有「删除的是当前正应用的壁纸」时才停止对应屏幕；否则不要动壁纸引擎，
@@ -445,7 +475,7 @@ pub fn library_delete(app: AppHandle, item_id: String) -> Result<bool, String> {
         let _ = wallpaper::stop(app.clone(), Some(d));
     }
 
-    if dir.exists() {
+    if !linked && dir.exists() {
         std::fs::remove_dir_all(&dir).map_err(|e| format!("删除文件失败: {e}"))?;
     }
     let conn = db.lock().map_err(|e| e.to_string())?;
@@ -466,20 +496,30 @@ pub fn library_prune(app: AppHandle) -> Result<Vec<String>, String> {
     }
 
     let db = app.state::<Arc<Mutex<Connection>>>();
-    let ids: Vec<String> = {
+    let ids: Vec<(String, Option<String>)> = {
         let conn = db.lock().map_err(|e| e.to_string())?;
         let mut stmt = conn
-            .prepare("SELECT item_id FROM library_items")
+            .prepare("SELECT item_id, source_path FROM library_items")
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map([], |r| r.get::<_, String>(0))
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })
             .map_err(|e| e.to_string())?;
         rows.filter_map(|r| r.ok()).collect()
     };
 
     let missing: Vec<String> = ids
         .into_iter()
-        .filter(|id| !item_files_exist(&root.join(id)))
+        .filter(|(id, source_path)| {
+            // 引用模式条目对账源目录；常规条目对账库根下的目录
+            let dir = match source_path.as_deref().filter(|s| !s.trim().is_empty()) {
+                Some(src) => std::path::PathBuf::from(src),
+                None => root.join(id),
+            };
+            !item_files_exist(&dir)
+        })
+        .map(|(id, _)| id)
         .collect();
     if missing.is_empty() {
         return Ok(Vec::new());
@@ -514,12 +554,8 @@ pub fn library_prune(app: AppHandle) -> Result<Vec<String>, String> {
 
 #[tauri::command]
 pub fn library_open_folder(app: AppHandle, item_id: String) -> Result<bool, String> {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?
-        .join("wallpapers")
-        .join(&item_id);
+    // 引用模式条目打开的是源目录
+    let dir = item_dir(&app, &item_id)?;
     if !dir.is_dir() {
         return Err("目录不存在".into());
     }
@@ -528,6 +564,72 @@ pub fn library_open_folder(app: AppHandle, item_id: String) -> Result<bool, Stri
         .open_path(dir.display().to_string(), None::<&str>)
         .map_err(|e| e.to_string())?;
     Ok(true)
+}
+
+// ---------- 视频封面后台补齐 ----------
+
+/// 视频封面抽帧失败记账。内存态即可：每次启动后再试一次，仍失败继续记账，
+/// 开销有界 —— 历史版本把抽帧放在列表路径里无限重试，是库页面卡死的帮凶之一。
+#[derive(Default)]
+pub struct PosterFailState(Mutex<HashSet<String>>);
+
+/// 启动后延迟补齐缺封面的视频条目（纯后台任务，不挡 UI、不在列表路径里）。
+pub fn spawn_poster_backfill(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let _ = tauri::async_runtime::spawn_blocking(move || backfill_posters(&app)).await;
+    });
+}
+
+fn backfill_posters(app: &AppHandle) {
+    let Some(fails) = app.try_state::<PosterFailState>() else {
+        return;
+    };
+    let db = app.state::<Arc<Mutex<Connection>>>();
+    let ids: Vec<String> = {
+        let Ok(conn) = db.lock() else { return };
+        let Ok(mut stmt) =
+            conn.prepare("SELECT item_id FROM library_items WHERE lower(type) = 'video'")
+        else {
+            return;
+        };
+        let mapped = stmt.query_map([], |r| r.get::<_, String>(0));
+        match mapped {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(_) => return,
+        }
+    };
+    for id in ids {
+        {
+            let Ok(set) = fails.0.lock() else { return };
+            if set.contains(&id) {
+                continue;
+            }
+        }
+        let dir = match item_dir(app, &id) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        if has_preview_file(&dir) {
+            continue;
+        }
+        let Some(video) = first_video_file(&dir) else {
+            // 没有可抽帧的视频文件：记账避免每次启动空跑
+            if let Ok(mut set) = fails.0.lock() {
+                set.insert(id);
+            }
+            continue;
+        };
+        match crate::system_wallpaper::video_poster_png(&video, &dir.join("preview.png")) {
+            Ok(()) => tracing::info!("视频封面后台补齐成功: {id}"),
+            Err(e) => {
+                tracing::warn!("视频封面后台抽帧失败（{id}，不再重试）: {e}");
+                if let Ok(mut set) = fails.0.lock() {
+                    set.insert(id);
+                }
+            }
+        }
+    }
 }
 
 // ---------- 导入：自定义文件 / Web 版数据 ----------
@@ -750,6 +852,8 @@ struct ImportCore {
     file_count: i64,
     /// 命中重复：未拷贝新文件，复用已有目录（失败回滚时**不得**删它）
     duplicate: bool,
+    /// 引用模式条目的源目录（canonicalize 后的绝对路径）；拷贝导入为 None
+    source_path: Option<String>,
 }
 
 /// 导入核心：把 src 拷贝进 dest_root 并解析元数据。
@@ -830,6 +934,7 @@ fn import_file_into(
             size_bytes: dir_size(&dir),
             file_count: dir_count(&dir),
             duplicate: true,
+            source_path: None,
         });
     }
 
@@ -880,6 +985,7 @@ fn import_file_into(
         size_bytes: dir_size(&dest),
         file_count: dir_count(&dest),
         duplicate: false,
+        source_path: None,
     })
 }
 
@@ -951,10 +1057,11 @@ fn import_dir_into(
         size_bytes: stats.bytes as i64,
         file_count: stats.files as i64,
         duplicate: false,
+        source_path: None,
     })
 }
 
-/// library_items  upsert：导入（自定义/Web）与重复命中共用一条写路径
+/// library_items  upsert：导入（自定义/Web/引用）与重复命中共用一条写路径
 fn upsert_library_item(conn: &Connection, core: &ImportCore) -> Result<(), String> {
     // 类型标签必须随条目一起落库：本地导入的条目在工坊元数据缓存里不存在，
     // 筛选面板的「类型」组（Scene/Video/Web…）读的就是 l.tags ∪ w.tags，
@@ -964,21 +1071,42 @@ fn upsert_library_item(conn: &Connection, core: &ImportCore) -> Result<(), Strin
         Some(t) => serde_json::to_string(&[t]).unwrap_or_else(|_| "[]".into()),
         None => "[]".to_string(),
     };
+    // 拷贝导入撞上引用条目的 id：引用条目没有磁盘目录，unique_dest_dir 看不见它
+    if core.source_path.is_none() {
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT source_path FROM library_items WHERE item_id = ?1",
+                [&core.item_id],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten();
+        if existing.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false) {
+            return Err(format!(
+                "条目 id「{}」已被引用导入占用（{}），请重命名源目录后重试",
+                core.item_id,
+                existing.unwrap_or_default()
+            ));
+        }
+    }
     conn.execute(
-        "INSERT INTO library_items(item_id, title, type, size_bytes, file_count, downloaded_at, tags)
-         VALUES (?1, ?2, ?3, ?4, ?5, unixepoch(), ?6)
+        "INSERT INTO library_items(item_id, title, type, size_bytes, file_count, downloaded_at, tags, source_path)
+         VALUES (?1, ?2, ?3, ?4, ?5, unixepoch(), ?6, ?7)
          ON CONFLICT(item_id) DO UPDATE SET
            title = ?2, type = ?3, size_bytes = ?4, file_count = ?5,
            -- 已有标签（工坊缓存回填的、或上一次导入写的）不动，
            -- 只为「从来没有过标签」的条目补上类型标签
-           tags = CASE WHEN tags IS NULL OR tags = '' OR tags = '[]' THEN ?6 ELSE tags END",
+           tags = CASE WHEN tags IS NULL OR tags = '' OR tags = '[]' THEN ?6 ELSE tags END,
+           -- 引用模式只进不退：拷贝导入的 upsert（source_path 为 NULL）不改写已有引用
+           source_path = COALESCE(?7, source_path)",
         rusqlite::params![
             core.item_id,
             core.title,
             core.wtype,
             core.size_bytes,
             core.file_count,
-            tags
+            tags,
+            core.source_path
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -1093,6 +1221,7 @@ fn import_from_web_impl(app: &AppHandle, web_data_dir: &str) -> Result<serde_jso
             size_bytes: dir_size(&dest),
             file_count: dir_count(&dest),
             duplicate: false,
+            source_path: None,
         };
         let r = {
             let conn = db.lock().map_err(|e| e.to_string())?;
@@ -1142,13 +1271,22 @@ pub async fn library_import_custom_pick(app: AppHandle) -> Result<serde_json::Va
     if paths.is_empty() {
         return Ok(json!({ "cancelled": true }));
     }
-    import_custom_batch_run(app, paths).await
+    import_custom_batch_run(app, paths, false).await
 }
 
-/// 导入自定义壁纸：原生文件夹选择框 → 作为完整壁纸目录导入
-/// （WE 工程目录，含 project.json 时优先）。
+/// 导入自定义壁纸：原生文件夹选择框。
+///
+/// - `mode = "scan"`（「添加壁纸目录」）：选中目录（自带 project.json 时含其自身）
+///   递归扫描壁纸工程目录，逐个以**引用模式**导入（不拷贝、零副本，库条目登记源目录）
+/// - 其他值（「导入文件夹」）：选中目录作为**单个壁纸**拷贝导入；
+///   目录不带 project.json 时退回扫描（逐个引用导入）
+///
+/// 散落的视频/图片文件两种模式都按拷贝导入处理。
 #[tauri::command]
-pub async fn library_import_folder_pick(app: AppHandle) -> Result<serde_json::Value, String> {
+pub async fn library_import_folder_pick(
+    app: AppHandle,
+    mode: Option<String>,
+) -> Result<serde_json::Value, String> {
     let app_pick = app.clone();
     let picked = tauri::async_runtime::spawn_blocking(move || {
         use tauri_plugin_dialog::DialogExt;
@@ -1164,7 +1302,7 @@ pub async fn library_import_folder_pick(app: AppHandle) -> Result<serde_json::Va
     let Some(path) = picked else {
         return Ok(json!({ "cancelled": true }));
     };
-    import_custom_batch_run(app, vec![path]).await
+    import_custom_batch_run(app, vec![path], mode.as_deref() == Some("copy")).await
 }
 
 /// 导入自定义壁纸：把单个壁纸文件/目录拷贝到本地库。
@@ -1201,55 +1339,273 @@ pub async fn library_import_custom_batch(
     if paths.is_empty() {
         return Err("没有可导入的路径".into());
     }
-    import_custom_batch_run(app, paths).await
+    import_custom_batch_run(app, paths, false).await
 }
 
 async fn import_custom_batch_run(
     app: AppHandle,
     paths: Vec<std::path::PathBuf>,
+    link_dirs: bool,
 ) -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(move || import_custom_batch_impl(&app, &paths))
+    tauri::async_runtime::spawn_blocking(move || import_custom_batch_impl(&app, &paths, link_dirs))
         .await
         .map_err(|e| e.to_string())?
 }
 
-/// 批量导入实现：每条路径独立走「拷贝 → 入库（失败回滚）」，互不影响。
+/// 批量导入实现。
+///
+/// - 目录且自带 project.json → 单工程拷贝导入（老行为）
+/// - 目录且无 project.json → 视为壁纸集合根：递归扫描 project.json 目录，逐个
+///   **引用导入**（零副本）；散落的视频/图片文件不导入（批量只认 project.json）
+/// - 文件 → 拷贝导入
+///
+/// 逐条容错：单条失败不拖垮整批。
 fn import_custom_batch_impl(
     app: &AppHandle,
     paths: &[std::path::PathBuf],
+    // true = 目录一律引用导入（「添加壁纸目录」）；false = 带 project.json 的目录
+    // 拷贝导入（「导入文件夹」），不带时退回扫描引用
+    link_dirs: bool,
 ) -> Result<serde_json::Value, String> {
     let mut items: Vec<serde_json::Value> = Vec::new();
     let mut failed: Vec<serde_json::Value> = Vec::new();
     let mut imported = 0usize;
     let mut duplicates = 0usize;
+    let mut skipped_dirs = 0usize;
 
     for path in paths {
-        match import_one(app, path) {
-            Ok(r) => {
-                if r.core.duplicate {
-                    duplicates += 1;
-                } else {
-                    imported += 1;
+        if path.is_dir() && (link_dirs || !path.join("project.json").is_file()) {
+            // 目录走引用：自带 project.json 直接登记；否则递归扫描其中的工程目录
+            if link_dirs && path.join("project.json").is_file() {
+                push_import_result(
+                    import_one_linked(app, path),
+                    path,
+                    &mut imported,
+                    &mut duplicates,
+                    &mut items,
+                    &mut failed,
+                );
+            } else {
+                let (found, skipped) = scan_project_dirs(path);
+                skipped_dirs += skipped;
+                if found.is_empty() {
+                    failed.push(json!({
+                        "path": path.display().to_string(),
+                        "error": "目录里没有扫描到任何包含 project.json 的壁纸",
+                    }));
+                    continue;
                 }
-                items.push(json!({
-                    "path": path.display().to_string(),
-                    "item_id": r.core.item_id,
-                    "title": r.core.title,
-                    "type": r.core.wtype,
-                    "duplicate": r.core.duplicate,
-                }));
+                for dir in &found {
+                    push_import_result(
+                        import_one_linked(app, dir),
+                        dir,
+                        &mut imported,
+                        &mut duplicates,
+                        &mut items,
+                        &mut failed,
+                    );
+                }
             }
-            Err(e) => {
-                failed.push(json!({ "path": path.display().to_string(), "error": e }));
-            }
+        } else {
+            push_import_result(
+                import_one(app, path),
+                path,
+                &mut imported,
+                &mut duplicates,
+                &mut items,
+                &mut failed,
+            );
         }
     }
     Ok(json!({
         "imported": imported,
         "duplicates": duplicates,
+        "skippedDirs": skipped_dirs,
         "items": items,
         "failed": failed,
     }))
+}
+
+/// 把单条导入结果记入批量账本（items/failed 计数）
+fn push_import_result(
+    r: Result<ImportOne, String>,
+    path: &Path,
+    imported: &mut usize,
+    duplicates: &mut usize,
+    items: &mut Vec<serde_json::Value>,
+    failed: &mut Vec<serde_json::Value>,
+) {
+    match r {
+        Ok(one) => {
+            if one.core.duplicate {
+                *duplicates += 1;
+            } else {
+                *imported += 1;
+            }
+            items.push(json!({
+                "path": path.display().to_string(),
+                "item_id": one.core.item_id,
+                "title": one.core.title,
+                "type": one.core.wtype,
+                "duplicate": one.core.duplicate,
+                "linked": one.core.source_path.is_some(),
+            }));
+        }
+        Err(e) => {
+            failed.push(json!({ "path": path.display().to_string(), "error": e }));
+        }
+    }
+}
+
+/// 批量扫描单次上限：防误选巨型目录（整个用户目录）扫出成千上万个工程拖死导入
+const MAX_SCAN_ITEMS: usize = 500;
+
+/// 递归扫描目录树中含 project.json 的壁纸目录：命中即算一个壁纸，**不再深入**
+/// （工程内部嵌套的资源目录不是壁纸）。跳过隐藏目录与生成物目录。
+/// 返回 (壁纸目录列表, 扫过但不是壁纸的目录数)。
+fn scan_project_dirs(root: &Path) -> (Vec<PathBuf>, usize) {
+    let mut found = Vec::new();
+    let mut scanned = 0usize;
+    scan_walk(root, &mut found, &mut scanned);
+    (found, scanned)
+}
+
+/// 深度优先走子目录；返回 true = 已达上限，提前收工
+fn scan_walk(dir: &Path, found: &mut Vec<PathBuf>, scanned: &mut usize) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let mut subdirs = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') || name == crate::workspace::VERSION_DIR {
+            continue;
+        }
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            subdirs.push(entry.path());
+        }
+    }
+    for d in subdirs {
+        if found.len() >= MAX_SCAN_ITEMS {
+            return true;
+        }
+        if d.join("project.json").is_file() {
+            found.push(d);
+        } else {
+            *scanned += 1;
+            if scan_walk(&d, found, scanned) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 引用模式导入：不拷贝任何文件，库条目直接登记源目录（source_path）。
+/// 同一源目录重复导入幂等（刷新标题/体积后原样返回，属性覆盖不丢）。
+fn import_one_linked(app: &AppHandle, src: &Path) -> Result<ImportOne, String> {
+    let root = wallpapers_dir(app)?;
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    // 源目录在库根内 = 自引用（下次清理会把自己删掉），拒绝
+    ensure_no_overlap(&root, src)?;
+    let canonical = std::fs::canonicalize(src).map_err(|e| e.to_string())?;
+    let src_str = canonical.to_string_lossy().to_string();
+
+    let raw_name = src
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "custom".into());
+    let clean = sanitize_id_stem(&raw_name);
+
+    let (ptype, ptitle) = parse_project(src);
+    let wtype = if ptype != "unknown" {
+        ptype
+    } else {
+        infer_type(src)
+    };
+    let title = if ptitle != "未命名" {
+        ptitle
+    } else {
+        raw_name.clone()
+    };
+    let size_bytes = dir_size(src);
+    let file_count = dir_count(src);
+
+    let db = app.state::<Arc<Mutex<Connection>>>();
+    let conn = db.lock().map_err(|e| e.to_string())?;
+
+    // 幂等：同一源目录已在库 → 刷新元数据后原样返回
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT item_id FROM library_items WHERE source_path = ?1",
+            [&src_str],
+            |r| r.get(0),
+        )
+        .ok();
+    if let Some(id) = existing {
+        let core = ImportCore {
+            item_id: id,
+            title,
+            wtype,
+            size_bytes,
+            file_count,
+            duplicate: true,
+            source_path: Some(src_str),
+        };
+        upsert_library_item(&conn, &core)?;
+        return Ok(ImportOne { core });
+    }
+
+    // item_id 分配：目录名清洗；已被占（拷贝条目或别的引用条目）→ 路径哈希兜底
+    let taken = |conn: &Connection, id: &str| -> bool {
+        conn.query_row("SELECT 1 FROM library_items WHERE item_id = ?1", [id], |_| Ok(true))
+            .is_ok()
+    };
+    let mut item_id = clean;
+    if taken(&conn, &item_id) {
+        item_id = format!("custom-{:08x}", fnv1a32(src_str.as_bytes()));
+        if taken(&conn, &item_id) {
+            return Err(format!("无法为「{raw_name}」分配库内唯一 id"));
+        }
+    }
+    let core = ImportCore {
+        item_id,
+        title,
+        wtype,
+        size_bytes,
+        file_count,
+        duplicate: false,
+        source_path: Some(src_str),
+    };
+    upsert_library_item(&conn, &core)?;
+    drop(conn);
+
+    // project.json 自带分类标签（含年龄分级）一并合并进库，
+    // 否则本地库按「年龄分级」筛选看不到引用导入的壁纸
+    let tags = project_tags_from(src);
+    if let Err(e) = merge_item_tags(app, &core.item_id, &tags) {
+        tracing::warn!("合并引用条目标签失败（不影响导入）: {e}");
+    }
+    Ok(ImportOne { core })
+}
+
+/// project.json 里的 tags 数组（年龄分级、类型等）；缺失/坏 JSON 返回空
+pub(crate) fn project_tags_from(dir: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(dir.join("project.json")) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    v.get("tags")
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 struct ImportOne {
@@ -1359,7 +1715,7 @@ fn has_preview_file(dir: &Path) -> bool {
 }
 
 /// 目录内第一个视频文件（按文件名排序，与 read_dir 枚举顺序无关，结果可复现）
-fn first_video_file(dir: &Path) -> Option<PathBuf> {
+pub(crate) fn first_video_file(dir: &Path) -> Option<PathBuf> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .ok()?
         .flatten()
@@ -1470,7 +1826,7 @@ pub(crate) fn wallpapers_dir(app: &AppHandle) -> Result<std::path::PathBuf, Stri
 /// 路径会整体替换前面的前缀，`..` 也能一路爬出库根，两者都会让下游的 `remove_dir_all`
 /// 删到库外（用户文档、应用数据目录）。真实 id 由 `sanitize_id_stem` 生成，只含
 /// `[A-Za-z0-9_-]` 且不以 `.` 开头，所以下面的规则不会误伤。
-fn check_item_id(item_id: &str) -> Result<(), String> {
+pub(crate) fn check_item_id(item_id: &str) -> Result<(), String> {
     let id = item_id.trim();
     if id.is_empty() || id.starts_with('.') {
         return Err(format!("非法 itemId: `{item_id}`"));
@@ -1483,9 +1839,41 @@ fn check_item_id(item_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 单个壁纸的目录 `<app_data>/wallpapers/<item_id>`
+/// 引用模式条目的源目录（库记录里登记的 source_path）。
+/// **不要在已持有 DB 锁的上下文里调用**（内部会再拿锁，同线程重入会死锁）；
+/// 持锁方请用 `item_source_path_in` / `resolved_item_dir_in`。
+pub(crate) fn item_source_path(app: &AppHandle, item_id: &str) -> Option<String> {
+    let db = app.try_state::<Arc<Mutex<Connection>>>()?;
+    let conn = db.lock().ok()?;
+    item_source_path_in(&conn, item_id)
+}
+
+/// 持锁版本：查引用模式条目的源目录
+pub(crate) fn item_source_path_in(conn: &Connection, item_id: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT source_path FROM library_items WHERE item_id = ?1",
+        [item_id],
+        |r| r.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .flatten()
+    .filter(|s| !s.trim().is_empty())
+    .map(|s| s.trim().to_string())
+}
+
+/// 持锁版本：解析条目内容目录 —— 引用模式条目是源目录，常规条目是 `<root>/<item_id>`
+pub(crate) fn resolved_item_dir_in(conn: &Connection, root: &Path, item_id: &str) -> PathBuf {
+    item_source_path_in(conn, item_id)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join(item_id.trim()))
+}
+
+/// 单个壁纸的内容目录：引用模式条目 → 源目录；常规条目 → `<app_data>/wallpapers/<item_id>`
 pub(crate) fn item_dir(app: &AppHandle, item_id: &str) -> Result<std::path::PathBuf, String> {
     check_item_id(item_id)?;
+    if let Some(src) = item_source_path(app, item_id) {
+        return Ok(PathBuf::from(src));
+    }
     Ok(wallpapers_dir(app)?.join(item_id.trim()))
 }
 
@@ -1613,13 +2001,19 @@ pub async fn set_item_prop_file(
         return Ok(json!({ "value": abs }));
     }
 
-    // 拷入 we-props/{prop}_{原文件名}（属性名前缀防冲突）
+    // 拷入 we-props/{prop}_{原文件名}（属性名前缀防冲突）。
+    // 引用模式条目写进源目录的 we-props/（WE 同语义：属性文件属于壁纸自身目录）
     let file_name = src
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "image.png".into());
     let dest_name = format!("{prop_name}_{file_name}");
-    let dest_dir = dir.join(&item_id).join("we-props");
+    let dest_dir = {
+        let root = wallpapers_dir(&app)?;
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        resolved_item_dir_in(&conn, &root, &item_id)
+            .join("we-props")
+    };
     std::fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
     let dest = dest_dir.join(&dest_name);
     std::fs::copy(&src, &dest).map_err(|e| format!("拷贝文件失败: {e}"))?;
@@ -1770,7 +2164,8 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE library_items(item_id TEXT PRIMARY KEY, title TEXT, type TEXT,
-                 size_bytes INTEGER, file_count INTEGER, downloaded_at INTEGER, tags TEXT);",
+                 size_bytes INTEGER, file_count INTEGER, downloaded_at INTEGER, tags TEXT,
+                 source_path TEXT);",
         )
         .unwrap();
         let core = |item_id: &str, ty: &str| ImportCore {
@@ -1780,6 +2175,7 @@ mod tests {
             size_bytes: 1,
             file_count: 1,
             duplicate: false,
+            source_path: None,
         };
         let tags_of = |id: &str| -> String {
             conn.query_row(
@@ -2383,6 +2779,80 @@ mod tests {
         assert!(import_into_library(&dest_root, &dest_root).is_err());
         // 试图导入库的祖先目录 → 同样拦下
         assert!(import_into_library(&dest_root, &root).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 构造一个「壁纸集合根」：子目录部分是 WE 工程（带 project.json），部分不是
+    fn scan_fixture(tag: &str) -> (std::path::PathBuf, Vec<std::path::PathBuf>) {
+        let root = tmpdir(tag);
+        let mut projects = Vec::new();
+        // 顶层两个工程
+        for n in ["p1", "p2"] {
+            let d = root.join(n);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("project.json"), "{}").unwrap();
+            projects.push(d);
+        }
+        // 深层嵌套工程（p1 的兄弟目录下的孙目录）
+        let deep = root.join("not-wall").join("sub").join("p3");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("project.json"), "{}").unwrap();
+        projects.push(deep);
+        // 干扰项：隐藏目录里的假工程、.version 目录、纯媒体目录
+        let hidden = root.join(".git").join("hidden-p");
+        std::fs::create_dir_all(&hidden).unwrap();
+        std::fs::write(hidden.join("project.json"), "{}").unwrap();
+        let ver = root.join("p1").join(crate::workspace::VERSION_DIR).join("1");
+        std::fs::create_dir_all(&ver).unwrap();
+        std::fs::write(ver.join("project.json"), "{}").unwrap();
+        let plain = root.join("just-videos");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(plain.join("a.mp4"), b"v").unwrap();
+        (root, projects)
+    }
+
+    #[test]
+    fn scan_project_dirs_finds_projects_and_stops_at_them() {
+        let (root, projects) = scan_fixture("scan");
+        let (mut found, skipped) = scan_project_dirs(&root);
+        found.sort();
+        let mut want = projects.clone();
+        want.sort();
+        assert_eq!(found, want, "必须命中三个工程且不深入工程内部/隐藏目录");
+        // not-wall / sub / just-videos 这些「扫过但不是壁纸」的目录要记账
+        assert!(skipped >= 3, "skipped={skipped}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_project_dirs_respects_limit() {
+        let root = tmpdir("scanlimit");
+        for i in 0..(MAX_SCAN_ITEMS + 50) {
+            let d = root.join(format!("p{i}"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("project.json"), "{}").unwrap();
+        }
+        let (found, _) = scan_project_dirs(&root);
+        assert_eq!(found.len(), MAX_SCAN_ITEMS, "必须在上限处停住");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn project_tags_from_parses_project_json() {
+        let root = tmpdir("ptags");
+        std::fs::write(
+            root.join("project.json"),
+            r#"{"title":"t","type":"scene","tags":["Everyone","  Anime  ",""]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            project_tags_from(&root),
+            vec!["Everyone".to_string(), "Anime".to_string()]
+        );
+        // 缺文件 / 坏 JSON 都安全返回空
+        assert!(project_tags_from(&tmpdir("ptags-empty")).is_empty());
+        std::fs::write(root.join("project.json"), "not json").unwrap();
+        assert!(project_tags_from(&root).is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

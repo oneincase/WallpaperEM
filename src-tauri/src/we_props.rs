@@ -269,7 +269,8 @@ pub fn effective_props(
     wallpapers_dir: &Path,
     item_id: &str,
 ) -> Map<String, Value> {
-    let item_dir = wallpapers_dir.join(item_id);
+    // 引用模式条目（source_path 登记）解析到源目录
+    let item_dir = crate::library::resolved_item_dir_in(conn, wallpapers_dir, item_id);
     let Some(project) = load_project(&item_dir) else {
         return Map::new();
     };
@@ -368,7 +369,8 @@ pub fn directory_files(
     wallpapers_dir: &Path,
     item_id: &str,
 ) -> Map<String, Value> {
-    let item_dir = wallpapers_dir.join(item_id);
+    // 引用模式条目（source_path 登记）解析到源目录
+    let item_dir = crate::library::resolved_item_dir_in(conn, wallpapers_dir, item_id);
     let Some(project) = load_project(&item_dir) else {
         return Map::new();
     };
@@ -609,7 +611,7 @@ fn resolve_text(project: &Value, raw: &str, fallback: &str) -> String {
 
 /// 属性定义列表（UI 编辑用）；无 project.json / 无属性时为空
 pub fn describe(conn: &Connection, wallpapers_dir: &Path, item_id: &str) -> Vec<WebPropDef> {
-    let Some(project) = load_project(&wallpapers_dir.join(item_id)) else {
+    let Some(project) = load_project(&crate::library::resolved_item_dir_in(conn, wallpapers_dir, item_id)) else {
         return Vec::new();
     };
     let overrides = read_overrides(conn, item_id);

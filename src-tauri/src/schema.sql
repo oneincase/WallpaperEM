@@ -66,8 +66,14 @@ CREATE TABLE IF NOT EXISTS library_items (
   file_count INTEGER,
   project_json TEXT,
   downloaded_at INTEGER NOT NULL DEFAULT (unixepoch()),
-  hash TEXT
+  hash TEXT,
+  -- 引用模式（批量导入）：壁纸内容留在源目录，不拷贝进库根；
+  -- NULL = 常规条目（内容在 wallpapers/<item_id>）
+  source_path TEXT,
+  -- 已发布/已更新的创意工坊条目 id（上传成功后回写）
+  publishedfileid TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_library_source ON library_items(source_path) WHERE source_path IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS wallpaper_sessions (
   display_id TEXT PRIMARY KEY,

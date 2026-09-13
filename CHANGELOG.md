@@ -6,6 +6,46 @@
 
 _（暂无 / Nothing yet）_
 
+## [v0.5.2] - 2026-09-13
+
+### ✨ 新增 / Added
+
+- **本地壁纸批量导入（递归扫描 + 引用模式）**：「导入文件夹」现在会递归扫描所选目录树，
+  每个带 `project.json` 的目录各自导入为一张壁纸（上限 500 个）；引用模式下壁纸内容
+  **留在源目录、零副本**（库条目登记 `source_path`），同一目录重复导入幂等。拖拽导入
+  同样支持目录树扫描。
+- **创意工坊上传**：基于 Steamworks SDK（ISteamUGC）的完整上传链路——内容暂存（scene
+  贴图自动转 `.tex`）、`CreateItem` / `SubmitItemUpdate`、实时进度、成功后回写
+  `publishedfileid`（库条目进 DB，工程写 `project.json` 的 `workshop.fileId`）。
+  入口：MCP 工具 `workshop_upload` / `workshop_upload_status` + 本地库卡片右上角上传按钮
+  （scene / web / video；视频与单文件网页上传时自动合成最小 `project.json`）。
+  上传对话框含版权/授权提示。需要 Steam 客户端运行且账号拥有 Wallpaper Engine。
+- **本地库「导入壁纸」弹框**：工具栏收敛为单个入口，弹框内含「添加壁纸目录 / 导入文件夹 /
+  导入文件」与已导入的壁纸目录列表（可移除，只删库记录不动源文件）。
+
+### 🐛 修复 / Fixes
+
+- **本地库页面卡死（含重启后依旧卡死）**：`library_list` 原是同步命令跑在主线程，
+  全库磁盘对账 + 缺封面视频的同步抽帧（失败还会无限重试）会把 UI 整个冻死。现在
+  列表查询移入阻塞线程池，视频封面改为启动后的后台补齐任务，失败条目记账不再重试。
+- **退出软件后被 launchd 反复拉起**：「开机自启」注入的 launchd plist 用了无条件
+  `KeepAlive`，用户主动退出也被立刻复活。改为条件化（仅崩溃 / 被信号杀死时拉起），
+  应用启动时自动升级存量 plist。
+- **CI 安装包每次都要重新授权录屏权限**：macOS TCC 权限绑定代码签名，ad-hoc 签名
+  每次构建都不同。CI 支持固定签名证书（Secrets：`MACOS_CERTIFICATE_P12` /
+  `MACOS_CERTIFICATE_PWD`），同一把证书的更新包授权跨版本保留。
+- 音频频谱 AGC 目标值修正（0.7，留 0.3 余量防止普遍削顶），静音回落与快攻慢放行为不变。
+
+### 🔧 变更 / Changed
+
+- **MCP 移除版本管理**：`project_snapshot` / `project_versions` / `project_rollback`
+  三个工具及其 `.version/` 机制移除，工程版本由创作者自行维护（git 等）。
+- **帧率上限新增 15 FPS 档并设为默认**；设置页与每壁纸「播放设置」的「帧率限制」
+  统一更名为「帧率上限」。
+- **全局消息提示**统一右上角 3 秒自动消失（原成功类 2.6s、错误类需手动关闭）。
+- 本地库上传按钮移至卡片右上角，操作行保留原 4 按钮。
+- Steam API 动态库随应用分发（macOS `Contents/MacOS`、Windows 资源、Linux rpath）。
+
 ## [v0.5.1] - 2026-09-12
 
 ### 🐛 修复 / Fixes

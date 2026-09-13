@@ -45,8 +45,8 @@ export function SettingsPage() {
   // 默认 2 高清（与 Rust DEFAULT_RENDER_DPR 一致）
   const [renderDpr, setRenderDpr] = useState<number>(2);
   const [renderDprMsg, setRenderDprMsg] = useState("");
-  // 全局场景帧率上限（24/30/45/60/120，越低 GPU 占用越低），默认 24
-  const [sceneFps, setSceneFps] = useState<number>(24);
+  // 全局场景帧率上限（15/24/30/45/60/120，越低 GPU 占用越低），默认 15
+  const [sceneFps, setSceneFps] = useState<number>(15);
   const [sceneFpsMsg, setSceneFpsMsg] = useState("");
   // 壁纸语言（只影响壁纸的 language 属性，不是软件本体语言）。默认英文
   const [language, setLanguage] = useState<string>("english");
@@ -123,7 +123,7 @@ export function SettingsPage() {
       .then((v) => setRenderDpr(Number(v) || 1))
       .catch(() => { });
     invoke<string | null>("settings_get", { key: "wallpaper_scene_fps" })
-      .then((v) => setSceneFps(Number(v) || 24))
+      .then((v) => setSceneFps(Number(v) || 15))
       .catch(() => { });
     invoke<string | null>("settings_get", { key: "language" })
       .then((v) => v && setLanguage(v))
@@ -974,17 +974,19 @@ export function SettingsPage() {
                 }
               />
               <Row
-                label={tr("帧率限制")}
+                label={tr("帧率上限")}
                 desc={
-                  sceneFps <= 24
-                    ? tr("24 FPS：默认，GPU 占用最低，最省电")
-                    : sceneFps <= 30
-                      ? tr("30 FPS：略流畅，GPU 占用仍低")
-                      : sceneFps <= 45
-                        ? tr("45 FPS：流畅度与功耗折中")
-                        : sceneFps >= 120
-                          ? tr("120 FPS：最流畅，GPU 占用最高（需高刷屏才看得出）")
-                          : tr("60 FPS：画质与 GPU 占用均衡")
+                  sceneFps <= 15
+                    ? tr("15 FPS：默认，GPU 占用最低，最省电")
+                    : sceneFps <= 24
+                      ? tr("24 FPS：略流畅，GPU 占用仍低")
+                      : sceneFps <= 30
+                        ? tr("30 FPS：流畅，GPU 占用低")
+                        : sceneFps <= 45
+                          ? tr("45 FPS：流畅度与功耗折中")
+                          : sceneFps >= 120
+                            ? tr("120 FPS：最流畅，GPU 占用最高（需高刷屏才看得出）")
+                            : tr("60 FPS：画质与 GPU 占用均衡")
                 }
                 control={
                   <div className="flex items-center gap-2">
@@ -993,6 +995,7 @@ export function SettingsPage() {
                       onChange={(e) => changeSceneFps(Number(e.target.value))}
                       className="rounded-lg border border-[var(--separator)] bg-[var(--content)] px-2 py-1 text-[12.5px] outline-none focus:border-[var(--accent-strong)]"
                     >
+                      <option value={15}>15 FPS</option>
                       <option value={24}>24 FPS</option>
                       <option value={30}>30 FPS</option>
                       <option value={45}>45 FPS</option>

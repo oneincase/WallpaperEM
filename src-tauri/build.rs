@@ -16,4 +16,97 @@ fn main() {
     println!("cargo:rerun-if-changed=icons");
     println!("cargo:rerun-if-changed=tauri.conf.json");
     println!("cargo:rerun-if-changed=capabilities");
+    copy_steam_api_dylib();
+}
+
+/// 把 Steam API 动态库复制到可执行文件旁边。
+///
+/// vendored 的 `libsteam_api.dylib` install name 是
+/// `@loader_path/libsteam_api.dylib`（@loader_path = 主程序所在目录），
+/// 所以运行时必须能在主程序同目录找到它：
+/// - dev/`cargo build`：这里复制到位（<target>/<profile>/）
+/// - macOS 打包：tauri.conf.json 的 bundle.macOS.files 把 sdk/libsteam_api.dylib
+///   送进 .app 的 Contents/MacOS
+/// - Windows 打包：tauri.windows.conf.json 的 resources（资源目录 = exe 同级）
+/// - Linux 打包：resources + build.rs 加的 rpath（/usr/lib/<productName>）
+fn copy_steam_api_dylib() {
+    let triple = std::env::var("TARGET").unwrap_or_default();
+    let (subdir, names): (&str, &[&str]) = if triple.contains("windows") {
+        ("win64", &["steam_api64.dll"])
+    } else if triple.contains("darwin") {
+        ("osx", &["libsteam_api.dylib"])
+    } else if triple.contains("linux") {
+        ("linux64", &["libsteam_api.so"])
+    } else {
+        return;
+    };
+
+    // 源：优先仓库内置的 sdk/（Steamworks SDK redistributables，随应用分发），
+    // 其次 STEAM_SDK_LOCATION（与 steamworks-sys 同名的环境变量约定），
+    // 最后在 cargo registry 缓存里找 steamworks-sys vendored 的 redistributable_bin
+    let candidates = |sub: &str| -> Vec<std::path::PathBuf> {
+        let mut roots = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("sdk")];
+        if let Ok(sdk) = std::env::var("STEAM_SDK_LOCATION") {
+            roots.push(std::path::PathBuf::from(sdk).join("redistributable_bin").join(sub));
+        }
+        let cargo_home = std::env::var("CARGO_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|_| dirs::home_dir().map(|h| h.join(".cargo")).ok_or(()))
+            .unwrap_or_default();
+        let registry = cargo_home.join("registry").join("src");
+        if let Ok(entries) = std::fs::read_dir(&registry) {
+            for e in entries.flatten() {
+                let pattern = e.path().join("steamworks-sys-*");
+                if let Ok(matches) = glob::glob(&pattern.to_string_lossy()) {
+                    for m in matches.flatten() {
+                        roots.push(
+                            m.join("lib").join("steam").join("redistributable_bin").join(sub),
+                        );
+                    }
+                }
+            }
+        }
+        roots
+    };
+
+    let out_dir = std::path::PathBuf::from(
+        std::env::var("OUT_DIR").expect("build.rs 的 OUT_DIR 必然存在"),
+    );
+    // OUT_DIR = <target>/<profile>/build/<pkg>-<hash>/out → 上三级是 <target>/<profile>，
+    // 即可执行文件所在目录（cargo 的约定布局）
+    let bin_dir = out_dir
+        .ancestors()
+        .nth(3)
+        .map(|p| p.to_path_buf())
+        .expect("OUT_DIR 层级异常");
+
+    for name in names {
+        let mut copied = false;
+        for dir in candidates(subdir) {
+            let src = dir.join(name);
+            if src.is_file() {
+                let dest = bin_dir.join(name);
+                match std::fs::copy(&src, &dest) {
+                    Ok(_) => {
+                        copied = true;
+                        println!("cargo:rerun-if-changed={}", src.display());
+                        break;
+                    }
+                    Err(e) => eprintln!("warning: 复制 {name} 失败（{src:?}）: {e}"),
+                }
+            }
+        }
+        if !copied {
+            println!(
+                "cargo:warning=未找到 Steam API 动态库 {name}（工坊上传功能运行时需要它）"
+            );
+        }
+    }
+
+    // Linux：动态库查找不认 @loader_path（ELF 用 SONAME + rpath）。rpath 覆盖
+    // dev（二进制同目录）与 deb 打包（资源目录 /usr/lib/<productName>）
+    if triple.contains("linux") {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib/WallpaperEM");
+    }
 }

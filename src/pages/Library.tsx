@@ -28,8 +28,10 @@ import {
   type TagSelection,
 } from "../lib/tags";
 import { readState, writeState } from "../lib/cache-snapshots";
-import { IconPreview, IconApply, IconOpenFile, IconTrash } from "../components/icons";
+import { IconPreview, IconApply, IconOpenFile, IconTrash, IconUpload } from "../components/icons";
 import { SubscriptionsModal } from "../components/SubscriptionsModal";
+import { LibraryImportModal } from "../components/LibraryImportModal";
+import { WorkshopUploadModal } from "../components/WorkshopUploadModal";
 import { VirtualGrid } from "../components/VirtualGrid";
 import { tr, trMsg } from "../lib/i18n";
 
@@ -100,6 +102,8 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
   const [pruning, setPruning] = useState(false);
   const [confirmPrune, setConfirmPrune] = useState(false);
   const [subsOpen, setSubsOpen] = useState(false);
+  // 正在上传到创意工坊的条目（弹框）
+  const [uploadItem, setUploadItem] = useState<LibraryItem | null>(null);
   // 文件已丢失的条目（数据库还留着记录）
   const missingItems = items.filter((it) => it.missing);
 
@@ -152,12 +156,16 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
         return;
       }
       const text = parts.join("，");
+      // 批量扫描根：引用模式提示（壁纸文件留在源目录）
+      const linkedHint = r.skippedDirs
+        ? tr("（批量扫描跳过 {n} 个非壁纸目录；壁纸以引用方式入库，请勿移动/删除源文件夹）", { n: r.skippedDirs })
+        : "";
       if (failedCount) {
         const first = r.failed![0];
         const name = first.path.split("/").pop() ?? first.path;
         msg.error(`${text}：${name} — ${trMsg(first.error)}`);
       } else if (r.imported) {
-        msg.success(text);
+        msg.success(text + (linkedHint ? " " + linkedHint : ""));
       } else {
         msg.info(text);
       }
@@ -180,8 +188,7 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
     [msg, reportImport],
   );
 
-  const importCustom = () => runImport(() => api.libraryImportCustomPick());
-  const importFolder = () => runImport(() => api.libraryImportFolderPick());
+  const [importOpen, setImportOpen] = useState(false);
 
   // 拖拽导入：把文件/文件夹拖到窗口任意位置即可批量导入
   const [dragOver, setDragOver] = useState(false);
@@ -303,19 +310,10 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
           </button>
           <button
             className="rounded-lg border border-[var(--separator)] px-3 py-1.5 text-[12.5px] font-medium hover:bg-black/5 disabled:opacity-60 dark:hover:bg-white/10"
-            onClick={importFolder}
-            disabled={importing}
-            title={tr("导入包含 project.json 的 WE 壁纸工程目录")}
+            onClick={() => setImportOpen(true)}
+            title={tr("添加壁纸目录 / 导入文件夹 / 导入文件")}
           >
-            {tr("导入文件夹")}
-          </button>
-          <button
-            className="rounded-lg border border-[var(--separator)] px-3 py-1.5 text-[12.5px] font-medium hover:bg-black/5 disabled:opacity-60 dark:hover:bg-white/10"
-            onClick={importCustom}
-            disabled={importing}
-            title={tr("支持多选；也可以直接把文件/文件夹拖进窗口")}
-          >
-            {importing ? tr("导入中…") : `＋ ${tr("导入文件")}`}
+            ＋ {tr("导入壁纸")}
           </button>
         </div>
       </div>
@@ -423,6 +421,25 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
                   </span>
                 ) : undefined
               }
+              coverBadgeRight={
+                (item.type === "scene" || item.type === "web" || item.type === "video") &&
+                !item.missing ? (
+                  <button
+                    className="flex items-center justify-center rounded bg-black/55 px-1.5 py-1 text-white/85 backdrop-blur-sm transition-colors hover:bg-black/75 hover:text-white"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setUploadItem(item);
+                    }}
+                    data-tip={
+                      item.publishedFileId
+                        ? tr("更新到创意工坊")
+                        : tr("上传到创意工坊")
+                    }
+                  >
+                    <IconUpload />
+                  </button>
+                ) : undefined
+              }
               metaLeft={<TypeChip label={tr(TYPE_LABELS[item.type])} />}
               metaRight={`${(item.sizeBytes / 1024 / 1024).toFixed(1)} MB`}
               actions={
@@ -481,6 +498,17 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
       </div>
 
       {previewItem && <PreviewModal item={previewItem} onClose={() => setPreviewItem(null)} />}
+
+      {uploadItem && (
+        <WorkshopUploadModal item={uploadItem} onClose={() => setUploadItem(null)} />
+      )}
+
+      {importOpen && (
+        <LibraryImportModal
+          onClose={() => setImportOpen(false)}
+          onImported={(r) => reportImport(r)}
+        />
+      )}
 
       {subsOpen && (
         <SubscriptionsModal

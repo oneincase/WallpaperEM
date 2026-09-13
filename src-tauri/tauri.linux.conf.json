@@ -4,6 +4,9 @@
     "targets": [
       "deb",
       "appimage"
+    ],
+    "resources": [
+      "sdk/libsteam_api.so"
     ]
   }
 }

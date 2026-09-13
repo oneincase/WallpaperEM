@@ -187,9 +187,35 @@ export type ImportBatchResult = {
   imported?: number;
   /** 重复复用条数（同名同大小已在库，未产生副本） */
   duplicates?: number;
-  items?: { path: string; item_id: string; title: string; type: string; duplicate: boolean }[];
+  /** 批量扫描时「扫过但不是壁纸工程」的目录数 */
+  skippedDirs?: number;
+  items?: {
+    path: string;
+    item_id: string;
+    title: string;
+    type: string;
+    duplicate: boolean;
+    /** 引用模式条目（不拷贝，库记录源目录） */
+    linked?: boolean;
+  }[];
   failed?: { path: string; error: string }[];
 };
+
+/** 工坊上传任务状态 */
+export interface WorkshopUploadJob {
+  jobId: string;
+  project?: string;
+  itemId?: string;
+  title: string;
+  /** staging | creating | uploading | committing | done | failed */
+  status: string;
+  /** 0-100 */
+  progress: number;
+  publishedfileid?: string;
+  error?: string;
+  workshopUrl?: string;
+  startedAt: number;
+}
 
 export const api = {
   // 关于 / 更新
@@ -269,11 +295,31 @@ export const api = {
     ),
   /** 文件选择框（支持多选）→ 批量导入 */
   libraryImportCustomPick: () => invoke<ImportBatchResult>("library_import_custom_pick"),
-  /** 文件夹选择框 → 作为完整壁纸目录导入（WE 工程目录） */
-  libraryImportFolderPick: () => invoke<ImportBatchResult>("library_import_folder_pick"),
+  /**
+   * 文件夹选择框。mode="scan"：扫描壁纸工程目录，引用模式入库（添加壁纸目录）；
+   * 其他/缺省：所选目录作为单个壁纸拷贝导入（导入文件夹；目录不含 project.json
+   * 时退回扫描）
+   */
+  libraryImportFolderPick: (mode?: "scan" | "copy") =>
+    invoke<ImportBatchResult>("library_import_folder_pick", { mode }),
   /** 拖拽导入：逐条容错，单条失败不拖垮整批 */
   libraryImportCustomBatch: (paths: string[]) =>
     invoke<ImportBatchResult>("library_import_custom_batch", { paths }),
+  // 创意工坊上传
+  /** 从本地库条目或 MCP 工程发起工坊上传（二选一），返回 { jobId } */
+  workshopUploadStart: (opts: {
+    itemId?: string;
+    project?: string;
+    title?: string;
+    description?: string;
+    tags?: string[];
+    /** public（默认）/ friends / private */
+    visibility?: string;
+    changelog?: string;
+  }) => invoke<{ jobId: string }>("workshop_upload_start", opts),
+  /** 查询上传任务（jobId 缺省 = 全部） */
+  workshopUploadStatus: (jobId?: string) =>
+    invoke<WorkshopUploadJob[]>("workshop_upload_status", { jobId }),
   // WE 网页壁纸用户属性
   libraryItemProps: (itemId: string) => invoke<WebPropDef[]>("library_item_props", { itemId }),
   /** 按 itemId 查标题（托盘入口给配置弹窗用；查不到返回 itemId） */
@@ -375,6 +421,10 @@ export interface LibraryItem {
   sizeBytes: number;
   fileCount: number;
   downloadedAt: number;
+  /** 引用模式条目的源目录（批量导入不拷贝；缺省 = 常规条目） */
+  sourcePath?: string;
+  /** 已发布/已更新的创意工坊条目 id */
+  publishedFileId?: string;
   /** 磁盘上的壁纸文件已丢失，条目仅剩数据库记录（需清理或重新下载） */
   missing: boolean;
 }

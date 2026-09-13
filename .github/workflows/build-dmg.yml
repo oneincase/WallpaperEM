@@ -75,17 +75,43 @@ jobs:
       - name: 安装依赖
         run: pnpm install --frozen-lockfile
 
+      # 签名证书（可选但强烈建议）：macOS 的 TCC 权限（录屏、辅助功能等）绑定在
+      # 应用的代码签名上。ad-hoc 签名（"-"）每次构建的签名哈希都不同，用户每次
+      # 安装新包都要重新授权录屏权限。把同一把证书的 .p12 存进仓库 Secrets
+      # （MACOS_CERTIFICATE_P12 = base64 内容、MACOS_CERTIFICATE_PWD = 导出密码，
+      # 可选 vars.MACOS_CERTIFICATE_NAME = 证书名，缺省用
+      # tauri.conf.json 里的 "WallpaperEM Dev Signer"），每次构建用同一把签，
+      # 授权即可跨版本保留。证书更换 = 用户需重新授权一次。
+      - name: 导入签名证书（存在 Secrets 时）
+        if: ${{ secrets.MACOS_CERTIFICATE_P12 != '' }}
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+        run: |
+          CERT_P12_PATH=$RUNNER_TEMP/wallpaperem-sign.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain-db
+          KEYCHAIN_PWD=$(openssl rand -hex 16)
+          echo -n "$MACOS_CERTIFICATE" | base64 --decode -o "$CERT_P12_PATH"
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security import "$CERT_P12_PATH" -k "$KEYCHAIN_PATH"             -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:             -k "$KEYCHAIN_PWD" "$KEYCHAIN_PATH" > /dev/null
+          security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain-db
+
       - name: 构建 Tauri（.app + .dmg）
         # beforeBuildCommand 会先跑 pnpm --filter @we/desktop build 生成前端 dist/，
         # 再编译 Rust release 并打包 app/dmg。
         #
-        # 签名：tauri.conf.json 的 bundle.macOS.signingIdentity 写的是本机证书名，
-        # CI 上不存在会让构建直接失败。默认 ad-hoc 签名（"-"）先把包出出来；要出
-        # 可对外分发的正式包，在仓库 Variables 里设
-        # APPLE_SIGNING_IDENTITY=<Developer ID 证书名>，并补
-        # APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_ID 等 secrets。
+        # 签名：优先仓库 Variables 的 APPLE_SIGNING_IDENTITY（Developer ID 正式包），
+        # 其次 Secrets 里那把自签名证书（见上一步；作用是固定签名让 TCC 授权跨版本
+        # 保留），都没有才退回 ad-hoc（"-"，仅能出包，用户每次安装都要重授权录屏）。
+        # 要出可对外分发的正式包，另补 APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD /
+        # APPLE_ID 等公证 secrets。
         env:
-          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY || '-' }}
+          # 优先级：Developer ID（Variables）→ Secrets 证书名 → 导入了证书时用
+          # 默认自签名证书名 → ad-hoc（无任何证书，授权无法跨版本保留）
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY || secrets.MACOS_CERTIFICATE_NAME || (secrets.MACOS_CERTIFICATE_P12 != '' && 'WallpaperEM Dev Signer' || '-') }}
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: pnpm tauri build --target universal-apple-darwin
 

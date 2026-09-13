@@ -539,23 +539,25 @@ async fn handle_conn(
         if token != state.token {
             return respond(stream, 401, "Unauthorized", "text/plain", b"", None).await;
         }
-        let ok = state
+        // 条目存在性检查 + 引用模式条目的源目录解析，一次加锁完成
+        let base = state
             .db
             .lock()
-            .map(|conn| {
-                conn.query_row(
-                    "SELECT COUNT(*) FROM library_items WHERE item_id = ?1",
-                    [item_id.as_str()],
-                    |r| r.get::<_, i64>(0),
-                )
-                .map(|n| n > 0)
-                .unwrap_or(false)
-            })
-            .unwrap_or(false);
-        if !ok {
+            .ok()
+            .and_then(|conn| {
+                let ok = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM library_items WHERE item_id = ?1",
+                        [item_id.as_str()],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .map(|n| n > 0)
+                    .unwrap_or(false);
+                ok.then(|| crate::library::resolved_item_dir_in(&conn, &state.wallpapers_dir, &item_id))
+            });
+        let Some(base) = base else {
             return respond(stream, 404, "Not Found", "text/plain", b"", None).await;
-        }
-        let base = state.wallpapers_dir.join(&item_id);
+        };
         let Some(dir) = normalize(&base, &rel_dir) else {
             return respond(stream, 403, "Forbidden", "text/plain", b"", None).await;
         };
@@ -597,25 +599,27 @@ async fn handle_conn(
         return respond(stream, 401, "Unauthorized", "text/plain", b"", None).await;
     }
     // itemId 白名单（guard 在闭包内释放，避免跨 await 持有非 Send 锁）
-    let ok = state
+    // 条目存在性检查 + 引用模式条目的源目录解析，一次加锁完成
+    let base = state
         .db
         .lock()
-        .map(|conn| {
-            conn.query_row(
-                "SELECT COUNT(*) FROM library_items WHERE item_id = ?1",
-                [item_id.as_str()],
-                |r| r.get::<_, i64>(0),
-            )
-            .map(|n| n > 0)
-            .unwrap_or(false)
-        })
-        .unwrap_or(false);
-    if !ok {
+        .ok()
+        .and_then(|conn| {
+            let ok = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM library_items WHERE item_id = ?1",
+                    [item_id.as_str()],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map(|n| n > 0)
+                .unwrap_or(false);
+            ok.then(|| crate::library::resolved_item_dir_in(&conn, &state.wallpapers_dir, &item_id))
+        });
+    let Some(base) = base else {
         return respond(stream, 404, "Not Found", "text/plain", b"", None).await;
-    }
+    };
 
     // 路径规范化防穿越
-    let base = state.wallpapers_dir.join(&item_id);
     let Some(target) = normalize(&base, &rel_path) else {
         return respond(stream, 403, "Forbidden", "text/plain", b"", None).await;
     };

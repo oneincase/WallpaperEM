@@ -120,6 +120,15 @@ export const IconOpenFile = () => (
   </Svg>
 );
 
+/** 上传到创意工坊：托盘 + 向上箭头 */
+export const IconUpload = () => (
+  <Svg>
+    <path d="M4.4 15.2v2.4a2.4 2.4 0 0 0 2.4 2.4h10.4a2.4 2.4 0 0 0 2.4-2.4v-2.4" />
+    <path d="M12 15.6V4.4" />
+    <path d="M7.6 8.4 12 4l4.4 4.4" />
+  </Svg>
+);
+
 /** 删除：圆角垃圾桶，桶身两道短竖 */
 export const IconTrash = () => (
   <Svg>

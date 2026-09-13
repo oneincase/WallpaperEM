@@ -1,8 +1,8 @@
 // 全局轻量消息提示（toast）
 //
 // 替代散落在各页的 `{msg && <div>…</div>}` 灰字条：那种写法会挤占布局、
-// 不会自动消失、也分不出成功/失败。这里做成右上角浮层，成功类 2.6s 后自动
-// 淡出，错误类保持到用户手动关闭（失败信息通常需要看清并处理）。
+// 不会自动消失、也分不出成功/失败。这里做成右上角浮层，所有类型统一 3s
+// 自动淡出（也可以点 × 立即关掉）。
 //
 // 用法：在应用根部挂 <MessageProvider>，页面里 const msg = useMessage()
 // 然后 msg.success("已清理 12 个失效条目") / msg.error(String(e))。
@@ -26,8 +26,8 @@ type MessageItem = {
   text: string;
 };
 
-/** 成功/提示类的自动消失时长；错误类不自动消失 */
-const AUTO_DISMISS_MS = 2600;
+/** 所有类型的自动消失时长（右上角 toast，3 秒） */
+const AUTO_DISMISS_MS = 3000;
 /** 同屏最多堆叠数量，超出时挤掉最旧的 */
 const MAX_STACK = 3;
 
@@ -103,9 +103,9 @@ function Toast({ item, onDismiss }: { item: MessageItem; onDismiss: () => void }
   }, [onDismiss]);
 
   useEffect(() => {
-    // 下一帧再切到入场终态，保证 transition 能被触发
+    // 下一帧再切到入场终态，保证 transition 能被触发。
+    // 所有类型（含错误）3s 自动消失，鼠标悬停可看，也能点 × 立即关
     const raf = requestAnimationFrame(() => setEntered(true));
-    if (item.kind === "error") return () => cancelAnimationFrame(raf);
     const timer = window.setTimeout(close, AUTO_DISMISS_MS);
     return () => {
       cancelAnimationFrame(raf);

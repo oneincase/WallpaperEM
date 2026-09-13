@@ -139,6 +139,24 @@ fn migrate(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
         conn.pragma_update(None, "user_version", 6)?;
         tracing::info!("db migrated to version 6（回填 {n} 条本地导入类型标签）");
     }
+    if v < 7 {
+        // v7：批量导入的引用模式 + 工坊上传回写。
+        // - source_path：非 NULL = 引用模式条目（壁纸内容留在源目录，不拷贝进库根）
+        // - publishedfileid：库条目上传创意工坊成功后的 publishedfileid（更新同一
+        //   工坊条目用）；MCP 工程目录的对应信息存 project.json 的 workshop.fileId
+        if !column_exists(conn, "library_items", "source_path")? {
+            conn.execute_batch("ALTER TABLE library_items ADD COLUMN source_path TEXT;")?;
+        }
+        if !column_exists(conn, "library_items", "publishedfileid")? {
+            conn.execute_batch("ALTER TABLE library_items ADD COLUMN publishedfileid TEXT;")?;
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_library_source
+                 ON library_items(source_path) WHERE source_path IS NOT NULL;",
+        )?;
+        conn.pragma_update(None, "user_version", 7)?;
+        tracing::info!("db migrated to version 7（引用模式 source_path + publishedfileid）");
+    }
     Ok(())
 }
 
@@ -329,7 +347,7 @@ mod tests {
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
         // 版本号是链式的：v4 的库跑一次 migrate() 会一路升到当前最新
-        assert_eq!(ver, 6);
+        assert_eq!(ver, 7);
     }
 
     #[test]

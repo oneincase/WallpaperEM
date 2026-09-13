@@ -39,11 +39,8 @@ pub fn sync_after_apply(
     let Some(item_id) = item_id else {
         return;
     };
-    let Ok(dir) = app
-        .path()
-        .app_data_dir()
-        .map(|d| d.join("wallpapers").join(&item_id))
-    else {
+    // 引用模式条目：内容目录是源目录
+    let Ok(dir) = crate::library::item_dir(&app, &item_id) else {
         return;
     };
     // scene/web：没有可直接解码的媒体文件，等渲染器 ready 后实拍截图

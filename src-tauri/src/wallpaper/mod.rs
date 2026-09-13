@@ -37,10 +37,10 @@ pub const RENDER_DPR_MIN: f32 = 0.8;
 pub const RENDER_DPR_MAX: f32 = 2.0;
 pub const DEFAULT_RENDER_DPR: f32 = 2.0;
 /// 场景壁纸帧率上限（帧/秒）：越低 GPU 占用越低。
-/// 可选 24 / 30 / 45 / 60 / 120，默认 24（最省电，且多数场景 24fps 观感足够）。
-pub const DEFAULT_SCENE_FPS: u32 = 24;
+/// 可选 15 / 24 / 30 / 45 / 60 / 120，默认 15（最省电，多数场景 15fps 观感足够）。
+pub const DEFAULT_SCENE_FPS: u32 = 15;
 /// 允许的全局帧率档位（托盘、设置页、`wallpaper_set_scene_fps` 共用同一份白名单）
-pub const SCENE_FPS_CHOICES: [u32; 5] = [24, 30, 45, 60, 120];
+pub const SCENE_FPS_CHOICES: [u32; 6] = [15, 24, 30, 45, 60, 120];
 
 /// 全局滤镜（帧率上限下面的那组）。**id 白名单本身就是契约**：
 /// 托盘菜单、设置项、URL query、`__wp.setFilter` 传的都只是这份 id，
@@ -334,7 +334,7 @@ pub struct WallpaperConfig {
     /// 渲染分辨率上限（有效 dpr 封顶），越低越省内存
     #[serde(default = "default_render_dpr")]
     pub render_dpr: f32,
-    /// 场景壁纸帧率上限（24/30/45/60/120），越低 GPU 占用越低
+    /// 场景壁纸帧率上限（15/24/30/45/60/120），越低 GPU 占用越低
     #[serde(default = "default_scene_fps")]
     pub scene_fps: u32,
     /// 全局滤镜 id（见 WALLPAPER_FILTERS 白名单）
@@ -2182,7 +2182,7 @@ pub fn set_language(app: AppHandle, language: String) -> Result<(), String> {
     Ok(())
 }
 
-/// 设置全局场景帧率上限（24/30/45/60/120），持久化并对所有壁纸窗口实时生效。
+/// 设置全局场景帧率上限（15/24/30/45/60/120），持久化并对所有壁纸窗口实时生效。
 #[tauri::command(rename = "wallpaper_set_scene_fps")]
 pub fn set_scene_fps(app: AppHandle, fps: u32) -> Result<(), String> {
     if !SCENE_FPS_CHOICES.contains(&fps) {
@@ -2338,21 +2338,20 @@ fn resolve_item_config(app: &AppHandle, item_id: &str) -> Result<WallpaperConfig
     let db = app
         .try_state::<Arc<Mutex<rusqlite::Connection>>>()
         .ok_or("DB 未就绪")?;
-    let (wtype,) = {
+    let (wtype, dir) = {
         let conn = db.lock().map_err(|e| e.to_string())?;
-        conn.query_row(
-            "SELECT type FROM library_items WHERE item_id = ?1",
-            [item_id],
-            |r| Ok((r.get::<_, String>(0)?,)),
-        )
-        .map_err(|_| "壁纸不在本地库中（请先下载）".to_string())?
+        let wtype = conn
+            .query_row(
+                "SELECT type FROM library_items WHERE item_id = ?1",
+                [item_id],
+                |r| r.get::<_, String>(0),
+            )
+            .map_err(|_| "壁纸不在本地库中（请先下载）".to_string())?;
+        // 引用模式条目：内容目录是源目录，不是库根
+        let root = crate::library::wallpapers_dir(&app)?;
+        let dir = crate::library::resolved_item_dir_in(&conn, &root, item_id);
+        (wtype, dir)
     };
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?
-        .join("wallpapers")
-        .join(item_id);
     // 文件被手工删除时，下面各类型分支只会报「未找到视频文件」「不支持的壁纸类型」
     // 之类的错，掩盖真实原因。这里先给准确诊断。
     if !crate::library::item_files_exist(&dir) {

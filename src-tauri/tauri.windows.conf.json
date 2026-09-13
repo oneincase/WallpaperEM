@@ -17,6 +17,9 @@
           "English"
         ]
       }
-    }
+    },
+    "resources": [
+      "sdk/steam_api64.dll"
+    ]
   }
 }

@@ -158,9 +158,11 @@ window.wallpaperRequestRandomFileForProperty("photos", (prop, file) => {
 
 - `project.json` 的 `version`（≥ 1 的整数）与 `tags`（含年龄分级标签）是**必填**的，
   缺了 `project_validate` 直接报 error。
-- 版本历史：`project_snapshot` 把当前工程冻结到 `.version/<版本号>/` 并把工作副本的
-  `version` 推进一版（顺带清掉过期的 `scene.pkg`）；`project_versions` 看历史，
-  `project_rollback` 退回某一版。网页壁纸不用打包，冻结/回退只影响源文件。
+- 版本管理不在 MCP 服务里：`.version/` 历史由创作者自行维护（git 或自己的备份均可），
+  `project_write_file` 等工具不会碰隐藏目录。
+- 发布：`workshop_upload` 直接把工程上传/更新到 Steam 创意工坊（需要 Steam 客户端运行
+  且账号拥有 Wallpaper Engine）；首次上传成功后 `workshop.fileId` 会写进 `project.json`，
+  之后再传同一工程即自动更新原条目。进度用 `workshop_upload_status` 查。
 - **不要依赖网络**：壁纸是离线跑的，`fetch` 外网会一直挂着。素材放工程里。
 - **不要依赖 `localStorage` / `sessionStorage` / cookie**：壁纸页会被反复重载，
   状态存不住，还可能抛异常中断整个脚本。需要持久化的只有 `project.json` 属性。
@@ -243,8 +245,7 @@ html, body { margin: 0; height: 100%; overflow: hidden; background: #05070c; }
 ## 8. 闭环自检
 
 1. 写文件 → `project_validate`（`ok: true` 才继续）。
-2. `project_snapshot` 存一版（可选）：历史版本进 `.version/<版本号>/`，
-   看历史 `project_versions`，退回 `project_rollback`。
+2. （可选）版本备份由创作者自行维护（git 提交、拷贝目录均可）。
 3. `project_install` → `wallpaper_apply` → `wallpaper_screenshot`。
 4. **看截图**：黑屏 / 静止 / 布局错位都要回去改，改完 `project_update` 再截图，
    循环到画面符合预期。同一张壁纸再拍会复用已挂载实例（返回里 `applied: false`），连拍很快；

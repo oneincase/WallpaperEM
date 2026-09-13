@@ -26,6 +26,7 @@ mod system_wallpaper;
 mod update;
 mod util;
 mod wallpaper;
+mod workshop_upload;
 mod workspace;
 mod we_props;
 mod we_shim;
@@ -119,6 +120,10 @@ pub fn run() {
             }
             db::init(app.handle())?;
             init_steam(app.handle())?;
+            // 自愈：升级老版本写下的无条件 KeepAlive plist（否则用户退出会被
+            // launchd 立即复活，表现为"退出软件后一直自己重新启动"）
+            #[cfg(target_os = "macos")]
+            commands::ensure_keepalive_startup(app.handle());
             // 应用菜单改造：⌘H 从「隐藏应用」换成「最小化主窗口」
             // （壁纸窗口另有 canHide=false 兜底，双保险）
             // 句柄留着：语言切换时要重写这项文案（见 retranslate_native_ui）
@@ -171,6 +176,12 @@ pub fn run() {
             // 常驻子进程，起不来只是媒体集成不可用，不影响其他功能
             now_playing::start(app.handle());
             content_server::init(app.handle()).map_err(|e| e.to_string())?;
+            // 视频封面后台补齐：不在列表路径里做（历史版本在列表里惰性抽帧，
+            // 解不动的格式每次刷新重试一遍，直接把库页面冻死）
+            app.manage(library::PosterFailState::default());
+            library::spawn_poster_backfill(app.handle().clone());
+            // 创意工坊上传：任务表 + Steam 客户端懒初始化（首次上传时才连 Steam）
+            app.manage(workshop_upload::UploadState::default());
             // 开启音频可视化时先启动系统音频捕获，壁纸引擎（wallpaper::init）会
             // 有界等待其就绪后再创建壁纸窗口：保证壁纸页加载时注入服务已可用
             audio_capture::start_if_enabled(app.handle());
@@ -237,6 +248,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::ping,
+            workshop_upload::workshop_upload_start,
+            workshop_upload::workshop_upload_status,
             i18n::app_set_locale,
             commands::app_info,
             commands::db_status,
@@ -437,6 +450,7 @@ const FIT_ITEMS: &[(&str, &str)] = &[
 ];
 const DPR_ITEMS: &[(&str, &str)] = &[("0.8", "省电"), ("1", "标准"), ("2", "高清")];
 const FPS_ITEMS: &[(&str, &str)] = &[
+    ("15", "15 FPS"),
     ("24", "24 FPS"),
     ("30", "30 FPS"),
     ("45", "45 FPS"),

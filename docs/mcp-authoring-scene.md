@@ -25,12 +25,11 @@ prompt `create_scene_wallpaper`（完整闭环流程）。
 ├── particles/presets/*.json    粒子预设
 ├── shaders/*.frag|.vert        只有用非内置 shader 时才需要（见 §6）
 ├── sounds/、effects/…          按需
-└── .version/<版本号>/          版本历史（工具自动维护，别手写）
+└── （版本历史由创作者自行维护，MCP 服务不再代管 .version/）
 ```
 
-`.version/` 由 `project_snapshot` 写入：每个版本一份完整源文件副本，
-配上 `project_versions`（看历史）与 `project_rollback`（退回）。它**不进 `scene.pkg`、
-不进本地库**，也不该用 `project_write_file` 去写。
+版本管理不在 MCP 服务里：创作者用 git 或自己的方式维护历史；`.version/` 这类
+隐藏目录不进 `scene.pkg`、不进本地库，也不该用 `project_write_file` 去写。
 
 `scene_pack` 把**除 `project.json`、`preview.*`、`scene.pkg`、`*.md`/`*.txt`、
 隐藏项之外的所有文件**打进 `scene.pkg`（`materials/**` 下的 PNG/JPEG 会先转 `.tex`）。
@@ -316,10 +315,8 @@ prompt `create_scene_wallpaper`（完整闭环流程）。
 ## 10. 闭环自检
 
 1. 写 `scene.json` / `models` / `materials` / 贴图（贴图用 base64 写 `.png`）。
-2. `project_snapshot` 存一版（可选，但改大动作前后建议存）：冻结到 `.version/<版本号>/`，
-   工作副本的 `version` 自动 +1。看历史用 `project_versions`，退回用 `project_rollback`。
+2. （可选）版本备份由创作者自行维护（git 提交、拷贝目录均可）。
 3. `scene_pack`（自动转 `.tex` + 打 `scene.pkg`）→ 看返回的 `warnings`。
-   注意：冻结会让 `project.json` 的版本号变化，从而清掉旧的 `scene.pkg`，打包要放在冻结之后。
 4. `project_install` → `wallpaper_apply` → `wallpaper_screenshot`。
 5. **看截图**：黑屏多半是 `clearcolor` 太暗 / 图层不可见 / `origin.y` 反了 / 贴图没转成功；
    改完**必须重新 `scene_pack` + `project_install`** 再截图（源码不会自动重打包）。

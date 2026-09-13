@@ -68,28 +68,6 @@ pub fn definitions() -> Vec<Value> {
             "inputSchema": obj(json!({ "project": { "type": "string" } }), json!(["project"])),
         }),
         json!({
-            "name": "project_snapshot",
-            "description": "把当前工程冻结成一个历史版本（`.version/<版本号>/`），并把工作副本的 version 推进一版。同一版本号已存在且内容不同时自动顺延，绝不覆盖历史。会让已打好的 scene.pkg 失效。",
-            "inputSchema": obj(json!({
-                "project": { "type": "string" },
-                "note": { "type": "string", "description": "可选的版本说明，如「初版」「加了雨滴粒子」" },
-            }), json!(["project"])),
-        }),
-        json!({
-            "name": "project_versions",
-            "description": "列出工程的历史版本（版本号 / 说明 / 时间 / 文件数 / 体积）与工作副本当前版本号。",
-            "inputSchema": obj(json!({ "project": { "type": "string" } }), json!(["project"])),
-        }),
-        json!({
-            "name": "project_rollback",
-            "description": "回退到某个历史版本：源文件还原成那一版（工程根里该版没有的源文件会被删掉），scene.pkg 随之失效。默认拒绝在「有未冻结改动」时回退。",
-            "inputSchema": obj(json!({
-                "project": { "type": "string" },
-                "version": { "type": "integer", "description": "目标版本号，见 project_versions" },
-                "force": { "type": "boolean", "description": "有未冻结改动时是否强行丢弃，默认 false" },
-            }), json!(["project", "version"])),
-        }),
-        json!({
             "name": "project_install",
             "description": "把工程安装进本地库（拷贝 + 登记），返回 itemId；之后可用 wallpaper_apply / item_props_set。",
             "inputSchema": obj(json!({ "project": { "type": "string" } }), json!(["project"])),
@@ -194,6 +172,25 @@ pub fn definitions() -> Vec<Value> {
             "name": "workshop_item",
             "description": "取某个工坊条目的详情（标题/描述/标签/预览图）。",
             "inputSchema": obj(json!({ "id": { "type": "string" } }), json!(["id"])),
+        }),
+        json!({
+            "name": "workshop_upload",
+            "description": "把工程上传到 Steam 创意工坊（需要 Steam 客户端运行且账号拥有 Wallpaper Engine）。已有 workshop.fileId 的工程=更新原条目，否则新建。需要 preview 图（preview.png/jpg/gif）。注意版权/授权：上传他人制作的壁纸前必须确认已获得对方许可，并遵守 Steam 订阅者协议与工坊规则。",
+            "inputSchema": obj(json!({
+                "project": { "type": "string" },
+                "title": { "type": "string", "description": "可选：工坊标题，缺省用 project.json 的 title" },
+                "description": { "type": "string", "description": "工坊描述（建议写清楚用法与来源）" },
+                "tags": { "type": "array", "items": { "type": "string" }, "description": "可选：标签（含年龄分级 Everyone/Questionable/Mature，必须与 Steam 工坊标签逐字符一致），缺省用 project.json 的 tags" },
+                "visibility": { "type": "string", "description": "public（默认）/ friends / private" },
+                "changelog": { "type": "string", "description": "可选：更新说明（更新已有条目时显示）" },
+            }), json!(["project"])),
+        }),
+        json!({
+            "name": "workshop_upload_status",
+            "description": "查询工坊上传任务进度/结果（job_id 缺省 = 全部任务）。status=done 时含 workshopUrl 与 publishedfileid。",
+            "inputSchema": obj(json!({
+                "jobId": { "type": "string", "description": "workshop_upload 返回的任务 id" },
+            }), json!([])),
         }),
         json!({
             "name": "download_enqueue",
@@ -301,27 +298,6 @@ async fn call_inner(app: &AppHandle, name: &str, args: &Value) -> Result<Value, 
             let project = req_str(args, "project")?;
             blocking(move || workspace::delete_project(&app, &project)).await
         }
-        "project_snapshot" => {
-            let app = app.clone();
-            let project = req_str(args, "project")?;
-            let note = opt_str(args, "note");
-            blocking(move || workspace::snapshot_project(&app, &project, note.as_deref())).await
-        }
-        "project_versions" => {
-            let app = app.clone();
-            let project = req_str(args, "project")?;
-            blocking(move || workspace::list_project_versions(&app, &project)).await
-        }
-        "project_rollback" => {
-            let app = app.clone();
-            let project = req_str(args, "project")?;
-            let version = args
-                .get("version")
-                .and_then(|v| v.as_u64())
-                .ok_or("缺少 version（整数版本号，见 project_versions）")?;
-            let force = opt_bool(args, "force");
-            blocking(move || workspace::rollback_project(&app, &project, version, force)).await
-        }
         "project_install" => {
             let app = app.clone();
             let project = req_str(args, "project")?;
@@ -380,7 +356,8 @@ async fn call_inner(app: &AppHandle, name: &str, args: &Value) -> Result<Value, 
                 sort: opt_str(args, "sort"),
                 ..Default::default()
             });
-            let items = blocking(move || crate::library::library_list(app, wtype, filter)).await?;
+            let items =
+                blocking(move || crate::library::library_list_impl(app, wtype, filter)).await?;
             let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             let limit = args
                 .get("limit")
@@ -450,6 +427,34 @@ async fn call_inner(app: &AppHandle, name: &str, args: &Value) -> Result<Value, 
             let id = req_str(args, "id")?;
             let r = svc.detail(&id).await?;
             Ok(serde_json::to_value(r).unwrap_or(json!(null)))
+        }
+        "workshop_upload" => {
+            let app = app.clone();
+            let project = req_str(args, "project")?;
+            let r = crate::workshop_upload::workshop_upload_start(
+                app,
+                None,
+                Some(project),
+                opt_str(args, "title"),
+                opt_str(args, "description"),
+                args.get("tags")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|t| t.as_str().map(|s| s.to_string()))
+                            .collect()
+                    }),
+                opt_str(args, "visibility"),
+                opt_str(args, "changelog"),
+            )
+            .await?;
+            Ok(serde_json::to_value(r).unwrap_or(json!({})))
+        }
+        "workshop_upload_status" => {
+            let app = app.clone();
+            let job_id = opt_str(args, "jobId");
+            let r = crate::workshop_upload::workshop_upload_status(app, job_id).await?;
+            Ok(serde_json::to_value(r).unwrap_or(json!({})))
         }
         "download_enqueue" => {
             let app = app.clone();
