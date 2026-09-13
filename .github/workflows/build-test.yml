@@ -187,6 +187,9 @@ jobs:
           APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY || '-' }}
           # 没有配置签名证书时不要去自动发现钥匙串身份（会浪费几十秒并报错）
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          # runner 镜像不带 FUSE 后，linuxdeploy 的 AppImage 起不来（秒退，
+          # 表现为 "failed to run linuxdeploy"）；官方无 FUSE 运行模式兜底
+          APPIMAGE_EXTRACT_AND_RUN: '1'
         run: pnpm tauri build ${{ matrix.build_args }}
 
       - name: 上传构建产物

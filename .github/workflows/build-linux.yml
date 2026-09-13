@@ -102,6 +102,10 @@ jobs:
         # beforeBuildCommand 会先跑 pnpm --filter @we/desktop build 生成前端 dist/，
         # 再编译 Rust release 并打包 deb/appimage（targets 见 tauri.linux.conf.json）。
         # 显式 --target：产物落在 target/<triple>/release/bundle/ 下，两架构互不覆盖。
+        env:
+          # runner 镜像不带 FUSE 后，linuxdeploy 的 AppImage 起不来（秒退，
+          # 表现为 "failed to run linuxdeploy"）；官方无 FUSE 运行模式兜底
+          APPIMAGE_EXTRACT_AND_RUN: '1'
         run: pnpm tauri build --target ${{ matrix.target }}
 
       - name: 上传构建产物（artifact）
