@@ -127,7 +127,7 @@ fn copy_steam_api_dylib() {
             let _ = std::fs::create_dir_all(&bundled_dir);
             let dest = bundled_dir.join(names[0]);
             if let Err(e) = std::fs::copy(&src, &dest) {
-                eprintln!("warning: 复制 {name} 到 bundled/ 失败: {e}");
+                eprintln!("warning: 复制 {} 到 bundled/ 失败: {e}", names[0]);
             }
         }
     }
