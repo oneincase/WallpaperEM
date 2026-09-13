@@ -106,6 +106,9 @@ jobs:
           # runner 镜像不带 FUSE 后，linuxdeploy 的 AppImage 起不来（秒退，
           # 表现为 "failed to run linuxdeploy"）；官方无 FUSE 运行模式兜底
           APPIMAGE_EXTRACT_AND_RUN: '1'
+          # linuxdeploy 依赖解析（不认 $ORIGIN/../ 风格的 rpath）要能找到
+          # libsteam_api.so 才肯把它部署进 AppImage：把 vendored sdk 目录给它
+          LD_LIBRARY_PATH: ${{ github.workspace }}/src-tauri/sdk
         run: pnpm tauri build --target ${{ matrix.target }}
 
       - name: 上传构建产物（artifact）
