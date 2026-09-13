@@ -82,12 +82,17 @@ jobs:
       # 可选 vars.MACOS_CERTIFICATE_NAME = 证书名，缺省用
       # tauri.conf.json 里的 "WallpaperEM Dev Signer"），每次构建用同一把签，
       # 授权即可跨版本保留。证书更换 = 用户需重新授权一次。
+      # 注意：secrets 上下文不能用在步骤级 if 里（会导致整个 workflow 文件解析失败），
+      # 判空放在脚本里做
       - name: 导入签名证书（存在 Secrets 时）
-        if: ${{ secrets.MACOS_CERTIFICATE_P12 != '' }}
         env:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE_P12 }}
           MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
         run: |
+          if [ -z "$MACOS_CERTIFICATE" ]; then
+            echo "未配置 MACOS_CERTIFICATE_P12，跳过证书导入（ad-hoc 签名）"
+            exit 0
+          fi
           CERT_P12_PATH=$RUNNER_TEMP/wallpaperem-sign.p12
           KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain-db
           KEYCHAIN_PWD=$(openssl rand -hex 16)

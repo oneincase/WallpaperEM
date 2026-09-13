@@ -193,7 +193,7 @@ jobs:
           # linuxdeploy 依赖解析（不认 $ORIGIN/../ 风格的 rpath）要能找到
           # libsteam_api.so 才肯把它部署进 AppImage：把 vendored sdk 目录给它
           LD_LIBRARY_PATH: ${{ github.workspace }}/src-tauri/sdk/linux64:${{ github.workspace }}/src-tauri/sdk/linuxarm64
-        run: pnpm tauri build ${{ matrix.build_args }} --verbose
+        run: pnpm tauri build ${{ matrix.build_args }}
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
