@@ -18,8 +18,11 @@
         ]
       }
     },
-    "resources": [
-      "sdk/win64/steam_api64.dll"
-    ]
+    "resources": {
+      "../dist/renderer": "renderer",
+      "../dist/assets": "assets",
+      "vendor/mediaremote-adapter": "mediaremote-adapter",
+      "sdk/win64/steam_api64.dll": "steam_api64.dll"
+    }
   }
 }

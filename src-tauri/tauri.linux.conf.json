@@ -5,8 +5,11 @@
       "deb",
       "appimage"
     ],
-    "resources": [
-      "sdk/linux64/libsteam_api.so"
-    ]
+    "resources": {
+      "../dist/renderer": "renderer",
+      "../dist/assets": "assets",
+      "vendor/mediaremote-adapter": "mediaremote-adapter",
+      "sdk/linux64/libsteam_api.so": "libsteam_api.so"
+    }
   }
 }
