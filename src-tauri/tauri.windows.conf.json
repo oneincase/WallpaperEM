@@ -19,7 +19,7 @@
       }
     },
     "resources": [
-      "sdk/steam_api64.dll"
+      "sdk/win64/steam_api64.dll"
     ]
   }
 }

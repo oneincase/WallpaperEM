@@ -6,7 +6,7 @@
       "appimage"
     ],
     "resources": [
-      "sdk/libsteam_api.so"
+      "sdk/linux64/libsteam_api.so"
     ]
   }
 }

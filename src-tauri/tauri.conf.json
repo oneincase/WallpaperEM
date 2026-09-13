@@ -51,7 +51,7 @@
       "entitlements": "entitlements.plist",
       "signingIdentity": "WallpaperEM Dev Signer",
       "files": {
-        "MacOS/libsteam_api.dylib": "sdk/libsteam_api.dylib"
+        "MacOS/libsteam_api.dylib": "sdk/osx/libsteam_api.dylib"
       }
     },
     "linux": {

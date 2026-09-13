@@ -40,7 +40,12 @@ fn copy_steam_api_dylib() {
     } else if triple.contains("darwin") {
         ("osx", &["libsteam_api.dylib"])
     } else if triple.contains("linux") {
-        ("linux64", &["libsteam_api.so"])
+        // SDK 的原生命名：x64 = linux64，ARM64 = linuxarm64
+        if triple.contains("aarch64") {
+            ("linuxarm64", &["libsteam_api.so"])
+        } else {
+            ("linux64", &["libsteam_api.so"])
+        }
     } else {
         return;
     };
@@ -49,7 +54,8 @@ fn copy_steam_api_dylib() {
     // 其次 STEAM_SDK_LOCATION（与 steamworks-sys 同名的环境变量约定），
     // 最后在 cargo registry 缓存里找 steamworks-sys vendored 的 redistributable_bin
     let candidates = |sub: &str| -> Vec<std::path::PathBuf> {
-        let mut roots = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("sdk")];
+        let mut roots =
+            vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("sdk").join(sub)];
         if let Ok(sdk) = std::env::var("STEAM_SDK_LOCATION") {
             roots.push(std::path::PathBuf::from(sdk).join("redistributable_bin").join(sub));
         }
