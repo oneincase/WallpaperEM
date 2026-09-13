@@ -45,8 +45,8 @@ export function SettingsPage() {
   // 默认 2 高清（与 Rust DEFAULT_RENDER_DPR 一致）
   const [renderDpr, setRenderDpr] = useState<number>(2);
   const [renderDprMsg, setRenderDprMsg] = useState("");
-  // 全局场景帧率上限（15/24/30/45/60/120，越低 GPU 占用越低），默认 15
-  const [sceneFps, setSceneFps] = useState<number>(15);
+  // 全局场景帧率上限（15/24/30/45/60/120，越低 GPU 占用越低），默认 24
+  const [sceneFps, setSceneFps] = useState<number>(24);
   const [sceneFpsMsg, setSceneFpsMsg] = useState("");
   // 壁纸语言（只影响壁纸的 language 属性，不是软件本体语言）。默认英文
   const [language, setLanguage] = useState<string>("english");
@@ -123,7 +123,7 @@ export function SettingsPage() {
       .then((v) => setRenderDpr(Number(v) || 1))
       .catch(() => { });
     invoke<string | null>("settings_get", { key: "wallpaper_scene_fps" })
-      .then((v) => setSceneFps(Number(v) || 15))
+      .then((v) => setSceneFps(Number(v) || 24))
       .catch(() => { });
     invoke<string | null>("settings_get", { key: "language" })
       .then((v) => v && setLanguage(v))
@@ -977,9 +977,9 @@ export function SettingsPage() {
                 label={tr("帧率上限")}
                 desc={
                   sceneFps <= 15
-                    ? tr("15 FPS：默认，GPU 占用最低，最省电")
+                    ? tr("15 FPS：最省电")
                     : sceneFps <= 24
-                      ? tr("24 FPS：略流畅，GPU 占用仍低")
+                      ? tr("24 FPS：默认，GPU 占用最低，最省电")
                       : sceneFps <= 30
                         ? tr("30 FPS：流畅，GPU 占用低")
                         : sceneFps <= 45

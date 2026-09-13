@@ -4,7 +4,10 @@
 
 ## [Unreleased]
 
-_（暂无 / Nothing yet）_
+### 🔧 变更 / Changed
+
+- **默认帧率上限由 15 FPS 调回 24 FPS**（15 档保留可选；从未手动改过帧率的用户生效）。
+  Default FPS cap back to 24 (15 stays available as an option).
 
 ## [v0.5.2] - 2026-09-13
 

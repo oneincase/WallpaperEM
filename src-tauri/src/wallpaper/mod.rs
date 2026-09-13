@@ -37,8 +37,8 @@ pub const RENDER_DPR_MIN: f32 = 0.8;
 pub const RENDER_DPR_MAX: f32 = 2.0;
 pub const DEFAULT_RENDER_DPR: f32 = 2.0;
 /// 场景壁纸帧率上限（帧/秒）：越低 GPU 占用越低。
-/// 可选 15 / 24 / 30 / 45 / 60 / 120，默认 15（最省电，多数场景 15fps 观感足够）。
-pub const DEFAULT_SCENE_FPS: u32 = 15;
+/// 可选 15 / 24 / 30 / 45 / 60 / 120，默认 24（低功耗，多数场景 24fps 观感足够）。
+pub const DEFAULT_SCENE_FPS: u32 = 24;
 /// 允许的全局帧率档位（托盘、设置页、`wallpaper_set_scene_fps` 共用同一份白名单）
 pub const SCENE_FPS_CHOICES: [u32; 6] = [15, 24, 30, 45, 60, 120];
 

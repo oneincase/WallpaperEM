@@ -526,9 +526,9 @@ export const EN_US: Record<string, string> = {
   "缩放": "Fit",
   "越高越清晰，显存占用也越高。实际生效值不超过屏幕像素比。默认高清":
     "Higher is sharper but uses more VRAM. The effective value never exceeds the screen pixel ratio. Default: High",
-  "15 FPS：默认，GPU 占用最低，最省电":
-    "15 FPS: default, lowest GPU load, most power-efficient",
-  "24 FPS：略流畅，GPU 占用仍低": "24 FPS: slightly smoother, GPU load still low",
+  "15 FPS：最省电": "15 FPS: most power-efficient",
+  "24 FPS：默认，GPU 占用最低，最省电":
+    "24 FPS: default, lowest GPU load, most power-efficient",
   "30 FPS：流畅，GPU 占用低": "30 FPS: smooth, low GPU load",
   "45 FPS：流畅度与功耗折中": "45 FPS: a middle ground between smoothness and power use",
   "30 FPS：默认，GPU 占用最低，场景动画/视差略卡":
