@@ -1305,6 +1305,48 @@ pub async fn library_import_folder_pick(
     import_custom_batch_run(app, vec![path], mode.as_deref() == Some("copy")).await
 }
 
+/// 原生多选文件夹选择框：只返回选中的文件夹绝对路径（不做导入）。
+///
+/// 与单选的 `library_import_folder_pick` 不同，这里刻意不直接导入 ——「添加壁纸
+/// 目录」现在由前端先把多个文件夹收集到待导入列表（可再增删），用户确认后再统一
+/// 调 `library_link_folders`，因此后端要把「选了哪些」和「是否入库」解耦。
+#[tauri::command]
+pub async fn library_pick_folders(app: AppHandle) -> Result<Vec<String>, String> {
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        use tauri_plugin_dialog::DialogExt;
+        app.dialog()
+            .file()
+            .blocking_pick_folders()
+            .map(|fs| {
+                fs.iter()
+                    .filter_map(|f| f.as_path().map(|p| p.to_string_lossy().into_owned()))
+                    .collect::<Vec<_>>()
+            })
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(picked.unwrap_or_default())
+}
+
+/// 把多个文件夹以**引用模式**批量入库（不拷贝，库条目登记源目录）。
+///
+/// 与拖拽批量（`library_import_custom_batch`，带 project.json 的目录会拷贝导入）
+/// 不同：这是「添加壁纸目录」的确定动作，所选目录一律引用，含子目录时递归扫描
+/// 其中的壁纸工程（复用同一套扫描逻辑）。
+#[tauri::command]
+pub async fn library_link_folders(
+    app: AppHandle,
+    paths: Vec<String>,
+) -> Result<serde_json::Value, String> {
+    let paths: Vec<std::path::PathBuf> = paths.iter().map(std::path::PathBuf::from).collect();
+    if paths.is_empty() {
+        return Err("没有可添加的文件夹".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || import_custom_batch_impl(&app, &paths, true))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// 导入自定义壁纸：把单个壁纸文件/目录拷贝到本地库。
 ///
 /// 支持：mp4/webm/mov/mkv/avi → video；gif → gif；png/jpg/jpeg/webp/bmp/avif → image；
@@ -1807,6 +1849,21 @@ fn parse_project(dir: &Path) -> (String, String) {
         }
     }
     ("unknown".into(), "未命名".into())
+}
+
+/// project.json 的 `workshopid`（WE 发布/重新关联工坊时写入的字段）。
+/// 本地工程关联工坊条目的唯一线索；未发布/无此字段返回 None。
+/// 数字与字符串写法都兼容（WE 写数字，手工编辑常写成字符串）。
+pub(crate) fn project_workshopid(app: &AppHandle, item_id: &str) -> Option<String> {
+    let dir = item_dir(app, item_id).ok()?;
+    let text = std::fs::read_to_string(dir.join("project.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let s = match v.get("workshopid")? {
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => s.trim().to_string(),
+        _ => return None,
+    };
+    (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).then_some(s)
 }
 
 // ---------- WE 网页壁纸用户属性 ----------

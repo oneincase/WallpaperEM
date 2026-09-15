@@ -10,7 +10,7 @@ import {
 } from "../api/steam";
 import { PreviewModal } from "../components/PreviewModal";
 import { ConfirmModal } from "../components/ConfirmModal";
-import { WallpaperCard, TypeChip } from "../components/WallpaperCard";
+import { WallpaperCard, TypeChip, CoverSizeBadge } from "../components/WallpaperCard";
 import { useMessage } from "../components/Message";
 import { EmptyState } from "../components/EmptyState";
 import {
@@ -32,6 +32,11 @@ import { IconPreview, IconApply, IconOpenFile, IconTrash, IconUpload } from "../
 import { SubscriptionsModal } from "../components/SubscriptionsModal";
 import { LibraryImportModal } from "../components/LibraryImportModal";
 import { WorkshopUploadModal } from "../components/WorkshopUploadModal";
+import {
+  WorkshopUploadChoiceModal,
+  type UploadMethod,
+} from "../components/WorkshopUploadChoiceModal";
+import { WorkshopWebUploadModal } from "../components/WorkshopWebUploadModal";
 import { VirtualGrid } from "../components/VirtualGrid";
 import { tr, trMsg } from "../lib/i18n";
 
@@ -39,6 +44,10 @@ import { tr, trMsg } from "../lib/i18n";
     用户调好的标签/排序会静默回到默认值（与工坊页 useWorkshopFilter 同一套
     做法与键约定） */
 const FILTER_STATE_KEY = "filter.library";
+
+/** 上传到创意工坊：功能代码（弹框 / state / 后端）完整保留，入口暂时隐藏，
+    待功能优化后把此常量改回 true 即恢复卡片右上角的上传按钮（与大小徽标并排） */
+const WORKSHOP_UPLOAD_ENABLED = false;
 
 type PersistedFilter = {
   search: string;
@@ -104,6 +113,11 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
   const [subsOpen, setSubsOpen] = useState(false);
   // 正在上传到创意工坊的条目（弹框）
   const [uploadItem, setUploadItem] = useState<LibraryItem | null>(null);
+  // 已选过上传方式、进入具体上传流程的条目（Steam 客户端 / 网页版）
+  const [uploadMethodItem, setUploadMethodItem] = useState<{
+    item: LibraryItem;
+    method: UploadMethod;
+  } | null>(null);
   // 文件已丢失的条目（数据库还留着记录）
   const missingItems = items.filter((it) => it.missing);
 
@@ -422,26 +436,29 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
                 ) : undefined
               }
               coverBadgeRight={
-                (item.type === "scene" || item.type === "web" || item.type === "video") &&
-                !item.missing ? (
-                  <button
-                    className="flex items-center justify-center rounded bg-black/55 px-1.5 py-1 text-white/85 backdrop-blur-sm transition-colors hover:bg-black/75 hover:text-white"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setUploadItem(item);
-                    }}
-                    data-tip={
-                      item.publishedFileId
-                        ? tr("更新到创意工坊")
-                        : tr("上传到创意工坊")
-                    }
-                  >
-                    <IconUpload />
-                  </button>
-                ) : undefined
+                <div className="flex items-center gap-1">
+                  <CoverSizeBadge bytes={item.sizeBytes} />
+                  {WORKSHOP_UPLOAD_ENABLED &&
+                  (item.type === "scene" || item.type === "web" || item.type === "video") &&
+                  !item.missing ? (
+                    <button
+                      className="flex items-center justify-center rounded bg-black/55 px-1.5 py-1 text-white/85 backdrop-blur-sm transition-colors hover:bg-black/75 hover:text-white"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setUploadItem(item);
+                      }}
+                      data-tip={
+                        item.publishedFileId
+                          ? tr("更新到创意工坊（Steam 客户端 / 网页）")
+                          : tr("上传到创意工坊（Steam 客户端 / 网页）")
+                      }
+                    >
+                      <IconUpload />
+                    </button>
+                  ) : undefined}
+                </div>
               }
               metaLeft={<TypeChip label={tr(TYPE_LABELS[item.type])} />}
-              metaRight={`${(item.sizeBytes / 1024 / 1024).toFixed(1)} MB`}
               actions={
                 <div className="grid grid-cols-4 gap-1">
                   <button
@@ -499,8 +516,32 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
 
       {previewItem && <PreviewModal item={previewItem} onClose={() => setPreviewItem(null)} />}
 
-      {uploadItem && (
-        <WorkshopUploadModal item={uploadItem} onClose={() => setUploadItem(null)} />
+      {uploadItem && !uploadMethodItem && (
+        <WorkshopUploadChoiceModal
+          item={uploadItem}
+          onClose={() => setUploadItem(null)}
+          onChoose={(method) => setUploadMethodItem({ item: uploadItem, method })}
+        />
+      )}
+
+      {uploadItem && uploadMethodItem?.method === "steam" && (
+        <WorkshopUploadModal
+          item={uploadMethodItem.item}
+          onClose={() => {
+            setUploadItem(null);
+            setUploadMethodItem(null);
+          }}
+        />
+      )}
+
+      {uploadItem && uploadMethodItem?.method === "web" && (
+        <WorkshopWebUploadModal
+          item={uploadMethodItem.item}
+          onClose={() => {
+            setUploadItem(null);
+            setUploadMethodItem(null);
+          }}
+        />
       )}
 
       {importOpen && (

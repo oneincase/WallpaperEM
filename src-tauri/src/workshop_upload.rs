@@ -823,3 +823,154 @@ pub async fn workshop_upload_status(
 ) -> Result<serde_json::Value, String> {
     job_status(&app, job_id.as_deref())
 }
+
+// ---------------------------------------------------------------- 网页版上传
+
+/// 网页版工坊上传：不依赖 Steam 客户端 / steamworks SDK。
+///
+/// Steam 工坊没有公开的「直接 POST 一个 zip」HTTP 接口，网页版上传靠的是
+/// steamcommunity.com 上的「创建/编辑工坊条目」页面 + 浏览器登录态，内容目录由
+/// 用户在该页面里本地选择。因此这里做三件事：
+/// 1. 把壁纸内容暂存到一个**持久**目录（与 SDK 上传同口径：过滤杂物、贴图转 .tex、
+///    单文件壁纸合成 project.json），供网页表单选择；
+/// 2. 已有 publishedfileid（更新）→ 打开该条目的网页编辑页；否则打开「新建条目」页；
+/// 3. 在系统文件管理器中定位到暂存目录，方便用户直接在网页表单里选中它。
+///
+/// 返回 { url, stagedPath, update }。网页提交动作发生在浏览器里，本应用无法感知
+/// 结果，因此不回写 publishedfileid（更新已有条目不受影响；新建条目成功后用户可在
+/// 本地库再次上传时把网页链接/ID 关联进来）。
+#[tauri::command]
+pub async fn workshop_web_upload_prepare(
+    app: AppHandle,
+    item_id: String,
+) -> Result<serde_json::Value, String> {
+    let item_id = item_id.trim().to_string();
+    crate::library::check_item_id(&item_id)?;
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || web_upload_prepare_impl(&app2, &item_id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn web_upload_prepare_impl(
+    app: &AppHandle,
+    item_id: &str,
+) -> Result<serde_json::Value, String> {
+    let db = app.state::<Arc<Mutex<rusqlite::Connection>>>();
+    let root = crate::library::wallpapers_dir(app)?;
+    let (dir, wtype, db_title, file_id) = {
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        let row: Option<(String, String, Option<String>)> = conn
+            .query_row(
+                "SELECT COALESCE(type,''), COALESCE(title,''), publishedfileid
+                 FROM library_items WHERE item_id = ?1",
+                [item_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .ok();
+        let Some((wtype, db_title, file_id)) = row else {
+            return Err(format!("本地库里没有条目: {item_id}"));
+        };
+        let dir = crate::library::resolved_item_dir_in(&conn, &root, item_id);
+        (dir, wtype, db_title, file_id)
+    };
+    if !dir.is_dir() {
+        return Err(format!("条目内容目录不存在: {}", dir.display()));
+    }
+
+    let existing = file_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<u64>().ok());
+
+    // 更新已有条目：网页编辑页直接编辑现内容，不必再暂存一份
+    if let Some(id) = existing {
+        let url = format!(
+            "https://steamcommunity.com/app/{WE_APP_ID}/workshop/editsharedfile/?id={id}"
+        );
+        use tauri_plugin_opener::OpenerExt;
+        app.opener().open_url(&url, None::<&str>).map_err(|e| e.to_string())?;
+        return Ok(json!({ "url": url, "stagedPath": null, "update": true }));
+    }
+
+    // 新建条目：内容暂存到持久目录（临时目录会在系统重启后被清掉，用户可能稍后
+    // 才在浏览器里完成选择）。每次准备都清空重建，保证目录里是当前最新内容。
+    let stage_root = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("workshop-web-upload");
+    std::fs::create_dir_all(&stage_root).map_err(|e| e.to_string())?;
+    // item_id 已过 check_item_id，只含 [A-Za-z0-9_-]，可安全作目录名
+    let staging = stage_root.join(item_id);
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
+    copy_stage_tree(&dir, &staging, 0)?;
+    synth_project_json(&staging, Some(&wtype), &db_title)?;
+
+    let url = format!("https://steamcommunity.com/app/{WE_APP_ID}/workshop/editsharedfile/");
+    use tauri_plugin_opener::OpenerExt;
+    // 打开网页版新建条目页（走系统默认浏览器的 Steam 登录态）
+    app.opener().open_url(&url, None::<&str>).map_err(|e| e.to_string())?;
+    // 在文件管理器里定位暂存目录，方便用户在网页「内容文件夹」一栏直接选中
+    let _ = app
+        .opener()
+        .open_path(staging.display().to_string(), None::<&str>)
+        .map_err(|e| tracing::warn!("打开暂存目录失败: {e}"));
+
+    Ok(json!({
+        "url": url,
+        "stagedPath": staging.display().to_string(),
+        "update": false,
+    }))
+}
+
+/// 与 SDK 上传的暂存同口径递归拷贝（跳过隐藏文件、scene.pkg、we-props、materials
+/// 贴图转 .tex、体积上限）。单独留一份是因为 `stage_content` 用一次性临时目录，
+/// 网页上传需要持久目录。
+fn copy_stage_tree(src: &Path, dest: &Path, depth: u32) -> Result<(), String> {
+    if depth > 16 {
+        return Err("内容目录嵌套过深，疑似异常目录".into());
+    }
+    std::fs::create_dir_all(dest).map_err(|e| e.to_string())?;
+    for entry in std::fs::read_dir(src).map_err(|e| e.to_string())?.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') || name == "we-props" || name == "scene.pkg" {
+            continue;
+        }
+        let path = entry.path();
+        let target = dest.join(&name);
+        match entry.file_type() {
+            Ok(ft) if ft.is_dir() => copy_stage_tree(&path, &target, depth + 1)?,
+            Ok(ft) if ft.is_file() => {
+                let ext = path
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                    .unwrap_or_default();
+                if src.file_name().map(|n| n == "materials").unwrap_or(false)
+                    && matches!(ext.as_str(), "png" | "jpg" | "jpeg")
+                {
+                    let bytes =
+                        std::fs::read(&path).map_err(|e| format!("读取 {name} 失败: {e}"))?;
+                    let tex = crate::workspace::tex_from_image(&bytes, &ext)?;
+                    let stem = path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| name.clone());
+                    std::fs::write(target.with_file_name(format!("{stem}.tex")), tex)
+                        .map_err(|e| format!("写出 {stem}.tex 失败: {e}"))?;
+                } else {
+                    std::fs::copy(&path, &target)
+                        .map_err(|e| format!("复制 {name} 失败: {e}"))?;
+                }
+            }
+            _ => {}
+        }
+    }
+    let total = stage_size(dest);
+    if total > MAX_STAGING_BYTES {
+        return Err(format!("暂存内容超过上限 {} 字节", MAX_STAGING_BYTES));
+    }
+    Ok(())
+}
