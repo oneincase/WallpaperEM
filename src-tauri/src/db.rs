@@ -212,6 +212,21 @@ fn migrate(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
         conn.pragma_update(None, "user_version", 8)?;
         tracing::info!("db migrated to version 8（清晰度改相对倍率四档，修正 {fixed} 条壁纸覆盖）");
     }
+    if v < 9 {
+        // v9：作者昵称/头像缓存（Steam 资料页抓取结果）。ok=0 是负缓存——
+        // 抓取失败也记一行，离线/被限流时避免每次打开面板都重打 Steam。
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS author_profiles (
+               steamid TEXT PRIMARY KEY,
+               persona TEXT,
+               avatar_url TEXT,
+               fetched_at INTEGER NOT NULL,
+               ok INTEGER NOT NULL DEFAULT 1
+             );",
+        )?;
+        conn.pragma_update(None, "user_version", 9)?;
+        tracing::info!("db migrated to version 9（作者昵称/头像缓存表）");
+    }
     Ok(())
 }
 
@@ -341,6 +356,74 @@ pub fn find_workshop_item(
     }
 }
 
+// ---------- 作者昵称/头像缓存 ----------
+
+/// 成功缓存 TTL：7 天（昵称/头像不常变）
+pub const AUTHOR_OK_TTL_SECS: i64 = 7 * 24 * 3600;
+/// 失败负缓存 TTL：12 小时（离线/限流时不反复重试）
+pub const AUTHOR_FAIL_TTL_SECS: i64 = 12 * 3600;
+
+/// 读作者缓存：
+/// - `Some(Some((name, avatar)))` = 命中成功缓存
+/// - `Some(None)` = 命中负缓存（近期抓取失败过，别再立刻重试 Steam）
+/// - `None` = 无记录或已过期，需要重新抓取
+pub fn find_author_profile(
+    conn: &Connection,
+    steamid: &str,
+) -> Result<Option<Option<(String, String)>>, String> {
+    let row = conn
+        .query_row(
+            "SELECT persona, avatar_url, fetched_at, ok FROM author_profiles WHERE steamid = ?1",
+            [steamid],
+            |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some((persona, avatar, fetched_at, ok)) = row else {
+        return Ok(None);
+    };
+    let ttl = if ok == 1 {
+        AUTHOR_OK_TTL_SECS
+    } else {
+        AUTHOR_FAIL_TTL_SECS
+    };
+    if chrono::Utc::now().timestamp() - fetched_at > ttl {
+        return Ok(None);
+    }
+    if ok == 1 {
+        Ok(Some(persona.map(|p| (p, avatar.unwrap_or_default()))))
+    } else {
+        Ok(Some(None))
+    }
+}
+
+/// 写作者缓存。persona=None 记负缓存（ok=0）。
+pub fn upsert_author_profile(
+    conn: &Connection,
+    steamid: &str,
+    persona: Option<(&str, &str)>,
+) -> Result<(), String> {
+    let (name, avatar, ok) = match persona {
+        Some((n, a)) => (Some(n), Some(a), 1),
+        None => (None, None, 0),
+    };
+    conn.execute(
+        "INSERT INTO author_profiles(steamid, persona, avatar_url, fetched_at, ok)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(steamid) DO UPDATE SET persona = ?2, avatar_url = ?3, fetched_at = ?4, ok = ?5",
+        params![steamid, name, avatar, chrono::Utc::now().timestamp(), ok],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,8 +484,45 @@ mod tests {
         let ver: i64 = c
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        // 版本号是链式的：v4 的库跑一次 migrate() 会一路升到当前最新（v8）
-        assert_eq!(ver, 8);
+        // 版本号是链式的：v4 的库跑一次 migrate() 会一路升到当前最新（v9）
+        assert_eq!(ver, 9);
+    }
+
+    #[test]
+    fn v9_author_profile_cache_roundtrip_and_ttls() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(include_str!("schema.sql")).unwrap();
+        migrate(&c).unwrap();
+
+        // 无记录 → 需要抓取
+        assert_eq!(find_author_profile(&c, "123").unwrap(), None);
+
+        // 成功缓存：命中且带头像
+        upsert_author_profile(&c, "123", Some(("abi toads", "https://a/b.jpg"))).unwrap();
+        assert_eq!(
+            find_author_profile(&c, "123").unwrap(),
+            Some(Some(("abi toads".into(), "https://a/b.jpg".into())))
+        );
+
+        // 负缓存：近期失败 → Some(None)，调用方不应立刻重试
+        upsert_author_profile(&c, "456", None).unwrap();
+        assert_eq!(find_author_profile(&c, "456").unwrap(), Some(None));
+
+        // 过期的成功缓存 → 重新抓取
+        c.execute(
+            "UPDATE author_profiles SET fetched_at = ?1 WHERE steamid = '123'",
+            [chrono::Utc::now().timestamp() - AUTHOR_OK_TTL_SECS - 1],
+        )
+        .unwrap();
+        assert_eq!(find_author_profile(&c, "123").unwrap(), None);
+
+        // 过期的负缓存 → 重新抓取
+        c.execute(
+            "UPDATE author_profiles SET fetched_at = ?1 WHERE steamid = '456'",
+            [chrono::Utc::now().timestamp() - AUTHOR_FAIL_TTL_SECS - 1],
+        )
+        .unwrap();
+        assert_eq!(find_author_profile(&c, "456").unwrap(), None);
     }
 
     #[test]

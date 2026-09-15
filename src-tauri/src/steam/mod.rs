@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod browse;
 pub mod details;
+pub mod profile;
 pub mod rsa;
 pub mod types;
 

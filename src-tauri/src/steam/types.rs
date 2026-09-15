@@ -80,6 +80,17 @@ pub struct WorkshopSearchParams {
     pub page: Option<u32>,
 }
 
+/// 作者名片：Steam 个人资料解析结果（昵称 + 头像）。
+/// project.json 本身没有 author 字段，作者 = 工坊条目 creator(SteamID64)
+/// 经 steam/profile.rs 抓取解析而来。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthorSummary {
+    pub steam_id: String,
+    pub name: String,
+    pub avatar_url: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkshopSearchResult {

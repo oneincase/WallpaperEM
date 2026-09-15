@@ -9,6 +9,7 @@ import { IconSliders } from "../components/icons";
 import { useMessage } from "../components/Message";
 import { tr, trMsg } from "../lib/i18n";
 import { tagLabel } from "../lib/tags";
+import { renderBbcode } from "../lib/bbcode";
 
 export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
   const [item, setItem] = useState<WorkshopItem | null>(null);
@@ -20,6 +21,8 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
   const [applying, setApplying] = useState(false);
   const [showProps, setShowProps] = useState(false);
   const { appliedItems, downloadedItems, refreshApplied } = useWallpaperMeta();
+  // 作者名片（Steam 资料页解析）；解析失败回退显示裸 SteamID64
+  const [authorName, setAuthorName] = useState<string | null>(null);
 
   const downloaded = item ? downloadedItems.has(item.id) : false;
   const applied = item ? appliedItems.has(item.id) : false;
@@ -31,6 +34,7 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
     setLoading(true);
     setError("");
     setItem(null);
+    setAuthorName(null);
     api
       .workshopItem(id)
       .then(setItem)
@@ -38,6 +42,18 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
       .finally(() => setLoading(false));
     api.favoriteStatus(id).then(setFaved).catch(() => {});
   }, [id]);
+
+  useEffect(() => {
+    if (!item?.creator) return;
+    let alive = true;
+    api
+      .steamAuthorSummary(item.creator)
+      .then((a) => alive && a && setAuthorName(a.name))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [item?.creator]);
 
   return (
     <div className="flex h-full flex-col">
@@ -112,7 +128,7 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
               )}
               {item.creator && (
                 <span>
-                  {tr("作者")} {item.creator}
+                  {tr("作者")} {authorName ?? item.creator}
                 </span>
               )}
             </div>
@@ -202,9 +218,10 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
             {item.description && (
               <div className="mt-5">
                 <div className="text-[13px] font-semibold mb-1.5">{tr("描述")}</div>
-                <p className="whitespace-pre-wrap text-[13px] leading-relaxed text-[var(--text-2)]">
-                  {item.description}
-                </p>
+                {/* 工坊描述是 BBCode（[h1]/[b]/[url=] 等），渲染成富文本而不是原文 */}
+                <div className="whitespace-pre-wrap text-[13px] leading-relaxed text-[var(--text-2)]">
+                  {renderBbcode(item.description)}
+                </div>
               </div>
             )}
           </div>

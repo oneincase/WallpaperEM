@@ -45,6 +45,17 @@ export interface WorkshopItem extends WorkshopItemSummary {
   timeUpdated?: number;
 }
 
+/**
+ * 作者名片（Steam 个人资料解析结果）。project.json 没有 author 字段：
+ * 作者 = 工坊条目 creator(SteamID64) 经后端抓 Steam 资料页解析而来。
+ * 本地未发布的壁纸没有作者（接口返回 null）。
+ */
+export interface AuthorSummary {
+  steamId: string;
+  name: string;
+  avatarUrl: string;
+}
+
 export interface WorkshopSearchParams {
   query?: string;
   type?: WallpaperType | "";
@@ -238,6 +249,15 @@ export const api = {
   workshopRandom: (params?: WorkshopSearchParams) =>
     invoke<WorkshopSearchResult>("workshop_random", { params }),
   workshopItem: (id: string) => invoke<WorkshopItem | null>("workshop_item", { id }),
+  /** 已知 creator(SteamID64) 时查作者名片；解析失败/资料私密返回 null */
+  steamAuthorSummary: (steamId: string) =>
+    invoke<AuthorSummary | null>("steam_author_summary", { steamId }),
+  /**
+   * 本地库条目的作者名片：工坊下载/已上传条目经工坊元数据解析；
+   * 本地未发布壁纸返回 null（此时前端隐藏作者行，与 WE 一致）。
+   */
+  libraryItemAuthor: (itemId: string) =>
+    invoke<AuthorSummary | null>("library_item_author", { itemId }),
   // 下载
   downloadToolStatus: () => invoke<DownloadToolStatus>("download_tool_status"),
   steamcmdInstall: (force?: boolean) =>
@@ -302,6 +322,14 @@ export const api = {
    */
   libraryImportFolderPick: (mode?: "scan" | "copy") =>
     invoke<ImportBatchResult>("library_import_folder_pick", { mode }),
+  /**
+   * 多选文件夹选择框：只返回选中的绝对路径（不导入），由前端维护待添加列表。
+   * 用户取消时返回空数组。
+   */
+  libraryPickFolders: () => invoke<string[]>("library_pick_folders"),
+  /** 批量引用入库：所选文件夹一律以引用方式登记（不拷贝），返回批量导入结果 */
+  libraryLinkFolders: (paths: string[]) =>
+    invoke<ImportBatchResult>("library_link_folders", { paths }),
   /** 拖拽导入：逐条容错，单条失败不拖垮整批 */
   libraryImportCustomBatch: (paths: string[]) =>
     invoke<ImportBatchResult>("library_import_custom_batch", { paths }),
@@ -320,6 +348,15 @@ export const api = {
   /** 查询上传任务（jobId 缺省 = 全部） */
   workshopUploadStatus: (jobId?: string) =>
     invoke<WorkshopUploadJob[]>("workshop_upload_status", { jobId }),
+  /**
+   * 网页版上传准备：暂存内容到持久目录并用系统浏览器打开 Steam 工坊网页版
+   * 上传/编辑页（走浏览器登录态，不依赖 Steam 客户端）。返回页面 URL 与暂存目录。
+   */
+  workshopWebUploadPrepare: (itemId: string) =>
+    invoke<{ url: string; stagedPath: string | null; update: boolean }>(
+      "workshop_web_upload_prepare",
+      { itemId },
+    ),
   // WE 网页壁纸用户属性
   libraryItemProps: (itemId: string) => invoke<WebPropDef[]>("library_item_props", { itemId }),
   /** 按 itemId 查标题（托盘入口给配置弹窗用；查不到返回 itemId） */
@@ -348,6 +385,12 @@ export const api = {
   wallpaperSetLanguage: (language: string) =>
     invoke<void>("wallpaper_set_language", { language }),
   wallpaperSetSceneFps: (fps: number) => invoke<void>("wallpaper_set_scene_fps", { fps }),
+  /** 全局抗锯齿（off/fxaa/msaa2/msaa4，库 1.3.23+），持久化并对所有壁纸窗口热切 */
+  wallpaperSetAa: (mode: string) => invoke<void>("wallpaper_set_aa", { mode }),
+  /** 全局粒子质量档（off/low/medium/high，库 1.3.23+） */
+  wallpaperSetParticles: (quality: string) => invoke<void>("wallpaper_set_particles", { quality }),
+  /** 全局后处理质量档（off/low/medium/high，库 1.3.23+） */
+  wallpaperSetPost: (quality: string) => invoke<void>("wallpaper_set_post", { quality }),
   /** 读某壁纸的播放设置覆盖 + 当前全局默认（用于把未覆盖项显示成「跟随全局」） */
   wallpaperItemPlayConfig: (itemId: string) =>
     invoke<{ override: ItemPlayConfig; globals: PlayConfigGlobals }>(
@@ -500,6 +543,12 @@ export interface ItemPlayConfig {
   sceneFps?: number;
   /** 0..1，0 即静音 */
   volume?: number;
+  /** 抗锯齿（库 1.3.23+） */
+  aa?: "off" | "fxaa" | "msaa2" | "msaa4";
+  /** 粒子质量（库 1.3.23+） */
+  particles?: "off" | "low" | "medium" | "high";
+  /** 后处理质量（库 1.3.23+） */
+  postProcessing?: "off" | "low" | "medium" | "high";
 }
 
 /** 当前全局默认（供 UI 在「跟随全局」时显示实际会用的值） */
@@ -507,12 +556,26 @@ export interface PlayConfigGlobals {
   fit: string;
   renderDpr: number;
   sceneFps: number;
+  /** 库 1.3.23+ 的全局质量档位（供「跟随全局（{v}）」显示） */
+  aa: string;
+  particles: string;
+  postProcessing: string;
+}
+
+/** 文案 HTML 里抽出的图（WE 属性面板会渲染 <img>），由后端 we_props 解析 */
+export interface PropMedia {
+  src: string;
+  /** <a> 包裹时的跳转链接（仅 http(s)） */
+  href?: string;
+  width?: string;
+  height?: string;
 }
 
 export interface WebPropDef {
   name: string;
   ptype: WebPropType;
-  /** 已解析的显示文案（localization 表 → WE 内建映射 → 属性名；已剥离 HTML） */
+  /** 已解析的显示文案（localization 表 → WE 内建映射 → 属性名；已剥离 HTML，
+   *  保留 <br> 换行；纯图横幅时为 ""，图片见 media） */
   text: string;
   /** 排序键，可为浮点（壁纸用 32.5 这类细分序） */
   order: number;
@@ -529,6 +592,8 @@ export interface WebPropDef {
   precision?: number;
   /** file 属性的期望类别（image/video/audio），决定文件选择器过滤器 */
   fileType?: string;
+  /** 文案里抽出的图片（分隔图/赞助图/示意图）；渲染在标签上方 */
+  media?: PropMedia[];
 }
 
 export type WebPropValues = Record<string, string | number | boolean>;

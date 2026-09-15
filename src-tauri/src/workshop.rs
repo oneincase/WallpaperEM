@@ -6,12 +6,14 @@ use rusqlite::Connection;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tauri::Manager;
 
 use crate::db;
 use crate::steam::browse::{browse_workshop_raw, BrowseQuery, BrowseRawItem};
 use crate::steam::details::get_item_details;
+use crate::steam::profile::fetch_persona;
 use crate::steam::types::{
-    WorkshopItem, WorkshopItemSummary, WorkshopSearchParams, WorkshopSearchResult,
+    AuthorSummary, WorkshopItem, WorkshopItemSummary, WorkshopSearchParams, WorkshopSearchResult,
 };
 use crate::steam::SteamClient;
 
@@ -422,6 +424,44 @@ impl WorkshopService {
         Ok(item)
     }
 
+    /// SteamID64 → 作者名片（昵称 + 头像）。
+    /// DB 缓存（7 天）→ 负缓存短路（12h）→ steam/profile.rs 抓取并回写。
+    /// 一切失败都返回 None（调用方回退显示 SteamID64），绝不向上抛错阻塞 UI。
+    pub async fn author_summary(&self, steamid: &str) -> Option<AuthorSummary> {
+        {
+            let conn = self.db.lock().ok()?;
+            match db::find_author_profile(&conn, steamid) {
+                Ok(Some(Some((name, avatar_url)))) => {
+                    return Some(AuthorSummary {
+                        steam_id: steamid.to_string(),
+                        name,
+                        avatar_url,
+                    })
+                }
+                Ok(Some(None)) => return None, // 负缓存：近期抓过且失败
+                _ => {}
+            }
+        }
+        let found = fetch_persona(&self.client, steamid).await;
+        if let Ok(conn) = self.db.lock() {
+            if let Err(e) = db::upsert_author_profile(
+                &conn,
+                steamid,
+                found.as_ref().map(|(n, a)| (n.as_str(), a.as_str())),
+            ) {
+                tracing::warn!("author cache write failed: {e}");
+            }
+        }
+        if found.is_none() {
+            tracing::info!("author persona unresolved for {steamid}");
+        }
+        found.map(|(name, avatar_url)| AuthorSummary {
+            steam_id: steamid.to_string(),
+            name,
+            avatar_url,
+        })
+    }
+
     /// 为列表条目补齐类型/标签/订阅数：本地库 24h 内优先，缺失批量调详情 API 并入库
     async fn enrich(&self, raw: &[BrowseRawItem]) -> Result<Vec<WorkshopItemSummary>, String> {
         let ids: Vec<String> = raw.iter().map(|r| r.id.clone()).collect();
@@ -521,6 +561,56 @@ pub async fn workshop_item(
     id: String,
 ) -> Result<Option<WorkshopItem>, String> {
     svc.detail(&id).await
+}
+
+/// 已知 creator(SteamID64) 的场景（工坊详情页）直接查作者名片
+#[tauri::command]
+pub async fn steam_author_summary(
+    svc: tauri::State<'_, Arc<WorkshopService>>,
+    steam_id: String,
+) -> Result<Option<AuthorSummary>, String> {
+    Ok(svc.author_summary(&steam_id).await)
+}
+
+/// 本地库条目 → 作者名片。
+/// publishedfileid 解析链：上传回写列 → 纯数字 item_id（工坊下载目录名即 pfid）
+/// → project.json 的 workshopid（本地工程发布关联）；都没有 = 本地未发布，None。
+/// 任何一步失败（离线/条目被删/资料私密）都回 None，前端直接隐藏作者行。
+#[tauri::command]
+pub async fn library_item_author(
+    app: tauri::AppHandle,
+    svc: tauri::State<'_, Arc<WorkshopService>>,
+    item_id: String,
+) -> Result<Option<AuthorSummary>, String> {
+    crate::library::check_item_id(&item_id)?;
+    let uploaded_pfid = {
+        let db = app.state::<Arc<Mutex<Connection>>>();
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT NULLIF(TRIM(publishedfileid), '') FROM library_items WHERE item_id = ?1",
+            [item_id.as_str()],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+    };
+    let is_numeric_id = !item_id.is_empty() && item_id.bytes().all(|b| b.is_ascii_digit());
+    let pfid = uploaded_pfid
+        .or_else(|| is_numeric_id.then(|| item_id.clone()))
+        .or_else(|| crate::library::project_workshopid(&app, &item_id));
+    let Some(pfid) = pfid else {
+        return Ok(None);
+    };
+    let creator = svc
+        .detail(&pfid)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|it| it.creator);
+    let Some(creator) = creator else {
+        return Ok(None);
+    };
+    Ok(svc.author_summary(&creator).await)
 }
 
 #[cfg(test)]
