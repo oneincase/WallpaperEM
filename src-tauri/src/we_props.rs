@@ -51,6 +51,20 @@ pub fn global_language(conn: &Connection) -> String {
     }
 }
 
+/// 文案 HTML 里抽出的图（WE 属性面板会渲染 <img>；只含 http(s) 或壁纸内相对路径）
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PropMedia {
+    pub src: String,
+    /// <a> 包裹时的跳转链接（仅 http(s)）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub href: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<String>,
+}
+
 /// UI 编辑用的属性定义
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -58,7 +72,8 @@ pub struct WebPropDef {
     pub name: String,
     /// color | bool | slider | combo | text | textinput | file | other
     pub ptype: String,
-    /// 显示名（localization 表 → WE 内建映射 → 属性名；已剥离 HTML）
+    /// 显示名（localization 表 → WE 内建映射 → 属性名；已剥离 HTML，保留 <br> 换行）。
+    /// 纯图横幅（剥离后为空但 media 非空）时为 ""，不回退成属性名
     pub text: String,
     /// 排序键。真实 project.json 里存在 `32.5`、`1151.0022` 这类浮点细分序，
     /// 必须按 f64 读，否则整数化会把同组属性压平成随机序
@@ -89,6 +104,9 @@ pub struct WebPropDef {
     /// 决定选择器过滤器；directory 属性无此字段
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_type: Option<String>,
+    /// 文案里抽出的图片（分隔图/赞助图/示意图）；渲染在标签上方
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media: Option<Vec<PropMedia>>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -514,12 +532,26 @@ fn localized(project: &Value, key: &str) -> Option<String> {
         .find_map(|(_, entries)| lookup(entries, key).and_then(non_empty))
 }
 
-/// 剥离 HTML 标签、解码常见实体、折叠空白。
+/// 剥离 HTML 标签、解码常见实体、折叠空白（单行，用于 combo 选项等必须单行的场景）。
 /// 壁纸文案里 `<br />`、`<h4 class='ugcSuccess'>`、整段打赏 `<a><img></a>` 都很常见
 fn strip_html(raw: &str) -> String {
-    let mut text = String::with_capacity(raw.len());
+    strip_html_keep(raw, false)
+}
+
+/// `keep_breaks`：属性显示名保留作者的 `<br>`（中英对照各占一行），
+/// 逐行折叠空白并压缩 3+ 连续换行；false = 整体压成单行
+fn strip_html_keep(raw: &str, keep_breaks: bool) -> String {
+    static BR_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let src = if keep_breaks {
+        BR_RE.get_or_init(|| regex::Regex::new(r"(?i)<br\s*/?>").unwrap())
+            .replace_all(raw, "\n")
+            .into_owned()
+    } else {
+        raw.to_string()
+    };
+    let mut text = String::with_capacity(src.len());
     let mut depth = 0usize;
-    for ch in raw.chars() {
+    for ch in src.chars() {
         match ch {
             '<' => depth += 1,
             '>' => depth = depth.saturating_sub(1),
@@ -531,8 +563,31 @@ fn strip_html(raw: &str) -> String {
             text.push(' ');
         }
     }
-    let text = decode_entities(&text);
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    let decoded = decode_entities(&text);
+    if !keep_breaks {
+        return decoded.split_whitespace().collect::<Vec<_>>().join(" ");
+    }
+    let lines: Vec<String> = decoded
+        .split('\n')
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
+    let joined = lines.join("\n");
+    let trimmed = joined.trim_matches('\n');
+    // 3+ 连续换行压缩成 2（作者常拿 <br><br><br> 当大间距）
+    let mut out = String::with_capacity(trimmed.len());
+    let mut run = 0;
+    for ch in trimmed.chars() {
+        if ch == '\n' {
+            run += 1;
+            if run <= 2 {
+                out.push(ch);
+            }
+        } else {
+            run = 0;
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// 解码 HTML 实体：数值实体 `&#8470;` / `&#x2030;` 通用处理，命名实体取常见集。
@@ -609,6 +664,140 @@ fn resolve_text(project: &Value, raw: &str, fallback: &str) -> String {
     clean
 }
 
+// ---------- 文案 HTML 图片提取（WE 属性面板会渲染 <img>） ----------
+
+/// <a>/<img> 标签属性值：双引号/单引号/无引号三种形态都收（真实壁纸全有）
+fn tag_attr(tag: &str, name: &str) -> Option<String> {
+    let re = regex::Regex::new(&format!(
+        r#"(?i)\b{name}\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))"#
+    ))
+    .ok()?;
+    let caps = re.captures(tag)?;
+    let (v, unquoted_end) = if let Some(m) = caps.get(1).or_else(|| caps.get(2)) {
+        (m.as_str(), None)
+    } else {
+        let m = caps.get(3)?;
+        (m.as_str(), Some(m.end()))
+    };
+    let mut v = v.trim().to_string();
+    // 自闭合标签的无引号值会把结尾 / 吞进来（height=60/>）；
+    // 仅当这个 / 紧邻 >（即属于 `/>`）才剥掉，URL 里正常的 / 不受影响
+    if let Some(end) = unquoted_end {
+        if v.ends_with('/') && tag[end..].starts_with('>') {
+            v.pop();
+        }
+    }
+    if v.is_empty() {
+        return None;
+    }
+    Some(decode_entities(&v))
+}
+
+fn is_http_url(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+/// 壁纸内相对路径（无协议、非绝对）或 http(s)。javascript:/data: 一律丢。
+/// `..` 已在 normalize_pkg_src 归一化阶段剥掉，到这里的相对路径都安全
+fn is_safe_img_src(s: &str) -> bool {
+    if is_http_url(s) {
+        return true;
+    }
+    if s.contains("..") {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    // 协议前缀（任意 scheme）一律拒
+    if bytes.iter().position(|&b| b == b':').is_some_and(|i| {
+        i > 0 && bytes[..i].iter().all(|b| b.is_ascii_alphanumeric() || *b == b'+' || *b == b'-' || *b == b'.')
+    }) {
+        return false;
+    }
+    !s.is_empty() && !s.starts_with('/')
+}
+
+/// 作者常按 Steam 目录结构写包内图片路径：
+/// `../../../../workshop/content/431960/<id>/mypic/logo.png`（真实壁纸 1108983160）。
+/// 归一化到壁纸根（剥掉工坊目录前缀与 ../ 回退），这类图才能被内容服务器解析；
+/// 穿越尝试经归一化后仍落在包内，天然无害。
+fn normalize_pkg_src(src: &str) -> String {
+    static WS_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let mut s = src.trim().replace('\\', "/");
+    if let Some(m) = WS_RE
+        .get_or_init(|| regex::Regex::new(r"(?i)workshop/content/431960/\d+/").unwrap())
+        .find(&s)
+    {
+        s = s[m.end()..].to_string();
+    }
+    while let Some(rest) = s.strip_prefix("../") {
+        s = rest.to_string();
+    }
+    while let Some(rest) = s.strip_prefix("./") {
+        s = rest.to_string();
+    }
+    s.trim_start_matches('/').to_string()
+}
+
+/// 从文案 HTML 抽出 <img>：记录 <a> 包裹关系（图可点击），属性值三种形态都收。
+/// 只产出结构化数据，前端拼 URL/决定渲染，不走 innerHTML，杜绝注入。
+fn extract_media(html: &str) -> Vec<PropMedia> {
+    let mut out = Vec::new();
+    let re = regex::Regex::new(r"(?i)<a\b[^>]*>|<\/a>|<img\b[^>]*>").unwrap();
+    let mut href: Option<String> = None;
+    for m in re.find_iter(html) {
+        let tag = m.as_str();
+        let lower = tag.to_ascii_lowercase();
+        if lower.starts_with("<a") {
+            href = tag_attr(tag, "href").filter(|h| is_http_url(h));
+        } else if lower.starts_with("</a") {
+            href = None;
+        } else {
+            let Some(raw_src) = tag_attr(tag, "src") else {
+                continue;
+            };
+            let src = if is_http_url(&raw_src) {
+                raw_src
+            } else {
+                normalize_pkg_src(&raw_src)
+            };
+            if !is_safe_img_src(&src) {
+                continue;
+            }
+            out.push(PropMedia {
+                src,
+                href: href.clone(),
+                width: tag_attr(tag, "width").map(|w| w.trim_matches(['\'', '"']).to_string()),
+                height: tag_attr(tag, "height").map(|h| h.trim_matches(['\'', '"']).to_string()),
+            });
+        }
+    }
+    out
+}
+
+/// 属性显示名 + 文案里的图。纯图横幅（剥离后为空但 media 非空）不回退成属性名 ——
+/// 否则面板上只剩 logo1 / fengefu000，作者的分隔 GIF 全没了。
+/// 显示名保留 <br> 换行（中英对照各占一行）。
+fn resolve_display(project: &Value, raw: &str, fallback: &str) -> (String, Option<Vec<PropMedia>>) {
+    let resolved = localized(project, raw)
+        .or_else(|| builtin_text(raw).map(str::to_string))
+        .unwrap_or_else(|| raw.to_string());
+    let media = extract_media(&resolved);
+    let clean = strip_html_keep(&resolved, true);
+    let empty = clean.is_empty() || clean.starts_with("ui_");
+    let text = if empty {
+        if media.is_empty() {
+            fallback.to_string()
+        } else {
+            String::new()
+        }
+    } else {
+        clean
+    };
+    let media = (!media.is_empty()).then_some(media);
+    (text, media)
+}
+
 /// 属性定义列表（UI 编辑用）；无 project.json / 无属性时为空
 pub fn describe(conn: &Connection, wallpapers_dir: &Path, item_id: &str) -> Vec<WebPropDef> {
     let Some(project) = load_project(&crate::library::resolved_item_dir_in(conn, wallpapers_dir, item_id)) else {
@@ -617,6 +806,12 @@ pub fn describe(conn: &Connection, wallpapers_dir: &Path, item_id: &str) -> Vec<
     let overrides = read_overrides(conn, item_id);
     raw_props(&project)
         .into_iter()
+        // `editable: false` = 作者在 WE 编辑器里明确标记「用户不可编辑」——
+        // 这类属性是壁纸自己读写的工作变量（真实语料：背景色相旋转/音量/字号），
+        // WE 的属性面板不显示。仅严格布尔 false 隐藏；缺省 / true / "true" 都显示。
+        // 注意只影响 UI 列表：effective_props 照常下发（与 condition 隐藏同理，
+        // 壁纸代码要读这些值，过滤会让壁纸读不到而异常）。
+        .filter(|(_, def)| def.get("editable").and_then(|e| e.as_bool()) != Some(false))
         .map(|(name, def)| {
             // checkbox 是 bool 的别名（真实语料里 2 处）：wire 语义完全相同，
             // 归一化成 bool，避免前端为同一个开关写两套渲染。
@@ -636,6 +831,9 @@ pub fn describe(conn: &Connection, wallpapers_dir: &Path, item_id: &str) -> Vec<
             // 空白间隔（kong10/fengexian3 这类间隔键在真实壁纸里很常见），
             // 回退成属性名会把间隔键名直接显示在面板上，必须保留为空
             let is_header = ptype == "text" || ptype == "group";
+            // 文案 HTML 里的图（分隔图/赞助图）抽成结构化 media；
+            // 纯图文案的 text 为 ""（不回退成属性名，见 resolve_display）
+            let (text, media) = resolve_display(&project, text_raw, if is_header { "" } else { &name });
             let options = def
                 .get("options")
                 .and_then(|o| o.as_array())
@@ -660,11 +858,7 @@ pub fn describe(conn: &Connection, wallpapers_dir: &Path, item_id: &str) -> Vec<
                 .unwrap_or_default();
             WebPropDef {
                 name: name.clone(),
-                text: if is_header {
-                    resolve_text(&project, text_raw, "")
-                } else {
-                    resolve_text(&project, text_raw, &name)
-                },
+                text,
                 ptype,
                 order: order_of(&def),
                 overridden: overrides.contains_key(&name),
@@ -677,6 +871,7 @@ pub fn describe(conn: &Connection, wallpapers_dir: &Path, item_id: &str) -> Vec<
                 step: def.get("step").and_then(|m| m.as_f64()),
                 precision: def.get("precision").and_then(|m| m.as_i64()),
                 file_type: str_field(&def, "fileType"),
+                media,
             }
         })
         .collect()
@@ -928,9 +1123,64 @@ mod tests {
         assert_eq!(text("b"), "貝塔", "zh-chs 缺该键 → 逐键回退 zh-cht");
         assert_eq!(text("c"), "Gamma", "前两档都缺 → 回退 en-us");
         assert_eq!(text("miss"), "miss", "全表未命中的 ui_ 键 → 回退属性名");
-        assert_eq!(text("html"), "定位城市 City", "剥离标签，边界补空格");
-        assert_eq!(text("deco"), "deco", "纯 HTML 装饰清理后为空 → 回退属性名");
+        assert_eq!(text("html"), "定位城市\nCity", "剥离标签保留 <br> 换行");
+        // deco 的 text 是纯 <a><img>：清理后为空但 media 非空 → text 为 ""
+        // （不回退属性名），图片交给 media 渲染
+        assert_eq!(text("deco"), "", "纯图文案不回退属性名");
+        let deco = defs.iter().find(|d| d.name == "deco").unwrap();
+        assert_eq!(
+            deco.media.as_ref().map(|m| m.len()),
+            Some(1),
+            "纯图文案应抽出 media"
+        );
         assert_eq!(text("ent"), "A & B C", "实体解码");
+    }
+
+    /// 文案 HTML 图片提取：http 外链、<a> 包裹链接、包内相对路径归一化、危险协议拒收
+    #[test]
+    fn extract_media_from_caption_html() {
+        // http 外链 + <a> 包裹 + 无引号属性 + 引号内尺寸
+        let m = extract_media(
+            r#"<a href=https://example.com/donate><img src='https://cdn.x.com/d.png' width='200' height=60/></a>"#,
+        );
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].src, "https://cdn.x.com/d.png");
+        assert_eq!(m[0].href.as_deref(), Some("https://example.com/donate"));
+        assert_eq!(m[0].width.as_deref(), Some("200"));
+        assert_eq!(m[0].height.as_deref(), Some("60"));
+
+        // 包内相对路径：Steam 工坊目录前缀 + ../ 归一化到壁纸根
+        let m = extract_media(r#"<img src='../../../../workshop/content/431960/1108983160/mypic/LOGO1.png' width='250'/>"#);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].src, "mypic/LOGO1.png");
+        assert_eq!(m[0].href, None);
+
+        // 普通包内路径；<a> 闭合后图不再带链接
+        let m = extract_media(r#"<a href='https://a.com'><img src='a.png'></a><img src='b.png'>"#);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0].href.as_deref(), Some("https://a.com"));
+        assert_eq!(m[1].href, None);
+
+        // javascript:/data: 协议、非 http 链接一律丢
+        assert!(extract_media(r#"<img src='javascript:alert(1)'>"#).is_empty());
+        assert!(extract_media(r#"<img src='data:image/png;base64,xx'>"#).is_empty());
+        let m = extract_media(r#"<a href='steam://open/x'><img src='ok.png'></a>"#);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].href, None, "非 http 链接不带跳转");
+
+        // 属性值里的实体要解码（&amp; 在 URL 里常见）
+        let m = extract_media(r#"<img src='https://x.com/a.png?x=1&amp;y=2'>"#);
+        assert_eq!(m[0].src, "https://x.com/a.png?x=1&y=2");
+    }
+
+    /// 属性显示名的 <br> 换行保留 + 多行空白折叠
+    #[test]
+    fn caption_keeps_br_breaks_and_collapses_whitespace() {
+        assert_eq!(
+            strip_html_keep("定位城市<br />City<br><br><br>副标题", true),
+            "定位城市\nCity\n\n副标题"
+        );
+        assert_eq!(strip_html_keep("a<br>b", false), "a b", "单行模式 <br> 按标签边界补空格");
     }
 
     /// WE 对齐的空/异形态过滤：空 type、大写类型名、空 text 分节标题
@@ -1017,6 +1267,33 @@ mod tests {
         // 下发给壁纸时同样保型（壁纸里的 === / switch 依赖此）
         let props = effective_props(&conn, &dir, "x7");
         assert_eq!(props.get("mode").unwrap(), &json!({"value": 1}));
+    }
+
+    /// editable:false = 作者明确不让用户编辑：UI 列表隐藏，但值照常下发给壁纸
+    #[test]
+    fn non_editable_props_hidden_from_ui_but_still_delivered() {
+        let conn = mem_db();
+        let dir = fixture_dir(
+            "editable",
+            "x30",
+            r#"{"type":"web","general":{"properties":{
+                "workvar":  {"order":1, "type":"slider", "text":"ui_workvar", "value":67, "editable": false},
+                "normal":   {"order":2, "type":"slider", "text":"正常滑条", "value":1},
+                "explicit": {"order":3, "type":"slider", "text":"显式可编辑", "value":2, "editable": true},
+                "strbool":  {"order":4, "type":"slider", "text":"字符串形态", "value":3, "editable": "true"}
+            }}}"#,
+        );
+        let defs = describe(&conn, &dir, "x30");
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["normal", "explicit", "strbool"],
+            "editable:false 不出现在 UI 列表（缺省/true/字符串 true 均显示）"
+        );
+
+        // 值照常下发：壁纸代码要读 workvar（与 condition 隐藏同一原则）
+        let props = effective_props(&conn, &dir, "x30");
+        assert_eq!(props.get("workvar").unwrap(), &json!({"value": 67.0}));
     }
 
     /// condition 只用于 UI 显隐：effective_props 不得据此过滤（否则壁纸读不到值）

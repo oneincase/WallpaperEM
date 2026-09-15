@@ -12,13 +12,16 @@
 //   - WE 的这几项是**按壁纸记忆**的，不是全局单例；未设置的项显示「跟随全局」
 //   - 与作者属性分开保存：存储位置与生效路径都不同（前者要热更属性/重挂，
 //     后者只需 setFit / setRenderDpr / setSceneFps / setVolume）
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   api,
+  type AuthorSummary,
   type ItemPlayConfig,
   type PlayConfigGlobals,
+  type PropMedia,
   type WebPropDef,
   type WebPropValues,
 } from "../api/steam";
@@ -65,10 +68,11 @@ const KNOWN_PROP_TYPES = new Set([
   "group",
 ]);
 
-/** 该属性是否会在 WE 属性窗口里占一行（可编辑控件 / 非空分节标题） */
+/** 该属性是否会在 WE 属性窗口里占一行（可编辑控件 / 非空分节标题 / 带图横幅） */
 function isDisplayableProp(p: WebPropDef): boolean {
   if (!KNOWN_PROP_TYPES.has(p.ptype)) return false;
-  if (p.ptype === "text" || p.ptype === "group") return !!p.text.trim();
+  if (p.ptype === "text" || p.ptype === "group")
+    return !!p.text.trim() || !!p.media?.length;
   return true;
 }
 
@@ -114,6 +118,8 @@ export function WallpaperPropsPanel({
   const [saveState, setSaveState] = useState<SaveState>("idle");
   const [errMsg, setErrMsg] = useState("");
   const [confirmReset, setConfirmReset] = useState(false);
+  /** group 分节的开合状态（组名 → 是否展开；缺省展开） */
+  const [groupOpen, setGroupOpen] = useState<Record<string, boolean>>({});
   /** 当前分区。作者属性为空的壁纸直接落到播放设置（那才是它唯一能配的东西） */
   const [tab, setTab] = useState<"props" | "play">("props");
   /** 每壁纸播放设置覆盖（字段缺失 = 跟随全局）+ 当前全局默认 */
@@ -357,36 +363,74 @@ export function WallpaperPropsPanel({
     return () => window.removeEventListener("keydown", onKey);
   }, [close, confirmReset]);
 
-  // ---- 派生：condition 显隐（按当前草稿求值，开关联动即时反映）+ 搜索过滤 ----
+  // ---- 派生：分节 → condition 显隐（按当前草稿求值，开关联动即时反映）→ 搜索过滤 ----
   // 只统计/渲染 WE 属性窗口真正会显示的项（与 WE 对齐，不多也不少）：
   // - scenetexture / usershortcut 等 scene 内部类型没有对应控件，WE 不显示
   // - 空 text 是作者留的空白间隔（kong10/fengexian3 这类间隔键很常见），
   //   WE 显示为一小段空白，不占列表项、不参与计数与搜索
   // 注意保存仍遍历完整 defs（doSave 用 defsRef），隐藏类型的已有覆盖不会丢
   const all = useMemo(() => (defs ?? []).filter(isDisplayableProp), [defs]);
-  const visible = useMemo(() => all.filter((p) => evalCondition(p.condition, draft)), [all, draft]);
-  const q = query.trim().toLowerCase();
-  const shown = useMemo(
+
+  // 按 WE 语义把 type=group 当可折叠分节：其后属性归属该组，直到下一个 group
+  const sections = useMemo(() => {
+    const out: { group: WebPropDef | null; items: WebPropDef[] }[] = [{ group: null, items: [] }];
+    for (const p of all) {
+      if (p.ptype === "group") {
+        out.push({ group: p, items: [] });
+      } else {
+        out[out.length - 1].items.push(p);
+      }
+    }
+    return out;
+  }, [all]);
+
+  // condition 显隐：组条件作用于整节，条目条件作用于自身
+  const visibleSections = useMemo(
     () =>
-      q
-        ? visible.filter(
-            (p) => p.text.toLowerCase().includes(q) || p.name.toLowerCase().includes(q)
-          )
-        : visible,
-    [visible, q]
+      sections
+        .filter((sec) => !sec.group || evalCondition(sec.group.condition, draft))
+        .map((sec) => ({
+          ...sec,
+          items: sec.items.filter((p) => evalCondition(p.condition, draft)),
+        })),
+    [sections, draft],
   );
+  const visibleCount = useMemo(
+    () => visibleSections.reduce((n, s) => n + s.items.length + (s.group ? 1 : 0), 0),
+    [visibleSections],
+  );
+
+  // 搜索：组名命中整组保留，否则按条目过滤；无搜索时只剩标题的空组也显示（作者分隔）
+  const q = query.trim().toLowerCase();
+  const shownSections = useMemo(() => {
+    if (!q) return visibleSections;
+    const hit = (p: WebPropDef) =>
+      propLabel(p).toLowerCase().includes(q) || p.name.toLowerCase().includes(q);
+    return visibleSections
+      .map((sec) =>
+        sec.group && hit(sec.group)
+          ? sec
+          : { group: sec.group, items: sec.items.filter(hit) },
+      )
+      .filter((sec) => sec.items.length > 0);
+  }, [visibleSections, q]);
+  const shownCount = useMemo(
+    () => shownSections.reduce((n, s) => n + s.items.length + (s.group ? 1 : 0), 0),
+    [shownSections],
+  );
+
   const modifiedCount = useMemo(
     () => all.filter((p) => p.value !== null && !sameValue(draft[p.name], p.default)).length,
     [all, draft]
   );
 
   const showSearch = all.length > 6;
-  const searchHint = q ? tr("匹配 {n} 项", { n: shown.length }) : "";
+  const searchHint = q ? tr("匹配 {n} 项", { n: shownCount }) : "";
   const infoBits = [
     tr("共 {n} 项", { n: all.length }),
     modifiedCount > 0 ? tr("已修改 {n} 项", { n: modifiedCount }) : "",
-    visible.length < all.length
-      ? tr("{n} 项因条件隐藏", { n: all.length - visible.length })
+    visibleCount < all.length
+      ? tr("{n} 项因条件隐藏", { n: all.length - visibleCount })
       : "",
   ].filter(Boolean);
 
@@ -434,6 +478,10 @@ export function WallpaperPropsPanel({
             </button>
           )}
         </div>
+
+        {/* 作者行（WE 式：头像 + 昵称 + 放大镜浏览作者工坊页）。
+            本地未发布/解析失败时整行隐藏 —— WE 对无工坊关联的壁纸也不显示作者 */}
+        <AuthorRow itemId={itemId} />
 
         {/* 分区切换。作者属性为空时依然要能进播放设置 —— 那是这张壁纸唯一可配的东西，
             旧版在这种情况下直接显示空态、整个弹窗没有任何可操作项 */}
@@ -510,22 +558,50 @@ export function WallpaperPropsPanel({
               </div>
             </div>
 
-            {/* 属性列表 */}
+            {/* 属性列表（group 为可折叠分节；节内条目跟随组开合） */}
             <div className="flex-1 overflow-y-auto px-5 py-3">
-              {shown.length === 0 ? (
+              {shownCount === 0 ? (
                 <EmptyState art="search" title={tr("没有匹配「{query}」的属性", { query })} />
               ) : (
                 <div className="flex flex-col gap-3">
-                  {shown.map((p) => (
-                    <PropRow
-                      key={p.name}
-                      p={p}
-                      draft={draft}
-                      onChange={change}
-                      onFilePick={pickFile}
-                      fileUrl={fileUrl}
-                    />
-                  ))}
+                  {shownSections.map((sec) =>
+                    sec.group ? (
+                      <GroupSection
+                        key={sec.group.name}
+                        group={sec.group}
+                        open={groupOpen[sec.group.name] ?? true}
+                        onToggle={() =>
+                          setGroupOpen((m) => ({
+                            ...m,
+                            [sec.group!.name]: !(m[sec.group!.name] ?? true),
+                          }))
+                        }
+                        fileUrl={fileUrl}
+                      >
+                        {sec.items.map((p) => (
+                          <PropRow
+                            key={p.name}
+                            p={p}
+                            draft={draft}
+                            onChange={change}
+                            onFilePick={pickFile}
+                            fileUrl={fileUrl}
+                          />
+                        ))}
+                      </GroupSection>
+                    ) : (
+                      sec.items.map((p) => (
+                        <PropRow
+                          key={p.name}
+                          p={p}
+                          draft={draft}
+                          onChange={change}
+                          onFilePick={pickFile}
+                          fileUrl={fileUrl}
+                        />
+                      ))
+                    ),
+                  )}
                 </div>
               )}
             </div>
@@ -602,7 +678,212 @@ export function WallpaperPropsModal(props: {
   );
 }
 
-// ---------- 单个属性行 ----------
+// ---------- 作者行（WE：头像 + 昵称 + 放大镜按作者浏览） ----------
+
+function AuthorRow({ itemId }: { itemId: string }) {
+  // undefined = 解析中（显示骨架，避免解析完成后面板高度跳动）
+  const [author, setAuthor] = useState<AuthorSummary | null | undefined>(undefined);
+  const [avatarFailed, setAvatarFailed] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    setAuthor(undefined);
+    setAvatarFailed(false);
+    api
+      .libraryItemAuthor(itemId)
+      .then((a) => alive && setAuthor(a))
+      .catch(() => alive && setAuthor(null));
+    return () => {
+      alive = false;
+    };
+  }, [itemId]);
+
+  if (author === undefined) {
+    return (
+      <div className="flex shrink-0 items-center gap-2 border-b border-[var(--separator)] px-5 py-2">
+        <span className="h-[18px] w-[18px] animate-pulse rounded-full bg-[var(--separator)]" />
+        <span className="h-2.5 w-24 animate-pulse rounded bg-[var(--separator)]" />
+      </div>
+    );
+  }
+  if (!author) return null;
+
+  return (
+    <div className="flex shrink-0 items-center gap-2 border-b border-[var(--separator)] px-5 py-2">
+      {author.avatarUrl && !avatarFailed ? (
+        <img
+          src={author.avatarUrl}
+          alt=""
+          draggable={false}
+          onError={() => setAvatarFailed(true)}
+          className="h-[18px] w-[18px] shrink-0 rounded-full object-cover"
+        />
+      ) : (
+        <span className="flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-full bg-[var(--separator)] text-[10px] text-[var(--text-2)]">
+          ?
+        </span>
+      )}
+      <span className="min-w-0 flex-1 truncate text-[12px] text-[var(--text-2)]" title={author.name}>
+        {tr("作者")} · {author.name}
+      </span>
+    </div>
+  );
+}
+
+// ---------- 单个属性行（WE 几何：属性名小字在上、控件通栏在下） ----------
+
+/**
+ * WE 属性区的行骨架：标签行（属性名 + 已自定义点 + 可选右侧挂件 + 单项重置 ↺）
+ * + 通栏控件。bool 是唯一的例外（左侧方框勾选与标签同行），不走这个骨架。
+ */
+function RowShell({
+  label,
+  title,
+  isDefault,
+  canReset,
+  aside,
+  onReset,
+  children,
+}: {
+  label: string;
+  title: string;
+  isDefault: boolean;
+  /** 有默认值可恢复（project.json 提供了 default） */
+  canReset: boolean;
+  aside?: React.ReactNode;
+  onReset: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="flex items-center gap-2">
+        <div
+          className="min-w-0 flex-1 whitespace-pre-line text-[12px] leading-snug text-[var(--text-2)]"
+          title={title}
+        >
+          {label}
+          {!isDefault && (
+            <span className="ml-1 text-[var(--accent-strong)]" title={tr("已自定义")}>
+              •
+            </span>
+          )}
+        </div>
+        {aside}
+        {canReset && !isDefault && (
+          <button
+            className="shrink-0 text-[11px] text-[var(--text-2)] hover:text-[var(--accent-strong)]"
+            title={tr("恢复该属性默认值")}
+            onClick={onReset}
+          >
+            ↺
+          </button>
+        )}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+// ---------- 文案图片（后端 we_props 从属性 text 抽出的 media） ----------
+//
+// 与上游 WebWallGL 测试台同一条管线：提取/清洗在解析层完成（we_props.rs），
+// 面板只渲染结构化 media —— text 不会再残留 HTML，也不会有 imgsrchttp… 残渣键名。
+// src 两种形态：http(s) 外链直接用；包内相对路径走内容服务器 /media 前缀（同
+// file 属性缩略图）。
+
+/** 作者 HTML 常写 height=30 当图标、width=2000 当横幅：横幅按比例缩，图标才钉高度
+ *  （与上游测试台 applyMediaSize 同一套规则） */
+function mediaStyle(m: PropMedia): React.CSSProperties {
+  const w = cssLen(m.width);
+  const h = cssLen(m.height);
+  const hPx = h && h.endsWith("px") ? Number.parseFloat(h) : NaN;
+  if (w && w.endsWith("%")) return { width: w, height: "auto" };
+  if (Number.isFinite(hPx) && hPx >= 16 && hPx <= 96) return { height: h, width: "auto" };
+  if (w) return { width: w, height: "auto" };
+  if (h) return { height: h, width: "auto" };
+  return { height: "auto" };
+}
+
+/** CSS 尺寸：105% / 120px / 120 / 1.5em；裸数字按 px */
+function cssLen(v?: string): string | undefined {
+  if (!v) return undefined;
+  const s = v.trim().replace(/^['"]+|['"]+$/g, "");
+  if (!s) return undefined;
+  if (/%|px|em|rem|vh|vw$/i.test(s)) return s;
+  const n = Number(s);
+  return Number.isFinite(n) && n > 0 ? `${n}px` : undefined;
+}
+
+function PropMediaView({
+  media,
+  align = "center",
+  fileUrl,
+}: {
+  media: PropMedia[];
+  /** text 属性的分隔/赞助图居中；属性行里的示意图左对齐 */
+  align?: "center" | "start";
+  fileUrl: (val: unknown) => string;
+}) {
+  return (
+    <div
+      className={`my-1 flex flex-col gap-1.5 ${
+        align === "center" ? "items-center" : "items-start"
+      }`}
+    >
+      {media.map((m, i) => {
+        const src = /^https?:\/\//i.test(m.src) ? m.src : fileUrl(m.src);
+        if (!src) return null; // 内容服务器未就绪：就绪后重渲染自然出现
+        const img = (
+          <img
+            src={src}
+            alt=""
+            loading="lazy"
+            draggable={false}
+            // qpic.cn 等图床校验 Referer，不带才能加载（上游测试台同样处理）
+            referrerPolicy="no-referrer"
+            style={mediaStyle(m)}
+            className="block max-w-full rounded-[3px]"
+          />
+        );
+        // <a> 包裹的图可点击（href 后端已限定 http(s)），走系统浏览器
+        return m.href ? (
+          <a
+            key={i}
+            href={m.href}
+            className="block max-w-full"
+            onClick={(e) => {
+              e.preventDefault();
+              void openUrl(m.href!).catch(() => {});
+            }}
+          >
+            {img}
+          </a>
+        ) : (
+          <React.Fragment key={i}>{img}</React.Fragment>
+        );
+      })}
+    </div>
+  );
+}
+
+/** 作者常把整段 <img> HTML 写进属性 key，WE 剥掉符号后变成 imgsrchttp… 这种「名字」。
+ *  有抽出的图时不要回退显示这段残渣（与上游测试台 looksLikeHtmlResidue 一致） */
+function looksLikeHtmlResidue(s: string): boolean {
+  if (s.length < 24 || /\s/.test(s)) return false;
+  return /^(imgsrc|ahref|hrbig|brahref)/i.test(s) || /viewer_4|photostore|qpiccn/i.test(s);
+}
+
+/** 面板显示用的属性名：优先解析后的文案；纯图属性与残渣键名不显示 */
+function propLabel(p: WebPropDef): string {
+  if (p.text && !looksLikeHtmlResidue(p.text)) return p.text;
+  if (p.media?.length) return "";
+  if (looksLikeHtmlResidue(p.name)) return "";
+  return p.text || p.name;
+}
+
+/** 行 tooltip（键名 + 类型）；残渣键名只留类型 */
+function propTitle(p: WebPropDef): string {
+  return looksLikeHtmlResidue(p.name) ? p.ptype : `${p.name} · ${p.ptype}`;
+}
 
 function PropRow({
   p,
@@ -615,138 +896,322 @@ function PropRow({
   draft: WebPropValues;
   onChange: (name: string, v: WebPropValues[string]) => void;
   onFilePick: (p: WebPropDef) => Promise<void>;
-  /** file 属性值 → 可访问 URL（用于图片缩略图） */
+  /** file/media 相对路径 → 可访问 URL（内容服务器） */
   fileUrl: (val: unknown) => string;
 }) {
   const cur = draft[p.name];
   const isDefault = sameValue(cur, p.default);
   const controlCls =
-    "rounded-lg border border-[var(--separator)] bg-[var(--card)] px-2.5 py-1.5 text-[12.5px] focus:outline-none focus:ring-1 focus:ring-[var(--accent-strong)]";
+    "w-full rounded-lg border border-[var(--separator)] bg-[var(--card)] px-2.5 py-1.5 text-[12.5px] focus:outline-none focus:ring-1 focus:ring-[var(--accent-strong)]";
+  const label = propLabel(p);
+  const reset = () => onChange(p.name, p.default as WebPropValues[string]);
+  const canReset = p.default !== null;
 
-  // WE 的 text 是静态说明/分节标题（不可编辑）；group 是分组标题（带 text 的
-  // 容器，真实数据 13 处）。两者都整行跨栏展示，充当分组分隔。
+  // WE 的 text 是静态说明/分节标题（不可编辑）：文案图（分隔 GIF/赞助图）居中在上，
+  // 说明文字在下。group 在列表层当可折叠分节处理，不会流到这里。
   // 未知类型（scenetexture/usershortcut 等 scene 专属）WE 不显示，整行跳过
   // （列表已按 isDisplayableProp 预过滤，此为防御兜底）
   if (!KNOWN_PROP_TYPES.has(p.ptype)) return null;
+  if (p.ptype === "group") return null;
 
-  // 空标题是作者留的空白间隔：渲染一小段间距而不是键名（WE 行为）
-  if (p.ptype === "text" || p.ptype === "group") {
-    if (!p.text) return <div className="h-1" aria-hidden />;
+  if (p.ptype === "text") {
+    if (!label && !p.media?.length) return <div className="h-1" aria-hidden />;
     return (
-      <div
-        className={`mt-1 border-t border-[var(--separator)] pt-2.5 leading-relaxed text-[var(--text-2)] ${
-          p.ptype === "group"
-            ? "text-[12.5px] font-semibold text-[var(--text-1)]"
-            : "text-[12px] font-medium"
-        }`}
-      >
-        {p.text || p.name}
+      <div className="mt-1 border-t border-[var(--separator)] pt-2.5 leading-relaxed text-[var(--text-2)]">
+        {p.media?.length ? <PropMediaView media={p.media} fileUrl={fileUrl} /> : null}
+        {label && (
+          <div className="whitespace-pre-line text-[12px] font-medium" title={propTitle(p)}>
+            {label}
+          </div>
+        )}
       </div>
     );
   }
 
-  return (
-    <div className="flex items-center gap-3">
-      <div className="w-44 shrink-0 truncate text-[12.5px] text-[var(--text-2)]" title={p.name}>
-        {p.text || p.name}
-        {!isDefault && (
-          <span className="ml-1 text-[var(--accent-strong)]" title={tr("已自定义")}>
-            •
-          </span>
-        )}
-      </div>
-      <div className="flex flex-1 items-center gap-2">
-        {p.ptype === "color" && (
-          <>
-            <input
-              type="color"
-              className="h-7 w-10 cursor-pointer rounded border border-[var(--separator)] bg-transparent"
-              value={rgbStrToHex(String(cur ?? "0 0 0"))}
-              onChange={(e) => {
-                const v = hexToRgbStr(e.target.value);
-                if (v !== null) onChange(p.name, v);
-              }}
-            />
-            <span className="text-[11.5px] text-[var(--text-2)]">{rgbStrToHex(String(cur ?? ""))}</span>
-          </>
-        )}
-        {p.ptype === "bool" && (
+  // bool：WE 是「左侧方框勾选 + 标签同行」的单行布局，没有通栏控件
+  if (p.ptype === "bool") {
+    return (
+      <div>
+        {p.media?.length ? <PropMediaView media={p.media} align="start" fileUrl={fileUrl} /> : null}
+        <div className="flex items-center gap-2">
           <button
-            role="switch"
+            role="checkbox"
             aria-checked={!!cur}
-            className={`relative h-[22px] w-10 rounded-full transition-colors ${
-              cur ? "bg-[var(--accent-strong)]" : "bg-[var(--separator)]"
+            className={`flex h-4 w-4 shrink-0 items-center justify-center rounded-[3px] border transition-colors ${
+              cur
+                ? "border-[var(--accent-strong)] bg-[var(--accent-strong)] text-[var(--accent-fg)]"
+                : "border-[var(--separator)] bg-[var(--card)] hover:border-[var(--accent-strong)]"
             }`}
             onClick={() => onChange(p.name, !cur)}
           >
-            <span
-              className="absolute top-0.5 h-[18px] w-[18px] rounded-full bg-[var(--content)] shadow transition-all"
-              style={{ left: cur ? 20 : 2 }}
-            />
+            {!!cur && (
+              <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M1.5 5.5l2.5 2.5 4.5-5.5" />
+              </svg>
+            )}
           </button>
-        )}
-        {p.ptype === "slider" && (
-          <SliderControl p={p} value={cur} onChange={(v) => onChange(p.name, v)} />
-        )}
-        {p.ptype === "combo" && (
-          <ComboControl p={p} cur={cur} draft={draft} controlCls={controlCls} onChange={(v) => onChange(p.name, v)} />
-        )}
-        {p.ptype === "textinput" && (
-          <input
-            type="text"
-            className={`${controlCls} w-full`}
-            value={String(cur ?? "")}
-            onChange={(e) => onChange(p.name, e.target.value)}
-          />
-        )}
-        {p.ptype === "file" && (
-          <>
-            {/* 图片类 file 属性显示缩略图（WE 编辑器就是这样：背景图/LED 背景
-                等属性在选择框旁给出当前图预览）。video/audio 没有可渲染的首帧，
-                仍只显示文件名。URL 拼不出（内容服务器未就绪）时退化为文件名。 */}
-            {isImageProp(p, cur) ? <FileThumb url={fileUrl(cur)} /> : null}
-            <span
-              className="min-w-0 flex-1 truncate text-[11.5px] text-[var(--text-2)]"
-              title={cur ? String(cur) : undefined}
-            >
-              {cur ? shortFileName(String(cur)) : tr("未设置")}
-            </span>
-            <button className="btn !py-1 !text-[11.5px]" onClick={() => void onFilePick(p)}>
-              {tr("选择文件…")}
-            </button>
-          </>
-        )}
-        {/* directory：选择本地目录，存绝对路径（WE 语义）；不进壁纸站点目录故不补前缀 */}
-        {p.ptype === "directory" && (
-          <>
-            <span
-              className="min-w-0 flex-1 truncate text-[11.5px] text-[var(--text-2)]"
-              title={cur ? String(cur) : undefined}
-            >
-              {cur ? String(cur) : tr("未设置")}
-            </span>
-            <button className="btn !py-1 !text-[11.5px]" onClick={() => void onFilePick(p)}>
-              {tr("选择目录…")}
-            </button>
-          </>
-        )}
-        {!isDefault && p.default !== null && (
-          <button
-            className="text-[11px] text-[var(--text-2)] hover:text-[var(--accent-strong)]"
-            title={tr("恢复该属性默认值")}
-            onClick={() => onChange(p.name, p.default as WebPropValues[string])}
+          <div
+            className="min-w-0 flex-1 cursor-pointer whitespace-pre-line text-[12.5px] leading-snug"
+            title={propTitle(p)}
+            onClick={() => onChange(p.name, !cur)}
           >
-            ↺
-          </button>
-        )}
+            {label}
+            {!isDefault && (
+              <span className="ml-1 text-[var(--accent-strong)]" title={tr("已自定义")}>
+                •
+              </span>
+            )}
+          </div>
+          {canReset && !isDefault && (
+            <button
+              className="shrink-0 text-[11px] text-[var(--text-2)] hover:text-[var(--accent-strong)]"
+              title={tr("恢复该属性默认值")}
+              onClick={reset}
+            >
+              ↺
+            </button>
+          )}
+        </div>
       </div>
+    );
+  }
+
+  const controls = (
+    <>
+      {p.ptype === "color" && (
+        <ColorControl value={cur} onChange={(v) => onChange(p.name, v)} />
+      )}
+      {p.ptype === "slider" && (
+        <SliderTrack p={p} value={cur} onChange={(v) => onChange(p.name, v)} />
+      )}
+      {p.ptype === "combo" && (
+        <ComboControl p={p} cur={cur} draft={draft} controlCls={controlCls} onChange={(v) => onChange(p.name, v)} />
+      )}
+      {p.ptype === "textinput" && (
+        <input
+          type="text"
+          className={controlCls}
+          value={String(cur ?? "")}
+          onChange={(e) => onChange(p.name, e.target.value)}
+        />
+      )}
+      {p.ptype === "file" && (
+        <div className="flex items-center gap-2">
+          {/* 图片类 file 属性显示缩略图（WE 编辑器就是这样：背景图/LED 背景
+              等属性在选择框旁给出当前图预览）。video/audio 没有可渲染的首帧，
+              仍只显示文件名。URL 拼不出（内容服务器未就绪）时退化为文件名。 */}
+          {isImageProp(p, cur) ? <FileThumb url={fileUrl(cur)} /> : null}
+          <span
+            className="min-w-0 flex-1 truncate text-[11.5px] text-[var(--text-2)]"
+            title={cur ? String(cur) : undefined}
+          >
+            {cur ? shortFileName(String(cur)) : tr("未设置")}
+          </span>
+          <button className="btn !py-1 !text-[11.5px]" onClick={() => void onFilePick(p)}>
+            {tr("选择文件…")}
+          </button>
+        </div>
+      )}
+      {/* directory：选择本地目录，存绝对路径（WE 语义）；不进壁纸站点目录故不补前缀 */}
+      {p.ptype === "directory" && (
+        <div className="flex items-center gap-2">
+          <span
+            className="min-w-0 flex-1 truncate text-[11.5px] text-[var(--text-2)]"
+            title={cur ? String(cur) : undefined}
+          >
+            {cur ? String(cur) : tr("未设置")}
+          </span>
+          <button className="btn !py-1 !text-[11.5px]" onClick={() => void onFilePick(p)}>
+            {tr("选择目录…")}
+          </button>
+        </div>
+      )}
+    </>
+  );
+
+  return (
+    <div>
+      {p.media?.length ? <PropMediaView media={p.media} align="start" fileUrl={fileUrl} /> : null}
+      {label ? (
+        <RowShell
+          label={label}
+          title={propTitle(p)}
+          isDefault={isDefault}
+          canReset={canReset}
+          onReset={reset}
+          // WE 把滑条当前值放在标签行右端
+          aside={
+            p.ptype === "slider" ? (
+              <SliderValueInput p={p} value={cur} onChange={(v) => onChange(p.name, v)} />
+            ) : undefined
+          }
+        >
+          {controls}
+        </RowShell>
+      ) : (
+        // 纯图属性（标签为残渣/空）：图后面直接跟控件
+        controls
+      )}
     </div>
   );
 }
 
-// ---------- slider：拖动 + 可编辑数值（精度随 step） ----------
+// ---------- group：可折叠分节（WE 语义：其后属性归属该组，直到下一个 group） ----------
 
-function SliderControl({
+function GroupSection({
+  group,
+  open,
+  onToggle,
+  fileUrl,
+  children,
+}: {
+  group: WebPropDef;
+  open: boolean;
+  onToggle: () => void;
+  fileUrl: (val: unknown) => string;
+  children: React.ReactNode;
+}) {
+  // 空 text 的组没有标签可显示（极少见；spacer 多为 text 而非 group），回退键名
+  const label = propLabel(group) || group.name;
+  return (
+    <section className="flex flex-col">
+      <button
+        type="button"
+        className="flex w-full items-center gap-1.5 border-t border-[var(--separator)] pb-0.5 pt-2.5 text-left"
+        onClick={onToggle}
+        aria-expanded={open}
+        title={propTitle(group)}
+      >
+        <svg
+          width="9"
+          height="9"
+          viewBox="0 0 10 10"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.6"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          className={`shrink-0 text-[var(--text-2)] transition-transform ${open ? "" : "-rotate-90"}`}
+        >
+          <path d="M2 3.5l3 3 3-3" />
+        </svg>
+        <span className="min-w-0 flex-1 whitespace-pre-line text-[12.5px] font-semibold text-[var(--text-1)]">
+          {label}
+        </span>
+      </button>
+      {group.media?.length ? <PropMediaView media={group.media} fileUrl={fileUrl} /> : null}
+      {open && <div className="mt-3 flex flex-col gap-3">{children}</div>}
+    </section>
+  );
+}
+
+// ---------- color：通栏色块按钮 + 行内展开的 RGB 取色器（WE 式） ----------
+
+function ColorControl({
+  value,
+  onChange,
+}: {
+  value: WebPropValues[string] | undefined;
+  onChange: (v: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const hex = rgbStrToHex(String(value ?? "0 0 0"));
+  const n = parseInt(hex.slice(1), 16);
+  const chans = [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  // 色块上的文字颜色按亮度取黑/白，保证任何底色都可读
+  const luminance = 0.299 * chans[0] + 0.587 * chans[1] + 0.114 * chans[2];
+  const onSwatch = luminance > 150 ? "text-black/70" : "text-white/90";
+
+  const setChannel = (i: number, v: number) => {
+    const next = chans.slice();
+    next[i] = v;
+    const wire = hexToRgbStr(`#${next.map((c) => c.toString(16).padStart(2, "0")).join("")}`);
+    if (wire !== null) onChange(wire);
+  };
+
+  return (
+    <div>
+      <button
+        type="button"
+        className="flex h-7 w-full items-center justify-between rounded-[4px] border border-black/20 px-2 transition-shadow hover:ring-1 hover:ring-[var(--accent-strong)]"
+        style={{ backgroundColor: hex }}
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+      >
+        <span className={`text-[11px] font-medium uppercase tracking-wide ${onSwatch}`}>{hex}</span>
+        <span className={`text-[10px] ${onSwatch} opacity-70`}>{open ? "▴" : "▾"}</span>
+      </button>
+      {open && (
+        <div className="mt-1.5 flex flex-col gap-1.5 rounded-md border border-[var(--separator)] bg-[var(--card)] p-2.5">
+          {(["R", "G", "B"] as const).map((label, i) => (
+            <div key={label} className="flex items-center gap-2">
+              <span className="w-3 shrink-0 text-[11px] text-[var(--text-2)]">{label}</span>
+              <input
+                type="range"
+                min={0}
+                max={255}
+                step={1}
+                value={chans[i]}
+                onChange={(e) => setChannel(i, Number(e.target.value))}
+                className="min-w-0 flex-1 accent-[var(--accent-strong)]"
+              />
+              <span className="w-7 shrink-0 text-right text-[11px] tabular-nums text-[var(--text-2)]">
+                {chans[i]}
+              </span>
+            </div>
+          ))}
+          <div className="flex items-center gap-2 pt-0.5">
+            <span className="w-3 shrink-0 text-[11px] text-[var(--text-2)]">#</span>
+            <HexInput
+              hex={hex}
+              onCommit={(h) => {
+                const wire = hexToRgbStr(h);
+                if (wire !== null) onChange(wire);
+              }}
+            />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** hex 输入框：失焦/回车提交，非法值由 hexToRgbStr 判 null 丢弃 */
+function HexInput({ hex, onCommit }: { hex: string; onCommit: (hex: string) => void }) {
+  const [text, setText] = useState<string | null>(null);
+  return (
+    <input
+      type="text"
+      className="w-20 rounded border border-[var(--separator)] bg-[var(--content)] px-1.5 py-0.5 text-[11.5px] uppercase focus:outline-none focus:ring-1 focus:ring-[var(--accent-strong)]"
+      value={text ?? hex}
+      onChange={(e) => setText(e.target.value)}
+      onBlur={(e) => {
+        onCommit(e.target.value);
+        setText(null);
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+        if (e.key === "Escape") setText(null);
+      }}
+    />
+  );
+}
+
+// ---------- slider：通栏轨道 + 标签行右端的可编辑数值（精度随 step） ----------
+
+/** 滑条参数：精度优先级 project.json step > precision 推导 > 缺省 0.01；
+ *  显示小数位优先取 precision（真实数据 51 处声明，如 min=-100..100 precision=1） */
+function sliderSpec(p: WebPropDef) {
+  const min = p.min ?? 0;
+  const max = p.max ?? 1;
+  const precisionStep = p.precision !== undefined ? Math.pow(10, -p.precision) : undefined;
+  const step = p.step ?? precisionStep ?? 0.01;
+  const decimals = p.precision ?? (String(step).split(".")[1] ?? "").length;
+  const clamp = (n: number) => Math.min(max, Math.max(min, n));
+  return { min, max, step, decimals, clamp };
+}
+
+function SliderTrack({
   p,
   value,
   onChange,
@@ -755,14 +1220,30 @@ function SliderControl({
   value: WebPropValues[string] | undefined;
   onChange: (v: number) => void;
 }) {
-  const min = p.min ?? 0;
-  const max = p.max ?? 1;
-  // 精度优先级：project.json step > precision 推导 > 缺省 0.01；
-  // 显示小数位优先取 precision（真实数据 51 处声明，如 min=-100..100 precision=1）
-  const precisionStep = p.precision !== undefined ? Math.pow(10, -p.precision) : undefined;
-  const step = p.step ?? precisionStep ?? 0.01;
-  const decimals = p.precision ?? (String(step).split(".")[1] ?? "").length;
-  const clamp = (n: number) => Math.min(max, Math.max(min, n));
+  const { min, max, step, clamp } = sliderSpec(p);
+  return (
+    <input
+      type="range"
+      className="w-full accent-[var(--accent-strong)]"
+      min={min}
+      max={max}
+      step={step}
+      value={clamp(Number(value ?? 0))}
+      onChange={(e) => onChange(Number(e.target.value))}
+    />
+  );
+}
+
+function SliderValueInput({
+  p,
+  value,
+  onChange,
+}: {
+  p: WebPropDef;
+  value: WebPropValues[string] | undefined;
+  onChange: (v: number) => void;
+}) {
+  const { decimals, clamp } = sliderSpec(p);
   const cur = clamp(Number(value ?? 0));
   // 编辑中的原始文本（null = 未在打字，直接显示格式化值）
   const [text, setText] = useState<string | null>(null);
@@ -774,28 +1255,17 @@ function SliderControl({
   };
 
   return (
-    <>
-      <input
-        type="range"
-        className="min-w-0 flex-1 accent-[var(--accent-strong)]"
-        min={min}
-        max={max}
-        step={step}
-        value={cur}
-        onChange={(e) => onChange(Number(e.target.value))}
-      />
-      <input
-        type="text"
-        className="w-14 rounded-md border border-[var(--separator)] bg-[var(--card)] px-1.5 py-1 text-right text-[11.5px] focus:outline-none focus:ring-1 focus:ring-[var(--accent-strong)]"
-        value={text ?? cur.toFixed(decimals)}
-        onChange={(e) => setText(e.target.value)}
-        onBlur={(e) => commit(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") (e.target as HTMLInputElement).blur();
-          if (e.key === "Escape") setText(null);
-        }}
-      />
-    </>
+    <input
+      type="text"
+      className="w-14 shrink-0 rounded-md border border-[var(--separator)] bg-[var(--card)] px-1.5 py-0.5 text-right text-[11.5px] tabular-nums focus:outline-none focus:ring-1 focus:ring-[var(--accent-strong)]"
+      value={text ?? cur.toFixed(decimals)}
+      onChange={(e) => setText(e.target.value)}
+      onBlur={(e) => commit(e.target.value)}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+        if (e.key === "Escape") setText(null);
+      }}
+    />
   );
 }
 
@@ -857,6 +1327,20 @@ const FIT_LABELS: Record<string, string> = {
   stretch: "拉伸",
 };
 const FPS_TIERS = [15, 24, 30, 45, 60, 120];
+/** 抗锯齿档位（与设置页、Rust 的 AA_CHOICES 一致，库 1.3.23+） */
+const AA_LABELS: Record<string, string> = {
+  off: "关",
+  fxaa: "FXAA",
+  msaa2: "MSAA 2x",
+  msaa4: "MSAA 4x",
+};
+/** 粒子/后处理质量档（与设置页、Rust 的 PARTICLE/POST_QUALITY_CHOICES 一致） */
+const QUALITY_LABELS: Record<string, string> = {
+  high: "高",
+  medium: "中",
+  low: "低",
+  off: "关",
+};
 
 function PlayConfigPanel({
   play,
@@ -891,7 +1375,7 @@ function PlayConfigPanel({
       <div className="flex-1 overflow-y-auto px-5 py-3">
         <div className="mb-3 text-[11.5px] leading-relaxed text-[var(--text-2)]">
           {tr(
-            "这些设置只作用于本张壁纸，切换壁纸后各自保留。选「跟随全局」则使用设置 → 通用里的值。",
+            "这些设置只作用于本张壁纸，切换壁纸后各自保留。选「跟随全局」则使用设置 → 性能里的值。",
           )}
         </div>
         <div className="flex flex-col gap-3">
@@ -967,6 +1451,78 @@ function PlayConfigPanel({
               {FPS_TIERS.map((f) => (
                 <option key={f} value={f}>
                   {f} FPS
+                </option>
+              ))}
+            </select>
+          </PlayRow>
+
+          <PlayRow
+            label={tr("抗锯齿")}
+            desc={tr("FXAA 平滑所有边缘（帧末后处理）；MSAA 只平滑几何边缘（图层/粒子）")}
+            isOverride={play.aa !== undefined}
+            onFollow={() => onChange({ aa: undefined })}
+          >
+            <select
+              className={playSelectCls}
+              value={play.aa ?? ""}
+              onChange={(e) =>
+                onChange({ aa: (e.target.value || undefined) as ItemPlayConfig["aa"] })
+              }
+            >
+              <option value="">
+                {tr("跟随全局（{v}）", { v: tr(AA_LABELS[globals.aa] ?? globals.aa) })}
+              </option>
+              {Object.entries(AA_LABELS).map(([v, label]) => (
+                <option key={v} value={v}>
+                  {tr(label)}
+                </option>
+              ))}
+            </select>
+          </PlayRow>
+
+          <PlayRow
+            label={tr("粒子")}
+            desc={tr("雨/雪/火花/雾等粒子数量；低/中档按比例缩数量与发射率，关=不渲染")}
+            isOverride={play.particles !== undefined}
+            onFollow={() => onChange({ particles: undefined })}
+          >
+            <select
+              className={playSelectCls}
+              value={play.particles ?? ""}
+              onChange={(e) =>
+                onChange({ particles: (e.target.value || undefined) as ItemPlayConfig["particles"] })
+              }
+            >
+              <option value="">
+                {tr("跟随全局（{v}）", { v: tr(QUALITY_LABELS[globals.particles] ?? globals.particles) })}
+              </option>
+              {Object.entries(QUALITY_LABELS).map(([v, label]) => (
+                <option key={v} value={v}>
+                  {tr(label)}
+                </option>
+              ))}
+            </select>
+          </PlayRow>
+
+          <PlayRow
+            label={tr("后处理")}
+            desc={tr("辉光/模糊/水波等画面效果；低/中档压效果链分辨率，关=效果链直通")}
+            isOverride={play.postProcessing !== undefined}
+            onFollow={() => onChange({ postProcessing: undefined })}
+          >
+            <select
+              className={playSelectCls}
+              value={play.postProcessing ?? ""}
+              onChange={(e) =>
+                onChange({ postProcessing: (e.target.value || undefined) as ItemPlayConfig["postProcessing"] })
+              }
+            >
+              <option value="">
+                {tr("跟随全局（{v}）", { v: tr(QUALITY_LABELS[globals.postProcessing] ?? globals.postProcessing) })}
+              </option>
+              {Object.entries(QUALITY_LABELS).map(([v, label]) => (
+                <option key={v} value={v}>
+                  {tr(label)}
                 </option>
               ))}
             </select>
