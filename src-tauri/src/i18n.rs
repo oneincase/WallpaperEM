@@ -77,6 +77,7 @@ fn en(zh: &str) -> Option<&'static str> {
         "缩放" => "Fit",
         "拉伸" => "Stretch",
         "清晰度" => "Quality",
+        "自动" => "Auto",
         "省电" => "Battery Saver",
         "标准" => "Standard",
         "高清" => "High",

@@ -254,6 +254,8 @@ pub fn run() {
             workshop_upload::workshop_upload_start,
             #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
             workshop_upload::workshop_upload_status,
+            #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
+            workshop_upload::workshop_web_upload_prepare,
             i18n::app_set_locale,
             commands::app_info,
             commands::db_status,
@@ -321,6 +323,8 @@ pub fn run() {
             library::library_import_custom,
             library::library_import_custom_pick,
             library::library_import_folder_pick,
+            library::library_pick_folders,
+            library::library_link_folders,
             library::library_import_custom_batch,
             library::item_props,
             library::item_title,
@@ -452,7 +456,13 @@ const FIT_ITEMS: &[(&str, &str)] = &[
     ("contain", "缩放"),
     ("stretch", "拉伸"),
 ];
-const DPR_ITEMS: &[(&str, &str)] = &[("0.8", "省电"), ("1", "标准"), ("2", "高清")];
+// 相对设备像素比倍率：0 自动（=设备 DPR）/ 0.75 省电 / 0.85 标准 / 1 高清（=原生）
+const DPR_ITEMS: &[(&str, &str)] = &[
+    ("0", "自动"),
+    ("0.75", "省电"),
+    ("0.85", "标准"),
+    ("1", "高清"),
+];
 const FPS_ITEMS: &[(&str, &str)] = &[
     ("15", "15 FPS"),
     ("24", "24 FPS"),
@@ -554,7 +564,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<TrayMenu> {
 
     // 全局快速设置：与设置页同一份持久化（settings 表），初始勾选读当前值
     let cur_fit = tray_read_setting(app, "wallpaper_fit", "cover");
-    let cur_dpr = tray_read_setting(app, "wallpaper_render_dpr", "1");
+    let cur_dpr = tray_read_setting(app, "wallpaper_render_dpr", "0");
     let cur_fps = tray_read_setting(app, "wallpaper_scene_fps", "24");
     let cur_filter = tray_read_setting(app, "wallpaper_filter", wallpaper::DEFAULT_FILTER);
     let cur_auto_pause = tray_read_setting(app, "wallpaper_auto_pause", "false");

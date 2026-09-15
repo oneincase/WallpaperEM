@@ -335,6 +335,7 @@ export const EN_US: Record<string, string> = {
   "选择目录…": "Choose folder…",
   "恢复该属性默认值": "Reset this property to its default",
   "{v}（当前值不在可选范围）": "{v} (current value is out of range)",
+  "自动": "Auto",
   "省电": "Battery saver",
   "标准": "Standard",
   "高清": "High",
@@ -524,6 +525,8 @@ export const EN_US: Record<string, string> = {
     "Stretch to fill, ignoring the aspect ratio (distorts; legacy behaviour)",
   "裁剪": "Crop",
   "缩放": "Fit",
+  "自动=跟随屏幕像素比（Retina 原生清晰，默认）；高清=100% 像素比；标准/省电逐级降低分辨率以省显存。宿主窗口像素比异常时自动档也能识别":
+    "Auto = follow the screen pixel ratio (native-sharp on Retina, default); High = 100% pixel ratio; Standard/Battery saver progressively lower resolution to save VRAM. Auto also handles hosts that report an abnormal pixel ratio",
   "越高越清晰，显存占用也越高。实际生效值不超过屏幕像素比。默认高清":
     "Higher is sharper but uses more VRAM. The effective value never exceeds the screen pixel ratio. Default: High",
   "15 FPS：最省电": "15 FPS: most power-efficient",

@@ -41,9 +41,10 @@ export function SettingsPage() {
   // 全局壁纸显示模式（cover/contain/stretch），默认 cover 等比铺满裁切
   const [fit, setFit] = useState<"cover" | "contain" | "stretch">("cover");
   const [fitMsg, setFitMsg] = useState("");
-  // 全局清晰度（有效 dpr 封顶，越低越省内存）。三档 0.8 / 1 / 2，
-  // 默认 2 高清（与 Rust DEFAULT_RENDER_DPR 一致）
-  const [renderDpr, setRenderDpr] = useState<number>(2);
+  // 全局清晰度（相对设备像素比的倍率）。四档：0 自动（=设备 DPR）/
+  // 0.75 省电 / 0.85 标准 / 1 高清（=原生），默认 0 自动（与 Rust
+  // DEFAULT_RENDER_DPR 一致）。renderer 会乘 devicePixelRatio 换算成绝对 DPR。
+  const [renderDpr, setRenderDpr] = useState<number>(0);
   const [renderDprMsg, setRenderDprMsg] = useState("");
   // 全局场景帧率上限（15/24/30/45/60/120，越低 GPU 占用越低），默认 24
   const [sceneFps, setSceneFps] = useState<number>(24);
@@ -120,7 +121,11 @@ export function SettingsPage() {
       .then((v) => setFit((v as "cover" | "contain" | "stretch") || "cover"))
       .catch(() => { });
     invoke<string | null>("settings_get", { key: "wallpaper_render_dpr" })
-      .then((v) => setRenderDpr(Number(v) || 1))
+      // 未设置/非法值回落到 0（自动）
+      .then((v) => {
+        const n = Number(v);
+        setRenderDpr(Number.isFinite(n) && n >= 0 ? n : 0);
+      })
       .catch(() => { });
     invoke<string | null>("settings_get", { key: "wallpaper_scene_fps" })
       .then((v) => setSceneFps(Number(v) || 24))
@@ -957,7 +962,7 @@ export function SettingsPage() {
               />
               <Row
                 label={tr("清晰度")}
-                desc={tr("越高越清晰，显存占用也越高。实际生效值不超过屏幕像素比。默认高清")}
+                desc={tr("自动=跟随屏幕像素比（Retina 原生清晰，默认）；高清=100% 像素比；标准/省电逐级降低分辨率以省显存。宿主窗口像素比异常时自动档也能识别")}
                 control={
                   <div className="flex items-center gap-2">
                     <select
@@ -965,9 +970,10 @@ export function SettingsPage() {
                       onChange={(e) => changeRenderDpr(Number(e.target.value))}
                       className="rounded-lg border border-[var(--separator)] bg-[var(--content)] px-2 py-1 text-[12.5px] outline-none focus:border-[var(--accent-strong)]"
                     >
-                      <option value={0.8}>{tr("省电")}</option>
-                      <option value={1}>{tr("标准")}</option>
-                      <option value={2}>{tr("高清")}</option>
+                      <option value={0}>{tr("自动")}</option>
+                      <option value={0.75}>{tr("省电")}</option>
+                      <option value={0.85}>{tr("标准")}</option>
+                      <option value={1}>{tr("高清")}</option>
                     </select>
                     {renderDprMsg && <span className="text-[12px] text-red-500">{renderDprMsg}</span>}
                   </div>

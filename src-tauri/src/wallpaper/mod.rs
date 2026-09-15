@@ -26,16 +26,17 @@ use tauri_plugin_desktop_underlay::DesktopUnderlayExt;
 use crate::content_server::ContentServerState;
 
 pub const DEFAULT_FIT: &str = "cover";
-/// 清晰度（有效 devicePixelRatio 的封顶）：越低越省内存（GPU 画布/纹理）。
-/// 三档：0.8 省电 / 1 标准 / 2 高清。
+/// 清晰度（相对设备 devicePixelRatio 的倍率）：越低越省内存（GPU 画布/纹理）。
+/// 四档：0 自动（=设备 DPR，Retina 原生）/ 0.75 省电 / 0.85 标准 / 1 高清（=原生）。
 ///
-/// 上限 2.0 而非更高：实际生效值是 `min(window.devicePixelRatio, cap)`，
-/// 而 Retina 的 dpr 就是 2 —— 更高的档位在任何 Mac 上都会被压到 2，只会让
-/// 下拉框多出"选了没变化"的空档位（此前 3x/4x/5x 就是这个问题）。
-/// 缩放模式下 WebKit 自己把 dpr 报成 1，也不需要更高的 cap 去补。
-pub const RENDER_DPR_MIN: f32 = 0.8;
-pub const RENDER_DPR_MAX: f32 = 2.0;
-pub const DEFAULT_RENDER_DPR: f32 = 2.0;
+/// 这里存的是**相对倍率**，壁纸页 renderer 收到后乘 `devicePixelRatio` 换算成
+/// webwallgl 库使用的绝对 DPR（库 1.3.22+：0=自动，正数=目标 DPR，可高于设备上报值，
+/// 解决宿主 WKWebView 把 devicePixelRatio 报成 1 时高清档被钉在逻辑像素的问题）。
+/// 值域 [0,1]：倍率超过 1 只会超采样、无清晰度收益且费显存，故封顶 1。
+pub const RENDER_DPR_MIN: f32 = 0.0;
+pub const RENDER_DPR_MAX: f32 = 1.0;
+/// 0 = 自动（跟随设备像素比，默认）。
+pub const DEFAULT_RENDER_DPR: f32 = 0.0;
 /// 场景壁纸帧率上限（帧/秒）：越低 GPU 占用越低。
 /// 可选 15 / 24 / 30 / 45 / 60 / 120，默认 24（低功耗，多数场景 24fps 观感足够）。
 pub const DEFAULT_SCENE_FPS: u32 = 24;

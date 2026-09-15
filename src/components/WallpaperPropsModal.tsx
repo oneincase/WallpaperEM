@@ -842,11 +842,12 @@ function ComboControl({
 
 // ---------- 播放设置分区（每壁纸覆盖，未设置则跟随全局） ----------
 
-/** 清晰度档位：与设置页、Rust 的 RENDER_DPR_MIN/MAX 保持一致 */
+/** 清晰度档位：与设置页、Rust 的 RENDER_DPR 常量保持一致（相对设备像素比倍率，0=自动） */
 const DPR_TIERS: Array<{ v: number; label: string }> = [
-  { v: 0.8, label: "省电" },
-  { v: 1, label: "标准" },
-  { v: 2, label: "高清" },
+  { v: 0, label: "自动" },
+  { v: 0.75, label: "省电" },
+  { v: 0.85, label: "标准" },
+  { v: 1, label: "高清" },
 ];
 const FIT_LABELS: Record<string, string> = {
   // 与设置页、托盘菜单同一套说法（cover/contain/stretch → 裁剪/缩放/拉伸），

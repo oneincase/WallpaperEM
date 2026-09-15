@@ -157,6 +157,61 @@ fn migrate(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
         conn.pragma_update(None, "user_version", 7)?;
         tracing::info!("db migrated to version 7（引用模式 source_path + publishedfileid）");
     }
+    if v < 8 {
+        // v8：清晰度从「绝对 DPR 三档（0.8/1/2）」改为「相对设备像素比倍率四档」：
+        //   0 自动（=设备 DPR，新默认）/ 0.75 省电 / 0.85 标准 / 1 高清（=原生）。
+        // 旧值是绝对 DPR（语义受 min(devicePixelRatio, cap) 约束），按观感就近映射：
+        //   2（旧高清，Retina 上=2x）→ 1（新高清=1×设备，Retina 同为 2x，观感一致）
+        //   1（旧标准）             → 0.85（新标准）
+        //   ≤0.9（旧省电 0.8 等）   → 0.75（新省电）
+        // renderer 收到倍率后乘 devicePixelRatio 换算成库的绝对 DPR。
+        fn map_dpr(raw: f64) -> f64 {
+            if raw <= 0.9 {
+                0.75
+            } else if raw <= 1.5 {
+                0.85
+            } else {
+                1.0
+            }
+        }
+        if let Some(raw) = get_setting(conn, "wallpaper_render_dpr")
+            .as_deref()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+        {
+            let mapped = map_dpr(raw);
+            set_setting(conn, "wallpaper_render_dpr", &mapped.to_string())?;
+            tracing::info!("db v8：全局清晰度（绝对 DPR {raw}）→ 相对倍率 {mapped}");
+        }
+        // 每壁纸覆盖（play_cfg:* 的 renderDpr）同样映射
+        let mut fixed = 0usize;
+        {
+            let rows: Vec<(String, String)> = conn
+                .prepare("SELECT key, value FROM settings WHERE key LIKE 'play_cfg:%'")?
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect();
+            for (k, val) in rows {
+                let Ok(mut j) = serde_json::from_str::<serde_json::Value>(&val) else {
+                    continue;
+                };
+                let Some(d) = j.get("renderDpr").and_then(|x| x.as_f64()) else {
+                    continue;
+                };
+                let mapped = map_dpr(d);
+                if (d - mapped).abs() < 1e-9 {
+                    continue;
+                }
+                j["renderDpr"] = serde_json::json!(mapped);
+                conn.execute(
+                    "UPDATE settings SET value = ?2 WHERE key = ?1",
+                    rusqlite::params![k, j.to_string()],
+                )?;
+                fixed += 1;
+            }
+        }
+        conn.pragma_update(None, "user_version", 8)?;
+        tracing::info!("db migrated to version 8（清晰度改相对倍率四档，修正 {fixed} 条壁纸覆盖）");
+    }
     Ok(())
 }
 
@@ -323,6 +378,7 @@ mod tests {
         let c = v4_db();
         migrate(&c).unwrap();
 
+        // v8 把绝对 DPR 三档再映射成相对倍率四档：旧 2（高清）→ 1（新高清）
         let v: String = c
             .query_row(
                 "SELECT value FROM settings WHERE key='wallpaper_render_dpr'",
@@ -330,10 +386,9 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        // 旧 5（高清档 3/4/5 之一）就近归到 2，不能留着让下拉框找不到对应项
-        assert_eq!(v, "2");
+        assert_eq!(v, "1");
 
-        // 每壁纸覆盖里的 renderDpr 也要一起迁移
+        // 每壁纸覆盖里的 renderDpr 也一路迁移到相对倍率（旧 2 → 1）
         let cfg: String = c
             .query_row(
                 "SELECT value FROM settings WHERE key='play_cfg:999'",
@@ -341,13 +396,49 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(cfg.contains("\"renderDpr\":2"), "cfg 未迁移: {cfg}");
+        assert!(cfg.contains("\"renderDpr\":1"), "cfg 未迁移: {cfg}");
 
         let ver: i64 = c
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        // 版本号是链式的：v4 的库跑一次 migrate() 会一路升到当前最新
-        assert_eq!(ver, 7);
+        // 版本号是链式的：v4 的库跑一次 migrate() 会一路升到当前最新（v8）
+        assert_eq!(ver, 8);
+    }
+
+    #[test]
+    fn v8_maps_absolute_dpr_to_relative_multipliers() {
+        // 旧绝对 DPR（v5 三档：0.8/1/2）→ 新相对倍率（0.75/0.85/1）
+        let map = |raw: f64| -> f64 {
+            if raw <= 0.9 {
+                0.75
+            } else if raw <= 1.5 {
+                0.85
+            } else {
+                1.0
+            }
+        };
+        assert_eq!(map(0.8), 0.75); // 旧省电 → 新省电
+        assert_eq!(map(1.0), 0.85); // 旧标准 → 新标准
+        assert_eq!(map(2.0), 1.0); // 旧高清（Retina 上=2x）→ 新高清（1×设备=2x）
+
+        // 已是相对倍率的库（v7）迁移到 v8 后，三档历史值（0.8/1/2）会被映射；
+        // 自动档 0 是 v8 新引入，旧库不可能存，无需保持。
+        for (existing, expected) in [(0.8_f64, 0.75), (1.0, 0.85), (2.0, 1.0)] {
+            let c = Connection::open_in_memory().unwrap();
+            c.execute_batch(include_str!("schema.sql")).unwrap();
+            set_setting(&c, "wallpaper_render_dpr", &existing.to_string()).unwrap();
+            // 钉到 7，migrate 只跑 v8
+            c.pragma_update(None, "user_version", 7).unwrap();
+            migrate(&c).unwrap();
+            let v: String = c
+                .query_row(
+                    "SELECT value FROM settings WHERE key='wallpaper_render_dpr'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!((v.parse::<f64>().unwrap() - expected).abs() < 1e-9, "existing={existing}");
+        }
     }
 
     #[test]

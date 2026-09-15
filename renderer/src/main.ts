@@ -25,7 +25,12 @@ type WallpaperConfig = {
   type: "canvas" | "video" | "gif" | "web" | "scene" | "image";
   src?: string;
   fit?: WallpaperFit;
-  /** 渲染分辨率上限（有效 devicePixelRatio 封顶），越低越省内存；默认 1 */
+  /**
+   * 渲染分辨率**相对倍率**：0=自动（跟随设备 devicePixelRatio，Retina 原生）；
+   * 0.75=省电 / 0.85=标准 / 1=高清（=设备像素比，原生清晰）。
+   * 注意这是相对设备 DPR 的倍率，传给 webwallgl 库前经 toAbsoluteDpr 换算成
+   * 库使用的绝对 DPR（库 1.3.22+：0=自动，正数=目标 DPR，可高于设备上报值）。
+   */
   renderDpr?: number;
   /** 场景壁纸帧率上限（24/30/45/60/120），越低 GPU 占用越低；默认 24 */
   sceneFps?: number;
@@ -44,6 +49,24 @@ function normalizeFit(fit?: WallpaperFit): "cover" | "contain" | "stretch" {
   if (fit === "fill") return "cover"; // 旧默认"填充"曾是拉伸 → 修复为等比裁切
   return fit === "contain" || fit === "stretch" ? fit : "cover";
 }
+
+/**
+ * 把设置里的**相对倍率**（0=自动 / 0.75 省电 / 0.85 标准 / 1 高清=原生）
+ * 换算成 webwallgl 库使用的**绝对 DPR**：
+ *   - 0（自动）→ **直接在渲染层解析成设备 devicePixelRatio**，不把 0 透传给库。
+ *     原因：旧版库的 effectiveDpr 是 min(devicePixelRatio, renderDpr)，把 0 传
+ *     进去会得到 0 → canvas backing 恒为 1×1 → 永久黑屏（「自动」档的回归）；
+ *     解析成正数后新旧库行为一致（自动=原生）。
+ *   - 正数 → 倍率 × 设备 DPR。高清 1.0 在 Retina（DPR 2）上即 2，达物理原生。
+ * 旧版本存的是绝对 DPR（如 2），无法与新的「倍率 1」区分——统一在 Rust 侧
+ * 迁移，这里只认相对倍率。
+ */
+function toAbsoluteDpr(relative?: number): number {
+  const device = window.devicePixelRatio || 1;
+  if (relative === undefined || relative === null || relative <= 0) return device; // 自动=设备 DPR
+  return Math.max(0.25, relative * device);
+}
+
 
 // ---- 全局滤镜（对齐上游独立测试台的实现）----
 //
@@ -768,7 +791,7 @@ function mountViaLib(cfg: WallpaperConfig) {
       const mountOpts: Parameters<typeof mountLib>[1] = {
         source,
         fit: normalizeFit(cfg.fit),
-        renderDpr: cfg.renderDpr ?? 1,
+        renderDpr: toAbsoluteDpr(cfg.renderDpr ?? 0),
         fps: cfg.sceneFps ?? 24,
         volume: cfg.muted === false ? 1 : 0,
         // 场景壁纸的初始属性（project.json 值，含全局语言）
@@ -846,7 +869,8 @@ function startCanvasLoop() {
   const c = state.canvas;
   const ctx = state.ctx;
   if (!c || !ctx) return;
-  const dpr = Math.min(window.devicePixelRatio || 1, state.cfg.renderDpr || 1);
+  // 相对倍率 → 绝对 DPR（与库渲染路径同一换算）
+  const dpr = toAbsoluteDpr(state.cfg.renderDpr ?? 0) || (window.devicePixelRatio || 1);
   const resize = () => {
     c.width = Math.max(1, Math.round(innerWidth * dpr));
     c.height = Math.max(1, Math.round(innerHeight * dpr));
@@ -986,12 +1010,13 @@ window.__wp = {
     }
     if (state.cfg) mount(state.cfg);
   },
-  // 动态调整渲染分辨率上限
+  // 动态调整渲染分辨率（入参是相对倍率：0 自动 / 0.75 / 0.85 / 1 高清）
   setRenderDpr(dpr: number) {
     state.cfg.renderDpr = dpr;
-    // 库内部重挂载，不重新下载解析（source.key 命中缓存）
+    // 换算成库的绝对 DPR；库内部重挂载，不重新下载解析（source.key 命中缓存）
+    const absolute = toAbsoluteDpr(dpr);
     if (state.inst) {
-      state.inst.setRenderDpr(dpr);
+      state.inst.setRenderDpr(absolute);
       if (state.paused) state.inst.pause();
       return;
     }
@@ -1051,7 +1076,8 @@ const initialCfg: WallpaperConfig = {
   type: (params.get("type") as WallpaperConfig["type"]) ?? "canvas",
   src: params.get("src") ?? undefined,
   fit: (params.get("fit") as WallpaperConfig["fit"]) ?? "cover",
-  renderDpr: Number(params.get("renderDpr")) || 2,
+  // query 未带 renderDpr 时为 0（自动跟随设备 DPR）；query 值是相对倍率
+  renderDpr: Number(params.get("renderDpr")) || 0,
   sceneFps: Number(params.get("sceneFps")) || 24,
   filter: params.get("filter") ?? undefined,
   muted: params.get("muted") !== "false",
