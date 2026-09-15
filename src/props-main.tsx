@@ -10,11 +10,14 @@ import { WallpaperPropsPanel } from "./components/WallpaperPropsModal";
 import { api } from "./api/steam";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { pushLocaleToBackend, tr, useLocale } from "./lib/i18n";
+import { useGlobalTheme } from "./lib/theme";
 import "./index.css";
 
 function PropsWindow() {
   // 独立窗口也要订阅语言：切换后标题与文案跟着变（窗口标题由 Rust 设，见下）
   useLocale();
+  // 跟随主窗口设置的全局主题（localStorage 跨 WebView 共享 + storage 事件同步）
+  useGlobalTheme();
   const [itemId] = useState(() => new URLSearchParams(location.search).get("item") ?? "");
   const [title, setTitle] = useState(itemId);
 

@@ -23,11 +23,10 @@ import { applySidebarAlpha, getSidebarAlpha } from "./lib/sidebar";
 import { GuardDialogs } from "./components/GuardDialogs";
 import { readState, writeState } from "./lib/cache-snapshots";
 import { applyDocumentLang, pushLocaleToBackend, tr, useLocale } from "./lib/i18n";
+import { applyTheme, readStoredTheme, THEME_STORAGE_KEY, type Theme } from "./lib/theme";
 
 type PageId = "home" | "workshop" | "downloads" | "library" | "favorites" | "settings";
-type Theme = "system" | "light" | "dark";
 
-const THEME_STORAGE_KEY = "we.theme";
 const PAGE_STORAGE_KEY = "nav.page";
 
 const NAV: { id: PageId; label: string; icon: ReactNode; group: string }[] = [
@@ -47,16 +46,6 @@ function readInitialCollapsed(): boolean {
   } catch {
     return false;
   }
-}
-
-function readInitialTheme(): Theme {
-  try {
-    const t = localStorage.getItem(THEME_STORAGE_KEY);
-    if (t === "light" || t === "dark" || t === "system") return t;
-  } catch {
-    /* ignore */
-  }
-  return "system";
 }
 
 /**
@@ -93,15 +82,10 @@ function Shell() {
   }));
 
   // 主题：system / light / dark，默认跟随系统；应用到 <html data-theme>
-  const [theme, setTheme] = useState<Theme>(readInitialTheme);
+  const [theme, setTheme] = useState<Theme>(readStoredTheme);
 
   useEffect(() => {
-    const root = document.documentElement;
-    if (theme === "system") {
-      root.removeAttribute("data-theme");
-    } else {
-      root.setAttribute("data-theme", theme);
-    }
+    applyTheme(theme);
     try {
       localStorage.setItem(THEME_STORAGE_KEY, theme);
     } catch {

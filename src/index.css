@@ -196,6 +196,21 @@ body {
   box-shadow: var(--shadow);
 }
 
+/* 卡片抽屉标题：最多两行，超出省略。
+   不直接用 Tailwind 的 line-clamp-2 —— 它只给 -webkit-line-clamp，截断高度完全
+   依赖 WebKit 对「悬浮抽屉 transform 动画 + 虚拟列表重挂」时的行数测量；实测在
+   WKWebView 里这类合成上下文切换会让 -webkit-box 偶发按未截断高度排版，长标题
+   被截成两行后下面仍露出第三行的空白。这里在 line-clamp 之外再加一个与两行行高
+   严格相等的 max-height 硬封顶（font-size 12.5 × leading 1.375 × 2 = 2.75em）：
+   一行标题仍只占一行，两行封顶，任何测量异常都不可能再露出第三行空行。 */
+.card-title-clamp {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  max-height: 2.75em;
+}
+
 /* CSS tooltip（Tauri WebView 不渲染原生 title 提示，用 data-tip 伪元素实现）
    用法：在元素上加 data-tip="提示文字"，并保证元素有 position: relative（或包一层 relative） */
 [data-tip] {

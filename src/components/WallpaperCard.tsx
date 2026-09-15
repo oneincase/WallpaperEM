@@ -2,7 +2,7 @@
 // 预览图为 1:1，object-cover 充满整卡；详情/操作容器是「向上抽屉」——
 // 悬浮在卡片上时从底边滑出覆盖在图片上方，鼠标移出自动滑回隐藏。
 import type { ReactNode, SyntheticEvent } from "react";
-import { formatCount } from "../lib/format";
+import { formatBytes, formatCount } from "../lib/format";
 import { tr } from "../lib/i18n";
 
 export function WallpaperCard({
@@ -93,10 +93,11 @@ export function WallpaperCard({
             {/* 截断落在外层按钮里的 span 上，而不是按钮自己：
                 ① -webkit-line-clamp 要求 display:-webkit-box，而 <button> 在
                    WebKit 里会把内容包进匿名块，clamp 不保证生效；
-                ② 构建产物里 .block 排在 .line-clamp-* 之后，元素上多挂一个
-                   display 类就会把 -webkit-box 覆盖掉、截断被静默取消。
-                所以：给 span 只挂 line-clamp-2，别再加 display 工具类 */}
-            <span className="line-clamp-2">{title}</span>
+                ② 不用 Tailwind 的 line-clamp-2 工具类：它只给 -webkit-line-clamp，
+                   悬浮抽屉动画/虚拟列表重挂时 WebKit 偶发按未截断高度排版，两行
+                   之下会露出第三行空行。改用 index.css 里带 max-height 硬封顶的
+                   .card-title-clamp（见该类注释），span 上别再叠加 display 工具类 */}
+            <span className="card-title-clamp">{title}</span>
           </button>
           {(metaLeft || metaRight) && (
             <div className="mt-1.5 flex items-center justify-between gap-2">
@@ -142,6 +143,32 @@ export function CoverCountBadge({ count }: { count: number }) {
         <path d="M4.4 17.2v1.4a2 2 0 0 0 2 2h11.2a2 2 0 0 0 2-2v-1.4" />
       </svg>
       {formatCount(count)}
+    </span>
+  );
+}
+
+/**
+ * 卡片封面右上角的文件大小徽标（本地库用）—— 与 CoverCountBadge 同一观感。
+ * 常驻显示，不走悬浮抽屉。
+ */
+export function CoverSizeBadge({ bytes }: { bytes: number }) {
+  return (
+    <span className="flex items-center gap-1 rounded bg-black/55 px-1.5 py-0.5 text-[9.5px] font-semibold text-white backdrop-blur-sm">
+      <svg
+        width="9"
+        height="9"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth={2.6}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        <ellipse cx="12" cy="5.6" rx="7.4" ry="2.8" />
+        <path d="M4.6 5.6v6.2c0 1.55 3.31 2.8 7.4 2.8s7.4-1.25 7.4-2.8V5.6" />
+        <path d="M4.6 11.8v6.2c0 1.55 3.31 2.8 7.4 2.8s7.4-1.25 7.4-2.8v-6.2" />
+      </svg>
+      {formatBytes(bytes)}
     </span>
   );
 }
