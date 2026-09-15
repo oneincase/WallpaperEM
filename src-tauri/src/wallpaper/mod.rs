@@ -43,6 +43,18 @@ pub const DEFAULT_SCENE_FPS: u32 = 24;
 /// 允许的全局帧率档位（托盘、设置页、`wallpaper_set_scene_fps` 共用同一份白名单）
 pub const SCENE_FPS_CHOICES: [u32; 6] = [15, 24, 30, 45, 60, 120];
 
+/// 抗锯齿模式（webwallgl 库 1.3.23+）：off 默认（=库旧行为）/ fxaa 帧末后处理
+/// （全画面边缘）/ msaa2 / msaa4 多重采样（只平滑几何边缘）。
+pub const DEFAULT_AA: &str = "off";
+pub const AA_CHOICES: [&str; 4] = ["off", "fxaa", "msaa2", "msaa4"];
+/// 粒子质量档：high 默认 / medium / low（按倍率同缩数量上限与发射率）/ off（不渲染不推进）。
+pub const DEFAULT_PARTICLES: &str = "high";
+pub const PARTICLE_QUALITY_CHOICES: [&str; 4] = ["off", "low", "medium", "high"];
+/// 后处理质量档：high 默认 / medium / low（压效果链 FBO 分辨率）/ off
+/// （效果链直通 + 跳整屏后期层 + 关 Bloom）。
+pub const DEFAULT_POST: &str = "high";
+pub const POST_QUALITY_CHOICES: [&str; 4] = ["off", "low", "medium", "high"];
+
 /// 全局滤镜（帧率上限下面的那组）。**id 白名单本身就是契约**：
 /// 托盘菜单、设置项、URL query、`__wp.setFilter` 传的都只是这份 id，
 /// CSS filter 表达式只存在于渲染器里 —— 不让任意字符串流进 `style.filter`
@@ -80,6 +92,15 @@ fn default_scene_fps() -> u32 {
 }
 fn default_filter() -> String {
     DEFAULT_FILTER.into()
+}
+fn default_aa() -> String {
+    DEFAULT_AA.into()
+}
+fn default_particles() -> String {
+    DEFAULT_PARTICLES.into()
+}
+fn default_post() -> String {
+    DEFAULT_POST.into()
 }
 
 /// 全局壁纸显示模式（覆盖到每次应用/恢复），非法值回退到默认 cover。
@@ -131,6 +152,33 @@ pub(crate) fn global_filter(conn: Option<&Connection>) -> String {
     }
 }
 
+/// 全局抗锯齿模式（读设置 `wallpaper_aa`），白名单外回退默认 off。
+fn global_aa(conn: Option<&Connection>) -> String {
+    let raw = conn.and_then(|c| db::get_setting(c, "wallpaper_aa"));
+    match raw.as_deref() {
+        Some(v) if AA_CHOICES.contains(&v) => v.to_string(),
+        _ => DEFAULT_AA.into(),
+    }
+}
+
+/// 全局粒子质量档（读设置 `wallpaper_particles`），白名单外回退默认 high。
+fn global_particles(conn: Option<&Connection>) -> String {
+    let raw = conn.and_then(|c| db::get_setting(c, "wallpaper_particles"));
+    match raw.as_deref() {
+        Some(v) if PARTICLE_QUALITY_CHOICES.contains(&v) => v.to_string(),
+        _ => DEFAULT_PARTICLES.into(),
+    }
+}
+
+/// 全局后处理质量档（读设置 `wallpaper_post`），白名单外回退默认 high。
+fn global_post(conn: Option<&Connection>) -> String {
+    let raw = conn.and_then(|c| db::get_setting(c, "wallpaper_post"));
+    match raw.as_deref() {
+        Some(v) if POST_QUALITY_CHOICES.contains(&v) => v.to_string(),
+        _ => DEFAULT_POST.into(),
+    }
+}
+
 // ---------- 每壁纸播放设置（对标 WE 的「壁纸配置」）----------
 //
 // WE 的播放设置是**按壁纸记忆**的：A 壁纸调过音量，切到 B 再切回 A 仍是那个音量。
@@ -162,6 +210,15 @@ pub struct ItemPlayConfig {
     /// 音量 0..1（0 即静音）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume: Option<f32>,
+    /// 抗锯齿（off/fxaa/msaa2/msaa4，库 1.3.23+）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aa: Option<String>,
+    /// 粒子质量（off/low/medium/high，库 1.3.23+）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub particles: Option<String>,
+    /// 后处理质量（off/low/medium/high，库 1.3.23+）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_processing: Option<String>,
 }
 
 fn play_cfg_key(item_id: &str) -> String {
@@ -182,8 +239,13 @@ fn set_item_play_config(
     v: &ItemPlayConfig,
 ) -> Result<(), String> {
     let key = play_cfg_key(item_id);
-    let empty =
-        v.fit.is_none() && v.render_dpr.is_none() && v.scene_fps.is_none() && v.volume.is_none();
+    let empty = v.fit.is_none()
+        && v.render_dpr.is_none()
+        && v.scene_fps.is_none()
+        && v.volume.is_none()
+        && v.aa.is_none()
+        && v.particles.is_none()
+        && v.post_processing.is_none();
     if empty {
         // 留一个空 JSON 会让「跟随全局」和「曾经改过又还原」在 DB 里长得不一样，
         // 后续想按 key 存在性做统计就会错；直接删干净
@@ -210,6 +272,9 @@ fn apply_play_config(app: &AppHandle, cfg: &mut WallpaperConfig, item_id: Option
         cfg.render_dpr = DEFAULT_RENDER_DPR;
         cfg.scene_fps = DEFAULT_SCENE_FPS;
         cfg.filter = DEFAULT_FILTER.into();
+        cfg.aa = DEFAULT_AA.into();
+        cfg.particles = DEFAULT_PARTICLES.into();
+        cfg.post_processing = DEFAULT_POST.into();
         return;
     };
     let Ok(conn) = state.lock() else {
@@ -217,6 +282,9 @@ fn apply_play_config(app: &AppHandle, cfg: &mut WallpaperConfig, item_id: Option
         cfg.render_dpr = DEFAULT_RENDER_DPR;
         cfg.scene_fps = DEFAULT_SCENE_FPS;
         cfg.filter = DEFAULT_FILTER.into();
+        cfg.aa = DEFAULT_AA.into();
+        cfg.particles = DEFAULT_PARTICLES.into();
+        cfg.post_processing = DEFAULT_POST.into();
         return;
     };
     // 先铺全局
@@ -224,6 +292,9 @@ fn apply_play_config(app: &AppHandle, cfg: &mut WallpaperConfig, item_id: Option
     cfg.render_dpr = global_render_dpr(Some(&conn));
     cfg.scene_fps = global_scene_fps(Some(&conn));
     cfg.filter = global_filter(Some(&conn));
+    cfg.aa = global_aa(Some(&conn));
+    cfg.particles = global_particles(Some(&conn));
+    cfg.post_processing = global_post(Some(&conn));
     // 再叠本壁纸覆盖
     if let Some(id) = item_id {
         let ov = item_play_config(&conn, id);
@@ -244,6 +315,21 @@ fn apply_play_config(app: &AppHandle, cfg: &mut WallpaperConfig, item_id: Option
             // muted 是 renderer 侧的开关；音量 0 即静音，非 0 则取消静音
             cfg.muted = v <= 0.0;
         }
+        if let Some(v) = ov.aa.as_deref() {
+            if AA_CHOICES.contains(&v) {
+                cfg.aa = v.to_string();
+            }
+        }
+        if let Some(v) = ov.particles.as_deref() {
+            if PARTICLE_QUALITY_CHOICES.contains(&v) {
+                cfg.particles = v.to_string();
+            }
+        }
+        if let Some(v) = ov.post_processing.as_deref() {
+            if POST_QUALITY_CHOICES.contains(&v) {
+                cfg.post_processing = v.to_string();
+            }
+        }
     }
 }
 
@@ -261,6 +347,9 @@ pub fn item_play_config_get(app: AppHandle, item_id: String) -> Result<serde_jso
             "fit": global_fit(Some(&conn)),
             "renderDpr": global_render_dpr(Some(&conn)),
             "sceneFps": global_scene_fps(Some(&conn)),
+            "aa": global_aa(Some(&conn)),
+            "particles": global_particles(Some(&conn)),
+            "postProcessing": global_post(Some(&conn)),
         }
     }))
 }
@@ -310,6 +399,35 @@ pub fn item_play_config_set(
         let v = v.clamp(0.0, 1.0);
         eval_all(&app, &format!("window.__wp && window.__wp.setVolume({v})"));
     }
+    // 质量三项：渲染器 setQuality 接受部分更新，分键下发（None=跟随全局，
+    // 与 fit/dpr/fps 同语义——不即时下发，下次应用壁纸时按全局值生效）
+    if let Some(v) = config.aa.as_deref() {
+        eval_all(
+            &app,
+            &format!(
+                "window.__wp && window.__wp.setQuality({{antiAliasing:{}}})",
+                serde_json::json!(v)
+            ),
+        );
+    }
+    if let Some(v) = config.particles.as_deref() {
+        eval_all(
+            &app,
+            &format!(
+                "window.__wp && window.__wp.setQuality({{particles:{}}})",
+                serde_json::json!(v)
+            ),
+        );
+    }
+    if let Some(v) = config.post_processing.as_deref() {
+        eval_all(
+            &app,
+            &format!(
+                "window.__wp && window.__wp.setQuality({{postProcessing:{}}})",
+                serde_json::json!(v)
+            ),
+        );
+    }
     Ok(())
 }
 
@@ -341,6 +459,15 @@ pub struct WallpaperConfig {
     /// 全局滤镜 id（见 WALLPAPER_FILTERS 白名单）
     #[serde(default = "default_filter")]
     pub filter: String,
+    /// 抗锯齿模式（off/fxaa/msaa2/msaa4，库 1.3.23+）
+    #[serde(default = "default_aa")]
+    pub aa: String,
+    /// 粒子质量档（off/low/medium/high，库 1.3.23+）
+    #[serde(default = "default_particles")]
+    pub particles: String,
+    /// 后处理质量档（off/low/medium/high，库 1.3.23+）
+    #[serde(default = "default_post")]
+    pub post_processing: String,
     #[serde(default = "default_muted")]
     pub muted: bool,
     #[serde(default = "default_loop")]
@@ -359,6 +486,9 @@ impl Default for WallpaperConfig {
             render_dpr: default_render_dpr(),
             scene_fps: default_scene_fps(),
             filter: default_filter(),
+            aa: default_aa(),
+            particles: default_particles(),
+            post_processing: default_post(),
             muted: default_muted(),
             r#loop: default_loop(),
             media_base: None,
@@ -1948,6 +2078,10 @@ fn config_query_with_audio(cfg: &WallpaperConfig, audio_token: Option<&str>) -> 
     parts.push(format!("renderDpr={}", cfg.render_dpr));
     parts.push(format!("sceneFps={}", cfg.scene_fps));
     parts.push(format!("filter={}", url_encode(&cfg.filter)));
+    // 渲染质量档位（库 1.3.23+；query 键 aa/pq/pp 与上游 bench 约定一致）
+    parts.push(format!("aa={}", url_encode(&cfg.aa)));
+    parts.push(format!("pq={}", url_encode(&cfg.particles)));
+    parts.push(format!("pp={}", url_encode(&cfg.post_processing)));
     parts.push(format!("muted={}", cfg.muted));
     parts.push(format!("loop={}", cfg.r#loop));
     if let Some(base) = &cfg.media_base {
@@ -2204,6 +2338,81 @@ pub fn set_scene_fps(app: AppHandle, fps: u32) -> Result<(), String> {
     eval_all(
         &app,
         &format!("window.__wp && window.__wp.setSceneFps({fps})"),
+    );
+    Ok(())
+}
+
+/// 设置全局抗锯齿模式（off/fxaa/msaa2/msaa4，库 1.3.23+），持久化并对所有壁纸窗口实时生效。
+#[tauri::command(rename = "wallpaper_set_aa")]
+pub fn set_aa(app: AppHandle, mode: String) -> Result<(), String> {
+    if !AA_CHOICES.contains(&mode.as_str()) {
+        return Err(format!(
+            "未知的抗锯齿模式: {mode}（可选 {}）",
+            AA_CHOICES.join("/")
+        ));
+    }
+    if let Some(db) = app.try_state::<Arc<Mutex<Connection>>>() {
+        if let Ok(conn) = db.lock() {
+            let _ = db::set_setting(&conn, "wallpaper_aa", &mode);
+        }
+    }
+    tracing::info!("anti-aliasing set: {mode}");
+    eval_all(
+        &app,
+        &format!(
+            "window.__wp && window.__wp.setQuality({{antiAliasing:{}}})",
+            serde_json::json!(mode)
+        ),
+    );
+    Ok(())
+}
+
+/// 设置全局粒子质量档（off/low/medium/high，库 1.3.23+），持久化并对所有壁纸窗口实时生效。
+#[tauri::command(rename = "wallpaper_set_particles")]
+pub fn set_particles(app: AppHandle, quality: String) -> Result<(), String> {
+    if !PARTICLE_QUALITY_CHOICES.contains(&quality.as_str()) {
+        return Err(format!(
+            "未知的粒子质量档: {quality}（可选 {}）",
+            PARTICLE_QUALITY_CHOICES.join("/")
+        ));
+    }
+    if let Some(db) = app.try_state::<Arc<Mutex<Connection>>>() {
+        if let Ok(conn) = db.lock() {
+            let _ = db::set_setting(&conn, "wallpaper_particles", &quality);
+        }
+    }
+    tracing::info!("particle quality set: {quality}");
+    eval_all(
+        &app,
+        &format!(
+            "window.__wp && window.__wp.setQuality({{particles:{}}})",
+            serde_json::json!(quality)
+        ),
+    );
+    Ok(())
+}
+
+/// 设置全局后处理质量档（off/low/medium/high，库 1.3.23+），持久化并对所有壁纸窗口实时生效。
+#[tauri::command(rename = "wallpaper_set_post")]
+pub fn set_post(app: AppHandle, quality: String) -> Result<(), String> {
+    if !POST_QUALITY_CHOICES.contains(&quality.as_str()) {
+        return Err(format!(
+            "未知的后处理质量档: {quality}（可选 {}）",
+            POST_QUALITY_CHOICES.join("/")
+        ));
+    }
+    if let Some(db) = app.try_state::<Arc<Mutex<Connection>>>() {
+        if let Ok(conn) = db.lock() {
+            let _ = db::set_setting(&conn, "wallpaper_post", &quality);
+        }
+    }
+    tracing::info!("post-processing quality set: {quality}");
+    eval_all(
+        &app,
+        &format!(
+            "window.__wp && window.__wp.setQuality({{postProcessing:{}}})",
+            serde_json::json!(quality)
+        ),
     );
     Ok(())
 }
@@ -2829,6 +3038,9 @@ mod tests {
             render_dpr: 1.0,
             scene_fps: 45,
             filter: "blur".into(),
+            aa: "fxaa".into(),
+            particles: "low".into(),
+            post_processing: "medium".into(),
             muted: false,
             r#loop: true,
             media_base: Some("http://127.0.0.1:1/media/tok".into()),
@@ -2848,6 +3060,10 @@ mod tests {
             "renderDpr=1",
             "sceneFps=45",
             "filter=blur",
+            // 渲染质量档位（库 1.3.23+）：query 键 aa/pq/pp 与上游 bench 约定一致
+            "aa=fxaa",
+            "pq=low",
+            "pp=medium",
             "muted=false",
             "loop=true",
             "mediaBase=http%3A%2F%2F127.0.0.1%3A1%2Fmedia%2Ftok",

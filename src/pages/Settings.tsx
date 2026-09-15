@@ -22,10 +22,11 @@ import { useMessage } from "../components/Message";
 
 // 设置页标签：账号 / 通用 / AI / MCP / 网络 / 关于
 // （id 沿用 "download"：该页内容是下载工具安装 + 下载账号登录，改 id 无收益）
-type SettingsTab = "download" | "general" | "mcp" | "network" | "about";
+type SettingsTab = "download" | "general" | "performance" | "mcp" | "network" | "about";
 const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
   { id: "download", label: "账号" },
   { id: "general", label: "通用" },
+  { id: "performance", label: "性能" },
   { id: "mcp", label: "AI / MCP" },
   { id: "network", label: "网络" },
   { id: "about", label: "关于" },
@@ -49,6 +50,15 @@ export function SettingsPage() {
   // 全局场景帧率上限（15/24/30/45/60/120，越低 GPU 占用越低），默认 24
   const [sceneFps, setSceneFps] = useState<number>(24);
   const [sceneFpsMsg, setSceneFpsMsg] = useState("");
+  // 渲染质量档位（库 1.3.23+）：抗锯齿 off 默认 / fxaa / msaa2 / msaa4
+  const [aa, setAa] = useState<string>("off");
+  const [aaMsg, setAaMsg] = useState("");
+  // 粒子质量档 high 默认 / medium / low / off
+  const [particles, setParticles] = useState<string>("high");
+  const [particlesMsg, setParticlesMsg] = useState("");
+  // 后处理质量档 high 默认 / medium / low / off
+  const [post, setPost] = useState<string>("high");
+  const [postMsg, setPostMsg] = useState("");
   // 壁纸语言（只影响壁纸的 language 属性，不是软件本体语言）。默认英文
   const [language, setLanguage] = useState<string>("english");
   // 界面语言（i18n）：这里只是订阅，取词走模块级 tr()；订阅是为了本页文案跟着变
@@ -129,6 +139,15 @@ export function SettingsPage() {
       .catch(() => { });
     invoke<string | null>("settings_get", { key: "wallpaper_scene_fps" })
       .then((v) => setSceneFps(Number(v) || 24))
+      .catch(() => { });
+    invoke<string | null>("settings_get", { key: "wallpaper_aa" })
+      .then((v) => setAa(v || "off"))
+      .catch(() => { });
+    invoke<string | null>("settings_get", { key: "wallpaper_particles" })
+      .then((v) => setParticles(v || "high"))
+      .catch(() => { });
+    invoke<string | null>("settings_get", { key: "wallpaper_post" })
+      .then((v) => setPost(v || "high"))
       .catch(() => { });
     invoke<string | null>("settings_get", { key: "language" })
       .then((v) => v && setLanguage(v))
@@ -510,6 +529,36 @@ export function SettingsPage() {
       setSceneFps(next);
     } catch (e) {
       setSceneFpsMsg(String(e));
+    }
+  };
+
+  const changeAa = async (next: string) => {
+    setAaMsg("");
+    try {
+      await api.wallpaperSetAa(next);
+      setAa(next);
+    } catch (e) {
+      setAaMsg(String(e));
+    }
+  };
+
+  const changeParticles = async (next: string) => {
+    setParticlesMsg("");
+    try {
+      await api.wallpaperSetParticles(next);
+      setParticles(next);
+    } catch (e) {
+      setParticlesMsg(String(e));
+    }
+  };
+
+  const changePost = async (next: string) => {
+    setPostMsg("");
+    try {
+      await api.wallpaperSetPost(next);
+      setPost(next);
+    } catch (e) {
+      setPostMsg(String(e));
     }
   };
 
@@ -937,82 +986,6 @@ export function SettingsPage() {
                 control={<Switch checked={autostart === true} onChange={toggleAutostart} />}
               />
               <Row
-                label={tr("显示模式")}
-                desc={
-                  fit === "cover"
-                    ? tr("等比铺满并居中裁切溢出（不变形、无黑边，默认）")
-                    : fit === "contain"
-                      ? tr("等比缩放完整显示，边缘留暗边（不变形）")
-                      : tr("忽略宽高比铺满（会拉伸变形，旧行为）")
-                }
-                control={
-                  <div className="flex items-center gap-2">
-                    <select
-                      value={fit}
-                      onChange={(e) => changeFit(e.target.value as "cover" | "contain" | "stretch")}
-                      className="rounded-lg border border-[var(--separator)] bg-[var(--content)] px-2 py-1 text-[12.5px] outline-none focus:border-[var(--accent-strong)]"
-                    >
-                      <option value="cover">{tr("裁剪")}</option>
-                      <option value="contain">{tr("缩放")}</option>
-                      <option value="stretch">{tr("拉伸")}</option>
-                    </select>
-                    {fitMsg && <span className="text-[12px] text-red-500">{fitMsg}</span>}
-                  </div>
-                }
-              />
-              <Row
-                label={tr("清晰度")}
-                desc={tr("自动=跟随屏幕像素比（Retina 原生清晰，默认）；高清=100% 像素比；标准/省电逐级降低分辨率以省显存。宿主窗口像素比异常时自动档也能识别")}
-                control={
-                  <div className="flex items-center gap-2">
-                    <select
-                      value={renderDpr}
-                      onChange={(e) => changeRenderDpr(Number(e.target.value))}
-                      className="rounded-lg border border-[var(--separator)] bg-[var(--content)] px-2 py-1 text-[12.5px] outline-none focus:border-[var(--accent-strong)]"
-                    >
-                      <option value={0}>{tr("自动")}</option>
-                      <option value={0.75}>{tr("省电")}</option>
-                      <option value={0.85}>{tr("标准")}</option>
-                      <option value={1}>{tr("高清")}</option>
-                    </select>
-                    {renderDprMsg && <span className="text-[12px] text-red-500">{renderDprMsg}</span>}
-                  </div>
-                }
-              />
-              <Row
-                label={tr("帧率上限")}
-                desc={
-                  sceneFps <= 15
-                    ? tr("15 FPS：最省电")
-                    : sceneFps <= 24
-                      ? tr("24 FPS：默认，GPU 占用最低，最省电")
-                      : sceneFps <= 30
-                        ? tr("30 FPS：流畅，GPU 占用低")
-                        : sceneFps <= 45
-                          ? tr("45 FPS：流畅度与功耗折中")
-                          : sceneFps >= 120
-                            ? tr("120 FPS：最流畅，GPU 占用最高（需高刷屏才看得出）")
-                            : tr("60 FPS：画质与 GPU 占用均衡")
-                }
-                control={
-                  <div className="flex items-center gap-2">
-                    <select
-                      value={sceneFps}
-                      onChange={(e) => changeSceneFps(Number(e.target.value))}
-                      className="rounded-lg border border-[var(--separator)] bg-[var(--content)] px-2 py-1 text-[12.5px] outline-none focus:border-[var(--accent-strong)]"
-                    >
-                      <option value={15}>15 FPS</option>
-                      <option value={24}>24 FPS</option>
-                      <option value={30}>30 FPS</option>
-                      <option value={45}>45 FPS</option>
-                      <option value={60}>60 FPS</option>
-                      <option value={120}>120 FPS</option>
-                    </select>
-                    {sceneFpsMsg && <span className="text-[12px] text-red-500">{sceneFpsMsg}</span>}
-                  </div>
-                }
-              />
-              <Row
                 label={tr("界面语言")}
                 desc={tr(
                   "软件界面语言，切换后立即生效。托盘菜单等系统级文案由后端绘制，会在下次打开菜单时跟随",
@@ -1173,6 +1146,168 @@ export function SettingsPage() {
                 }
               />
               */}
+            </Group>
+          )}
+
+          {tab === "performance" && (
+            <Group title={tr("性能")}>
+              <Row
+                label={tr("显示模式")}
+                desc={
+                  fit === "cover"
+                    ? tr("等比铺满并居中裁切溢出（不变形、无黑边，默认）")
+                    : fit === "contain"
+                      ? tr("等比缩放完整显示，边缘留暗边（不变形）")
+                      : tr("忽略宽高比铺满（会拉伸变形，旧行为）")
+                }
+                control={
+                  <div className="flex items-center gap-2">
+                    <select
+                      value={fit}
+                      onChange={(e) => changeFit(e.target.value as "cover" | "contain" | "stretch")}
+                      className="rounded-lg border border-[var(--separator)] bg-[var(--content)] px-2 py-1 text-[12.5px] outline-none focus:border-[var(--accent-strong)]"
+                    >
+                      <option value="cover">{tr("裁剪")}</option>
+                      <option value="contain">{tr("缩放")}</option>
+                      <option value="stretch">{tr("拉伸")}</option>
+                    </select>
+                    {fitMsg && <span className="text-[12px] text-red-500">{fitMsg}</span>}
+                  </div>
+                }
+              />
+              <Row
+                label={tr("清晰度")}
+                desc={tr("自动=跟随屏幕像素比（Retina 原生清晰，默认）；高清=100% 像素比；标准/省电逐级降低分辨率以省显存。宿主窗口像素比异常时自动档也能识别")}
+                control={
+                  <div className="flex items-center gap-2">
+                    <select
+                      value={renderDpr}
+                      onChange={(e) => changeRenderDpr(Number(e.target.value))}
+                      className="rounded-lg border border-[var(--separator)] bg-[var(--content)] px-2 py-1 text-[12.5px] outline-none focus:border-[var(--accent-strong)]"
+                    >
+                      <option value={0}>{tr("自动")}</option>
+                      <option value={0.75}>{tr("省电")}</option>
+                      <option value={0.85}>{tr("标准")}</option>
+                      <option value={1}>{tr("高清")}</option>
+                    </select>
+                    {renderDprMsg && <span className="text-[12px] text-red-500">{renderDprMsg}</span>}
+                  </div>
+                }
+              />
+              <Row
+                label={tr("帧率上限")}
+                desc={
+                  sceneFps <= 15
+                    ? tr("15 FPS：最省电")
+                    : sceneFps <= 24
+                      ? tr("24 FPS：默认，GPU 占用最低，最省电")
+                      : sceneFps <= 30
+                        ? tr("30 FPS：流畅，GPU 占用低")
+                        : sceneFps <= 45
+                          ? tr("45 FPS：流畅度与功耗折中")
+                          : sceneFps >= 120
+                            ? tr("120 FPS：最流畅，GPU 占用最高（需高刷屏才看得出）")
+                            : tr("60 FPS：画质与 GPU 占用均衡")
+                }
+                control={
+                  <div className="flex items-center gap-2">
+                    <select
+                      value={sceneFps}
+                      onChange={(e) => changeSceneFps(Number(e.target.value))}
+                      className="rounded-lg border border-[var(--separator)] bg-[var(--content)] px-2 py-1 text-[12.5px] outline-none focus:border-[var(--accent-strong)]"
+                    >
+                      <option value={15}>15 FPS</option>
+                      <option value={24}>24 FPS</option>
+                      <option value={30}>30 FPS</option>
+                      <option value={45}>45 FPS</option>
+                      <option value={60}>60 FPS</option>
+                      <option value={120}>120 FPS</option>
+                    </select>
+                    {sceneFpsMsg && <span className="text-[12px] text-red-500">{sceneFpsMsg}</span>}
+                  </div>
+                }
+              />
+              <Row
+                label={tr("抗锯齿")}
+                desc={
+                  aa === "off"
+                    ? tr("关闭（默认，最省性能）")
+                    : aa === "fxaa"
+                      ? tr("FXAA：帧末一次后处理，平滑所有边缘（含贴图边缘），成本低")
+                      : aa === "msaa2"
+                        ? tr("MSAA 2x：多重采样，只平滑几何边缘（图层/粒子边缘），画质最正")
+                        : tr("MSAA 4x：多重采样 4 倍，几何边缘最平滑，GPU 占用最高")
+                }
+                control={
+                  <div className="flex items-center gap-2">
+                    <select
+                      value={aa}
+                      onChange={(e) => void changeAa(e.target.value)}
+                      className="rounded-lg border border-[var(--separator)] bg-[var(--content)] px-2 py-1 text-[12.5px] outline-none focus:border-[var(--accent-strong)]"
+                    >
+                      <option value="off">{tr("关")}</option>
+                      <option value="fxaa">FXAA</option>
+                      <option value="msaa2">MSAA 2x</option>
+                      <option value="msaa4">MSAA 4x</option>
+                    </select>
+                    {aaMsg && <span className="text-[12px] text-red-500">{aaMsg}</span>}
+                  </div>
+                }
+              />
+              <Row
+                label={tr("粒子")}
+                desc={
+                  particles === "high"
+                    ? tr("高（默认）：完整粒子数量（雨/雪/火花/雾/光轴）")
+                    : particles === "medium"
+                      ? tr("中：粒子数量与发射率 ×0.7，GPU/CPU 占用降低")
+                      : particles === "low"
+                        ? tr("低：粒子数量与发射率 ×0.4，明显省性能")
+                        : tr("关：不渲染也不模拟粒子，最省性能")
+                }
+                control={
+                  <div className="flex items-center gap-2">
+                    <select
+                      value={particles}
+                      onChange={(e) => void changeParticles(e.target.value)}
+                      className="rounded-lg border border-[var(--separator)] bg-[var(--content)] px-2 py-1 text-[12.5px] outline-none focus:border-[var(--accent-strong)]"
+                    >
+                      <option value="high">{tr("高")}</option>
+                      <option value="medium">{tr("中")}</option>
+                      <option value="low">{tr("低")}</option>
+                      <option value="off">{tr("关")}</option>
+                    </select>
+                    {particlesMsg && <span className="text-[12px] text-red-500">{particlesMsg}</span>}
+                  </div>
+                }
+              />
+              <Row
+                label={tr("后处理")}
+                desc={
+                  post === "high"
+                    ? tr("高（默认）：效果链全分辨率（辉光/模糊/水波等画面效果）")
+                    : post === "medium"
+                      ? tr("中：效果链分辨率压到屏幕尺寸以内，显存占用降低")
+                      : post === "low"
+                        ? tr("低：效果链分辨率减半，显存占用约 1/4")
+                        : tr("关：图层效果链直通 + 跳过整屏后期 + 关辉光，最省性能")
+                }
+                control={
+                  <div className="flex items-center gap-2">
+                    <select
+                      value={post}
+                      onChange={(e) => void changePost(e.target.value)}
+                      className="rounded-lg border border-[var(--separator)] bg-[var(--content)] px-2 py-1 text-[12.5px] outline-none focus:border-[var(--accent-strong)]"
+                    >
+                      <option value="high">{tr("高")}</option>
+                      <option value="medium">{tr("中")}</option>
+                      <option value="low">{tr("低")}</option>
+                      <option value="off">{tr("关")}</option>
+                    </select>
+                    {postMsg && <span className="text-[12px] text-red-500">{postMsg}</span>}
+                  </div>
+                }
+              />
             </Group>
           )}
 

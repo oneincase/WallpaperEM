@@ -15,6 +15,8 @@
 import {
   mount as mountLib,
   type AudioSource,
+  type QualityOptions,
+  type ResolvedQuality,
   type SceneInstance,
   type Source,
 } from "webwallgl";
@@ -36,6 +38,15 @@ type WallpaperConfig = {
   sceneFps?: number;
   /** 全局滤镜 id（见 WALLPAPER_FILTERS 白名单），未知 id 按无滤镜处理 */
   filter?: string;
+  /**
+   * 渲染质量档位（库 1.3.23+）：抗锯齿 aa（off/fxaa/msaa2/msaa4）、
+   * 粒子 particles（off/low/medium/high）、后处理 postProcessing（同档）。
+   * query 键是 aa/pq/pp（与上游 bench 约定）；setWallpaper 下发的 JSON 键与
+   * 这里的字段名一致（Rust serde camelCase）。缺省 = 库默认（off/high/high）。
+   */
+  aa?: string;
+  particles?: string;
+  postProcessing?: string;
   muted?: boolean;
   loop?: boolean;
   /** 内容服务器媒体基址：http://127.0.0.1:<port>/media/<token>（scene 拉取 pkg 用） */
@@ -794,6 +805,12 @@ function mountViaLib(cfg: WallpaperConfig) {
         renderDpr: toAbsoluteDpr(cfg.renderDpr ?? 0),
         fps: cfg.sceneFps ?? 24,
         volume: cfg.muted === false ? 1 : 0,
+        // 渲染质量档位（库 1.3.23+）：键缺省/非法值由库 normalizeQuality 落默认
+        quality: {
+          antiAliasing: cfg.aa as QualityOptions["antiAliasing"],
+          particles: cfg.particles as QualityOptions["particles"],
+          postProcessing: cfg.postProcessing as QualityOptions["postProcessing"],
+        },
         // 场景壁纸的初始属性（project.json 值，含全局语言）
         properties,
         onDiagnostic: (msg: string, level: string) => reportDiag(cfg, `[${level}] ${msg}`),
@@ -947,6 +964,10 @@ declare global {
       restore(): void;
       setRenderDpr(dpr: number): void;
       setSceneFps(fps: number): void;
+      /** 渲染质量档位热更（库 1.3.23+）：部分更新、就地生效不重挂载 */
+      setQuality(patch: QualityOptions): void;
+      /** 当前生效的质量档位（三项齐全；未挂载库实例时为 null） */
+      getQuality(): ResolvedQuality | null;
       /** 切换全局滤镜：传白名单 id（WALLPAPER_FILTERS），未知 id 按无滤镜处理 */
       setFilter(filter: string): void;
       /** 热更新 WE 用户属性（wire 格式：{name: {value: ...}}） */
@@ -1027,6 +1048,17 @@ window.__wp = {
     state.cfg.sceneFps = fps;
     state.inst?.setFps(fps);
   },
+  // 渲染质量档位热更（抗锯齿/粒子/后处理）：就地生效不重挂载；
+  // 写回 state.cfg 让 setRenderDpr/restore 这类重挂路径之后仍保持。只传要改的键。
+  setQuality(patch: QualityOptions) {
+    if (patch?.antiAliasing !== undefined) state.cfg.aa = patch.antiAliasing;
+    if (patch?.particles !== undefined) state.cfg.particles = patch.particles;
+    if (patch?.postProcessing !== undefined) state.cfg.postProcessing = patch.postProcessing;
+    state.inst?.setQuality(patch);
+  },
+  getQuality() {
+    return state.inst?.getQuality() ?? null;
+  },
   // 切换滤镜：纯 CSS 合成层的事，不用重挂壁纸、不用碰库实例
   setFilter(filter: string) {
     state.cfg.filter = filter;
@@ -1080,6 +1112,10 @@ const initialCfg: WallpaperConfig = {
   renderDpr: Number(params.get("renderDpr")) || 0,
   sceneFps: Number(params.get("sceneFps")) || 24,
   filter: params.get("filter") ?? undefined,
+  // 渲染质量档位（query 键 aa/pq/pp → cfg 字段 aa/particles/postProcessing）
+  aa: params.get("aa") ?? undefined,
+  particles: params.get("pq") ?? undefined,
+  postProcessing: params.get("pp") ?? undefined,
   muted: params.get("muted") !== "false",
   loop: params.get("loop") !== "false",
   mediaBase: params.get("mediaBase") ?? undefined,
