@@ -1196,6 +1196,9 @@ fn create_desktop_window(
     // 项被忽略（wry 里仅 Apple 生效）。
     #[cfg(target_os = "macos")]
     let data_store = custom_data_store_available().then(new_data_store_id);
+    // `mut` 只有 macOS 用得上（下面给 builder 重新赋 data_store_identifier），
+    // 其它平台按 unused_mut 警告处理
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut builder = WebviewWindowBuilder::new(app, label, url)
         .title("")
         .decorations(false)

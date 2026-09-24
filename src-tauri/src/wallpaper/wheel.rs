@@ -307,11 +307,12 @@ mod win32 {
         let _ = APP.set(app);
         loop {
             // 当前可执行模块句柄：低级钩子的回调在本进程内派发，按 MSDN 规范
-            // 传当前模块句柄最稳（与 windows.rs 的观察者窗口同一写法）
+            // 传当前模块句柄最稳（与 windows.rs 的观察者窗口同一写法）。
+            // windows-rs 把 HINSTANCE 的可空性建模成 Option（NULL 即 None），
+            // SetWindowsHookExW 要的正是 Option<HINSTANCE>，别在这里 unwrap_or_default。
             let hmod = unsafe { GetModuleHandleW(None) }
                 .ok()
-                .map(|h| HINSTANCE(h.0))
-                .unwrap_or_default();
+                .map(|h| HINSTANCE(h.0));
             let hook: Result<HHOOK, _> = unsafe {
                 SetWindowsHookExW(WH_MOUSE_LL, Some(low_level_mouse), hmod, 0)
             };

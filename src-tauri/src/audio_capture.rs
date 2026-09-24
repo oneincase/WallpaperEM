@@ -281,12 +281,14 @@ pub fn status(app: &tauri::AppHandle) -> AudioStatus {
     let running = inner()
         .map(|i| i.shared.is_running())
         .unwrap_or(false);
-    let granted = if cfg!(target_os = "macos") {
-        running || macos_permission_granted()
-    } else {
-        // Windows / Linux 采集无需系统级授权
-        platform_supported()
-    };
+    // ⚠️ 这里必须用属性而不是 `cfg!`：`cfg!` 是运行期常量，两个分支都会被编译，
+    // 而 `macos_permission_granted` 是 `#[cfg(target_os = "macos")]` 的 ——
+    // 用 `if cfg!(...)` 会让 Linux / Windows 报 E0425 找不到函数。
+    #[cfg(target_os = "macos")]
+    let granted = running || macos_permission_granted();
+    // Windows / Linux 采集无需系统级授权
+    #[cfg(not(target_os = "macos"))]
+    let granted = platform_supported();
     AudioStatus {
         enabled,
         running,
