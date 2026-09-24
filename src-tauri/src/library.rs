@@ -11,6 +11,7 @@ use serde::Serialize;
 use serde_json::json;
 use tauri::{AppHandle, Manager};
 
+use crate::cover_cache;
 use crate::wallpaper;
 use crate::we_props;
 
@@ -129,12 +130,14 @@ pub(crate) fn library_list_impl(
         binds.push(Value::Text(t.to_string()));
     }
     if let Some(q) = f.query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
-        where_parts.push("l.title LIKE ? ESCAPE '\\'".into());
+        // 标题模糊 + 壁纸 ID 子串（粘贴创意工坊 ID/链接里的数字串也能命中）
+        where_parts.push("(l.title LIKE ? ESCAPE '\\' OR l.item_id LIKE ? ESCAPE '\\')".into());
         // 用户输入里的 LIKE 通配符要转义，否则搜 "100%" 会匹配到一切
         let esc = q
             .replace('\\', "\\\\")
             .replace('%', "\\%")
             .replace('_', "\\_");
+        binds.push(Value::Text(format!("%{esc}%")));
         binds.push(Value::Text(format!("%{esc}%")));
     }
     if let Some(v) = f.min_size {
@@ -335,22 +338,38 @@ pub(crate) fn library_list_impl(
         items.retain(|it| it.missing);
     }
 
-    // 无工坊元数据的条目：回退到本地 preview.*（经内容服务器）。
+    // 封面：**本地优先，远端兜底**。
+    // 目录里已经有 preview.*（WE 工程自带 / 导入时生成 / 之前补过）就直接发本地
+    // URL：离线可用，卡片也不会再因为 Steam CDN 抽风而裂图。
+    // 目录里没有才退回工坊元数据里的远端 URL，同时把条目排进后台补齐队列
+    // （写回目录，下次列表就走本地了；见 cover_cache）。
+    //
     // 注意这里**不做**视频抽帧 —— 历史版本的惰性抽帧跑在列表路径里，视频解不动
     // （mkv/avi）时每次刷新都重试一遍，库一大就冻死 UI。补封面统一走后台任务
-    // `backfill_posters`（启动后延迟执行，失败条目记账不再重试）。
+    // （`backfill_posters` 抽帧、`cover_cache` 取远端封面），列表路径只入队。
+    let mut cover_jobs: Vec<cover_cache::CoverJob> = Vec::new();
     for it in items.iter_mut() {
-        if it.preview_url.is_some() {
-            continue;
-        }
         let dir = match it.source_path.as_deref() {
             Some(src) if !src.is_empty() => std::path::PathBuf::from(src),
             _ => root.join(&it.item_id),
         };
-        if let Some(url) = local_preview_url(&app, &it.item_id, &dir) {
-            it.preview_url = Some(url);
+        let remote = it.preview_url.take();
+        match local_preview_url(&app, &it.item_id, &dir) {
+            Some(url) => it.preview_url = Some(url),
+            None => {
+                it.preview_url = remote.clone();
+                // 目录不存在（条目已失效）就不排队：补了也没地方放
+                if let (Some(url), true) = (remote, dir.is_dir()) {
+                    cover_jobs.push(cover_cache::CoverJob {
+                        item_id: it.item_id.clone(),
+                        dir,
+                        url,
+                    });
+                }
+            }
         }
     }
+    cover_cache::enqueue(&app, cover_jobs);
     Ok(items)
 }
 
@@ -366,7 +385,7 @@ fn local_preview_url(app: &AppHandle, item_id: &str, dir: &Path) -> Option<Strin
         return None;
     }
     // 与导入侧的 preview.<ext> 命名一一对应；优先级固定，与目录枚举顺序无关
-    let ext = ["gif", "png", "jpg", "webp"]
+    let ext = PREVIEW_EXTS
         .iter()
         .find(|e| dir.join(format!("preview.{e}")).is_file())?;
     let token = app
@@ -376,6 +395,58 @@ fn local_preview_url(app: &AppHandle, item_id: &str, dir: &Path) -> Option<Strin
     Some(format!(
         "http://127.0.0.1:{port}/media/{token}/{item_id}/preview.{ext}"
     ))
+}
+
+/// 旁路轻量查询：只要「标题 + 封面」两项（显示器管理 / 未来轮播用），
+/// 跳过列表路径的磁盘对账与补封面入队。返回 item_id → (标题, 封面 URL)。
+pub fn item_cover_summary(
+    app: &AppHandle,
+    item_ids: &[String],
+) -> std::collections::HashMap<String, (String, Option<String>)> {
+    let mut out = std::collections::HashMap::new();
+    if item_ids.is_empty() {
+        return out;
+    }
+    let Some(db) = app.try_state::<Arc<Mutex<rusqlite::Connection>>>() else {
+        return out;
+    };
+    let Ok(conn) = db.lock() else {
+        return out;
+    };
+    let placeholders = vec!["?"; item_ids.len()].join(",");
+    let sql = format!(
+        "SELECT l.item_id, l.title, l.source_path, COALESCE(w.preview_url, '')
+         FROM library_items l LEFT JOIN workshop_items w ON w.id = l.item_id
+         WHERE l.item_id IN ({placeholders})"
+    );
+    let Ok(mut stmt) = conn.prepare(&sql) else {
+        return out;
+    };
+    let rows = stmt.query_map(rusqlite::params_from_iter(item_ids.iter()), |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, Option<String>>(2)?,
+            r.get::<_, String>(3)?,
+        ))
+    });
+    let Ok(rows) = rows else {
+        return out;
+    };
+    let root = wallpapers_dir(app).ok();
+    for (item_id, title, source_path, remote) in rows.flatten() {
+        let dir = match source_path.as_deref() {
+            Some(src) if !src.is_empty() => std::path::PathBuf::from(src),
+            _ => root.clone().unwrap_or_default().join(&item_id),
+        };
+        let preview = local_preview_url(app, &item_id, &dir)
+            .or_else(|| (!remote.is_empty()).then_some(remote));
+        let title = title
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| item_id.clone());
+        out.insert(item_id, (title, preview));
+    }
+    out
 }
 
 /// 清除一个 item_id 在数据库里的全部痕迹（不碰磁盘）。
@@ -654,6 +725,12 @@ const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "avif"];
 const WEB_EXTS: &[&str] = &["html", "htm"];
 /// 文件本身可直接当预览图的扩展名（内容服务器按 preview.<ext> 提供）
 const PREVIEW_COPY_EXTS: &[&str] = &["gif", "png", "jpg", "jpeg", "webp"];
+
+/// 磁盘上**封面**文件的扩展名清单（顺序即优先级，与目录枚举顺序无关）。
+/// 一份常量三处共用：下发给前端的 URL（`local_preview_url`）、判有没有封面
+/// （`has_preview_file`）、后台补封面前的检查（`cover_cache::existing_cover`）。
+/// 分散成三份字面量时漏改一处，就会出现「卡片说没封面、磁盘上其实有」或反之。
+pub(crate) const PREVIEW_EXTS: &[&str] = &["gif", "png", "jpg", "webp"];
 
 fn ext_lower(p: &Path) -> String {
     p.extension()
@@ -1751,7 +1828,7 @@ pub(crate) fn project_item_id_for(name: &str) -> String {
 
 /// 目录内是否已有预览图（扩展名清单与 local_preview_url 保持一致）
 fn has_preview_file(dir: &Path) -> bool {
-    ["gif", "png", "jpg", "webp"]
+    PREVIEW_EXTS
         .iter()
         .any(|e| dir.join(format!("preview.{e}")).is_file())
 }

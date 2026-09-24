@@ -32,12 +32,31 @@ use gtk::prelude::WidgetExt;
 
 #[derive(Debug, Clone)]
 pub struct ScreenInfo {
+    /// 稳定显示器 id（连接器名的 FNV-1a 哈希，见 [`monitor_id`]）
     pub id: u32,
+    /// 显示器名称（GDK 输出名，如 `DP-1`/`HDMI-A-1`）
+    pub name: String,
     pub x: f64,
     pub y: f64,
     pub w: f64,
     pub h: f64,
+    pub scale: f64,
+    pub is_primary: bool,
 }
+
+/// Linux 的显示器 id 用连接器名哈希、跨重启稳定，无旧→新 迁移需求。
+pub fn legacy_display_ids() -> Vec<(String, String)> {
+    Vec::new()
+}
+
+/// 供电类型。Linux 无统一查询（upower/logind 各管一段），恒 None = 不拦
+/// （「仅充电时轮播」暂仅 macOS 生效）。
+pub fn on_ac_power() -> Option<bool> {
+    None
+}
+
+/// 显示器名称缓存刷新（macOS 用：NSScreen 主线程限制）。Linux 无需缓存，空实现。
+pub fn refresh_display_meta() {}
 
 /// 引擎启动时注入的 AppHandle（屏幕枚举/光标查询都需要它进 Tauri runtime）
 static APP: OnceLock<AppHandle> = OnceLock::new();
@@ -133,10 +152,18 @@ fn query_monitors() -> Vec<(ScreenInfo, f64)> {
             (
                 ScreenInfo {
                     id: monitor_id(m.name().map(|s| s.as_str()), i),
+                    name: m
+                        .name()
+                        .map(|s| s.to_string())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| format!("显示器 {}", i + 1)),
                     x: pos.x as f64 / scale,
                     y: pos.y as f64 / scale,
                     w: size.width as f64 / scale,
                     h: size.height as f64 / scale,
+                    scale,
+                    // 虚拟桌面坐标系里主屏恒在原点
+                    is_primary: pos.x == 0 && pos.y == 0,
                 },
                 scale,
             )

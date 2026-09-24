@@ -92,6 +92,29 @@ export const IconHeart = () => (
   </Svg>
 );
 
+/** 显示器：圆角屏幕 + 底座，屏内小星星点缀 */
+export const IconMonitor = () => (
+  <Svg>
+    <rect x="2.8" y="4.2" width="18.4" height="12.8" rx="3" />
+    <path d="M12 17v3.2" />
+    <path d="M8.6 20.6h6.8" />
+    <path d="M12 7.9l.72 1.46 1.61.23-1.17 1.14.28 1.61L12 11.55l-1.44.79.28-1.61-1.17-1.14 1.61-.23z" strokeWidth={1.2} />
+  </Svg>
+);
+
+/** 切换列表：音符 + 列表线 */
+export const IconPlaylist = () => (
+  <Svg>
+    <path d="M4 6.5h9" />
+    <path d="M4 11.5h6" />
+    <path d="M4 16.5h6" />
+    <path d="M16.5 5.5v8.2" strokeWidth={1.6} />
+    <path d="M16.5 5.5l3.2-.9v8.2" strokeWidth={1.6} />
+    <circle cx="14.6" cy="15.8" r="1.9" strokeWidth={1.6} />
+    <circle cx="17.8" cy="14.9" r="1.9" strokeWidth={1.6} />
+  </Svg>
+);
+
 // ---------- 本地库卡片操作：预览 / 应用 / 打开文件 / 删除 ----------
 
 /** 预览：圆眼睛 + 眼底高光 */

@@ -1,11 +1,15 @@
 // 本地库页：已下载壁纸管理 + 应用到桌面（T4）
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
   api,
   TYPE_LABELS,
+  type DisplayInfo,
   type ImportBatchResult,
   type LibraryItem,
+  type Playlist,
+  type PlaylistStatus,
   type WallpaperType,
 } from "../api/steam";
 import { PreviewModal } from "../components/PreviewModal";
@@ -28,7 +32,15 @@ import {
   type TagSelection,
 } from "../lib/tags";
 import { readState, writeState } from "../lib/cache-snapshots";
-import { IconPreview, IconApply, IconOpenFile, IconTrash, IconUpload } from "../components/icons";
+import {
+  IconPreview,
+  IconApply,
+  IconOpenFile,
+  IconTrash,
+  IconUpload,
+} from "../components/icons";
+import { AnchoredMenu, MenuItem, MenuInputRow } from "../components/AnchoredMenu";
+import { formatCountdown } from "../lib/format";
 import { SubscriptionsModal } from "../components/SubscriptionsModal";
 import { LibraryImportModal } from "../components/LibraryImportModal";
 import { WorkshopUploadModal } from "../components/WorkshopUploadModal";
@@ -38,6 +50,8 @@ import {
 } from "../components/WorkshopUploadChoiceModal";
 import { WorkshopWebUploadModal } from "../components/WorkshopWebUploadModal";
 import { VirtualGrid } from "../components/VirtualGrid";
+import { useApplyWallpaper } from "../hooks/useApplyWallpaper";
+import { cancelApplyTarget, useArmedApplyTarget } from "../lib/apply-target";
 import { tr, trMsg } from "../lib/i18n";
 
 /** 筛选条件持久化：窗口会在内存压力下被回收重建（全新 JS 上下文），不落盘的话
@@ -267,12 +281,174 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
     loadApplied();
   }, [loadApplied]);
 
-  const apply = async (itemId: string) => {
+  const { apply: applyWithTarget, menuNode: applyMenu } = useApplyWallpaper();
+  const armedTarget = useArmedApplyTarget();
+
+  // ---- 切换列表（并入本地库：chips 筛选 + 卡片选中批量加入，全程无弹框）----
+  const [playlists, setPlaylists] = useState<Playlist[]>([]);
+  const [plStatus, setPlStatus] = useState<PlaylistStatus | null>(null);
+  const [boundNames, setBoundNames] = useState<Map<number, string[]>>(new Map());
+  const [displays, setDisplays] = useState<DisplayInfo[]>([]);
+  const [dispMode, setDispMode] = useState("unified");
+  const [listFilter, setListFilter] = useState<number | null>(null);
+  const [selectMode, setSelectMode] = useState(false);
+  const [picked, setPicked] = useState<Set<string>>(new Set());
+  // 锚定菜单（加入列表 / 独立模式启用选屏）与内联新建
+  const [addMenuAt, setAddMenuAt] = useState<{ x: number; y: number } | null>(null);
+  const [enableAt, setEnableAt] = useState<{ x: number; y: number; p: Playlist } | null>(null);
+  const [newName, setNewName] = useState("");
+  const [creating, setCreating] = useState(false);
+  // 列表上下文条的内联编辑
+  const [renameDraft, setRenameDraft] = useState<string | null>(null);
+  const [intervalDraft, setIntervalDraft] = useState("");
+  const [deleteList, setDeleteList] = useState<Playlist | null>(null);
+  const [rotNow, setRotNow] = useState(Date.now());
+
+  const loadPlaylists = useCallback(async () => {
     try {
-      await api.wallpaperApplyItem(itemId);
-      // 应用新壁纸会替换所有显示器上的旧壁纸，须重取权威的已应用集合，
+      const [ls, st, dl] = await Promise.all([
+        api.playlistList(),
+        api.playlistStatus(),
+        api.wallpaperDisplaysList(),
+      ]);
+      setPlaylists(ls);
+      setPlStatus(st);
+      setDispMode(dl.mode);
+      setDisplays(dl.displays);
+      const m = new Map<number, string[]>();
+      for (const d of dl.displays) {
+        const pid = d.binding?.playlistId;
+        if (pid != null) m.set(pid, [...(m.get(pid) ?? []), d.name]);
+      }
+      setBoundNames(m);
+    } catch {
+      // 列表功能不可用不影响浏览/筛选
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadPlaylists();
+  }, [loadPlaylists]);
+
+  // 轮播倒计时每秒本地走；状态 20s 对齐一次
+  useEffect(() => {
+    const t1 = window.setInterval(() => setRotNow(Date.now()), 1000);
+    const t2 = window.setInterval(() => void loadPlaylists(), 20_000);
+    return () => {
+      window.clearInterval(t1);
+      window.clearInterval(t2);
+    };
+  }, [loadPlaylists]);
+
+  // 托盘「轮播」子菜单改了暂停状态：轮播条的暂停/恢复钮立即跟上
+  // （本地动作走 plAct 已自带刷新，这里只补托盘/MCP 入口）
+  useEffect(() => {
+    const un = listen<{ key: string }>("settings-changed", (e) => {
+      if (e.payload.key === "playlist_rotation_paused") void loadPlaylists();
+    });
+    return () => {
+      void un.then((f) => f());
+    };
+  }, [loadPlaylists]);
+
+  // 切到某列表时初始化间隔输入框
+  useEffect(() => {
+    const p = playlists.find((x) => x.id === listFilter);
+    setIntervalDraft(p ? String(Math.max(1, Math.round(p.intervalSec / 60))) : "");
+    setRenameDraft(null);
+  }, [listFilter, playlists]);
+
+  const activeList = useMemo(
+    () => playlists.find((x) => x.id === listFilter) ?? null,
+    [playlists, listFilter],
+  );
+
+  // 列表筛选在服务端筛选结果之上做二次过滤（列表 = 条目 id 集合）
+  const shownItems = useMemo(() => {
+    if (listFilter == null) return items;
+    const p = playlists.find((x) => x.id === listFilter);
+    // 按播放顺序显示（itemIds 的顺序即轮播顺序），其它筛选仍在其上收窄
+    const order = new Map((p?.itemIds ?? []).map((id, i) => [id, i] as const));
+    return items
+      .filter((i) => order.has(i.itemId))
+      .sort((a, b) => (order.get(a.itemId) ?? 0) - (order.get(b.itemId) ?? 0));
+  }, [items, listFilter, playlists]);
+
+  /** 切到列表上下文：清掉其它筛选，保证点开列表一定看到它的壁纸 */
+  const clearFilters = useCallback(() => {
+    setSearch("");
+    setDebouncedSearch("");
+    setSelected({});
+    setOnlyMissing(false);
+  }, []);
+
+  const plAct = useCallback(
+    async (fn: () => Promise<unknown>, ok?: string) => {
+      try {
+        await fn();
+        if (ok) msg.success(ok);
+        await loadPlaylists();
+      } catch (e) {
+        msg.error(String(e));
+      }
+    },
+    [msg, loadPlaylists],
+  );
+
+  const toggleSelect = useCallback((id: string) => {
+    setPicked((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  /** 选中条目并入某列表（去重追加） */
+  const addSelectionTo = async (pid: number) => {
+    const p = playlists.find((x) => x.id === pid);
+    if (!p) return;
+    setAddMenuAt(null);
+    const merged = [...p.itemIds, ...[...picked].filter((id) => !p.itemIds.includes(id))];
+    await plAct(
+      () => api.playlistUpdate(pid, { itemIds: merged }),
+      tr("已把 {n} 张加入「{name}」", { n: picked.size, name: p.name }),
+    );
+    setPicked(new Set());
+  };
+
+  const createListWithSelection = async () => {
+    const name = newName.trim();
+    if (!name) {
+      msg.error(tr("请填写列表名称"));
+      return;
+    }
+    setAddMenuAt(null);
+    setCreating(false);
+    setNewName("");
+    await plAct(
+      () => api.playlistCreate(name, [...picked], 600, false),
+      tr("已新建「{name}」", { name }),
+    );
+    setPicked(new Set());
+  };
+
+  /** 从当前查看的列表移出选中条目 */
+  const removeSelectionFromList = async () => {
+    if (!activeList) return;
+    const kept = activeList.itemIds.filter((id) => !picked.has(id));
+    await plAct(
+      () => api.playlistUpdate(activeList.id, { itemIds: kept }),
+      tr("已从「{name}」移出 {n} 张", { name: activeList.name, n: picked.size }),
+    );
+    setPicked(new Set());
+  };
+  const apply = async (itemId: string, anchor?: HTMLElement) => {
+    try {
+      const r = await applyWithTarget(itemId, anchor);
+      // 应用后须重取权威的已应用集合（多屏时可同时有多条「已应用」），
       // 否则旧壁纸的「已应用」状态会残留（前端只 add 不删除旧 id）。
-      await loadApplied();
+      if (r === "done") await loadApplied();
     } catch (e) {
       msg.error(String(e));
     }
@@ -287,6 +463,17 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
           <span className="rounded-lg bg-[var(--content)] px-4 py-2 text-[13px] font-medium shadow-lg">
             {tr("松开导入壁纸（支持文件与文件夹，可多个）")}
           </span>
+        </div>
+      )}
+      {/* 显示器页「更换壁纸」锁定的目标屏提示（应用后或点取消自动解除） */}
+      {armedTarget && (
+        <div className="mb-3 flex shrink-0 items-center gap-2 rounded-lg border border-[var(--accent-strong)]/40 bg-[var(--accent)]/10 px-3 py-1.5 text-[12.5px]">
+          <span className="flex-1 truncate">
+            {tr("正在为「{name}」选择壁纸 —— 点「应用」只设置该屏", { name: armedTarget.name })}
+          </span>
+          <button className="btn !py-0.5 text-[11.5px]" onClick={cancelApplyTarget}>
+            {tr("取消")}
+          </button>
         </div>
       )}
       {/* 工具栏 */}
@@ -309,6 +496,20 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
             </option>
           ))}
         </select>
+        <button
+          className={`rounded-lg border px-3 py-1.5 text-[12.5px] font-medium transition-colors ${
+            selectMode
+              ? "border-[var(--accent-strong)] bg-[var(--accent-strong)] text-[var(--content)]"
+              : "border-[var(--separator)] hover:bg-black/5 dark:hover:bg-white/10"
+          }`}
+          onClick={() => {
+            setSelectMode((v) => !v);
+            setPicked(new Set());
+          }}
+          title={tr("点选卡片批量加入切换列表")}
+        >
+          ✓ {tr("开启多选")}
+        </button>
         {!loading && (
           <span className="text-[12px] text-[var(--text-2)]">
             {tr("{n} 张", { n: items.length })}
@@ -331,6 +532,229 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
           </button>
         </div>
       </div>
+
+      {/* 切换列表 chips（点击 = 筛选该列表的条目）+ 新建 + 轮播运行指示 */}
+      <div className="mb-2 flex shrink-0 flex-wrap items-center gap-1.5">
+        <span className="text-[11px] font-semibold uppercase tracking-wide text-[var(--text-2)]/70">
+          {tr("切换列表")}
+        </span>
+        <button
+          onClick={() => setListFilter(null)}
+          className={`rounded-full border px-2.5 py-0.5 text-[12px] transition-colors ${
+            listFilter === null
+              ? "border-[var(--accent-strong)] bg-[var(--accent-strong)] text-[var(--content)]"
+              : "border-[var(--separator)] text-[var(--text-2)] hover:border-[var(--accent-strong)]/50"
+          }`}
+        >
+          {tr("全部")}
+        </button>
+        {playlists.map((p) => (
+          <button
+            key={p.id}
+            onClick={() => {
+              if (listFilter === p.id) {
+                setListFilter(null);
+              } else {
+                clearFilters();
+                setListFilter(p.id);
+              }
+            }}
+            className={`rounded-full border px-2.5 py-0.5 text-[12px] transition-colors ${
+              listFilter === p.id
+                ? "border-[var(--accent-strong)] bg-[var(--accent-strong)] text-[var(--content)]"
+                : "border-[var(--separator)] text-[var(--text-2)] hover:border-[var(--accent-strong)]/50"
+            }`}
+          >
+            {p.name}
+            <span className="ml-1 text-[10px] opacity-60">{p.itemIds.length}</span>
+          </button>
+        ))}
+        {creating ? (
+          <span className="flex items-center gap-1 rounded-full border border-[var(--accent-strong)]/60 px-2 py-0.5">
+            <input
+              autoFocus
+              value={newName}
+              onChange={(e) => setNewName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void createListWithSelection();
+                if (e.key === "Escape") {
+                  setCreating(false);
+                  setNewName("");
+                }
+                e.stopPropagation();
+              }}
+              placeholder={tr("列表名称")}
+              className="w-24 bg-transparent text-[12px] outline-none placeholder:text-[var(--text-2)]"
+            />
+            <button
+              className="text-[11px] font-medium text-[var(--accent-strong)]"
+              onClick={() => void createListWithSelection()}
+            >
+              {tr("建")}
+            </button>
+          </span>
+        ) : (
+          <button
+            onClick={() => {
+              setCreating(true);
+              if (selectMode) setAddMenuAt(null);
+            }}
+            title={tr("新建切换列表")}
+            className="rounded-full border border-dashed border-[var(--separator)] px-2.5 py-0.5 text-[12px] text-[var(--text-2)] transition-colors hover:border-[var(--accent-strong)]/60 hover:text-[var(--accent-strong)]"
+          >
+            ＋ {tr("新建")}
+          </button>
+        )}
+
+        {/* 轮播运行指示 + 快捷控制 */}
+        {(plStatus?.active || boundNames.size > 0) && (
+          <span className="ml-auto flex items-center gap-2 rounded-full bg-[var(--accent)]/10 px-3 py-0.5 text-[12px] text-[var(--text-2)]">
+            <span className="text-[var(--accent-strong)]">▶</span>
+            <span className="font-medium text-[var(--text-1)]">
+              {plStatus?.active && plStatus.mode !== "independent"
+                ? tr("轮播：{name} {i}/{t}", {
+                    name: plStatus.name ?? "",
+                    i: (plStatus.index ?? 0) + 1,
+                    t: plStatus.total ?? 0,
+                  })
+                : tr("{n} 块屏在轮播", { n: boundNames.size })}
+            </span>
+            {plStatus?.active &&
+              plStatus.mode !== "independent" &&
+              (plStatus.paused ? (
+                <span>{tr("已暂停")}</span>
+              ) : plStatus.nextAtMs ? (
+                <span>{formatCountdown(plStatus.nextAtMs - rotNow)}</span>
+              ) : null)}
+            <span className="mx-0.5 h-3 w-px bg-[var(--separator)]" />
+            <button
+              title={tr("上一张")}
+              className="hover:text-[var(--accent-strong)]"
+              onClick={() => void plAct(() => api.wallpaperPrev())}
+            >
+              ‹
+            </button>
+            <button
+              title={tr("下一张")}
+              className="hover:text-[var(--accent-strong)]"
+              onClick={() => void plAct(() => api.wallpaperNext())}
+            >
+              ›
+            </button>
+            <button
+              title={plStatus?.paused ? tr("恢复轮播") : tr("暂停轮播")}
+              className="hover:text-[var(--accent-strong)]"
+              onClick={() => void plAct(() => api.wallpaperRotationSet(!plStatus?.paused))}
+            >
+              {plStatus?.paused ? "▶" : "⏸"}
+            </button>
+            <button
+              title={tr("停止轮播")}
+              className="hover:text-red-500"
+              onClick={() => void plAct(() => api.playlistStop(), tr("已停止轮播"))}
+            >
+              ⏹
+            </button>
+          </span>
+        )}
+      </div>
+
+      {/* 列表上下文条：重命名 / 间隔 / 随机 / 启用 / 删除，全部内联编辑 */}
+      {activeList && (
+        <div className="mb-3 flex shrink-0 flex-wrap items-center gap-2.5 rounded-xl border border-[var(--separator)] bg-[var(--card)]/60 px-3 py-2 text-[12.5px] backdrop-blur">
+          {renameDraft !== null ? (
+            <input
+              autoFocus
+              value={renameDraft}
+              onChange={(e) => setRenameDraft(e.target.value)}
+              onBlur={() => {
+                const name = renameDraft.trim();
+                setRenameDraft(null);
+                if (name && name !== activeList.name) {
+                  void plAct(() => api.playlistUpdate(activeList.id, { name }));
+                }
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                if (e.key === "Escape") setRenameDraft(null);
+                e.stopPropagation();
+              }}
+              className="w-36 rounded-md border border-[var(--accent-strong)]/60 bg-[var(--content)] px-2 py-0.5 text-[13px] font-medium outline-none"
+            />
+          ) : (
+            <button
+              className="font-medium hover:text-[var(--accent-strong)]"
+              title={tr("重命名")}
+              onClick={() => setRenameDraft(activeList.name)}
+            >
+              {activeList.name} <span className="text-[11px] opacity-50">✎</span>
+            </button>
+          )}
+          <span className="text-[var(--text-2)]">
+            {tr("{n} 项", { n: activeList.itemIds.length })}
+          </span>
+          <label className="flex items-center gap-1 text-[var(--text-2)]">
+            {tr("间隔")}
+            <input
+              type="number"
+              min={1}
+              value={intervalDraft}
+              onChange={(e) => setIntervalDraft(e.target.value)}
+              onBlur={() => {
+                const m = Math.max(1, Number(intervalDraft) || 1);
+                if (m * 60 !== activeList.intervalSec) {
+                  void plAct(() => api.playlistUpdate(activeList.id, { intervalSec: m * 60 }));
+                }
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                e.stopPropagation();
+              }}
+              className="w-14 rounded-md border border-[var(--separator)] bg-[var(--content)] px-1.5 py-0.5 text-[12px] outline-none focus:border-[var(--accent-strong)]"
+            />
+            {tr("分钟")}
+          </label>
+          <button
+            className={`rounded-full border px-2.5 py-0.5 text-[11.5px] transition-colors ${
+              activeList.shuffle
+                ? "border-[var(--accent-strong)] bg-[var(--accent-strong)] text-[var(--content)]"
+                : "border-[var(--separator)] text-[var(--text-2)] hover:border-[var(--accent-strong)]/50"
+            }`}
+            title={tr("随机播放（一轮内不重复）")}
+            onClick={() =>
+              void plAct(() => api.playlistUpdate(activeList.id, { shuffle: !activeList.shuffle }))
+            }
+          >
+            ⇄ {tr("随机")}
+          </button>
+          {boundNames.has(activeList.id) && (
+            <span className="text-[11.5px] text-[var(--accent-strong)]">
+              {tr("已绑定：{names}", { names: (boundNames.get(activeList.id) ?? []).join("、") })}
+            </span>
+          )}
+          <div className="ml-auto flex items-center gap-2">
+            <button
+              className="btn btn-primary !py-0.5 text-[11.5px]"
+              onClick={(e) => {
+                if (dispMode === "independent") {
+                  const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                  setEnableAt({ x: r.left, y: r.bottom, p: activeList });
+                } else {
+                  void plAct(() => api.playlistApply(activeList.id), tr("已启用轮播"));
+                }
+              }}
+            >
+              {tr("启用轮播")}
+            </button>
+            <button
+              className="btn btn-danger !py-0.5 text-[11.5px]"
+              onClick={() => setDeleteList(activeList)}
+            >
+              {tr("删除")}
+            </button>
+          </div>
+        </div>
+      )}
 
       <FilterDrawer
         open={filterOpen}
@@ -409,10 +833,38 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
           </div>
         )}
 
+        {/* 列表视图空态：分清「列表本来没壁纸」和「被当前筛选收窄没了」 */}
+        {!loading && listFilter != null && shownItems.length === 0 && (
+          <div className="shrink-0 card mb-4">
+            <EmptyState
+              art="library"
+              title={
+                (activeList?.itemIds.length ?? 0) === 0
+                  ? tr("「{name}」还没有壁纸", { name: activeList?.name ?? "" })
+                  : tr("当前筛选下没有「{name}」的壁纸", { name: activeList?.name ?? "" })
+              }
+              hint={
+                (activeList?.itemIds.length ?? 0) === 0
+                  ? tr("开「选择」点选卡片，底部一键加入本列表")
+                  : tr("本列表有 {n} 张，被当前搜索/筛选收窄没了", {
+                      n: activeList?.itemIds.length ?? 0,
+                    })
+              }
+            />
+            {(activeList?.itemIds.length ?? 0) > 0 && (
+              <div className="mb-3 mt-1 flex justify-center">
+                <button className="btn !py-1 text-[12px]" onClick={clearFilters}>
+                  {tr("清除筛选")}
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* 虚拟滚动：本地库条目数没有上限（实测几百项），整表渲染会让滚动掉帧 */}
         <VirtualGrid
           className="min-h-0 flex-1 overflow-y-auto"
-          items={items}
+          items={shownItems}
           minColumnWidth={168}
           gap={12}
           keyOf={(it) => it.itemId}
@@ -423,6 +875,9 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
               // 虚拟滚动：格子随滚动挂载/卸载，lazy 的加载判定会被跳过（白块），
               // 直接立即加载
               eager
+              selectMode={selectMode}
+              selected={picked.has(item.itemId)}
+              onToggleSelect={() => toggleSelect(item.itemId)}
               onOpen={() => onOpenDetail(item.itemId)}
               badges={
                 item.missing ? (
@@ -460,6 +915,7 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
               }
               metaLeft={<TypeChip label={tr(TYPE_LABELS[item.type])} />}
               actions={
+                selectMode ? undefined : (
                 <div className="grid grid-cols-4 gap-1">
                   <button
                     className="flex items-center justify-center rounded-lg border border-[var(--separator)] px-0.5 py-1 text-[var(--text-2)] hover:text-[var(--accent-strong)] hover:bg-black/5 dark:hover:bg-white/10"
@@ -478,16 +934,16 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
                     </button>
                   ) : appliedItems.has(item.itemId) ? (
                     <button
-                      className="flex items-center justify-center rounded-lg border border-green-500/30 px-0.5 py-1 !text-green-600 dark:!text-green-400 bg-green-500/10 cursor-default disabled:opacity-75"
-                      disabled
-                      data-tip={tr("已应用到桌面")}
+                      className="flex items-center justify-center rounded-lg border border-green-500/30 px-0.5 py-1 !text-green-600 dark:!text-green-400 bg-green-500/10 hover:opacity-80"
+                      onClick={(e) => void apply(item.itemId, e.currentTarget)}
+                      data-tip={tr("已应用到桌面（可点击重新应用或指定屏）")}
                     >
                       <IconApply />
                     </button>
                   ) : (
                     <button
                       className="flex items-center justify-center rounded-lg border border-[var(--accent-strong)] px-0.5 py-1 text-[var(--accent-fg)] bg-[var(--accent)] hover:opacity-90"
-                      onClick={() => apply(item.itemId)}
+                      onClick={(e) => void apply(item.itemId, e.currentTarget)}
                       data-tip={tr("应用到桌面")}
                     >
                       <IconApply />
@@ -508,6 +964,7 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
                     <IconTrash />
                   </button>
                 </div>
+                )
               }
             />
           )}
@@ -601,6 +1058,103 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
           }}
         />
       )}
+
+      {/* 批量选择浮动条 + 「加入切换列表」上拉菜单（锚定菜单，不是弹框） */}
+      {selectMode && picked.size > 0 && (
+        <div className="pointer-events-none fixed inset-x-0 bottom-6 z-[65] flex justify-center">
+          <div className="pointer-events-auto flex animate-modal-pop items-center gap-2 rounded-2xl border border-[var(--separator)] bg-[var(--card)]/95 px-4 py-2 shadow-xl backdrop-blur">
+            <span className="text-[13px] font-medium">
+              {tr("已选 {n} 张", { n: picked.size })}
+            </span>
+            <span className="mx-1 h-4 w-px bg-[var(--separator)]" />
+            <button
+              className="btn btn-primary !py-1 text-[12px]"
+              onClick={(e) => {
+                setNewName("");
+                const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                setAddMenuAt({ x: r.left, y: r.top });
+              }}
+            >
+              {tr("加入切换列表")} ⌃
+            </button>
+            {activeList && (
+              <button
+                className="btn !py-1 text-[12px]"
+                onClick={() => void removeSelectionFromList()}
+              >
+                {tr("移出「{name}」", { name: activeList.name })}
+              </button>
+            )}
+            <button className="btn !py-1 text-[12px]" onClick={() => setPicked(new Set())}>
+              {tr("清除")}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {addMenuAt && (
+        <AnchoredMenu x={addMenuAt.x} y={addMenuAt.y} drop="up" onClose={() => setAddMenuAt(null)}>
+          {playlists.map((p) => (
+            <MenuItem key={p.id} onClick={() => void addSelectionTo(p.id)}>
+              {p.name}
+            </MenuItem>
+          ))}
+          {playlists.length === 0 && (
+            <div className="px-3 py-1.5 text-[12px] text-[var(--text-2)]">
+              {tr("还没有切换列表")}
+            </div>
+          )}
+          <MenuInputRow
+            value={newName}
+            onChange={setNewName}
+            onSubmit={() => void createListWithSelection()}
+            placeholder={tr("新列表名称")}
+            submitText={tr("建")}
+          />
+        </AnchoredMenu>
+      )}
+
+      {/* 独立模式：启用轮播 = 绑定到目标屏（锚定菜单） */}
+      {enableAt && (
+        <AnchoredMenu x={enableAt.x} y={enableAt.y} drop="down" onClose={() => setEnableAt(null)}>
+          {displays.map((d) => (
+            <MenuItem
+              key={d.id}
+              onClick={() => {
+                const p = enableAt.p;
+                setEnableAt(null);
+                void plAct(
+                  () => api.displayBindingSet(d.id, p.id),
+                  tr("「{name}」开始轮播", { name: d.name }),
+                );
+              }}
+            >
+              {d.name}
+            </MenuItem>
+          ))}
+        </AnchoredMenu>
+      )}
+
+      {deleteList && (
+        <ConfirmModal
+          title={tr("删除切换列表")}
+          message={tr("确定删除「{name}」？壁纸本身不受影响。", { name: deleteList.name })}
+          confirmText={tr("删除")}
+          danger
+          onCancel={() => setDeleteList(null)}
+          onConfirm={() => {
+            const target = deleteList;
+            setDeleteList(null);
+            if (listFilter === target.id) setListFilter(null);
+            void plAct(
+              () => api.playlistDelete(target.id),
+              tr("已删除「{name}」", { name: target.name }),
+            );
+          }}
+        />
+      )}
+
+      {applyMenu}
     </div>
   );
 }

@@ -6,6 +6,7 @@ mod audio_capture;
 mod blur;
 mod commands;
 mod content_server;
+mod cover_cache;
 mod db;
 mod download;
 mod ffmpeg;
@@ -42,7 +43,7 @@ use tauri::menu::MenuItemKind;
 use tauri::{
     menu::{CheckMenuItem, CheckMenuItemBuilder, Menu, MenuItem, PredefinedMenuItem, Submenu},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager,
+    AppHandle, Emitter, Manager,
 };
 
 pub fn run() {
@@ -82,8 +83,23 @@ pub fn run() {
                             }
                             'n' => {
                                 // ⌘⇧N：下一张（轮播）
-                                if let Err(e) = wallpaper::next(app.clone()) {
+                                if let Err(e) = wallpaper::next(app.clone(), None) {
                                     tracing::warn!("next failed: {e}");
+                                }
+                            }
+                            'r' => {
+                                // ⌘⇧R：暂停/恢复轮播（定时自动切换；⌘⇧P 是暂停壁纸渲染，两回事）
+                                let paused = app
+                                    .try_state::<Arc<Mutex<Connection>>>()
+                                    .and_then(|db| {
+                                        db.lock().ok().and_then(|c| {
+                                            db::get_setting(&c, "playlist_rotation_paused")
+                                        })
+                                    })
+                                    .map(|v| v == "true" || v == "1")
+                                    .unwrap_or(false);
+                                if let Err(e) = wallpaper::rotation_set(app.clone(), !paused) {
+                                    tracing::warn!("rotation_set failed: {e}");
                                 }
                             }
                             _ => {}
@@ -170,6 +186,8 @@ pub fn run() {
                 #[cfg(target_os = "macos")]
                 minimize_main,
             });
+            // 轮播状态文案（当前项 / 暂停·恢复）按启动时状态刷新一次
+            update_tray_rotation(app.handle());
             register_shortcuts(app.handle())?;
             // 抽帧组件（ffmpeg）的托管路径：抽帧入口拿不到 AppHandle，启动时缓存一份
             ffmpeg::init(app.handle());
@@ -184,6 +202,9 @@ pub fn run() {
             // 解不动的格式每次刷新重试一遍，直接把库页面冻死）
             app.manage(library::PosterFailState::default());
             library::spawn_poster_backfill(app.handle().clone());
+            // 封面本地化队列：本地库列表发现「目录里没封面但有远端 URL」时入队，
+            // 由后台 worker 取回写成 preview.jpg/preview.gif（列表路径只入队）
+            app.manage(Arc::new(cover_cache::CoverCacheState::default()));
             // 创意工坊上传：任务表 + Steam 客户端懒初始化（首次上传时才连 Steam）
             #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
             app.manage(workshop_upload::UploadState::default());
@@ -224,7 +245,7 @@ pub fn run() {
                     });
                     let _ = library::library_import_from_web(app2.clone(), web_data);
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    match wallpaper::apply_item(app2.clone(), item_id.clone()) {
+                    match wallpaper::apply_item(app2.clone(), item_id.clone(), None) {
                         Ok(_) => tracing::info!("AUTO APPLY OK: {item_id}"),
                         Err(e) => tracing::error!("AUTO APPLY FAILED: {e}"),
                     }
@@ -262,6 +283,7 @@ pub fn run() {
             workshop_upload::workshop_web_upload_prepare,
             i18n::app_set_locale,
             commands::app_info,
+            commands::app_pick_folder,
             commands::db_status,
             commands::settings_get,
             commands::settings_set,
@@ -272,6 +294,8 @@ pub fn run() {
             wallpaper::library_preview,
             wallpaper::stop,
             wallpaper::list_sessions,
+            wallpaper::displays_list,
+            wallpaper::display_binding_set,
             wallpaper::active_items,
             wallpaper::pause_all,
             wallpaper::resume_all,
@@ -291,10 +315,16 @@ pub fn run() {
             wallpaper::we_assets_dir_set,
             wallpaper::local_assets_status,
             wallpaper::next,
+            wallpaper::prev,
+            wallpaper::rotation_set,
             wallpaper::playlist_list,
+            wallpaper::playlist_get,
             wallpaper::playlist_create,
+            wallpaper::playlist_update,
             wallpaper::playlist_delete,
             wallpaper::playlist_apply,
+            wallpaper::playlist_stop,
+            wallpaper::playlist_status,
             audio_capture::audio_processing_set,
             audio_capture::audio_processing_status,
             content_server::content_server_status,
@@ -491,6 +521,11 @@ pub struct TrayMenu {
     show: MenuItem<tauri::Wry>,
     item_props: MenuItem<tauri::Wry>,
     auto_pause: CheckMenuItem<tauri::Wry>,
+    rot_menu: Submenu<tauri::Wry>,
+    rot_status: MenuItem<tauri::Wry>,
+    rot_prev: MenuItem<tauri::Wry>,
+    rot_next: MenuItem<tauri::Wry>,
+    rot_pause: MenuItem<tauri::Wry>,
     fit_menu: Submenu<tauri::Wry>,
     fit_items: Vec<CheckMenuItem<tauri::Wry>>,
     dpr_menu: Submenu<tauri::Wry>,
@@ -503,11 +538,14 @@ pub struct TrayMenu {
 }
 
 impl TrayMenu {
-    fn retranslate(&self) -> tauri::Result<()> {
+    fn retranslate(&self, app: &AppHandle) -> tauri::Result<()> {
         self.show.set_text(i18n::tr("显示主窗口"))?;
         self.item_props.set_text(i18n::tr("壁纸设置"))?;
         self.auto_pause.set_text(i18n::tr("自动暂停"))?;
         self.quit.set_text(i18n::tr("退出"))?;
+        self.rot_menu.set_text(i18n::tr("轮播"))?;
+        self.rot_prev.set_text(i18n::tr("上一张"))?;
+        self.rot_next.set_text(i18n::tr("下一张"))?;
         self.fit_menu.set_text(i18n::tr("显示模式"))?;
         self.dpr_menu.set_text(i18n::tr("清晰度"))?;
         self.fps_menu.set_text(i18n::tr("帧率上限"))?;
@@ -524,7 +562,74 @@ impl TrayMenu {
         for (item, (_, label)) in self.filter_items.iter().zip(wallpaper::WALLPAPER_FILTERS) {
             item.set_text(i18n::tr(label))?;
         }
+        // 轮播状态文案是动态的（当前项 / 暂停·恢复），按当前状态重写
+        self.refresh_rotation(app)?;
         Ok(())
+    }
+
+    /// 轮播状态 → 托盘文案。切换/激活/暂停后由 [`update_tray_rotation`] 调用。
+    fn refresh_rotation(&self, app: &AppHandle) -> tauri::Result<()> {
+        let st = wallpaper::playlist_status(app.clone())
+            .unwrap_or_else(|_| serde_json::json!({ "active": false, "paused": false }));
+        let paused = st.get("paused").and_then(|v| v.as_bool()).unwrap_or(false);
+        let status = if st.get("active").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let name = st.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let index = st.get("index").and_then(|v| v.as_i64()).unwrap_or(0) + 1;
+            let total = st.get("total").and_then(|v| v.as_i64()).unwrap_or(0);
+            format!("{}：{} {}/{}", i18n::tr("轮播"), name, index, total)
+        } else {
+            i18n::tr("轮播：未启用").to_string()
+        };
+        self.rot_status.set_text(status)?;
+        self.rot_pause
+            .set_text(i18n::tr(if paused { "恢复轮播" } else { "暂停轮播" }))?;
+        Ok(())
+    }
+
+    /// 某项共享设置改了（托盘自身点击 / 设置页 / MCP 任一入口）：把勾选同步到当前值。
+    /// 单选语义 —— 档位表里没有匹配项时整组取消勾选（值非法或来自旧版本）。
+    fn apply_setting(&self, key: &str, value: &str) {
+        fn sync(items: &[CheckMenuItem<tauri::Wry>], table: &[(&str, &str)], value: &str) {
+            for (item, (id, _)) in items.iter().zip(table) {
+                let _ = item.set_checked(*id == value);
+            }
+        }
+        match key {
+            "wallpaper_auto_pause" => {
+                let _ = self.auto_pause.set_checked(value == "true" || value == "1");
+            }
+            "wallpaper_fit" => sync(&self.fit_items, FIT_ITEMS, value),
+            "wallpaper_render_dpr" => sync(&self.dpr_items, DPR_ITEMS, value),
+            "wallpaper_scene_fps" => sync(&self.fps_items, FPS_ITEMS, value),
+            "wallpaper_filter" => sync(&self.filter_items, wallpaper::WALLPAPER_FILTERS, value),
+            _ => {}
+        }
+    }
+}
+
+/// 共享设置（托盘快速设置 ↔ 设置页 ↔ MCP）写入后的统一通知：托盘勾选就地同步 +
+/// 广播 `settings-changed`，让各窗口的控件（设置页下拉/开关、轮播条暂停钮）跟上。
+/// 值以持久化后的字符串为准，调用方须在 DB 锁外调用（内部不拿锁）。
+pub(crate) fn notify_setting_changed(app: &AppHandle, key: &str, value: &str) {
+    if let Some(state) = app.try_state::<NativeMenuState>() {
+        if let Some(tray) = &state.tray {
+            tray.apply_setting(key, value);
+        }
+    }
+    let _ = app.emit(
+        "settings-changed",
+        serde_json::json!({ "key": key, "value": value }),
+    );
+}
+
+/// 轮播状态变化（切换 / 激活 / 暂停）后刷新托盘「轮播」子菜单文案
+pub(crate) fn update_tray_rotation(app: &AppHandle) {
+    if let Some(state) = app.try_state::<NativeMenuState>() {
+        if let Some(tray) = &state.tray {
+            if let Err(e) = tray.refresh_rotation(app) {
+                tracing::warn!("refresh tray rotation failed: {e}");
+            }
+        }
     }
 }
 
@@ -541,7 +646,7 @@ pub struct NativeMenuState {
 pub(crate) fn retranslate_native_ui(app: &AppHandle) {
     if let Some(state) = app.try_state::<NativeMenuState>() {
         if let Some(tray) = &state.tray {
-            if let Err(e) = tray.retranslate() {
+            if let Err(e) = tray.retranslate(app) {
                 tracing::warn!("retranslate tray failed: {e}");
             }
         }
@@ -585,6 +690,25 @@ fn build_tray(app: &AppHandle) -> tauri::Result<TrayMenu> {
         .checked(cur_auto_pause == "true" || cur_auto_pause == "1")
         .build(app)?;
 
+    // 轮播（自动切换）：当前项 / 上一张 / 下一张 / 暂停自动切换。
+    // 「暂停轮播」只停定时切换（wallpaper::rotation_set），不动壁纸渲染（那是全局「暂停播放」）。
+    let rot_status =
+        MenuItem::with_id(app, "rot_status", i18n::tr("轮播：未启用"), false, None::<&str>)?;
+    let rot_prev = MenuItem::with_id(app, "rot_prev", i18n::tr("上一张"), true, None::<&str>)?;
+    let rot_next = MenuItem::with_id(app, "rot_next", i18n::tr("下一张"), true, None::<&str>)?;
+    let rot_pause = MenuItem::with_id(app, "rot_pause", i18n::tr("暂停轮播"), true, None::<&str>)?;
+    let rot_menu = Submenu::with_items(
+        app,
+        i18n::tr("轮播"),
+        true,
+        &[
+            &rot_status as &dyn tauri::menu::IsMenuItem<tauri::Wry>,
+            &rot_prev,
+            &rot_next,
+            &rot_pause,
+        ],
+    )?;
+
     let mk_check = |id: &str, text: &str, checked: bool| {
         CheckMenuItemBuilder::with_id(id, text)
             .checked(checked)
@@ -625,6 +749,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<TrayMenu> {
             &show,
             &item_props,
             &auto_pause_item,
+            &rot_menu,
             &sep1,
             &fit_menu,
             &dpr_menu,
@@ -640,6 +765,11 @@ fn build_tray(app: &AppHandle) -> tauri::Result<TrayMenu> {
         show: show.clone(),
         item_props: item_props.clone(),
         auto_pause: auto_pause_item.clone(),
+        rot_menu: rot_menu.clone(),
+        rot_status: rot_status.clone(),
+        rot_prev: rot_prev.clone(),
+        rot_next: rot_next.clone(),
+        rot_pause: rot_pause.clone(),
         fit_menu: fit_menu.clone(),
         fit_items: fit_items.clone(),
         dpr_menu: dpr_menu.clone(),
@@ -659,6 +789,30 @@ fn build_tray(app: &AppHandle) -> tauri::Result<TrayMenu> {
             let id = event.id.as_ref();
             match id {
                 "show" => main_window::ensure_main_window(app),
+                "rot_prev" => {
+                    if let Err(e) = wallpaper::prev(app.clone(), None) {
+                        tracing::warn!("tray rot_prev: {e}");
+                    }
+                }
+                "rot_next" => {
+                    if let Err(e) = wallpaper::next(app.clone(), None) {
+                        tracing::warn!("tray rot_next: {e}");
+                    }
+                }
+                "rot_pause" => {
+                    let paused = app
+                        .try_state::<Arc<Mutex<Connection>>>()
+                        .and_then(|db| {
+                            db.lock()
+                                .ok()
+                                .and_then(|c| db::get_setting(&c, "playlist_rotation_paused"))
+                        })
+                        .map(|v| v == "true" || v == "1")
+                        .unwrap_or(false);
+                    if let Err(e) = wallpaper::rotation_set(app.clone(), !paused) {
+                        tracing::warn!("tray rot_pause: {e}");
+                    }
+                }
                 "item_props" => {
                     // 独立设置窗口：只带配置面板，不唤起主界面。
                     // 多显示器时取第一个已应用项（active_items 已过滤文件丢失）。
@@ -687,7 +841,12 @@ fn build_tray(app: &AppHandle) -> tauri::Result<TrayMenu> {
                             );
                         }
                     }
-                    let _ = auto_pause_item.set_checked(next);
+                    // 托盘勾选 + 设置页同名开关都由这条统一通知跟上
+                    notify_setting_changed(
+                        app,
+                        "wallpaper_auto_pause",
+                        if next { "true" } else { "false" },
+                    );
                     // 关闭时若正挂在自动暂停上，立即恢复播放（标志一清，
                     // 回桌面也不会再代劳恢复了）
                     if !next {
@@ -704,33 +863,22 @@ fn build_tray(app: &AppHandle) -> tauri::Result<TrayMenu> {
                 }
                 "quit" => app.exit(0),
                 _ => {
-                    // 全局快速设置：复用设置页的三个 command 实现（持久化 + 实时下发）
+                    // 全局快速设置：复用设置页的 command 实现（持久化 + 实时下发 +
+                    // notify_setting_changed 统一同步勾选/设置页控件，这里不再手动勾选）
                     if let Some(fit) = id.strip_prefix("fit_") {
                         let _ = wallpaper::set_fit(app.clone(), fit.to_string());
-                        for item in &fit_items {
-                            let _ = item.set_checked(item.id() == &event.id);
-                        }
                     } else if let Some(dpr) = id.strip_prefix("dpr_") {
                         if let Ok(v) = dpr.parse::<f32>() {
                             let _ = wallpaper::set_render_dpr(app.clone(), v);
-                            for item in &dpr_items {
-                                let _ = item.set_checked(item.id() == &event.id);
-                            }
                         }
                     } else if let Some(fps) = id.strip_prefix("fps_") {
                         if let Ok(v) = fps.parse::<u32>() {
                             let _ = wallpaper::set_scene_fps(app.clone(), v);
-                            for item in &fps_items {
-                                let _ = item.set_checked(item.id() == &event.id);
-                            }
                         }
                     } else if let Some(filter) = id.strip_prefix("filter_") {
-                        // 白名单校验在 command 里；这里只负责持久化 + 实时下发 + 同步勾选
+                        // 白名单校验在 command 里；这里只负责调用，失败记日志
                         if let Err(e) = wallpaper::set_filter(app.clone(), filter.to_string()) {
                             tracing::warn!("tray set filter failed: {e}");
-                        }
-                        for item in &filter_items {
-                            let _ = item.set_checked(item.id() == &event.id);
                         }
                     }
                 }
@@ -782,16 +930,16 @@ fn tray_read_setting(app: &AppHandle, key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
-/// 全局快捷键：暂停/恢复、下一张（轮播）。
+/// 全局快捷键：暂停/恢复渲染、下一张（轮播）、暂停/恢复轮播。
 ///
-/// macOS 用 ⌘⇧P / ⌘⇧N；Windows / Linux 用 Ctrl+Shift+P / Ctrl+Shift+N
+/// macOS 用 ⌘⇧P / ⌘⇧N / ⌘⇧R；Windows / Linux 用 Ctrl+Shift+ 同字母
 /// （"cmd" 修饰键在非 macOS 平台上解析失败，会静默不注册）。
 fn register_shortcuts(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     use tauri_plugin_global_shortcut::GlobalShortcutExt;
     #[cfg(target_os = "macos")]
-    const SHORTCUTS: [&str; 2] = ["cmd+shift+p", "cmd+shift+n"];
+    const SHORTCUTS: [&str; 3] = ["cmd+shift+p", "cmd+shift+n", "cmd+shift+r"];
     #[cfg(not(target_os = "macos"))]
-    const SHORTCUTS: [&str; 2] = ["ctrl+shift+p", "ctrl+shift+n"];
+    const SHORTCUTS: [&str; 3] = ["ctrl+shift+p", "ctrl+shift+n", "ctrl+shift+r"];
     for s in SHORTCUTS {
         match app.global_shortcut().register(s) {
             Ok(_) => tracing::info!("shortcut registered: {s}"),

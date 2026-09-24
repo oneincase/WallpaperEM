@@ -35,9 +35,20 @@ jobs:
           repository: oneincase/webwallgl
           path: webwallgl-github-src
 
+      # media-bridge 同样是同级自有仓库（src-tauri/Cargo.toml 里
+      # path = "../../media-bridge/crates/media-bridge"），缺了它 cargo 直接报
+      # 找不到 path 依赖；纯 Rust 依赖，检出即可
+      - name: 检出 media-bridge
+        uses: actions/checkout@v4
+        with:
+          repository: oneincase/media-bridge
+          path: media-bridge-src
+
       # actions/checkout 不允许直接检出到 workspace 外，先落到子目录再移到平级
       - name: 移动到仓库平级目录
-        run: mv webwallgl-github-src ../webwallgl-github
+        run: |
+          mv webwallgl-github-src ../webwallgl-github
+          mv media-bridge-src ../media-bridge
 
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable

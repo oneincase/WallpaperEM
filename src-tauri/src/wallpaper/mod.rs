@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use tauri_plugin_desktop_underlay::DesktopUnderlayExt;
 
 use crate::content_server::ContentServerState;
@@ -448,7 +448,7 @@ pub fn item_play_config_set(
         let display_id_key = label.strip_prefix("wallpaper-").unwrap_or(&label).to_string();
         reset_play_fields(&mut cfg2);
         apply_play_config(&app, &mut cfg2, Some(&item_id));
-        if let Some(w) = app.get_webview_window(&label) {
+        for w in wallpaper_windows(&app, &label) {
             let _ = w.eval(&format!(
                 "window.__wp && window.__wp.setFit({})",
                 serde_json::json!(cfg2.fit)
@@ -628,6 +628,10 @@ impl Default for WallpaperEngineState {
 /// 初始化：管理状态 + 恢复会话 + 启动监控任务（屏幕布局 2s / 睡眠 5s）
 pub fn init(app: &AppHandle) -> tauri::Result<()> {
     app.manage(WallpaperEngineState::default());
+    // 显示器名称缓存 + 稳定 id 迁移都要先于会话恢复（setup 跑在主线程，NSScreen 可用）：
+    // 迁移会把旧 CGDirectDisplayID 键改写成稳定 id，晚于恢复就对不上窗口 label 了
+    platform::refresh_display_meta();
+    migrate_display_ids(app);
     restore_sessions(app);
     // 等待内容服务器端口就绪（最长 3s），壁纸窗口从内容服务器同源加载渲染器页
     for _ in 0..30 {
@@ -739,6 +743,54 @@ fn sweep_stale_data_stores(app: &AppHandle, delay: Duration) {
     });
 }
 
+/// 一次性会话迁移：旧版本 macOS 把 CGDirectDisplayID（重启后会变）直接当
+/// display_id 持久化，稳定 id 上线后按当前已连接显示器的 旧→新 映射改写会话键。
+/// 键冲突（新 id 已有会话）时旧行是过期副本，直接删掉；未连接显示器的旧行保留
+/// （无法反查 UUID），下次手动应用时覆盖。
+fn migrate_display_ids(app: &AppHandle) {
+    let pairs = platform::legacy_display_ids();
+    if pairs.is_empty() {
+        return;
+    }
+    let Some(db) = app.try_state::<Arc<Mutex<rusqlite::Connection>>>() else {
+        return;
+    };
+    let Ok(conn) = db.lock() else {
+        return;
+    };
+    for (old, new) in pairs {
+        let moved = conn
+            .execute(
+                "UPDATE OR IGNORE wallpaper_sessions SET display_id = ?1 WHERE display_id = ?2",
+                rusqlite::params![new, old],
+            )
+            .unwrap_or(0);
+        if moved > 0 {
+            tracing::info!("display id migrated: {old} -> {new}");
+        } else {
+            let _ = conn.execute(
+                "DELETE FROM wallpaper_sessions WHERE display_id = ?1",
+                [&old],
+            );
+        }
+    }
+}
+
+/// 读某屏的持久化会话配置（显示器热插拔回归时精确恢复它自己的壁纸，
+/// 而不是退化为「最近一次全局配置」；stop 删行后不会复活）。
+fn load_db_session(app: &AppHandle, display_id: &str) -> Option<WallpaperConfig> {
+    let db = app.try_state::<Arc<Mutex<rusqlite::Connection>>>()?;
+    let conn = db.lock().ok()?;
+    let raw: String = conn
+        .query_row(
+            "SELECT config_json FROM wallpaper_sessions WHERE display_id = ?1",
+            [display_id],
+            |r| r.get(0),
+        )
+        .ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
 /// 从 wallpaper_sessions 表恢复各屏壁纸
 fn restore_sessions(app: &AppHandle) {
     let Some(db) = app.try_state::<Arc<Mutex<rusqlite::Connection>>>() else {
@@ -793,6 +845,45 @@ fn restore_sessions(app: &AppHandle) {
     tracing::info!("wallpaper sessions restored: {count}");
 }
 
+// ---------- 壁纸窗口 label 双变体（无缝切换） ----------
+//
+// 换壁纸走「旧窗保持播放 + 新窗后台就绪后替换」（见 [`seamless_swap`]），同一块屏
+// 同一时刻可能有两扇窗口，label 在两个变体间交替：
+//   wallpaper-<display_id>    基 label —— `state.windows` 的规范键、会话表 display_id、
+//                             指针/滚轮派发都用它
+//   wallpaper-<display_id>-b  交替变体（display id 是纯数字，不会自带 -b 后缀）
+// 真实窗口经 [`wallpaper_window`] / [`wallpaper_windows`] 解析到活着的那扇/两扇。
+
+/// 基 label → 两个候选 label（[基, 交替]）
+fn label_variants(base: &str) -> (String, String) {
+    (base.to_string(), format!("{base}-b"))
+}
+
+/// 任意壁纸窗口 label → 基 label（非壁纸窗口返回 None）
+fn base_label_of(label: &str) -> Option<String> {
+    if !label.starts_with("wallpaper-") {
+        return None;
+    }
+    Some(label.strip_suffix("-b").unwrap_or(label).to_string())
+}
+
+/// 基 label 下所有活着的壁纸窗口（无缝切换期间新旧两扇都在）。
+/// 热更新（eval）与几何更新遍历它，别漏掉正在渐入的新窗。
+fn wallpaper_windows(app: &AppHandle, base: &str) -> Vec<WebviewWindow> {
+    let (a, b) = label_variants(base);
+    [a, b]
+        .iter()
+        .filter_map(|l| app.get_webview_window(l))
+        .collect()
+}
+
+/// 基 label 现役的壁纸窗口（存在性判断用；两扇都在时任取其一）。
+/// pub(crate)：系统壁纸抽帧 / MCP 截图按 label 取窗也要过它（无缝切换后
+/// 现役窗可能是 `-b` 变体）。
+pub(crate) fn wallpaper_window(app: &AppHandle, base: &str) -> Option<WebviewWindow> {
+    wallpaper_windows(app, base).into_iter().next()
+}
+
 /// 确保每个活动显示器都有壁纸窗口（创建/缩放/回收）
 fn ensure_windows(app: &AppHandle) {
     ensure_windows_inner(app, platform::display_asleep());
@@ -801,10 +892,16 @@ fn ensure_windows(app: &AppHandle) {
 /// 「没有会话配置所以不建窗」只提示一次，避免每 2s 刷屏
 static NO_CONFIG_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// 上一轮 ensure_windows 观察到的显示器集合（热插拔变化检测 → 事件推送前端）
+static LAST_SEEN_SCREENS: Mutex<Option<std::collections::HashSet<u32>>> = Mutex::new(None);
+
 /// `display_asleep` 由调用方传入：monitor 用「CG 报告 && 音频样本停止流动」的
 /// 复合判定（CGDisplayIsAsleep 的进程内状态在合盖唤醒后可能卡死在 true，
 /// 样本恢复流动即证明系统实际已唤醒）。
 fn ensure_windows_inner(app: &AppHandle, display_asleep: bool) {
+    // NSScreen 名称缓存刷新（本函数的正常调用方在主线程：2s 监控 tick 与 init；
+    // 非主线程调用内部直接返回，名称读缓存兜底）
+    platform::refresh_display_meta();
     // 「暂停释放内存」挂起期间不建窗：自动暂停已把壁纸渲染器整个销毁，
     // 这里若照常同步会把刚结束的进程立刻建回来（等于没释放）。恢复播放时
     // 由 resume_all 清标志后主动重建。
@@ -827,6 +924,17 @@ fn ensure_windows_inner(app: &AppHandle, display_asleep: bool) {
     if screens.is_empty() {
         return;
     }
+    // 显示器集合变化（热插拔/合盖开合）→ 通知前端刷新显示器管理页。
+    // 首轮只记录不推送（启动时没有监听方，也没变化可言）。
+    {
+        let ids: std::collections::HashSet<u32> = screens.iter().map(|s| s.id).collect();
+        let mut last = LAST_SEEN_SCREENS.lock().unwrap();
+        if matches!(&*last, Some(prev) if prev != &ids) {
+            tracing::info!("displays changed: {} -> {} screens", last.as_ref().map(|s| s.len()).unwrap_or(0), ids.len());
+            let _ = app.emit("displays-changed", ());
+        }
+        *last = Some(ids);
+    }
     let state = match app.try_state::<WallpaperEngineState>() {
         Some(s) => s,
         None => return,
@@ -841,15 +949,17 @@ fn ensure_windows_inner(app: &AppHandle, display_asleep: bool) {
         desired.insert(format!("wallpaper-{}", s.id), (s.id, s.x, s.y, s.w, s.h));
     }
 
-    // 移除已断开的显示器窗口
-    let existing_labels: Vec<String> = configs.keys().cloned().collect();
-    for label in &existing_labels {
-        if !desired.contains_key(label) {
-            if let Some(w) = app.get_webview_window(label) {
-                destroy_wallpaper_window(app, &w);
-            }
+    // 移除已断开的显示器窗口。按**真实活着的窗口**盘点（而不是 state.windows
+    // 的键）：无缝切换的交替变体 / 进行中的新窗也在场，基 label 不在需求集合
+    // 就整对收掉；屏还在则一律不动（切换半成品由换壁纸任务自己收尾）。
+    for (l, w) in app.webview_windows() {
+        let Some(base) = base_label_of(&l) else {
+            continue;
+        };
+        if !desired.contains_key(&base) {
+            destroy_wallpaper_window(app, &w);
             if let Ok(mut windows) = state.windows.lock() {
-                windows.remove(label);
+                windows.remove(&base);
             }
         }
     }
@@ -859,7 +969,14 @@ fn ensure_windows_inner(app: &AppHandle, display_asleep: bool) {
     // 不要弹出一个「降级提示页」占着桌面。用户应用第一张壁纸时再由
     // apply_on_main 按需建窗。
     for (label, (id, x, y, w, h)) in &desired {
-        let Some(cfg) = configs.get(label).cloned().or_else(|| default_cfg.clone()) else {
+        // 配置优先级：内存会话 > 本屏的持久化会话（拔掉的屏插回来时按 DB 行
+        // 精确恢复它自己的壁纸，而不是退化为「最近一次全局配置」）> 最近一次配置
+        let cfg_opt = configs
+            .get(label)
+            .cloned()
+            .or_else(|| load_db_session(app, &id.to_string()))
+            .or_else(|| default_cfg.clone());
+        let Some(cfg) = cfg_opt else {
             // 启动后「一直不出壁纸」时，这一行是最直接的线索：库里没有任何会话配置
             if !NO_CONFIG_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 tracing::info!(
@@ -868,18 +985,17 @@ fn ensure_windows_inner(app: &AppHandle, display_asleep: bool) {
             }
             continue;
         };
-        match app.get_webview_window(label) {
-            Some(win) => {
+        let live = wallpaper_windows(app, label);
+        if live.is_empty() {
+            if let Err(e) = create_desktop_window(app, label, &cfg, (*x, *y, *w, *h)) {
+                tracing::error!("create wallpaper window {label} failed: {e}");
+                continue;
+            }
+        } else {
+            for win in live {
                 platform::set_frame(&win, *x, *y, *w, *h);
             }
-            None => {
-                if let Err(e) = create_desktop_window(app, label, &cfg, (*x, *y, *w, *h)) {
-                    tracing::error!("create wallpaper window {label} failed: {e}");
-                    continue;
-                }
-            }
         }
-        let _ = id;
     }
 }
 
@@ -1177,38 +1293,16 @@ fn create_desktop_window(
     Ok(window)
 }
 
-/// 正在重建窗口的 label 集合。每个 label 同时只允许一个重建任务在跑 ——
-/// 快速连切时后一次 apply 只更新 `state.windows`，由这个唯一任务收敛到最后一张，
-/// 不会出现两个任务抢建同一 label（一个建成功后另一个报 already exists，最终
-/// 停在中间某张的错误画面上）。
-// 非 macOS：仅作为就地导航失败时的兜底重建（macOS 换壁纸走 replace_wallpaper_window）
-#[cfg(not(target_os = "macos"))]
-static RECREATING: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
-    std::sync::OnceLock::new();
-
 /// 正在换壁纸的 label 集合（防抖 + 单飞，所有平台共用）。
 static RELOADING: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
     std::sync::OnceLock::new();
 
 /// 换壁纸（防抖 + 单飞）：连切时等目标稳定后只加载最后一张。
 ///
-/// ## macOS：销毁旧窗口 + 显式结束 WebContent 进程 + 同名重建
-///
-/// 不能在**同一个 WKWebView 里整页导航**（实测 macOS 26）：连续切换（尤其
-/// 视频↔场景）时，`window.navigate()` 会返回成功，但旧页的 WebGL 上下文 / JS
-/// 堆没被干净回收，新页随后加载失败、渲染器永久不上报 ready，主线程最终卡死
-/// （2026-09-24 真机复现：场景→视频正常，视频→4K 场景即冻死）。就地导航是
-/// 「换文档不换进程」，回收全靠 WebKit 自觉，而它在重内容页上不可靠。
-///
-/// 可靠路径是把旧进程**显式结束**（[`destroy_wallpaper_window`] 内部走「主线程
-/// 取 pid → destroy → 按 pid SIGKILL」，见 [`macos::kill_web_content_process`]），
-/// 等 label 释放后再建一个干净的新窗口。旧壁纸占的内存这时是实打实还回去的，
-/// 也不会留下以 `http://127.0.0.1:<port>` 记名的残留 WebContent 进程。
-///
-/// ## 非 macOS：同窗口整页导航
-///
-/// WebView2 / WebKitGTK 的导航会连带销毁旧文档与渲染资源，实测健康，无需重付
-/// 建窗（GL 上下文、桌面层重挂）的代价。
+/// 所有平台统一走**无缝切换**（[`seamless_swap`]）：旧窗保持播放、新窗后台加载，
+/// 首帧 ready 后渐入、渐入走完再收旧窗 —— 慢加载的壁纸不再露出加载空白，加载
+/// 失败时旧壁纸继续留在屏上。就地导航 / 先销毁后重建都会立刻抹掉旧画面，做不到
+/// 无缝（macOS 就地导航在重内容页上还会冻死，见 [`destroy_wallpaper_window`]）。
 fn schedule_window_reload(app: &AppHandle, label: &str, frame: (f64, f64, f64, f64)) {
     use std::time::Duration;
     /// 连切合并窗口：目标稳定这么久才动手
@@ -1247,130 +1341,175 @@ fn schedule_window_reload(app: &AppHandle, label: &str, frame: (f64, f64, f64, f
             last = Some(cur);
             tokio::time::sleep(DEBOUNCE).await;
         }
-        let Some(target) = last else {
-            done();
-            return;
-        };
-        // 「暂停释放内存」挂起期间不加载：配置已登记进 state.windows，
-        // 恢复播放时按最新配置整窗重建；轮播也不该在后台把渲染进程建回来
-        if is_released(&app) {
-            done();
-            return;
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            replace_wallpaper_window(&app, &label, frame, &target, current).await;
-            done();
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        {
-            // 3 次机会：窗口刚被销毁（stop → 立刻重新应用）时头一次会扑空
-            let mut navigated = false;
-            for attempt in 0..3 {
-                if let Some(w) = app.get_webview_window(&label) {
-                    match navigate_to_config(&app, &w, &target) {
-                        Ok(()) => {
-                            tracing::info!(
-                                "wallpaper window {label} 就地重载（type={}），复用原渲染进程",
-                                target.r#type
-                            );
-                            crate::mem_watch::report("换壁纸（就地重载）");
-                            navigated = true;
-                            break;
-                        }
-                        Err(e) => tracing::debug!(
-                            "wallpaper window {label} 就地重载失败（第 {} 次）：{e}",
-                            attempt + 1
-                        ),
-                    }
-                } else {
-                    tracing::debug!(
-                        "wallpaper window {label} 不在（第 {} 次尝试）",
-                        attempt + 1
-                    );
-                }
-                tokio::time::sleep(Duration::from_millis(120)).await;
+        // 收敛循环：无缝切换期间目标又变（连切）→ 作废本次、换最新目标再切一轮
+        loop {
+            // 「暂停释放内存」挂起期间不加载：配置已登记进 state.windows，
+            // 恢复播放时按最新配置整窗重建；轮播也不该在后台把渲染进程建回来
+            if is_released(&app) {
+                done();
+                return;
             }
-            done();
-            if !navigated {
-                // 导航始终不成（窗口没了等）：回退销毁重建兜底
-                tracing::warn!(
-                    "wallpaper window {label}: 就地重载未成功，回退销毁重建"
-                );
-                schedule_window_recreate(&app, &label, frame);
+            let Some(target) = current(&app) else {
+                done();
+                return;
+            };
+            match seamless_swap(&app, &label, frame, &target).await {
+                SwapOutcome::Swapped => {
+                    crate::mem_watch::report("换壁纸（无缝切换）");
+                    if current(&app).is_some_and(|c| same_wallpaper(&c, &target)) {
+                        done();
+                        return;
+                    }
+                    // 收尾瞬间又切了新目标：继续收敛
+                }
+                SwapOutcome::Superseded => {
+                    // 半成品已由 seamless_swap 回收，直接换最新目标重来
+                }
+                SwapOutcome::KeptOld(reason) => {
+                    tracing::warn!("wallpaper {label}: 未切换（{reason}），旧壁纸继续留在屏上");
+                    let _ = app.emit(
+                        "wallpaper-load-failed",
+                        serde_json::json!({ "label": label, "reason": reason }),
+                    );
+                    done();
+                    return;
+                }
             }
         }
     });
 }
 
-/// macOS：销毁旧壁纸窗口（结束其 WebContent 进程）→ 等 label 释放 → 同名重建。
+/// 无缝切换的结果
+enum SwapOutcome {
+    /// 新窗已就绪并完成渐入，旧窗已收掉
+    Swapped,
+    /// 切换目标被更新的配置取代（本次的半成品新窗已回收）
+    Superseded,
+    /// 新壁纸没准备好（加载失败等），旧壁纸留在屏上
+    KeptOld(String),
+}
+
+/// 无缝切换一块屏的壁纸：旧窗保持播放，新窗后台加载，首帧 ready 后渐入、
+/// 渐入走完再收旧窗（视觉上是叠化，不是跳变）。
 ///
-/// 重建带重试：若期间又切了壁纸，重读最新目标再来一轮，最终收敛到当前配置。
-#[cfg(target_os = "macos")]
-async fn replace_wallpaper_window(
+/// - 首帧信号复用截图那套：渲染器 mount 到首帧才报 `ready`（/diag 回流），
+///   大 scene.pkg 冷启动 30s+ 也不误判（[`renderer_ready_since`]）；
+/// - 加载失败（渲染器报 `failed:`）→ 销毁新窗、返回 [`SwapOutcome::KeptOld`]，
+///   旧壁纸留在屏上 —— 「资源没准备好前，继续上一张」的语义就落在这条分支；
+/// - 等待期间目标又被改掉（连切）→ 销毁新窗、返回 [`SwapOutcome::Superseded`]；
+/// - 渐入由渲染器页面自己完成（wrap opacity 0→1，0.7s），宿主等它走完才收旧窗；
+///   收旧窗前先把旧窗音量归零，避免叠化期间双声重叠。
+async fn seamless_swap(
     app: &AppHandle,
-    label: &str,
+    base: &str,
     frame: (f64, f64, f64, f64),
     target: &WallpaperConfig,
-    current: impl Fn(&AppHandle) -> Option<WallpaperConfig>,
-) {
-    for _ in 0..20 {
-        // 销毁旧窗口：destroy_wallpaper_window 会取 pid 并在后台结束其 WebContent 进程
-        if let Some(w) = app.get_webview_window(label) {
-            let before = w.url().ok();
-            destroy_wallpaper_window(app, &w);
-            // 等窗口真的从注册表消失（destroy 是异步投递），再重建 —— 同轮次
-            // create 会撞 WebviewLabelAlreadyExists
-            for _ in 0..40 {
-                match app.get_webview_window(label) {
-                    None => break,
-                    // 等待期间窗口可能已被别处的新壁纸接管（navigate 而非销毁），
-                    // 那就别再建，交给那条路径
-                    Some(w) => {
-                        let taken_over = w.url().map(|now_url| {
-                            before.as_ref().is_some_and(|b| *b != now_url)
-                                && now_url.scheme() != "about"
-                        }).unwrap_or(false);
-                        if taken_over {
-                            tracing::debug!(
-                                "wallpaper window {label}: 替换前已被新壁纸接管，取消重建"
-                            );
-                            return;
-                        }
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+) -> SwapOutcome {
+    use std::time::Duration;
+    /// 渐入时长（渲染器 wrap 的 transition 0.7s + 裕量）
+    const FADE: Duration = Duration::from_millis(900);
+    /// 等首帧上限。渲染器自身的 90s 硬兜底会先报 failed（见 mountViaLib），
+    /// 这里多留一拍只作最后防线 —— 播着旧壁纸远好过换上一张空白。
+    const READY_TIMEOUT: Duration = Duration::from_secs(95);
+
+    if is_released(app) {
+        return SwapOutcome::KeptOld("「暂停释放内存」挂起中".into());
+    }
+    // 起点先于建窗：ready/failed 时间戳要「晚于它」才算本次的结果
+    let t0 = crate::system_wallpaper::ready_stamp(app);
+    let item = item_id_of(target);
+
+    // 双变体交替占 label：旧窗在基 label 就让新窗去 `-b`，反之亦然；
+    // 旧窗不在（首次应用）时新窗直接占基 label，没有旧窗可保。
+    let old = wallpaper_window(app, base);
+    let (va, vb) = label_variants(base);
+    let incoming = match &old {
+        Some(w) => {
+            if w.label() == va {
+                vb
+            } else {
+                va
             }
         }
+        None => va,
+    };
 
-        // 主线程建一个干净的新窗口（新进程、新 GL 上下文）
+    // 主线程建新窗（透明窗口；渲染器页面 opacity 0 起步，就绪后渐入）
+    let created = {
+        let (tx, rx) = std::sync::mpsc::channel();
         let app2 = app.clone();
-        let label2 = label.to_string();
+        let incoming2 = incoming.clone();
         let target2 = target.clone();
         let _ = app.run_on_main_thread(move || {
-            if let Err(e) = create_desktop_window(&app2, &label2, &target2, frame) {
-                tracing::debug!(
-                    "wallpaper window {label2} recreate attempt failed: {e}"
-                );
-            }
+            let r = create_desktop_window(&app2, &incoming2, &target2, frame).map(|_| ());
+            let _ = tx.send(r);
         });
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        if app.get_webview_window(label).is_none() {
-            continue; // 没建起来，重试
+        rx.recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|_| Err("建窗超时".into()))
+    };
+    if let Err(e) = created {
+        return SwapOutcome::KeptOld(format!("新窗口创建失败：{e}"));
+    }
+
+    // 等首帧 / 失败 / 目标变更 / 超时
+    let start = std::time::Instant::now();
+    loop {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // 目标被取代（含 stop 清会话）：回收半成品，交给调用方换最新目标
+        let superseded = app
+            .try_state::<WallpaperEngineState>()
+            .and_then(|st| st.windows.lock().unwrap().get(base).cloned())
+            .map(|c| !same_wallpaper(&c, target))
+            .unwrap_or(true);
+        if superseded {
+            destroy_incoming(app, &incoming);
+            return SwapOutcome::Superseded;
         }
-        // 建好了；若期间又切了壁纸，重读最新目标再来一轮
-        if item_id_of(&current(app).unwrap_or_else(|| target.clone())) == item_id_of(target) {
-            tracing::info!(
-                "wallpaper window {label}: 已换为新壁纸（销毁旧进程后重建，type={}）",
-                target.r#type
+        if let Some(reason) = crate::content_server::failure_since(app, t0, item.as_deref()) {
+            destroy_incoming(app, &incoming);
+            return SwapOutcome::KeptOld(reason);
+        }
+        if renderer_ready_since(app, t0, item.as_deref()) {
+            break;
+        }
+        if start.elapsed() > READY_TIMEOUT {
+            tracing::warn!(
+                "wallpaper {base}: 等首帧超时（{}s），强制替换",
+                READY_TIMEOUT.as_secs()
             );
-            crate::mem_watch::report("换壁纸（销毁重建）");
-            return;
+            break;
         }
     }
-    tracing::error!("wallpaper window {label}: 销毁重建多次失败");
+
+    // 渐入收尾：旧窗先收音量，等渐入走完再销毁，叠化过渡
+    if let Some(w) = &old {
+        let _ = w.eval("window.__wp && window.__wp.setVolume(0)");
+    }
+    tokio::time::sleep(FADE).await;
+    if let Some(w) = old {
+        if app.get_webview_window(w.label()).is_some() {
+            destroy_wallpaper_window(app, &w);
+        }
+    }
+    SwapOutcome::Swapped
+}
+
+/// 半成品新窗回收（中止 / 被取代时）
+fn destroy_incoming(app: &AppHandle, label: &str) {
+    if let Some(w) = app.get_webview_window(label) {
+        destroy_wallpaper_window(app, &w);
+    }
+}
+
+/// 新壁纸首帧是否就绪：ready 时间戳不早于 t0，且归属目标条目（None = 不校验归属）。
+fn renderer_ready_since(app: &AppHandle, t0: u64, item: Option<&str>) -> bool {
+    if crate::system_wallpaper::ready_stamp(app) < t0 {
+        return false;
+    }
+    match item {
+        Some(want) => crate::content_server::ready_item(app).as_deref() == Some(want),
+        None => true,
+    }
 }
 
 /// 销毁前那次主线程调用的结果（决定销毁后走哪条路）。
@@ -1688,96 +1827,6 @@ async fn reap_data_store(app: &AppHandle, label: &str, uuid: [u8; 16]) {
     }
 }
 
-/// 非 macOS 兜底：就地导航始终不成（窗口没了等）时，销毁后同名重建。
-/// 防抖 + 单飞（语义见 [`crate::wallpaper`] 换壁纸任务）。
-///
-/// `destroy()` 走的是异步投递，同一主线程轮次里重建必撞
-/// `WebviewLabelAlreadyExists`，所以先等 label 从注册表消失，再回主线程 create。
-#[cfg(not(target_os = "macos"))]
-fn schedule_window_recreate(app: &AppHandle, label: &str, frame: (f64, f64, f64, f64)) {
-    use std::time::Duration;
-    /// 连切合并窗口：目标稳定这么久才动手
-    const DEBOUNCE: Duration = Duration::from_millis(350);
-
-    let set = RECREATING.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
-    {
-        let mut g = set.lock().unwrap();
-        if !g.insert(label.to_string()) {
-            return; // 已有任务在跑，它会读到最新配置
-        }
-    }
-    let app = app.clone();
-    let label = label.to_string();
-    tauri::async_runtime::spawn(async move {
-        let done = || {
-            if let Some(set) = RECREATING.get() {
-                set.lock().unwrap().remove(&label);
-            }
-        };
-        let current = |app: &AppHandle| {
-            app.try_state::<WallpaperEngineState>()
-                .and_then(|st| st.windows.lock().unwrap().get(&label).cloned())
-        };
-
-        // 防抖：目标还在变就继续等，稳定 DEBOUNCE 后才开工
-        let mut last: Option<WallpaperConfig> = None;
-        loop {
-            let Some(cur) = current(&app) else {
-                done();
-                return; // 会话已清（stop/退出）
-            };
-            if last.as_ref().is_some_and(|p| same_wallpaper(p, &cur)) {
-                break;
-            }
-            last = Some(cur);
-            tokio::time::sleep(DEBOUNCE).await;
-        }
-        let Some(target) = last else {
-            done();
-            return;
-        };
-        // 「暂停释放内存」挂起期间不重建（同 schedule_window_reload 的说明）
-        if is_released(&app) {
-            done();
-            return;
-        }
-        let target_item = item_id_of(&target);
-
-        for _ in 0..20 {
-            // 销毁旧窗口并等注册表释放 label（macOS 顺带回收它的 WebContent 进程）
-            if let Some(w) = app.get_webview_window(&label) {
-                destroy_wallpaper_window(&app, &w);
-                for _ in 0..30 {
-                    if app.get_webview_window(&label).is_none() {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            }
-            let app2 = app.clone();
-            let label2 = label.clone();
-            let target2 = target.clone();
-            let _ = app.run_on_main_thread(move || {
-                if let Err(e) = create_desktop_window(&app2, &label2, &target2, frame) {
-                    tracing::debug!("wallpaper window {label2} recreate attempt failed: {e}");
-                }
-            });
-            tokio::time::sleep(Duration::from_millis(80)).await;
-            if app.get_webview_window(&label).is_none() {
-                continue; // 没建起来，重试
-            }
-            // 建好了；若期间又切了壁纸，重读目标再来一轮
-            if current(&app).as_ref().and_then(item_id_of) == target_item {
-                tracing::info!("wallpaper window {label} recreated");
-                done();
-                return;
-            }
-        }
-        tracing::error!("wallpaper window {label} recreate failed after retries");
-        done();
-    });
-}
-
 fn apply_on_main(
     app: &AppHandle,
     display_id: Option<String>,
@@ -1839,7 +1888,7 @@ fn apply_on_main(
             // 防抖 + 单飞：连切时任务读最新配置、收敛到最后一张
             schedule_window_reload(app, label, *frame);
         } else {
-            let window = match app.get_webview_window(label) {
+            let window = match wallpaper_window(app, label) {
                 Some(w) => w,
                 None => {
                     create_desktop_window(app, label, &cfg, *frame).map_err(|e| e.to_string())?
@@ -1884,6 +1933,9 @@ fn apply_on_main(
         }
     }
 
+    // 会话已变化 → 前端刷新「已应用」徽章与显示器管理页
+    let _ = app.emit("sessions-changed", ());
+
     // 系统静态壁纸同步（默认开）：抽首帧/代表帧设为系统桌面壁纸，
     // 锁屏/引擎未运行时与桌面视觉一致。失败只记日志，不影响应用结果
     crate::system_wallpaper::sync_after_apply(app, &cfg.r#type, cfg.src.as_deref(), item_id);
@@ -1898,7 +1950,7 @@ fn eval_all(app: &AppHandle, js: &str) {
     };
     let labels: Vec<String> = state.windows.lock().unwrap().keys().cloned().collect();
     for label in labels {
-        if let Some(w) = app.get_webview_window(&label) {
+        for w in wallpaper_windows(app, &label) {
             let _ = w.eval(js);
         }
     }
@@ -2202,7 +2254,7 @@ fn spawn_force_reload(app: AppHandle) {
             if cfg.r#type != "web" {
                 continue;
             }
-            if let Some(w) = app.get_webview_window(&label) {
+            for w in wallpaper_windows(&app, &label) {
                 cfg.media_base = media_base(&app);
                 refresh_src(&app, &mut cfg);
                 let item = item_id_of(&cfg);
@@ -2345,7 +2397,8 @@ pub fn stop(app: AppHandle, display_id: Option<String>) -> Result<(), String> {
         };
         let db = app2.try_state::<Arc<Mutex<rusqlite::Connection>>>();
         for label in &labels {
-            if let Some(w) = app2.get_webview_window(label) {
+            // 两扇都收（无缝切换的基/交替变体可能同时在场）
+            for w in wallpaper_windows(&app2, label) {
                 destroy_wallpaper_window(&app2, &w);
             }
             state.windows.lock().unwrap().remove(label);
@@ -2370,6 +2423,7 @@ pub fn stop(app: AppHandle, display_id: Option<String>) -> Result<(), String> {
         // 无法同步）。部分停止只清对应 label 的话，全停之外的场景由
         // resume_all 的重建兜底，这里不必精细区分。
         *state.released.lock().unwrap() = false;
+        let _ = app2.emit("sessions-changed", ());
         let _ = tx.send(Ok(()));
     })
     .map_err(|e| e.to_string())?;
@@ -2381,6 +2435,114 @@ pub fn list_sessions(_app: AppHandle, state: State<'_, WallpaperEngineState>) ->
     let windows = state.windows.lock().unwrap().clone();
     let paused = *state.paused.lock().unwrap();
     serde_json::json!({ "active": !windows.is_empty(), "paused": paused, "sessions": windows })
+}
+
+/// 显示器列表 + 每屏当前会话摘要（显示器管理页 / MCP 用）。
+/// `id` 与 `wallpaper_sessions.display_id`、`wallpaper_apply_item`/`wallpaper_stop`
+/// 的 displayId 是同一套稳定 id。
+#[tauri::command(async, rename = "wallpaper_displays_list")]
+pub fn displays_list(app: AppHandle) -> Result<serde_json::Value, String> {
+    // 非主线程调用时是空操作，名称走 2s 监控 tick 维护的缓存
+    platform::refresh_display_meta();
+    let screens = platform::active_screens();
+    let state = app.try_state::<WallpaperEngineState>();
+    let db = app.try_state::<Arc<Mutex<rusqlite::Connection>>>();
+
+    // 每屏当前条目：内存会话优先、DB 兜底（与 ensure_windows 的恢复优先级一致）
+    let mut item_ids: Vec<String> = Vec::new();
+    let mut per_display: Vec<(String, Option<String>)> = Vec::new();
+    for s in &screens {
+        let id = s.id.to_string();
+        let item_id = state
+            .as_ref()
+            .and_then(|st| {
+                let windows = st.windows.lock().unwrap();
+                windows.get(&format!("wallpaper-{id}")).and_then(item_id_of)
+            })
+            .or_else(|| {
+                let conn = db.as_ref()?.lock().ok()?;
+                conn.query_row(
+                    "SELECT item_id FROM wallpaper_sessions WHERE display_id = ?1",
+                    [&id],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .ok()?
+            });
+        if let Some(i) = &item_id {
+            item_ids.push(i.clone());
+        }
+        per_display.push((id, item_id));
+    }
+    let summaries = crate::library::item_cover_summary(&app, &item_ids);
+    // 模式 + 每屏轮播绑定（独立模式的每屏上下文摘要）
+    let (mode, bindings) = match &db {
+        Some(db) => match db.lock() {
+            Ok(conn) => {
+                let mode =
+                    db::get_setting(&conn, "display_mode").unwrap_or_else(|| "unified".to_string());
+                let mut bindings = HashMap::new();
+                for s in &screens {
+                    let id = s.id.to_string();
+                    if let Some(ctx) = read_ctx(&conn, &id) {
+                        let interval = ctx.playlist.interval_sec.max(30);
+                        let last = clock_get(&id);
+                        let next_at_ms = if rotation_paused(&conn) || last <= 0 {
+                            None
+                        } else {
+                            Some((last + interval) * 1000)
+                        };
+                        bindings.insert(
+                            id,
+                            serde_json::json!({
+                                "playlistId": ctx.playlist.id,
+                                "playlistName": ctx.playlist.name,
+                                "index": ctx.index,
+                                "total": ctx.playlist.item_ids.len(),
+                                "intervalSec": interval,
+                                "nextAtMs": next_at_ms,
+                            }),
+                        );
+                    }
+                }
+                (mode, bindings)
+            }
+            Err(_) => ("unified".to_string(), HashMap::new()),
+        },
+        None => ("unified".to_string(), HashMap::new()),
+    };
+
+    let displays: Vec<serde_json::Value> = screens
+        .iter()
+        .map(|s| {
+            let id = s.id.to_string();
+            let item_id = per_display
+                .iter()
+                .find(|(d, _)| d == &id)
+                .and_then(|(_, i)| i.clone());
+            let summary = item_id
+                .as_ref()
+                .map(|i| summaries.get(i).cloned().unwrap_or_else(|| (i.clone(), None)));
+            let binding = bindings
+                .get(&id)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            serde_json::json!({
+                "id": id,
+                "name": s.name,
+                "x": s.x,
+                "y": s.y,
+                "w": s.w,
+                "h": s.h,
+                "scale": s.scale,
+                "isPrimary": s.is_primary,
+                "itemId": item_id,
+                "title": summary.as_ref().map(|(t, _)| t.clone()),
+                "previewUrl": summary.and_then(|(_, p)| p),
+                "binding": binding,
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({ "mode": mode, "displays": displays }))
 }
 
 /// 当前已应用的本地库条目 id 集（供「本地库」页把已应用壁纸的应用按钮置为已应用/禁用）。
@@ -2479,7 +2641,7 @@ fn release_wallpaper_windows(app: &AppHandle) {
     *st.released.lock().unwrap() = true;
     let labels: Vec<String> = st.windows.lock().unwrap().keys().cloned().collect();
     for label in &labels {
-        if let Some(w) = app.get_webview_window(label) {
+        for w in wallpaper_windows(app, label) {
             destroy_wallpaper_window(app, &w);
         }
     }
@@ -2541,6 +2703,7 @@ pub fn set_fit(app: AppHandle, fit: String) -> Result<(), String> {
             let _ = db::set_setting(&conn, "wallpaper_fit", &fit);
         }
     }
+    crate::notify_setting_changed(&app, "wallpaper_fit", &fit);
     let js = format!("window.__wp && window.__wp.setFit({:?})", fit);
     eval_all(&app, &js);
     Ok(())
@@ -2555,6 +2718,7 @@ pub fn set_render_dpr(app: AppHandle, dpr: f32) -> Result<(), String> {
             let _ = db::set_setting(&conn, "wallpaper_render_dpr", &format!("{dpr}"));
         }
     }
+    crate::notify_setting_changed(&app, "wallpaper_render_dpr", &format!("{dpr}"));
     tracing::info!("render dpr set: {dpr}");
     eval_all(
         &app,
@@ -2601,6 +2765,7 @@ pub fn set_scene_fps(app: AppHandle, fps: u32) -> Result<(), String> {
             let _ = db::set_setting(&conn, "wallpaper_scene_fps", &fps.to_string());
         }
     }
+    crate::notify_setting_changed(&app, "wallpaper_scene_fps", &fps.to_string());
     eval_all(
         &app,
         &format!("window.__wp && window.__wp.setSceneFps({fps})"),
@@ -2622,6 +2787,7 @@ pub fn set_aa(app: AppHandle, mode: String) -> Result<(), String> {
             let _ = db::set_setting(&conn, "wallpaper_aa", &mode);
         }
     }
+    crate::notify_setting_changed(&app, "wallpaper_aa", &mode);
     tracing::info!("anti-aliasing set: {mode}");
     eval_all(
         &app,
@@ -2647,6 +2813,7 @@ pub fn set_particles(app: AppHandle, quality: String) -> Result<(), String> {
             let _ = db::set_setting(&conn, "wallpaper_particles", &quality);
         }
     }
+    crate::notify_setting_changed(&app, "wallpaper_particles", &quality);
     tracing::info!("particle quality set: {quality}");
     eval_all(
         &app,
@@ -2673,6 +2840,7 @@ pub fn set_post(app: AppHandle, quality: String) -> Result<(), String> {
             let _ = db::set_setting(&conn, "wallpaper_post", &quality);
         }
     }
+    crate::notify_setting_changed(&app, "wallpaper_post", &quality);
     tracing::info!("post-processing quality set: {quality}");
     eval_all(
         &app,
@@ -2706,6 +2874,7 @@ pub fn set_filter(app: AppHandle, filter: String) -> Result<(), String> {
             let _ = db::set_setting(&conn, "wallpaper_filter", &filter);
         }
     }
+    crate::notify_setting_changed(&app, "wallpaper_filter", &filter);
     tracing::info!("wallpaper filter set: {filter}");
     eval_all(
         &app,
@@ -2742,7 +2911,7 @@ pub fn interactive_set(app: AppHandle, enabled: bool) -> Result<(), String> {
             let screens = platform::active_screens();
             for s in &screens {
                 let label = format!("wallpaper-{}", s.id);
-                if let Some(w) = app2.get_webview_window(&label) {
+                for w in wallpaper_windows(&app2, &label) {
                     platform::apply_desktop_window(&w, (s.x, s.y, s.w, s.h), interactive);
                 }
             }
@@ -2766,8 +2935,13 @@ fn renavigate_all_windows(app: &AppHandle) -> Result<(), String> {
         st.windows.lock().unwrap().iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     for (label, cfg) in configs {
         let target = prepare_cfg(app, &cfg);
-        let Some(w) = app.get_webview_window(&label) else { continue };
-        navigate_to_config(app, &w, &target)?;
+        let wins = wallpaper_windows(app, &label);
+        if wins.is_empty() {
+            continue;
+        }
+        for w in &wins {
+            navigate_to_config(app, w, &target)?;
+        }
         st.windows.lock().unwrap().insert(label, target);
     }
     Ok(())
@@ -3147,9 +3321,13 @@ fn resolve_item_config(app: &AppHandle, item_id: &str) -> Result<WallpaperConfig
     Ok(cfg)
 }
 
-/// 把本地库条目应用到桌面（解析文件 → 全部显示器）。
+/// 把本地库条目应用到桌面（解析文件 → 全部显示器，或 `display_id` 指定的单屏）。
 /// 内部共用实现：不触碰播放/暂停状态（轮播在后台切换时必须保持自动暂停）。
-fn apply_item_inner(app: &AppHandle, item_id: &str) -> Result<(), String> {
+fn apply_item_inner(
+    app: &AppHandle,
+    item_id: &str,
+    display_id: Option<String>,
+) -> Result<(), String> {
     let cfg = resolve_item_config(app, item_id)?;
     let (tx, rx) = std::sync::mpsc::channel();
     let app2 = app.clone();
@@ -3164,7 +3342,7 @@ fn apply_item_inner(app: &AppHandle, item_id: &str) -> Result<(), String> {
     app.run_on_main_thread(move || {
         let t0 = std::time::Instant::now();
         tracing::info!("apply[{item_id}]: 主线程处理器进入");
-        let res = apply_on_main(&app2, None, cfg, Some(&item_id));
+        let res = apply_on_main(&app2, display_id, cfg, Some(&item_id));
         tracing::info!(
             "apply[{item_id}]: 主线程处理器返回（{}ms, ok={}）",
             t0.elapsed().as_millis(),
@@ -3186,14 +3364,111 @@ fn apply_item_inner(app: &AppHandle, item_id: &str) -> Result<(), String> {
     }
 }
 
-/// 把本地库条目应用到桌面（用户显式点击；自动暂停态下立即恢复播放）
+/// 把本地库条目应用到桌面（用户显式点击；自动暂停态下立即恢复播放）。
+/// `display_id` 缺省 = 全部显示器；传值 = 只刷该屏（显示器管理 / 独立模式）。
+/// 手动应用 = 该屏回到固定单张：清掉对应轮播绑定（统一上下文不动）。
 #[tauri::command(async, rename = "wallpaper_apply_item")]
-pub fn apply_item(app: AppHandle, item_id: String) -> Result<(), String> {
-    let res = apply_item_inner(&app, &item_id);
+pub fn apply_item(
+    app: AppHandle,
+    item_id: String,
+    display_id: Option<String>,
+) -> Result<(), String> {
+    let res = apply_item_inner(&app, &item_id, display_id.clone());
     if res.is_ok() {
+        clear_display_bindings(&app, display_id.as_deref());
         resume_if_auto_paused(&app);
     }
     res
+}
+
+/// 清掉手动应用所影响的屏的轮播绑定：传值清单屏；缺省清全部屏（统一上下文不动，
+/// 全停用 [`playlist_stop`]）。
+fn clear_display_bindings(app: &AppHandle, display_id: Option<&str>) {
+    let Some(db) = app.try_state::<Arc<Mutex<rusqlite::Connection>>>() else {
+        return;
+    };
+    let Ok(conn) = db.lock() else {
+        return;
+    };
+    match display_id {
+        Some(d) => {
+            if read_ctx(&conn, d).is_some() {
+                clear_ctx(&conn, d);
+                clock_forget(d);
+            }
+        }
+        None => {
+            for s in platform::active_screens() {
+                let key = s.id.to_string();
+                if read_ctx(&conn, &key).is_some() {
+                    clear_ctx(&conn, &key);
+                    clock_forget(&key);
+                }
+            }
+        }
+    }
+}
+
+/// 绑定/解绑某屏的轮播列表（独立模式的每屏上下文）：
+/// - `Some(playlist_id)`：该屏开始轮播该列表（立即应用第一项）；
+/// - `None`：解绑，回到固定单张（当前壁纸保持不动）。
+#[tauri::command(async, rename = "display_binding_set")]
+pub fn display_binding_set(
+    app: AppHandle,
+    display_id: String,
+    playlist_id: Option<i64>,
+) -> Result<(), String> {
+    // 目标屏必须在（绑到拔掉的屏上没有意义，会话也对不上）
+    if !platform::active_screens().iter().any(|s| s.id.to_string() == display_id) {
+        return Err("未找到目标显示器".into());
+    }
+    let Some(pid) = playlist_id else {
+        {
+            let db = app.state::<Arc<Mutex<rusqlite::Connection>>>();
+            let conn = db.lock().map_err(|e| e.to_string())?;
+            clear_ctx(&conn, &display_id);
+        }
+        clock_forget(&display_id);
+        crate::update_tray_rotation(&app);
+        return Ok(());
+    };
+    let mut p = {
+        let db = app.state::<Arc<Mutex<rusqlite::Connection>>>();
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        list_playlists(&conn)?
+            .into_iter()
+            .find(|p| p.id == pid)
+            .ok_or("播放列表不存在")?
+    };
+    // 剪条目（resolve 回表查库）锁外做，见 load_ctx_pruned 注释
+    let gone = prune_items(&app, &mut p);
+    {
+        let db = app.state::<Arc<Mutex<rusqlite::Connection>>>();
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        if gone > 0 {
+            let _ = conn.execute(
+                "UPDATE playlists SET item_ids = ?1 WHERE id = ?2",
+                rusqlite::params![serde_json::to_string(&p.item_ids).unwrap_or_default(), pid],
+            );
+        }
+        if p.item_ids.is_empty() {
+            return Err("播放列表为空".into());
+        }
+        save_ctx(&conn, &fresh_ctx(&display_id, p.clone(), 0))?;
+    }
+    clock_reset(&display_id);
+    let first = p.item_ids[0].clone();
+    apply_item_inner(&app, &first, Some(display_id.clone()))?;
+    crate::update_tray_rotation(&app);
+    tracing::info!(
+        "display {} bound to playlist {} ({} items, {}s, shuffle={})",
+        display_id,
+        p.id,
+        p.item_ids.len(),
+        p.interval_sec,
+        p.shuffle
+    );
+    Ok(())
 }
 
 /// 本地库条目预览信息（复用配置解析；前端按类型渲染弹框）
@@ -3211,11 +3486,156 @@ pub struct Playlist {
     pub name: String,
     pub item_ids: Vec<String>,
     pub interval_sec: i64,
+    /// 随机播放（洗牌队列：一轮内不重复、可回退）
+    #[serde(default)]
+    pub shuffle: bool,
+}
+
+/// 轮播上下文键：统一模式全局一份（"unified"）；独立模式每块绑定的屏一份（键 = display_id）。
+const CTX_UNIFIED: &str = "unified";
+
+/// 轮播上下文 = 列表快照 + 进度（index）+ 洗牌队列。统一/每屏共用同一套读写
+/// （settings 四件套，键名见 [`skey`]）——两套语义只差「应用目标屏」，见 [`step_one`]。
+#[derive(Debug, Clone)]
+struct Ctx {
+    key: String,
+    playlist: Playlist,
+    index: i64,
+    /// shuffle 且 n>1 时为 item_ids 下标的完整排列（一轮内不重复、可回退）；否则为空
+    queue: Vec<i64>,
+    /// 当前项在队列里的位置
+    queue_pos: i64,
+}
+
+/// 上下文 → settings 键名。统一模式沿用历史键名（active_playlist 等，免迁移）；
+/// 每屏上下文用 `rot:<display_id>:<field>`。
+fn skey(ctx: &str, field: &str) -> String {
+    if ctx == CTX_UNIFIED {
+        match field {
+            "playlist" => "active_playlist".to_string(),
+            "index" => "playlist_index".to_string(),
+            "queue" => "playlist_queue".to_string(),
+            _ => "playlist_queue_pos".to_string(),
+        }
+    } else {
+        format!("rot:{ctx}:{field}")
+    }
+}
+
+/// 新上下文（index 处打头；shuffle 时建洗牌队列）。激活列表 / 绑定屏时用。
+fn fresh_ctx(key: &str, playlist: Playlist, index: i64) -> Ctx {
+    let n = playlist.item_ids.len();
+    let (queue, queue_pos) = if playlist.shuffle && n > 1 {
+        (queue_with_head(make_queue(n), index), 0)
+    } else {
+        (Vec::new(), 0)
+    };
+    Ctx {
+        key: key.to_string(),
+        playlist,
+        index,
+        queue,
+        queue_pos,
+    }
+}
+
+/// 读上下文（含 index/队列的合法性收敛）。无激活返回 None。
+fn read_ctx(conn: &Connection, key: &str) -> Option<Ctx> {
+    let raw = db::get_setting(conn, &skey(key, "playlist"))?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    let playlist: Playlist = serde_json::from_str(&raw).ok()?;
+    let n = playlist.item_ids.len();
+    if n == 0 {
+        return None;
+    }
+    let mut index: i64 = db::get_setting(conn, &skey(key, "index"))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if index < 0 || index >= n as i64 {
+        index = 0;
+    }
+    let (queue, queue_pos) = if playlist.shuffle && n > 1 {
+        let q: Option<Vec<i64>> = db::get_setting(conn, &skey(key, "queue"))
+            .and_then(|s| serde_json::from_str(&s).ok());
+        let pos: Option<i64> = db::get_setting(conn, &skey(key, "qpos"))
+            .and_then(|s| s.parse().ok());
+        match (q, pos) {
+            (Some(q), Some(pos)) if q.len() == n && pos >= 0 && (pos as usize) < n => (q, pos),
+            // 缺失/失配（列表变过）：以当前项为队头重建
+            _ => (queue_with_head(make_queue(n), index), 0),
+        }
+    } else {
+        (Vec::new(), 0)
+    };
+    Some(Ctx {
+        key: key.to_string(),
+        playlist,
+        index,
+        queue,
+        queue_pos,
+    })
+}
+
+fn save_ctx(conn: &Connection, ctx: &Ctx) -> Result<(), String> {
+    db::set_setting(
+        conn,
+        &skey(&ctx.key, "playlist"),
+        &serde_json::to_string(&ctx.playlist).unwrap_or_default(),
+    )?;
+    db::set_setting(conn, &skey(&ctx.key, "index"), &ctx.index.to_string())?;
+    db::set_setting(
+        conn,
+        &skey(&ctx.key, "queue"),
+        &serde_json::to_string(&ctx.queue).unwrap_or_default(),
+    )?;
+    db::set_setting(conn, &skey(&ctx.key, "qpos"), &ctx.queue_pos.to_string())?;
+    Ok(())
+}
+
+fn clear_ctx(conn: &Connection, key: &str) {
+    for f in ["playlist", "index", "queue", "qpos"] {
+        let _ = conn.execute("DELETE FROM settings WHERE key = ?1", [skey(key, f)]);
+    }
+}
+
+/// 洗牌队列工具（item_ids 下标排列）：
+/// - [`make_queue`]：洗出 0..n 的随机排列（Fisher-Yates）；
+/// - [`queue_with_head`]：队头换成指定项（激活/重建时从当前项出发）；
+/// - [`queue_avoid_head`]：新一轮重洗的排列，队头避开指定项（不与刚播完的连续重复）。
+fn make_queue(n: usize) -> Vec<i64> {
+    use rand::RngCore;
+    let mut v: Vec<i64> = (0..n as i64).collect();
+    if n > 1 {
+        let mut rng = rand::thread_rng();
+        for i in (1..n).rev() {
+            let j = (rng.next_u32() as usize) % (i + 1);
+            v.swap(i, j);
+        }
+    }
+    v
+}
+
+fn queue_with_head(mut q: Vec<i64>, head: i64) -> Vec<i64> {
+    if q.len() > 1 {
+        if let Some(pos) = q.iter().position(|&x| x == head) {
+            q.swap(0, pos);
+        }
+    }
+    q
+}
+
+fn queue_avoid_head(mut q: Vec<i64>, avoid: i64) -> Vec<i64> {
+    if q.len() > 1 && q[0] == avoid {
+        q.swap(0, 1);
+    }
+    q
 }
 
 fn list_playlists(conn: &Connection) -> Result<Vec<Playlist>, String> {
     let mut stmt = conn
-        .prepare("SELECT id, name, item_ids, interval_sec FROM playlists ORDER BY id")
+        .prepare("SELECT id, name, item_ids, interval_sec, shuffle FROM playlists ORDER BY id")
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |r| {
@@ -3226,6 +3646,7 @@ fn list_playlists(conn: &Connection) -> Result<Vec<Playlist>, String> {
                 name: r.get(1)?,
                 item_ids,
                 interval_sec: r.get(3)?,
+                shuffle: r.get::<_, i64>(4)? != 0,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -3241,107 +3662,531 @@ pub fn playlist_list(app: AppHandle) -> Result<Vec<Playlist>, String> {
 }
 
 #[tauri::command]
+pub fn playlist_get(app: AppHandle, id: i64) -> Result<Playlist, String> {
+    let db = app.state::<Arc<Mutex<rusqlite::Connection>>>();
+    let conn = db.lock().map_err(|e| e.to_string())?;
+    list_playlists(&conn)?
+        .into_iter()
+        .find(|p| p.id == id)
+        .ok_or_else(|| "播放列表不存在".into())
+}
+
+#[tauri::command]
 pub fn playlist_create(
     app: AppHandle,
     name: String,
     item_ids: Vec<String>,
     interval_sec: i64,
+    shuffle: Option<bool>,
 ) -> Result<i64, String> {
     let db = app.state::<Arc<Mutex<rusqlite::Connection>>>();
     let conn = db.lock().map_err(|e| e.to_string())?;
     conn.execute(
-        "INSERT INTO playlists(name, item_ids, interval_sec) VALUES (?1, ?2, ?3)",
+        "INSERT INTO playlists(name, item_ids, interval_sec, shuffle) VALUES (?1, ?2, ?3, ?4)",
         rusqlite::params![
             name,
             serde_json::to_string(&item_ids).unwrap_or_default(),
-            interval_sec.max(30)
+            interval_sec.max(30),
+            shuffle.unwrap_or(false) as i64
         ],
     )
     .map_err(|e| e.to_string())?;
     Ok(conn.last_insert_rowid())
 }
 
-#[tauri::command]
-pub fn playlist_delete(app: AppHandle, id: i64) -> Result<bool, String> {
+/// 更新播放列表（None 字段不改）。条目或随机开关变化时重建轮播队列；
+/// 若是当前激活列表，同步快照并收敛 index —— 否则改完列表定时器还在按旧快照切。
+#[tauri::command(async)]
+pub fn playlist_update(
+    app: AppHandle,
+    id: i64,
+    name: Option<String>,
+    item_ids: Option<Vec<String>>,
+    interval_sec: Option<i64>,
+    shuffle: Option<bool>,
+) -> Result<Playlist, String> {
     let db = app.state::<Arc<Mutex<rusqlite::Connection>>>();
     let conn = db.lock().map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM playlists WHERE id = ?1", [id])
-        .map_err(|e| e.to_string())?;
+    let mut all = list_playlists(&conn)?;
+    let p = all
+        .iter_mut()
+        .find(|x| x.id == id)
+        .ok_or("播放列表不存在")?;
+    let mut shape_changed = false;
+    if let Some(n) = name {
+        p.name = n;
+    }
+    if let Some(ids) = item_ids {
+        shape_changed = ids != p.item_ids;
+        p.item_ids = ids;
+    }
+    if let Some(iv) = interval_sec {
+        p.interval_sec = iv.max(30);
+    }
+    if let Some(s) = shuffle {
+        if s != p.shuffle {
+            shape_changed = true;
+        }
+        p.shuffle = s;
+    }
+    conn.execute(
+        "UPDATE playlists SET name = ?1, item_ids = ?2, interval_sec = ?3, shuffle = ?4,
+         updated_at = ?5 WHERE id = ?6",
+        rusqlite::params![
+            p.name,
+            serde_json::to_string(&p.item_ids).unwrap_or_default(),
+            p.interval_sec,
+            p.shuffle as i64,
+            chrono::Utc::now().timestamp(),
+            id
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    let updated = p.clone();
+    drop(all);
+
+    // 同步所有引用该列表的上下文（统一 + 各绑定屏）：更新快照、收敛 index、按需重建队列
+    let mut keys: Vec<String> = vec![CTX_UNIFIED.to_string()];
+    keys.extend(platform::active_screens().iter().map(|s| s.id.to_string()));
+    for key in keys {
+        let Some(mut ctx) = read_ctx(&conn, &key) else {
+            continue;
+        };
+        if ctx.playlist.id != id {
+            continue;
+        }
+        ctx.playlist = updated.clone();
+        let n = updated.item_ids.len() as i64;
+        if ctx.index < 0 || ctx.index >= n {
+            ctx.index = 0;
+        }
+        if shape_changed {
+            let fresh = fresh_ctx(&key, updated.clone(), ctx.index);
+            ctx.queue = fresh.queue;
+            ctx.queue_pos = fresh.queue_pos;
+        }
+        save_ctx(&conn, &ctx)?;
+    }
+    drop(conn);
+    clock_clear_all();
+    crate::update_tray_rotation(&app);
+    Ok(updated)
+}
+
+#[tauri::command]
+pub fn playlist_delete(app: AppHandle, id: i64) -> Result<bool, String> {
+    let was_active = {
+        let db = app.state::<Arc<Mutex<rusqlite::Connection>>>();
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        conn.execute("DELETE FROM playlists WHERE id = ?1", [id])
+            .map_err(|e| e.to_string())?;
+        // 删的是当前激活列表：连轮播状态一起清，否则定时器拿着快照继续切
+        let was = db::get_setting(&conn, "active_playlist")
+            .and_then(|raw| serde_json::from_str::<Playlist>(&raw).ok())
+            .map(|ap| ap.id == id)
+            .unwrap_or(false);
+        if was {
+            let _ = conn.execute(
+                "DELETE FROM settings WHERE key IN
+                 ('active_playlist', 'playlist_index', 'playlist_queue', 'playlist_queue_pos')",
+                [],
+            );
+        }
+        // 绑定到屏的上下文也一并清（删除的列表不该在任何屏上继续轮播）
+        for s in platform::active_screens() {
+            let key = s.id.to_string();
+            if read_ctx(&conn, &key).map(|c| c.playlist.id == id).unwrap_or(false) {
+                clear_ctx(&conn, &key);
+                clock_forget(&key);
+            }
+        }
+        was
+    };
+    if was_active {
+        // update_tray_rotation → playlist_status 会拿 DB 锁，必须在锁外调
+        crate::update_tray_rotation(&app);
+    }
     Ok(true)
 }
 
 /// 激活播放列表：设置 active_playlist 并立即应用第一项
 #[tauri::command(async)]
 pub fn playlist_apply(app: AppHandle, id: i64) -> Result<serde_json::Value, String> {
-    let db = app.state::<Arc<Mutex<rusqlite::Connection>>>();
-    let playlist = {
+    let mut playlist = {
+        let db = app.state::<Arc<Mutex<rusqlite::Connection>>>();
         let conn = db.lock().map_err(|e| e.to_string())?;
-        let all = list_playlists(&conn)?;
-        all.into_iter()
+        list_playlists(&conn)?
+            .into_iter()
             .find(|p| p.id == id)
             .ok_or("播放列表不存在")?
     };
-    if playlist.item_ids.is_empty() {
-        return Err("播放列表为空".into());
-    }
+    // 剪掉失效条目（文件已丢失等）——resolve 回表查库，锁外做（见 load_active 注释）
+    let gone = prune_items(&app, &mut playlist);
     {
+        let db = app.state::<Arc<Mutex<rusqlite::Connection>>>();
         let conn = db.lock().map_err(|e| e.to_string())?;
+        if gone > 0 {
+            tracing::info!("playlist {}: {} 个条目已失效，已从列表移除", playlist.name, gone);
+            let _ = conn.execute(
+                "UPDATE playlists SET item_ids = ?1 WHERE id = ?2",
+                rusqlite::params![
+                    serde_json::to_string(&playlist.item_ids).unwrap_or_default(),
+                    id
+                ],
+            );
+        }
+        if playlist.item_ids.is_empty() {
+            return Err("播放列表为空".into());
+        }
         db::set_setting(
             &conn,
             "active_playlist",
             &serde_json::to_string(&playlist).unwrap_or_default(),
         )?;
         db::set_setting(&conn, "playlist_index", "0")?;
+        save_ctx(&conn, &fresh_ctx(CTX_UNIFIED, playlist.clone(), 0))?;
     }
-    // 应用第一项
-    if let Some(first) = playlist.item_ids.first() {
-        apply_item(app.clone(), first.clone())?;
-    }
+    // 应用第一项（失败不回滚激活态：条目在，只是当前应用失败，可下一张重试）
+    let first = playlist.item_ids[0].clone();
+    apply_item(app.clone(), first, None)?;
+    clock_reset(CTX_UNIFIED);
+    crate::update_tray_rotation(&app);
     tracing::info!(
-        "playlist {} activated ({} items, {}s)",
+        "playlist {} activated ({} items, {}s, shuffle={})",
         playlist.name,
         playlist.item_ids.len(),
-        playlist.interval_sec
+        playlist.interval_sec,
+        playlist.shuffle
     );
     Ok(serde_json::to_value(&playlist).unwrap_or_default())
 }
 
-/// 下一张（手动或轮播定时）
+/// 下一张（手动或轮播定时）。`display_id` = 只切该屏（独立模式）；缺省按当前模式
+/// 的活跃上下文走（统一 = 全局列表；独立 = 各绑定屏各自前进一张）。
 #[tauri::command(async, rename = "wallpaper_next")]
-pub fn next(app: AppHandle) -> Result<serde_json::Value, String> {
-    let db = app.state::<Arc<Mutex<rusqlite::Connection>>>();
-    let (playlist, index) = {
-        let conn = db.lock().map_err(|e| e.to_string())?;
-        let raw = db::get_setting(&conn, "active_playlist").ok_or("未激活播放列表")?;
-        let p: Playlist = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-        let idx: i64 = db::get_setting(&conn, "playlist_index")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        (p, idx)
-    };
-    if playlist.item_ids.is_empty() {
-        return Err("播放列表为空".into());
-    }
-    let n = playlist.item_ids.len() as i64;
-    let next_idx = (index + 1) % n;
-    let item = playlist.item_ids[next_idx as usize].clone();
-    {
-        let conn = db.lock().map_err(|e| e.to_string())?;
-        db::set_setting(&conn, "playlist_index", &next_idx.to_string())?;
-    }
-    apply_item_inner(&app, &item)?;
-    Ok(serde_json::json!({ "itemId": item, "index": next_idx }))
+pub fn next(app: AppHandle, display_id: Option<String>) -> Result<serde_json::Value, String> {
+    step_cmd(app, true, display_id)
 }
 
-/// 轮播定时任务：读取 active_playlist，按间隔自动下一张（由 init 启动）
+/// 上一张（顺序模式 ±1 环形；随机模式沿洗牌队列回退）
+#[tauri::command(async, rename = "wallpaper_prev")]
+pub fn prev(app: AppHandle, display_id: Option<String>) -> Result<serde_json::Value, String> {
+    step_cmd(app, false, display_id)
+}
+
+fn step_cmd(
+    app: AppHandle,
+    forward: bool,
+    display_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let keys: Vec<String> = match &display_id {
+        Some(d) => vec![d.clone()],
+        None => {
+            let db = app.state::<Arc<Mutex<rusqlite::Connection>>>();
+            let conn = db.lock().map_err(|e| e.to_string())?;
+            active_ctx_keys(&conn)
+        }
+    };
+    if keys.is_empty() {
+        return Err("未激活播放列表".into());
+    }
+    let mut steps = Vec::new();
+    let mut last_err = None;
+    for key in &keys {
+        match step_one(&app, key, forward) {
+            Ok((item, index)) => steps.push(serde_json::json!({
+                "displayId": (*key != CTX_UNIFIED).then(|| key.clone()),
+                "itemId": item,
+                "index": index,
+            })),
+            Err(e) => {
+                tracing::debug!("step[{key}]: {e}");
+                last_err = Some(e);
+            }
+        }
+    }
+    if steps.is_empty() {
+        return Err(last_err.unwrap_or_else(|| "未激活播放列表".into()));
+    }
+    crate::update_tray_rotation(&app);
+    // 单步时保持旧返回形（itemId / index）；多步（独立模式逐屏）时附完整 steps
+    let first = &steps[0];
+    Ok(serde_json::json!({
+        "itemId": first["itemId"],
+        "index": first["index"],
+        "steps": steps,
+    }))
+}
+
+/// 一个上下文走一步并应用：统一 = 刷全部屏；每屏 = 只刷那块屏。
+/// 手动/自动切换走同一入口：都重置该上下文的时钟（刚切过就重新计时）。
+fn step_one(app: &AppHandle, key: &str, forward: bool) -> Result<(String, i64), String> {
+    let mut ctx = load_ctx_pruned(app, key)?.ok_or("未激活播放列表")?;
+    let to = {
+        let db = app.state::<Arc<Mutex<rusqlite::Connection>>>();
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        let to = step_ctx(&mut ctx, forward);
+        ctx.index = to;
+        save_ctx(&conn, &ctx)?;
+        to
+    };
+    let item = ctx.playlist.item_ids[to as usize].clone();
+    clock_reset(key);
+    let display = (key != CTX_UNIFIED).then(|| key.to_string());
+    apply_item_inner(app, &item, display)?;
+    Ok((item, to))
+}
+
+/// 轮播暂停开关（持久化）。暂停的是「定时自动切换」，壁纸渲染不受影响
+/// （那是 ⌘⇧P 的「暂停播放」，两回事）。
+#[tauri::command(async, rename = "wallpaper_rotation_set")]
+pub fn rotation_set(app: AppHandle, paused: bool) -> Result<(), String> {
+    {
+        let db = app.state::<Arc<Mutex<rusqlite::Connection>>>();
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        db::set_setting(
+            &conn,
+            "playlist_rotation_paused",
+            if paused { "true" } else { "false" },
+        )?;
+    }
+    // 暂停/恢复都重新计时：恢复后满间隔再切，不补切暂停期间积压的次数
+    clock_clear_all();
+    crate::update_tray_rotation(&app);
+    // 托盘「轮播」子菜单与本地库轮播条的暂停钮要互相跟上（托盘点击时 UI 侧
+    // 没有自己的动作可挂靠，只能靠这条广播）
+    crate::notify_setting_changed(
+        &app,
+        "playlist_rotation_paused",
+        if paused { "true" } else { "false" },
+    );
+    Ok(())
+}
+
+/// 停止轮播（清除激活状态；壁纸停在当前这张不动）
+#[tauri::command(async, rename = "playlist_stop")]
+pub fn playlist_stop(app: AppHandle) -> Result<(), String> {
+    {
+        let db = app.state::<Arc<Mutex<rusqlite::Connection>>>();
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        let _ = conn.execute(
+            "DELETE FROM settings WHERE key IN
+             ('active_playlist', 'playlist_index', 'playlist_queue', 'playlist_queue_pos')
+             OR key LIKE 'rot:%'",
+            [],
+        );
+    }
+    clock_clear_all();
+    crate::update_tray_rotation(&app);
+    Ok(())
+}
+
+/// 轮播状态（切换列表页 / 显示器页 / 托盘共用）：
+/// 无激活列表时 `active: false`；倒计时以 nextAtMs 给出（暂停中为 null）。
+#[tauri::command(async, rename = "playlist_status")]
+pub fn playlist_status(app: AppHandle) -> Result<serde_json::Value, String> {
+    let db = app.state::<Arc<Mutex<rusqlite::Connection>>>();
+    let conn = db.lock().map_err(|e| e.to_string())?;
+    let paused = rotation_paused(&conn);
+    let Some(raw) = db::get_setting(&conn, "active_playlist") else {
+        return Ok(serde_json::json!({ "active": false, "paused": paused }));
+    };
+    let Ok(p) = serde_json::from_str::<Playlist>(&raw) else {
+        return Ok(serde_json::json!({ "active": false, "paused": paused }));
+    };
+    let index: i64 = db::get_setting(&conn, "playlist_index")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let interval = p.interval_sec.max(30);
+    let last = clock_get(CTX_UNIFIED);
+    let next_at_ms = if paused || last <= 0 {
+        None
+    } else {
+        Some((last + interval) * 1000)
+    };
+    let mode = db::get_setting(&conn, "display_mode").unwrap_or_else(|| "unified".to_string());
+    Ok(serde_json::json!({
+        "active": true,
+        "paused": paused,
+        "mode": mode,
+        "id": p.id,
+        "name": p.name,
+        "shuffle": p.shuffle,
+        "index": index,
+        "total": p.item_ids.len(),
+        "intervalSec": interval,
+        "nextAtMs": next_at_ms,
+    }))
+}
+
+// ---------- 轮播内部：时钟 / 条目清理 / 走步 ----------
+
+/// 轮播时钟（unix 秒）：每个上下文一份（键同 [`skey`]）。
+/// 手动/自动切换与暂停开关都会重置对应上下文 —— 「刚手动切过就重新计时」。
+/// 缺失/0 = 未初始化（应用重启后由定时任务补基准，间隔从启动起算）。
+static ROT_CLOCKS: Mutex<Vec<(String, i64)>> = Mutex::new(Vec::new());
+
+fn clock_reset(key: &str) {
+    if let Ok(mut g) = ROT_CLOCKS.lock() {
+        let now = chrono::Utc::now().timestamp();
+        match g.iter_mut().find(|(k, _)| k == key) {
+            Some((_, v)) => *v = now,
+            None => g.push((key.to_string(), now)),
+        }
+    }
+}
+
+fn clock_get(key: &str) -> i64 {
+    ROT_CLOCKS
+        .lock()
+        .ok()
+        .and_then(|g| g.iter().find(|(k, _)| k == key).map(|(_, v)| *v))
+        .unwrap_or(0)
+}
+
+fn clock_forget(key: &str) {
+    if let Ok(mut g) = ROT_CLOCKS.lock() {
+        g.retain(|(k, _)| k != key);
+    }
+}
+
+fn clock_clear_all() {
+    if let Ok(mut g) = ROT_CLOCKS.lock() {
+        g.clear();
+    }
+}
+
+/// 仅充电时轮播（设置开）：电池供电时暂缓自动切换（手动切换不受影响）。
+fn rotation_power_blocked(conn: &Connection) -> bool {
+    let on = matches!(
+        db::get_setting(conn, "playlist_rotation_power").as_deref(),
+        Some("true") | Some("1")
+    );
+    on && platform::on_ac_power() == Some(false)
+}
+
+/// 当前模式下活跃的上下文键：统一 = ["unified"]；独立 = 已绑定列表的屏 id。
+fn active_ctx_keys(conn: &Connection) -> Vec<String> {
+    let mode = db::get_setting(conn, "display_mode").unwrap_or_else(|| "unified".to_string());
+    if mode != "independent" {
+        return vec![CTX_UNIFIED.to_string()];
+    }
+    platform::active_screens()
+        .iter()
+        .map(|s| s.id.to_string())
+        .filter(|id| read_ctx(conn, id).is_some())
+        .collect()
+}
+
+/// 轮播暂停（持久化设置）。暂停的是「自动切换」，不是壁纸渲染。
+fn rotation_paused(conn: &Connection) -> bool {
+    matches!(
+        db::get_setting(conn, "playlist_rotation_paused").as_deref(),
+        Some("true") | Some("1")
+    )
+}
+
+/// 剪掉失效条目（本地文件已丢失等，配置解析失败）。返回剪掉数量。
+fn prune_items(app: &AppHandle, p: &mut Playlist) -> usize {
+    let before = p.item_ids.len();
+    p.item_ids.retain(|id| resolve_item_config(app, id).is_ok());
+    before - p.item_ids.len()
+}
+
+/// 读上下文并剪掉失效条目（快照 + 源表写回）。无激活返回 None。
+///
+/// ⚠️ 剪条目调 resolve_item_config（内部回表查库）——必须在**不持有 DB 锁**时做，
+/// 否则同一把 `Mutex<Connection>` 自锁死（本模块所有「锁内不做解析」都源于此）。
+fn load_ctx_pruned(app: &AppHandle, key: &str) -> Result<Option<Ctx>, String> {
+    let mut ctx = {
+        let db = app.state::<Arc<Mutex<rusqlite::Connection>>>();
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        match read_ctx(&conn, key) {
+            Some(c) => c,
+            None => return Ok(None),
+        }
+    };
+    let gone = prune_items(app, &mut ctx.playlist);
+    if gone > 0 {
+        tracing::info!(
+            "playlist {}: {} 个条目已失效，已跳过并移除",
+            ctx.playlist.name,
+            gone
+        );
+        let db = app.state::<Arc<Mutex<rusqlite::Connection>>>();
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        if ctx.playlist.item_ids.is_empty() {
+            clear_ctx(&conn, key);
+            clock_forget(key);
+            return Ok(None);
+        }
+        let n = ctx.playlist.item_ids.len() as i64;
+        if ctx.index >= n {
+            ctx.index = 0;
+        }
+        if ctx.playlist.shuffle && n > 1 {
+            ctx.queue = queue_with_head(make_queue(n as usize), ctx.index);
+            ctx.queue_pos = 0;
+        }
+        save_ctx(&conn, &ctx)?;
+        // 源表同步（列表实体可能还在；已删除则 UPDATE 不命中，无副作用）
+        let _ = conn.execute(
+            "UPDATE playlists SET item_ids = ?1 WHERE id = ?2",
+            rusqlite::params![
+                serde_json::to_string(&ctx.playlist.item_ids).unwrap_or_default(),
+                ctx.playlist.id
+            ],
+        );
+    }
+    Ok(Some(ctx))
+}
+
+/// 走一步（forward/backward）：顺序 ±1 环形；随机沿洗牌队列（一轮内不重复、可回退，
+/// 走穿队尾重洗且队头避开当前项）。纯函数，队列/位置写回 ctx，index 由调用方落。
+fn step_ctx(ctx: &mut Ctx, forward: bool) -> i64 {
+    let n = ctx.playlist.item_ids.len() as i64;
+    if n <= 1 {
+        return 0;
+    }
+    if !ctx.playlist.shuffle {
+        return if forward {
+            (ctx.index + 1) % n
+        } else {
+            (ctx.index - 1 + n) % n
+        };
+    }
+    let mut pos = ctx.queue_pos;
+    if forward {
+        pos += 1;
+        if pos >= n {
+            ctx.queue = queue_avoid_head(make_queue(n as usize), ctx.index);
+            pos = 0;
+        }
+    } else {
+        pos -= 1;
+        if pos < 0 {
+            pos = n - 1; // 环到本队列队尾（回退语义：本轮最后那格）
+        }
+    }
+    ctx.queue_pos = pos;
+    ctx.queue[pos as usize]
+}
+
+/// 洗牌队列（item_ids 下标的完整排列，随 [`Ctx`] 存放）：
+/// - 随机模式沿队列 ±1（回退 = 回到本队列上一个，一轮内不重复）；走穿队尾重洗一轮
+///   （新队列头避开当前项，不连续重复）。
+/// - 顺序模式不用队列，index 直接 ±1 环形。见 [`step_ctx`]。
+
+/// 轮播定时任务：按间隔自动下一张（由 init 启动），按模式驱动活跃上下文
+/// （统一一份 / 独立每屏一份，各自计时）。手动切换会重置对应时钟（[`clock_reset`]）；
+/// 暂停轮播与「仅充电时轮播」的电池暂缓期间不动。时钟缺失（应用刚启动）只补基准
+/// 不切换 —— 间隔从启动起算。
 pub fn start_playlist_rotation(app: &AppHandle) {
     let app2 = app.clone();
     tauri::async_runtime::spawn(async move {
-        let mut last_tick = chrono::Utc::now().timestamp();
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
-            let now = chrono::Utc::now().timestamp();
-            let interval = {
+            let due: Vec<String> = {
                 let Some(db) = app2.try_state::<Arc<Mutex<rusqlite::Connection>>>() else {
                     continue;
                 };
@@ -3349,15 +4194,28 @@ pub fn start_playlist_rotation(app: &AppHandle) {
                     Ok(c) => c,
                     Err(_) => continue,
                 };
-                db::get_setting(&conn, "active_playlist")
-                    .and_then(|raw| serde_json::from_str::<Playlist>(&raw).ok())
-                    .map(|p| p.interval_sec.max(30))
-                    .unwrap_or(0)
+                if rotation_paused(&conn) || rotation_power_blocked(&conn) {
+                    continue;
+                }
+                let mut due = Vec::new();
+                for key in active_ctx_keys(&conn) {
+                    let Some(ctx) = read_ctx(&conn, &key) else {
+                        continue;
+                    };
+                    let interval = ctx.playlist.interval_sec.max(30);
+                    let last = clock_get(&key);
+                    if last <= 0 {
+                        clock_reset(&key); // 重启后补基准：间隔从启动起算
+                    } else if chrono::Utc::now().timestamp() - last >= interval {
+                        due.push(key);
+                    }
+                }
+                due
             };
-            if interval > 0 && now - last_tick >= interval {
-                last_tick = now;
-                if let Err(e) = next(app2.clone()) {
-                    tracing::debug!("playlist rotation: {e}");
+            for key in due {
+                match step_one(&app2, &key, true) {
+                    Ok(_) => crate::update_tray_rotation(&app2),
+                    Err(e) => tracing::debug!("playlist rotation[{key}]: {e}"),
                 }
             }
         }
@@ -3373,6 +4231,60 @@ mod tests {
         c.execute_batch("CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             .unwrap();
         c
+    }
+
+    /// 轮播走步：顺序模式 ±1 环形；随机模式沿洗牌队列（一轮内不重复、可回退，
+    /// 跨轮重洗后头一张不与上一张连续重复）。
+    #[test]
+    fn playlist_step_sequential_and_shuffle() {
+        let mut ctx = Ctx {
+            key: "t".into(),
+            playlist: Playlist {
+                id: 1,
+                name: "t".into(),
+                item_ids: (0..5).map(|i| format!("i{i}")).collect(),
+                interval_sec: 60,
+                shuffle: false,
+            },
+            index: 0,
+            queue: Vec::new(),
+            queue_pos: 0,
+        };
+        // 顺序：±1 环形
+        ctx.index = 0;
+        assert_eq!(step_ctx(&mut ctx, true), 1);
+        ctx.index = 2;
+        assert_eq!(step_ctx(&mut ctx, true), 3);
+        ctx.index = 2;
+        assert_eq!(step_ctx(&mut ctx, false), 1);
+        ctx.index = 0;
+        assert_eq!(step_ctx(&mut ctx, false), 4);
+
+        // 随机：洗牌队列一轮内不重复
+        ctx.playlist.shuffle = true;
+        ctx.index = 0;
+        ctx.queue = queue_with_head(make_queue(5), 0);
+        ctx.queue_pos = 0;
+        let mut seen = vec![0i64];
+        for _ in 0..4 {
+            let to = step_ctx(&mut ctx, true);
+            assert!(!seen.contains(&to), "一轮内重复了: {seen:?} → {to}");
+            seen.push(to);
+            ctx.index = to;
+        }
+        // 回退两步再前进两步：队列位置 ±1，原路返回
+        let cur = ctx.index;
+        let back1 = step_ctx(&mut ctx, false);
+        ctx.index = back1;
+        let back2 = step_ctx(&mut ctx, false);
+        ctx.index = back2;
+        assert_eq!(step_ctx(&mut ctx, true), back1);
+        ctx.index = back1;
+        assert_eq!(step_ctx(&mut ctx, true), cur);
+        ctx.index = cur;
+        // 走穿队尾：重洗一轮，头一张不与上一张连续重复
+        let fresh = step_ctx(&mut ctx, true);
+        assert_ne!(fresh, cur, "跨轮不应与上一张连续重复");
     }
 
     /// 每壁纸播放设置的三态语义：缺失=跟随全局、有值=专属、全空=删键。

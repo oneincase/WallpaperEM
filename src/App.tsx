@@ -5,6 +5,7 @@ import { DetailPage } from "./pages/Detail";
 import { DownloadsPage } from "./pages/Downloads";
 import { LibraryPage } from "./pages/Library";
 import { FavoritesPage } from "./pages/Favorites";
+import { DisplaysPage } from "./pages/Displays";
 import { SettingsPage } from "./pages/Settings";
 import {
   IconHome,
@@ -12,6 +13,7 @@ import {
   IconDownload,
   IconLibrary,
   IconHeart,
+  IconMonitor,
   IconGear,
   IconSidebarCollapse,
   IconSidebarExpand,
@@ -25,7 +27,14 @@ import { readState, writeState } from "./lib/cache-snapshots";
 import { applyDocumentLang, pushLocaleToBackend, tr, useLocale } from "./lib/i18n";
 import { applyTheme, readStoredTheme, THEME_STORAGE_KEY, type Theme } from "./lib/theme";
 
-type PageId = "home" | "workshop" | "downloads" | "library" | "favorites" | "settings";
+type PageId =
+  | "home"
+  | "workshop"
+  | "downloads"
+  | "library"
+  | "favorites"
+  | "displays"
+  | "settings";
 
 const PAGE_STORAGE_KEY = "nav.page";
 
@@ -35,6 +44,7 @@ const NAV: { id: PageId; label: string; icon: ReactNode; group: string }[] = [
   { id: "downloads", label: "下载", icon: <IconDownload />, group: "浏览" },
   { id: "library", label: "本地库", icon: <IconLibrary />, group: "库" },
   { id: "favorites", label: "收藏", icon: <IconHeart />, group: "库" },
+  { id: "displays", label: "显示器", icon: <IconMonitor />, group: "系统" },
   { id: "settings", label: "设置", icon: <IconGear />, group: "系统" },
 ];
 
@@ -55,7 +65,14 @@ function readInitialCollapsed(): boolean {
  */
 function readInitialPage(): PageId {
   const p = readState<string>(PAGE_STORAGE_KEY, "home");
-  const valid: PageId[] = ["home", "workshop", "downloads", "library", "favorites"];
+  const valid: PageId[] = [
+    "home",
+    "workshop",
+    "downloads",
+    "library",
+    "favorites",
+    "displays",
+  ];
   return (valid as string[]).includes(p) ? (p as PageId) : "home";
 }
 
@@ -316,6 +333,8 @@ function Shell() {
             <LibraryPage onOpenDetail={openDetail} />
           ) : page === "favorites" ? (
             <FavoritesPage onOpenDetail={openDetail} />
+          ) : page === "displays" ? (
+            <DisplaysPage onNavigate={navigate} />
           ) : (
             <SettingsPage />
           )}

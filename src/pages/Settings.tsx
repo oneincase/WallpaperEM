@@ -38,6 +38,10 @@ export function SettingsPage() {
   const [interactive, setInteractive] = useState(false);
   const [autoSystemStatic, setAutoSystemStatic] = useState(true);
   const [autoPause, setAutoPause] = useState(false);
+  // 轮播默认值（新建切换列表时的初值）
+  const [plDefaultInterval, setPlDefaultInterval] = useState(10);
+  const [plDefaultShuffle, setPlDefaultShuffle] = useState(false);
+  const [plPowerOnly, setPlPowerOnly] = useState(false);
   // 暂停释放内存：自动暂停的加强形态（默认关）。开启后自动暂停会直接销毁
   // 壁纸渲染窗口（渲染进程结束、内存归还），回到桌面时按会话配置整窗重建
   const [autoPauseRelease, setAutoPauseRelease] = useState(false);
@@ -137,6 +141,19 @@ export function SettingsPage() {
     invoke<string | null>("settings_get", { key: "wallpaper_auto_pause_release" })
       .then((v) => setAutoPauseRelease(v === "true" || v === "1"))
       .catch(() => { });
+    // 轮播默认值：间隔存秒、展示分钟；未设置用 10 分钟
+    invoke<string | null>("settings_get", { key: "playlist_default_interval_sec" })
+      .then((v) => {
+        const s = Number(v);
+        setPlDefaultInterval(s >= 60 ? Math.round(s / 60) : 10);
+      })
+      .catch(() => { });
+    invoke<string | null>("settings_get", { key: "playlist_default_shuffle" })
+      .then((v) => setPlDefaultShuffle(v === "true" || v === "1"))
+      .catch(() => { });
+    invoke<string | null>("settings_get", { key: "playlist_rotation_power" })
+      .then((v) => setPlPowerOnly(v === "true" || v === "1"))
+      .catch(() => { });
     // 默认开启：键未写入过视为 true
     invoke<string | null>("settings_get", { key: "wallpaper_auto_system_static" })
       .then((v) => setAutoSystemStatic(v == null || v === "true" || v === "1"))
@@ -195,6 +212,48 @@ export function SettingsPage() {
     invoke<string | null>("settings_get", { key: "download_proxy" })
       .then((p) => setProxy(p ?? ""))
       .catch(() => { });
+  }, []);
+
+  // 共享设置被其它入口改了（托盘菜单 / MCP）：控件值跟上，避免两边状态不一致。
+  // 同一份广播由 Rust 侧 notify_setting_changed 在每次写入后发出
+  useEffect(() => {
+    const un = listen<{ key: string; value: string }>("settings-changed", (e) => {
+      const { key, value } = e.payload;
+      switch (key) {
+        case "wallpaper_auto_pause":
+          setAutoPause(value === "true" || value === "1");
+          break;
+        case "wallpaper_auto_pause_release":
+          setAutoPauseRelease(value === "true" || value === "1");
+          break;
+        case "wallpaper_fit":
+          if (value === "cover" || value === "contain" || value === "stretch") setFit(value);
+          break;
+        case "wallpaper_render_dpr": {
+          const n = Number(value);
+          if (Number.isFinite(n) && n >= 0) setRenderDpr(n);
+          break;
+        }
+        case "wallpaper_scene_fps": {
+          const n = Number(value);
+          if (Number.isFinite(n) && n > 0) setSceneFps(n);
+          break;
+        }
+        case "wallpaper_aa":
+          setAa(value || "off");
+          break;
+        case "wallpaper_particles":
+          setParticles(value || "high");
+          break;
+        case "wallpaper_post":
+          // 旧版本存过 off（该档已移除）：归一到 low，与首载一致
+          setPost(value === "off" ? "low" : value || "high");
+          break;
+      }
+    });
+    return () => {
+      void un.then((f) => f());
+    };
   }, []);
 
   // ---- 缓存（预览图/网页缓存 + 壁纸首帧封面）----
@@ -493,6 +552,46 @@ export function SettingsPage() {
     }
   };
 
+  // 轮播默认值：新建切换列表的初值（间隔存秒、展示分钟）
+  const changePlDefaultInterval = async (minutes: number) => {
+    const prev = plDefaultInterval;
+    setPlDefaultInterval(minutes);
+    try {
+      await invoke("settings_set", {
+        key: "playlist_default_interval_sec",
+        value: String(Math.max(30, Math.round(minutes * 60))),
+      });
+    } catch {
+      setPlDefaultInterval(prev); // 失败则回滚
+    }
+  };
+
+  const togglePlDefaultShuffle = async () => {
+    const next = !plDefaultShuffle;
+    try {
+      await invoke("settings_set", {
+        key: "playlist_default_shuffle",
+        value: next ? "true" : "false",
+      });
+      setPlDefaultShuffle(next);
+    } catch {
+      // 失败则不变
+    }
+  };
+
+  const togglePlPowerOnly = async () => {
+    const next = !plPowerOnly;
+    try {
+      await invoke("settings_set", {
+        key: "playlist_rotation_power",
+        value: next ? "true" : "false",
+      });
+      setPlPowerOnly(next);
+    } catch {
+      // 失败则不变
+    }
+  };
+
   const toggleInteractive = async () => {
     const next = !interactive;
     try {
@@ -619,6 +718,18 @@ export function SettingsPage() {
       setLocalAssetsMsg(String(e));
     } finally {
       setLocalAssetsBusy(false);
+    }
+  };
+
+  // 原生文件夹选择框：选中即把绝对路径填入输入框（不直接保存，
+  // 允许选完微调；生效仍走「保存」）
+  const pickWeAssetsDir = async () => {
+    setLocalAssetsMsg("");
+    try {
+      const dir = await api.appPickFolder();
+      if (dir) setWeAssetsDir(dir);
+    } catch (e) {
+      setLocalAssetsMsg(String(e));
     }
   };
 
@@ -1245,6 +1356,39 @@ export function SettingsPage() {
             </Group>
           )}
 
+          {tab === "general" && (
+            <Group title={tr("轮播")}>
+              <Row
+                label={tr("默认切换间隔")}
+                desc={tr("新建切换列表时的默认切换间隔，单个列表可在编辑时修改")}
+                control={
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      type="number"
+                      min={1}
+                      value={plDefaultInterval}
+                      onChange={(e) =>
+                        void changePlDefaultInterval(Math.max(1, Number(e.target.value) || 1))
+                      }
+                      className="w-16 rounded-lg border border-[var(--separator)] bg-[var(--content)] px-2 py-1 text-[12.5px] outline-none focus:border-[var(--accent-strong)]"
+                    />
+                    <span className="text-[12px] text-[var(--text-2)]">{tr("分钟")}</span>
+                  </div>
+                }
+              />
+              <Row
+                label={tr("默认随机播放")}
+                desc={tr("新建切换列表时默认开启随机（洗牌播放，一轮内不重复）")}
+                control={<Switch checked={plDefaultShuffle} onChange={togglePlDefaultShuffle} />}
+              />
+              <Row
+                label={tr("仅充电时轮播")}
+                desc={tr("开启后电池供电时暂缓自动切换，手动切换不受影响（暂仅 macOS）")}
+                control={<Switch checked={plPowerOnly} onChange={togglePlPowerOnly} />}
+              />
+            </Group>
+          )}
+
           {tab === "performance" && (
             <Group title={tr("性能")}>
               <Row
@@ -1438,7 +1582,7 @@ export function SettingsPage() {
                     label={tr("自定义素材目录")}
                     desc={tr("可选。直接包含 materials/ 子目录的 Wallpaper Engine assets 根；留空则自动探测所有 Steam 库。修改后壁纸重载一次")}
                     control={
-                      <div className="flex w-64 items-center gap-2">
+                      <div className="flex w-80 items-center gap-2">
                         <input
                           type="text"
                           value={weAssetsDir}
@@ -1447,6 +1591,14 @@ export function SettingsPage() {
                           onChange={(e) => setWeAssetsDir(e.target.value)}
                           className="min-w-0 flex-1 rounded-lg border border-[var(--separator)] bg-[var(--content)] px-2 py-1 text-[12px] outline-none focus:border-[var(--accent-strong)]"
                         />
+                        <button
+                          type="button"
+                          className="btn !py-1 text-[11.5px] disabled:opacity-50"
+                          disabled={localAssetsBusy}
+                          onClick={() => void pickWeAssetsDir()}
+                        >
+                          {tr("选择文件夹")}
+                        </button>
                         <button
                           type="button"
                           className="btn !py-1 text-[11.5px] disabled:opacity-50"

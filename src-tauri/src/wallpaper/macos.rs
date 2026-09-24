@@ -52,7 +52,54 @@ extern "C" {
     fn CGDisplayBounds(display: u32) -> CRect;
     fn CGDisplayIsAsleep(display: u32) -> bool;
     fn CGWindowLevelForKey(key: i32) -> i32;
+    fn CGDisplayCreateUUIDFromDisplayID(display: u32) -> *mut c_void;
+    fn CGDisplayPixelsWide(display: u32) -> usize;
 }
+
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    fn CFUUIDCreateString(alloc: *mut c_void, uuid: *mut c_void) -> *mut c_void;
+    fn CFStringGetCString(
+        s: *mut c_void,
+        buf: *mut std::os::raw::c_char,
+        size: usize,
+        enc: u32,
+    ) -> bool;
+    fn CFRelease(cf: *mut c_void);
+}
+
+#[link(name = "IOKit", kind = "framework")]
+extern "C" {
+    fn IOPSGetProvidingPowerSourceType() -> *mut c_void;
+}
+
+/// 供电类型：Some(true)=交流电源、Some(false)=电池；查询失败返回 None（视为不拦，
+/// 「仅充电时轮播」的语义是宁可多播不漏播）。macOS 台式机恒为 AC。
+pub fn on_ac_power() -> Option<bool> {
+    unsafe {
+        // 返回常量 CFString（Get 规则，不释放）："AC Power" | "Battery Power"
+        let state = IOPSGetProvidingPowerSourceType();
+        if state.is_null() {
+            return None;
+        }
+        let mut buf = [0 as std::os::raw::c_char; 32];
+        let ok = CFStringGetCString(state, buf.as_mut_ptr(), buf.len(), CF_STRING_ENCODING_UTF8);
+        if !ok {
+            return None;
+        }
+        let s = std::ffi::CStr::from_ptr(buf.as_ptr()).to_string_lossy();
+        if s.contains("AC") {
+            Some(true)
+        } else if s.contains("Battery") {
+            Some(false)
+        } else {
+            None
+        }
+    }
+}
+
+/// kCFStringEncodingUTF8
+const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 
 /// 本机实测的 CGWindowLevelForKey 取值（macOS 26 / Tahoe）：
 ///
@@ -90,11 +137,137 @@ fn target_window_level(interactive: bool) -> i32 {
 
 #[derive(Debug, Clone)]
 pub struct ScreenInfo {
+    /// 稳定显示器 id（显示器 UUID 的 FNV-1a 哈希；跨重启不变，会话恢复才对得上）
     pub id: u32,
+    /// 显示器名称（NSScreen.localizedName，如 "内建 Liquid Retina XDR 显示器"）
+    pub name: String,
     pub x: f64,
     pub y: f64,
     pub w: f64,
     pub h: f64,
+    /// backing scale（像素宽 / points 宽）
+    pub scale: f64,
+    pub is_primary: bool,
+}
+
+/// FNV-1a 32bit → 显示器数值 id（与 Windows/Linux 后端的 monitor_id 同一套哈希）。
+/// 避开 0（wallpaper-0 与「无 id」语义冲突）。
+fn hash_id(key: &str) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in key.as_bytes() {
+        h ^= *b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    if h == 0 {
+        1
+    } else {
+        h
+    }
+}
+
+/// CGDirectDisplayID → 稳定 id 的缓存。active_screens 被指针轮询以 ~30Hz 调用，
+/// CFUUID 查询不能每次都跑；显示器集合变化（重启/热插拔）自然会带来新键。
+/// （条目 ≤16，线性扫即可，不必 HashMap）
+static STABLE_IDS: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// 显示器的跨重启稳定 id：显示器 UUID 的哈希。
+///
+/// 为什么不用 CGDirectDisplayID 直接当 id：它只在本次开机内稳定，重启后同块屏
+/// 会拿到不同数值，`wallpaper_sessions` 的每屏会话就全对不上了（表现为「重启后
+/// 壁纸跑到别的屏上」）。UUID 是 EDID 派生的持久标识，重启/热插拔不变。
+/// 拿不到 UUID 时退回运行时 id（会话恢复降级为旧行为）。
+fn stable_display_id(cg_id: u32) -> u32 {
+    if let Ok(cache) = STABLE_IDS.lock() {
+        if let Some((_, v)) = cache.iter().find(|(c, _)| *c == cg_id) {
+            return *v;
+        }
+    }
+    let id = unsafe {
+        let uuid = CGDisplayCreateUUIDFromDisplayID(cg_id);
+        if uuid.is_null() {
+            return cg_id;
+        }
+        let cfstr = CFUUIDCreateString(std::ptr::null_mut(), uuid);
+        CFRelease(uuid);
+        if cfstr.is_null() {
+            return cg_id;
+        }
+        let mut buf = [0 as std::os::raw::c_char; 128];
+        let ok = CFStringGetCString(cfstr, buf.as_mut_ptr(), buf.len(), CF_STRING_ENCODING_UTF8);
+        CFRelease(cfstr);
+        if !ok {
+            return cg_id;
+        }
+        hash_id(std::ffi::CStr::from_ptr(buf.as_ptr()).to_string_lossy().as_ref())
+    };
+    if let Ok(mut cache) = STABLE_IDS.lock() {
+        cache.push((cg_id, id));
+    }
+    id
+}
+
+/// CGDisplayID → (显示器名称, backing scale)。NSScreen 是 AppKit 对象、只能主线程碰，
+/// 故由 [`refresh_display_meta`]（主线程调用：init 与 2s 监控 tick）写入，其余线程只读。
+/// scale 取 NSScreen.backingScaleFactor —— CGDisplayPixelsWide/Bounds 之比在
+/// 虚拟化/缩放模式的机器上会恒为 1.0，不是 Retina 倍率的可靠来源。
+static META: std::sync::Mutex<Vec<(u32, String, f64)>> = std::sync::Mutex::new(Vec::new());
+
+/// 刷新显示器名称缓存（NSScreen 只能在主线程访问，非主线程调用直接返回）。
+/// 名称只用于 UI 展示，读不到就降级为「显示器 N」，不影响任何会话逻辑。
+pub fn refresh_display_meta() {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use objc2_app_kit::NSScreen;
+    use objc2_foundation::NSString;
+    let Some(mtm) = objc2::MainThreadMarker::new() else {
+        return;
+    };
+    let screens = NSScreen::screens(mtm);
+    let mut out: Vec<(u32, String, f64)> = Vec::new();
+    for (i, screen) in screens.iter().enumerate() {
+        let name = screen.localizedName().to_string();
+        let scale = screen.backingScaleFactor() as f64;
+        // NSScreenNumber（= CGDirectDisplayID）在 deviceDescription 字典里；
+        // 键常量带 NSGraphics feature 门，这里用裸 msg_send 取，免受 feature 影响
+        let cg_id: Option<u32> = unsafe {
+            let desc: *mut AnyObject = msg_send![&*screen, deviceDescription];
+            if desc.is_null() {
+                None
+            } else {
+                let key = NSString::from_str("NSScreenNumber");
+                let num: *mut AnyObject = msg_send![desc, objectForKey: &*key];
+                if num.is_null() {
+                    None
+                } else {
+                    Some(msg_send![num, unsignedIntValue])
+                }
+            }
+        };
+        match cg_id {
+            Some(id) => out.push((id, name, scale)),
+            // 匹配不上 CG id 时按顺序兜底命名，不参与 id 映射
+            None => tracing::debug!("refresh_display_meta: 第 {} 块屏拿不到 NSScreenNumber", i + 1),
+        }
+    }
+    if let Ok(mut g) = META.lock() {
+        *g = out;
+    }
+}
+
+/// 旧版本把 CGDirectDisplayID 直接当 display_id 持久化（重启后会漂移），稳定 id
+/// 上线时按当前已连接显示器做一次性 旧→新 改写。返回 (旧 id 串, 新 id 串) 列表，
+/// 仅含两者不同的显示器；未连接的显示器无法反查 UUID，其旧行保留（下次手动应用覆盖）。
+pub fn legacy_display_ids() -> Vec<(String, String)> {
+    let mut ids = [0u32; 16];
+    let mut count: u32 = 0;
+    unsafe {
+        CGGetActiveDisplayList(16, ids.as_mut_ptr(), &mut count);
+    }
+    (0..(count.min(16) as usize))
+        .map(|i| ids[i])
+        .filter(|cg_id| stable_display_id(*cg_id) != *cg_id)
+        .map(|cg_id| (cg_id.to_string(), stable_display_id(cg_id).to_string()))
+        .collect()
 }
 
 /// 活动显示器列表（points 坐标）
@@ -104,16 +277,37 @@ pub fn active_screens() -> Vec<ScreenInfo> {
     unsafe {
         CGGetActiveDisplayList(16, ids.as_mut_ptr(), &mut count);
     }
+    let primary = unsafe { CGMainDisplayID() };
+    let meta = META.lock().map(|g| g.clone()).unwrap_or_default();
     let mut out = Vec::new();
     for i in 0..(count.min(16) as usize) {
-        let id = ids[i];
-        let b = unsafe { CGDisplayBounds(id) };
+        let cg_id = ids[i];
+        let b = unsafe { CGDisplayBounds(cg_id) };
+        let m = meta.iter().find(|(c, _, _)| *c == cg_id);
+        let name = m
+            .map(|(_, n, _)| n.clone())
+            .unwrap_or_else(|| format!("显示器 {}", out.len() + 1));
+        // 名称缓存未就绪（首帧 / 非主线程首查）时退回 像素/points 估算
+        let scale = match m.map(|(_, _, s)| *s) {
+            Some(s) if s > 0.0 => s,
+            _ => {
+                let px_w = unsafe { CGDisplayPixelsWide(cg_id) } as f64;
+                if b.size.width > 0.0 && px_w > 0.0 {
+                    px_w / b.size.width
+                } else {
+                    1.0
+                }
+            }
+        };
         out.push(ScreenInfo {
-            id,
+            id: stable_display_id(cg_id),
+            name,
             x: b.origin.x,
             y: b.origin.y,
             w: b.size.width,
             h: b.size.height,
+            scale,
+            is_primary: cg_id == primary,
         });
     }
     out

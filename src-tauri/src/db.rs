@@ -227,6 +227,31 @@ fn migrate(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
         conn.pragma_update(None, "user_version", 9)?;
         tracing::info!("db migrated to version 9（作者昵称/头像缓存表）");
     }
+    if v < 10 {
+        // v10：轮播升级 —— playlists 补随机开关（洗牌队列）与更新时间。
+        if !column_exists(conn, "playlists", "shuffle")? {
+            conn.execute_batch(
+                "ALTER TABLE playlists ADD COLUMN shuffle INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        if !column_exists(conn, "playlists", "updated_at")? {
+            conn.execute_batch(
+                "ALTER TABLE playlists ADD COLUMN updated_at INTEGER NOT NULL DEFAULT (unixepoch());",
+            )?;
+        }
+        conn.pragma_update(None, "user_version", 10)?;
+        tracing::info!("db migrated to version 10（playlists 加 shuffle/updated_at）");
+    }
+    if v < 11 {
+        // v11：下载任务自动重试轮数（网络瞬断自愈，见 download::fail）
+        if !column_exists(conn, "downloads", "attempts")? {
+            conn.execute_batch(
+                "ALTER TABLE downloads ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        conn.pragma_update(None, "user_version", 11)?;
+        tracing::info!("db migrated to version 11（downloads 加 attempts）");
+    }
     Ok(())
 }
 

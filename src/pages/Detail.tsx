@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { api, TYPE_LABELS, type WorkshopItem } from "../api/steam";
 import { useWallpaperMeta } from "../hooks/useWallpaperMeta";
+import { useApplyWallpaper } from "../hooks/useApplyWallpaper";
 import { useItemProps } from "../hooks/useItemProps";
 import { WallpaperPropsModal } from "../components/WallpaperPropsModal";
 import { IconSliders } from "../components/icons";
@@ -21,6 +22,7 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
   const [applying, setApplying] = useState(false);
   const [showProps, setShowProps] = useState(false);
   const { appliedItems, downloadedItems, refreshApplied } = useWallpaperMeta();
+  const { apply: applyWithTarget, menuNode: applyMenu } = useApplyWallpaper();
   // 作者名片（Steam 资料页解析）；解析失败回退显示裸 SteamID64
   const [authorName, setAuthorName] = useState<string | null>(null);
 
@@ -164,24 +166,34 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
               )}
               {applied ? (
                 <button
-                  className="btn !bg-green-500/15 !text-green-600 dark:!text-green-400 !border-green-500/30 cursor-default disabled:opacity-75"
-                  disabled
-                  title={tr("已应用到桌面")}
+                  className="btn !bg-green-500/15 !text-green-600 dark:!text-green-400 !border-green-500/30 hover:opacity-80"
+                  title={tr("已应用到桌面（可点击重新应用或指定屏）")}
+                  onClick={async (e) => {
+                    setApplying(true);
+                    try {
+                      const r = await applyWithTarget(item.id, e.currentTarget);
+                      if (r === "done") await refreshApplied();
+                    } catch (err) {
+                      msg.error(String(err));
+                    } finally {
+                      setApplying(false);
+                    }
+                  }}
                 >
-                  {tr("已应用")}
+                  {applying ? "…" : tr("已应用")}
                 </button>
               ) : (
                 <button
                   className="btn"
                   disabled={applying}
                   title={tr("需先下载到本地库")}
-                  onClick={async () => {
+                  onClick={async (e) => {
                     setApplying(true);
                     try {
-                      await api.wallpaperApplyItem(item.id);
-                      await refreshApplied();
-                    } catch (e) {
-                      msg.error(String(e));
+                      const r = await applyWithTarget(item.id, e.currentTarget);
+                      if (r === "done") await refreshApplied();
+                    } catch (err) {
+                      msg.error(String(err));
                     } finally {
                       setApplying(false);
                     }
@@ -236,6 +248,8 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
           onClose={() => setShowProps(false)}
         />
       )}
+
+      {applyMenu}
     </div>
   );
 }

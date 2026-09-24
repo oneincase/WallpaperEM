@@ -6,6 +6,7 @@ import {
   type WorkshopItemSummary,
 } from "../api/steam";
 import { useWallpaperMeta } from "../hooks/useWallpaperMeta";
+import { useApplyWallpaper } from "../hooks/useApplyWallpaper";
 import { useItemProps } from "../hooks/useItemProps";
 import { WallpaperPropsModal } from "../components/WallpaperPropsModal";
 import { IconSliders } from "../components/icons";
@@ -147,12 +148,13 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
     el.scrollBy({ left: dir * 240, behavior: "smooth" });
   };
 
-  const apply = async () => {
+  const { apply: applyWithTarget, menuNode: applyMenu } = useApplyWallpaper();
+  const apply = async (anchor?: HTMLElement) => {
     if (!current) return;
     setApplying(true);
     try {
-      await api.wallpaperApplyItem(current.id);
-      await refreshApplied();
+      const r = await applyWithTarget(current.id, anchor);
+      if (r === "done") await refreshApplied();
     } catch (e) {
       msg.error(String(e));
     } finally {
@@ -302,7 +304,7 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
               <button
                 className="btn btn-primary"
                 disabled={applying}
-                onClick={apply}
+                onClick={(e) => void apply(e.currentTarget)}
                 title={tr("已下载到本地库，直接应用到桌面")}
               >
                 {applying ? "…" : `🖥 ${tr("应用到桌面")}`}
@@ -404,6 +406,7 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
           </button>
         </div>
       )}
+      {applyMenu}
     </div>
   );
 }

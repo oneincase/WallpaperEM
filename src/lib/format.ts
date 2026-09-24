@@ -25,3 +25,10 @@ export function formatBytes(n: number): string {
   }
   return `${i === 0 ? Math.round(v) : v.toFixed(1)} ${units[i]}`;
 }
+
+/** 轮播倒计时："m:ss"（分钟不补零、秒补零），用于「xx 后切换」 */
+export function formatCountdown(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const m = Math.floor(s / 60);
+  return `${m}:${String(s % 60).padStart(2, "0")}`;
+}

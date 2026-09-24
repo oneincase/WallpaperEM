@@ -31,7 +31,7 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
 static STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -57,7 +57,7 @@ fn dispatch(app: &AppHandle, gx: f64, gy: f64, dx: f64, dy: f64, mode: u32, mods
         return;
     };
     let label = format!("wallpaper-{id}");
-    if let Some(w) = app.get_webview_window(&label) {
+    for w in super::wallpaper_windows(app, &label) {
         let js = format!("window.__wp&&window.__wp.pushWheel({dx:.4},{dy:.4},{mode},{mods})");
         let _ = w.eval(&js);
     }

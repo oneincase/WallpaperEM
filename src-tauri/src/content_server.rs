@@ -49,6 +49,8 @@ pub struct RendererDiag {
     pub fail_reason: String,
     /// 最近一次 `failed:` 的时间戳（epoch millis），0 表示没失败过
     pub fail_ms: u64,
+    /// 最近一次 `failed:` 归属的本地库条目 id（解析自诊断文本的 src 段，可为空）
+    pub fail_item: String,
     /// 最近一次 `ready` 对应的本地库条目 id（解析自诊断文本的 src 段）
     pub ready_item: String,
 }
@@ -113,8 +115,31 @@ fn record_renderer_diag(state: &ContentServerState, msg: &str) {
         if let Some((_, reason)) = msg.split_once("] failed: ") {
             d.fail_reason = reason.to_string();
             d.fail_ms = now_ms();
+            d.fail_item = diag_item_id(msg).unwrap_or_default();
         }
     }
+}
+
+/// 自 `since_ms`（含）之后、属于 `item` 的一次渲染失败原因（None = 没有匹配的失败）。
+///
+/// 无缝切换用它提前中止替换：新壁纸加载失败时旧壁纸继续留在屏上，而不是
+/// 把错误占位图换上去。`item` 为 None 时匹配任意失败（无条目归属的测试配置）。
+pub fn failure_since(
+    app: &tauri::AppHandle,
+    since_ms: u64,
+    item: Option<&str>,
+) -> Option<String> {
+    let state = app.try_state::<ContentServerState>()?;
+    let d = state.renderer_diag.lock().ok()?;
+    if d.fail_reason.is_empty() || d.fail_ms < since_ms {
+        return None;
+    }
+    if let (Some(want), true) = (item, !d.fail_item.is_empty()) {
+        if d.fail_item != want {
+            return None;
+        }
+    }
+    Some(d.fail_reason.clone())
 }
 
 /// 给「等待渲染器就绪超时」类错误配一句人能看懂的原因（渲染器自报失败优先，

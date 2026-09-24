@@ -4,14 +4,21 @@ name: 测试打包（macOS / Linux / Windows，不发布）
 # 发布仍由 `build-dmg.yml` / `build-linux.yml` / `build-windows.yml` 在推送 v* 标签时
 # 完成 —— 推 tag 就是人工确认那一步；本 workflow 不监听 tag、也不写 contents。
 #
-# webwallgl 是自维护渲染库，最新的改动只在你自己的仓库里（暂未发到 npm），
-# 所以这里始终从 GitHub 源码检出并构建 dist/lib，再让 `file:../webwallgl-github/dist/lib`
-# 依赖解析到它。可用 webwallgl_ref 指定要测的分支 / 标签 / SHA。
+# 两个自维护的仓库都要拉到**仓库平级**（与本地开发目录布局一致），否则构建解析不到：
+#   - webwallgl：前端渲染库，package.json 里依赖 `file:../webwallgl-github/dist/lib`，
+#     最新的改动只在你自己的仓库里（暂未发到 npm），所以从源码检出并构建出 dist/lib；
+#   - media-bridge：系统媒体桥接 crate，src-tauri/Cargo.toml 里依赖
+#     `path = "../../media-bridge/crates/media-bridge"`，纯 Rust 路径依赖，检出即可。
+# 两者都可用 *_ref 指定要测的分支 / 标签 / SHA。
 on:
   workflow_dispatch:
     inputs:
       webwallgl_ref:
         description: 'webwallgl 的 ref（分支 / 标签 / commit SHA）；留空用其默认分支'
+        required: false
+        default: ''
+      media_bridge_ref:
+        description: 'media-bridge 的 ref（分支 / 标签 / commit SHA）；留空用其默认分支'
         required: false
         default: ''
 
@@ -46,8 +53,11 @@ jobs:
             bundles: |
               src-tauri/target/release/bundle/deb/*.deb
               src-tauri/target/release/bundle/appimage/*.AppImage
-          - os: ubuntu-24.04-arm
+          - os: ubuntu-22.04-arm
             # 原生 arm64 runner（公共仓库可用）：不做交叉编译，装依赖后直接编。
+            # 用 22.04 而非 24.04：glibc 基线 2.35，deb/AppImage 在 22.04 及以上
+            # （22.04 / 24.04 / 26.04…）都能直接装；24.04 底座编出来要 glibc 2.39，
+            # 22.04 用户直接装不上。
             # 产物路径带 triple（显式 --target），与 x64 行互不覆盖。
             targets: aarch64-unknown-linux-gnu
             build_args: --target aarch64-unknown-linux-gnu
@@ -87,10 +97,21 @@ jobs:
           ref: ${{ inputs.webwallgl_ref }}
           path: webwallgl-github-src
 
+      # media-bridge 是同级自有仓库（Cargo.toml 里 `path = "../../media-bridge/..."`），
+      # 少了它 cargo 会直接报找不到 path 依赖
+      - name: 检出 media-bridge（源码）
+        uses: actions/checkout@v4
+        with:
+          repository: oneincase/media-bridge
+          ref: ${{ inputs.media_bridge_ref }}
+          path: media-bridge-src
+
       # actions/checkout 不允许直接检出到 workspace 之外，先落子目录再移平级
       - name: 移到仓库平级目录
         shell: bash
-        run: mv webwallgl-github-src ../webwallgl-github
+        run: |
+          mv webwallgl-github-src ../webwallgl-github
+          mv media-bridge-src ../media-bridge
 
       - name: 安装 Linux 系统依赖
         if: runner.os == 'Linux'
@@ -137,11 +158,13 @@ jobs:
           pnpm install --no-frozen-lockfile
           pnpm run build:lib
 
-      - name: 记录 webwallgl 版本（便于确认测的是哪一版）
+      - name: 记录依赖版本（便于确认测的是哪一版）
         shell: bash
         run: |
           echo "webwallgl version: $(node -p "require('../webwallgl-github/dist/lib/package.json').version")"
           echo "webwallgl ref: ${{ inputs.webwallgl_ref || '(默认分支)' }}"
+          echo "media-bridge version: $(grep -A1 '^name = "media-bridge"$' src-tauri/Cargo.lock | tail -1)"
+          echo "media-bridge ref: ${{ inputs.media_bridge_ref || '(默认分支)' }}"
           echo "wallpaperem version: $(node -p "require('./src-tauri/tauri.conf.json').version")"
 
       - name: 安装依赖

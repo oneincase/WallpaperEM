@@ -16,6 +16,7 @@ import {
 } from "../api/steam";
 import { TAG_GROUPS, TREND_DAYS, WORKSHOP_SORTS } from "../lib/tags";
 import { useWallpaperMeta } from "../hooks/useWallpaperMeta";
+import { useApplyWallpaper } from "../hooks/useApplyWallpaper";
 import { useWorkshopFilter } from "../hooks/useWorkshopFilter";
 import { VirtualGrid } from "../components/VirtualGrid";
 import { WallpaperCard, TypeChip, CoverCountBadge } from "../components/WallpaperCard";
@@ -141,18 +142,21 @@ export function WorkshopPage({ onOpenDetail }: { onOpenDetail: (id: string) => v
   );
 
   /** 卡片上的快捷应用（已下载条目） */
+  const { apply: applyWithTarget, menuNode: applyMenu } = useApplyWallpaper();
   const quickApply = useCallback(
-    async (id: string) => {
+    async (id: string, anchor?: HTMLElement) => {
       try {
-        await api.wallpaperApplyItem(id);
-        // 应用会替换所有显示器上的旧壁纸，重取权威集合（与本地库页同一纪律）
-        await refreshApplied();
-        msg.success(tr("已应用到桌面"));
+        const r = await applyWithTarget(id, anchor);
+        // 应用后重取权威集合（与本地库页同一纪律）；目标菜单被点掉时不报成功
+        if (r === "done") {
+          await refreshApplied();
+          msg.success(tr("已应用到桌面"));
+        }
       } catch (e) {
         msg.error(String(e));
       }
     },
-    [refreshApplied, msg],
+    [applyWithTarget, refreshApplied, msg],
   );
 
   useEffect(() => {
@@ -218,15 +222,29 @@ export function WorkshopPage({ onOpenDetail }: { onOpenDetail: (id: string) => v
     setLoadingMore(false);
     setLoading(true);
     setError("");
-    return api
-      .workshopSearch({
-        query: snapRef.current.query || undefined,
-        sort,
-        // days 只在趋势排序下有意义（实测其他排序完全忽略），-1 表示全部时间
-        days: sort === "trend" && days > 0 ? days : undefined,
-        tagGroups,
-        page: 1,
-      })
+    // 纯数字查询优先按壁纸 ID 精确直达（工坊链接里的 ID 粘进来就能搜到）
+    const q = (snapRef.current.query || "").trim();
+    const lookup: Promise<WorkshopSearchResult> = /^\d{3,}$/.test(q)
+      ? api.workshopItem(q).then((item) => {
+          if (!item) setError(tr("未找到 ID 为 {id} 的壁纸", { id: q }));
+          return {
+            items: item ? [item] : [],
+            total: item ? 1 : 0,
+            page: 1,
+            pageSize: 1,
+            hasMore: false,
+            truncated: false,
+          };
+        })
+      : api.workshopSearch({
+          query: snapRef.current.query || undefined,
+          sort,
+          // days 只在趋势排序下有意义（实测其他排序完全忽略），-1 表示全部时间
+          days: sort === "trend" && days > 0 ? days : undefined,
+          tagGroups,
+          page: 1,
+        });
+    return lookup
       .then((res: WorkshopSearchResult) => {
         if (seq !== seqRef.current) return;
         setItems(res.items);
@@ -497,7 +515,7 @@ export function WorkshopPage({ onOpenDetail }: { onOpenDetail: (id: string) => v
                         className="rounded-md p-0.5 text-[var(--accent-strong)] transition-colors hover:bg-black/5 dark:hover:bg-white/10"
                         title={tr("应用到桌面")}
                         aria-label={tr("应用到桌面")}
-                        onClick={() => void quickApply(item.id)}
+                        onClick={(e) => void quickApply(item.id, e.currentTarget)}
                       >
                         <CardActionIcon kind="apply" />
                       </button>
@@ -519,6 +537,7 @@ export function WorkshopPage({ onOpenDetail }: { onOpenDetail: (id: string) => v
           />
         )}
       </div>
+      {applyMenu}
     </div>
   );
 }

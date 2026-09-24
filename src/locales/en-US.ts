@@ -467,6 +467,7 @@ export const EN_US: Record<string, string> = {
   "可选。直接包含 materials/ 子目录的 Wallpaper Engine assets 根；留空则自动探测所有 Steam 库。修改后壁纸重载一次":
     "Optional. The Wallpaper Engine assets root that directly contains a materials/ subfolder; leave empty to auto-detect across Steam libraries. Wallpapers reload once after changing it",
   "自动探测，可手动填写绝对路径": "Auto-detected; you can type an absolute path",
+  "选择文件夹": "Choose Folder",
   "已清除 {size}": "Cleared {size}",
   "缓存已经是空的": "Cache is already empty",
   "请填写用户名与密码": "Enter the username and password",
@@ -998,4 +999,152 @@ export const EN_US_BACKEND: Record<string, string> = {
   "转入异步监听失败: {e}": "Failed to switch to async listening: {}",
   "服务异常退出: {e}": "Service exited unexpectedly: {}",
   "端口需大于 1024（避开系统保留端口）": "Port must be greater than 1024 (to avoid reserved ports)",
+
+  // ---------------- 多显示器管理（显示器页 / 应用目标选择） ----------------
+  "显示器": "Displays",
+  "每块屏独立管理壁纸；「更换壁纸」只作用于所选屏":
+    "Manage each display's wallpaper individually; “Change wallpaper” targets only that screen",
+  "统一模式": "Unified mode",
+  "独立模式": "Independent mode",
+  "统一模式：应用壁纸时同步替换所有显示器的壁纸":
+    "Unified: applying a wallpaper replaces it on all displays",
+  "独立模式：每块屏可各自指定壁纸（与后续各自的切换列表）；点「应用」时选择目标屏":
+    "Independent: each display gets its own wallpaper (and playlist later); pick a target display when applying",
+  "已切换到统一模式": "Switched to unified mode",
+  "已切换到独立模式": "Switched to independent mode",
+  "全部停止": "Stop all",
+  "已停止全部壁纸": "All wallpapers stopped",
+  "正在读取显示器信息…": "Reading display info…",
+  "未检测到显示器": "No displays detected",
+  "显示器布局": "Display layout",
+  "主屏": "Primary",
+  "当前：{title}": "Current: {title}",
+  "未设置壁纸": "No wallpaper set",
+  "更换壁纸": "Change wallpaper",
+  "同步到所有屏": "Sync to all displays",
+  "已同步到所有显示器": "Synced to all displays",
+  "停止": "Stop",
+  "应用到哪块屏？": "Apply to which display?",
+  "全部显示器": "All displays",
+  "上次": "Last used",
+  "正在为「{name}」选择壁纸 —— 点「应用」只设置该屏":
+    "Choosing a wallpaper for “{name}” — clicking apply sets only that screen",
+  "已应用到桌面（可点击重新应用或指定屏）":
+    "Applied to desktop (click to re-apply or target a display)",
+
+  // ---------------- 切换列表 / 轮播 ----------------
+  "切换列表": "Playlists",
+  "自动切换壁纸的列表；启用后按间隔轮播，可随时暂停":
+    "Wallpaper rotation lists — enable one to rotate at an interval; pause anytime",
+  "新建": "New",
+  "编辑": "Edit",
+  "启用": "Start",
+  "使用中": "In use",
+  "轮播": "Slideshow",
+  "轮播中：{name}（{i}/{t}）": "Slideshow: {name} ({i}/{t})",
+  "轮播：{name}（{i}/{t}）": "Slideshow: {name} ({i}/{t})",
+  "轮播：{name} {i}/{t}": "Slideshow: {name} {i}/{t}",
+  "已暂停自动切换": "Auto-rotation paused",
+  "{cd} 后切换": "Next in {cd}",
+  "计时中…": "Timing…",
+  "暂停轮播": "Pause slideshow",
+  "恢复轮播": "Resume slideshow",
+  "停止轮播": "Stop slideshow",
+  "已停止轮播": "Slideshow stopped",
+  "已启用轮播": "Slideshow started",
+  "还没有切换列表 —— 点右上角「新建」，挑几张壁纸定时轮播":
+    "No playlists yet — hit “New” and pick some wallpapers to rotate",
+  "{n} 项 · 每 {t} 切换": "{n} items · every {t}",
+  "随机": "Shuffle",
+  "{m} 分钟": "{m} min",
+  "{s} 秒": "{s} s",
+  "删除切换列表": "Delete playlist",
+  "确定删除「{name}」？壁纸本身不受影响。":
+    "Delete “{name}”? The wallpapers themselves are not affected.",
+  "已删除「{name}」": "Deleted “{name}”",
+  "编辑切换列表": "Edit playlist",
+  "新建切换列表": "New playlist",
+  "列表名称": "Playlist name",
+  "间隔": "Every",
+  "分钟": "min",
+  "随机播放（一轮内不重复）": "Shuffle (no repeats within a round)",
+  "播放顺序（{n} 项）": "Play order ({n} items)",
+  "从下方本地库添加壁纸": "Add wallpapers from the library below",
+  "移出列表": "Remove from playlist",
+  "添加壁纸": "Add wallpapers",
+  "本地库没有匹配的壁纸": "No matching wallpapers in the library",
+  "请填写列表名称": "Please enter a playlist name",
+  "请至少添加一张壁纸": "Add at least one wallpaper",
+  "已保存「{name}」": "Saved “{name}”",
+  "加入切换列表": "Add to playlist",
+  "该壁纸已在「{name}」中": "Already in “{name}”",
+  "已把「{title}」加入「{name}」": "Added “{title}” to “{name}”",
+  "还没有切换列表，在下方新建一个": "No playlists yet — create one below",
+  "{n} 项": "{n} items",
+  "已含": "Included",
+  "新列表名称": "New playlist name",
+  "新建并加入": "Create & add",
+  "已新建「{name}」并加入": "Created “{name}” and added it",
+
+  // ---------------- 设置 · 轮播默认值 ----------------
+  "默认切换间隔": "Default interval",
+  "新建切换列表时的默认切换间隔，单个列表可在编辑时修改":
+    "Default rotation interval for new playlists; each list can override it",
+  "默认随机播放": "Shuffle by default",
+  "新建切换列表时默认开启随机（洗牌播放，一轮内不重复）":
+    "New playlists start with shuffle on (no repeats within a round)",
+  "仅充电时轮播": "Rotate only when charging",
+  "开启后电池供电时暂缓自动切换，手动切换不受影响（暂仅 macOS）":
+    "Auto-rotation is held over on battery; manual switching unaffected (macOS only for now)",
+
+  // ---------------- 每屏轮播绑定（独立模式） ----------------
+  "轮播列表": "Slideshow playlist",
+  "固定（不轮播）": "Fixed (no rotation)",
+  "「{name}」已固定为当前壁纸": "“{name}” is now fixed to its current wallpaper",
+  "「{name}」开始轮播": "“{name}” is now rotating",
+  "「{name}」将在所选屏上轮播": "“{name}” will rotate on the selected display",
+  "还没有切换列表，先到「切换列表」页新建":
+    "No playlists yet — create one on the Playlists page first",
+  "已绑定：{names}": "Bound to {names}",
+  "独立模式：{n} 块屏在各自轮播，可在显示器页调整":
+    "Independent: {n} displays rotating on their own — manage them on the Displays page",
+  "绑定到显示器": "Bind to display",
+
+  // ---------------- ID 搜索 / ID 直下载 ----------------
+  "未找到 ID 为 {id} 的壁纸": "No wallpaper found with ID {id}",
+  "壁纸ID下载": "Download by ID",
+  "输入创意工坊壁纸 ID 直接下载（无需搜索，网络受限时也能用）":
+    "Download directly by Workshop ID (no search needed — works on restricted networks)",
+  "壁纸 ID（创意工坊数字 ID）": "Wallpaper ID (numeric Workshop ID)",
+  "请输入数字壁纸 ID（创意工坊条目 ID）": "Enter a numeric Wallpaper ID (Workshop item ID)",
+  "已加入下载队列：{id}": "Queued for download: {id}",
+
+  // ---------------- 切换列表（本地库内联管理） ----------------
+  "开启多选": "Multi-select",
+  "预设": "Preset",
+  "点选卡片批量加入切换列表": "Pick cards to batch-add to a playlist",
+  "全部": "All",
+  "建": "Create",
+  "{n} 块屏在轮播": "{n} displays rotating",
+  "已暂停": "Paused",
+  "重命名": "Rename",
+  "启用轮播": "Start slideshow",
+  "已把 {n} 张加入「{name}」": "Added {n} to “{name}”",
+  "已新建「{name}」": "Created “{name}”",
+  "移出「{name}」": "Remove from “{name}”",
+  "已从「{name}」移出 {n} 张": "Removed {n} from “{name}”",
+  "已选 {n} 张": "{n} selected",
+  "还没有切换列表": "No playlists yet",
+
+  // ---------------- 显示器页 ----------------
+  "停止所有屏的壁纸": "Stop wallpapers on all displays",
+  "停止该屏壁纸": "Stop this display's wallpaper",
+  "还没有切换列表，先到本地库新建": "No playlists yet — create one in Library first",
+  "「{name}」还没有壁纸": "“{name}” has no wallpapers yet",
+  "当前筛选下没有「{name}」的壁纸": "No wallpapers of “{name}” match the current filters",
+  "开「选择」点选卡片，底部一键加入本列表":
+    "Turn on “Select”, pick cards, then add them from the bottom bar",
+  "本列表有 {n} 张，被当前搜索/筛选收窄没了":
+    "This playlist has {n} items — current search/filters are hiding them",
+  "清除筛选": "Clear filters",
 };

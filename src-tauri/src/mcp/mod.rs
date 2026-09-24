@@ -129,8 +129,13 @@ fn load_settings(app: &AppHandle) -> (bool, u16, String) {
 
 fn save_setting(app: &AppHandle, key: &str, value: &str) -> Result<(), String> {
     let db = conn(app)?;
-    let c = db.lock().map_err(|e| e.to_string())?;
-    db::set_setting(&c, key, value)
+    {
+        let c = db.lock().map_err(|e| e.to_string())?;
+        db::set_setting(&c, key, value)?;
+    }
+    // MCP 侧改的共享设置：托盘勾选与各窗口控件同步跟上
+    crate::notify_setting_changed(app, key, value);
+    Ok(())
 }
 
 fn random_hex(bytes: usize) -> String {

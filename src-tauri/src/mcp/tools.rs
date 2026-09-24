@@ -82,8 +82,11 @@ pub fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": "wallpaper_apply",
-            "description": "把本地库里的壁纸应用到桌面（所有显示器）。",
-            "inputSchema": obj(json!({ "itemId": { "type": "string" } }), json!(["itemId"])),
+            "description": "把本地库里的壁纸应用到桌面。缺省应用到所有显示器；传 displayId（见 displays_list）只应用到指定屏。",
+            "inputSchema": obj(json!({
+                "itemId": { "type": "string" },
+                "displayId": { "type": "string", "description": "可选：只应用到该显示器 id（displays_list 返回）" },
+            }), json!(["itemId"])),
         }),
         json!({
             "name": "wallpaper_stop",
@@ -118,9 +121,87 @@ pub fn definitions() -> Vec<Value> {
             "inputSchema": obj(json!({}), json!([])),
         }),
         json!({
+            "name": "displays_list",
+            "description": "显示器列表（id/名称/位置/缩放/主屏）与每屏当前壁纸会话摘要，含统一/独立模式。id 即 wallpaper_apply / wallpaper_stop 的 displayId。",
+            "inputSchema": obj(json!({}), json!([])),
+        }),
+        json!({
             "name": "active_items",
             "description": "当前已应用的本地库条目 id 列表。",
             "inputSchema": obj(json!({}), json!([])),
+        }),
+        json!({
+            "name": "playlist_list",
+            "description": "切换列表（轮播播放列表）列表。",
+            "inputSchema": obj(json!({}), json!([])),
+        }),
+        json!({
+            "name": "playlist_create",
+            "description": "新建切换列表。intervalSec 最小 30；shuffle=随机播放（洗牌队列，一轮内不重复、可回退）。",
+            "inputSchema": obj(json!({
+                "name": { "type": "string" },
+                "itemIds": { "type": "array", "items": { "type": "string" }, "description": "本地库条目 id，数组顺序即播放顺序" },
+                "intervalSec": { "type": "integer", "description": "切换间隔（秒），默认 600，最小 30" },
+                "shuffle": { "type": "boolean", "description": "随机播放，默认 false" },
+            }), json!(["name", "itemIds"])),
+        }),
+        json!({
+            "name": "playlist_update",
+            "description": "更新切换列表（缺省字段不改）。条目或随机开关变化会重建轮播队列。",
+            "inputSchema": obj(json!({
+                "id": { "type": "integer" },
+                "name": { "type": "string" },
+                "itemIds": { "type": "array", "items": { "type": "string" } },
+                "intervalSec": { "type": "integer" },
+                "shuffle": { "type": "boolean" },
+            }), json!(["id"])),
+        }),
+        json!({
+            "name": "playlist_delete",
+            "description": "删除切换列表（删除当前激活列表时一并停止轮播）。",
+            "inputSchema": obj(json!({ "id": { "type": "integer" } }), json!(["id"])),
+        }),
+        json!({
+            "name": "playlist_apply",
+            "description": "激活切换列表：立即应用第一项并开始轮播（自动剪掉文件已丢失的条目）。",
+            "inputSchema": obj(json!({ "id": { "type": "integer" } }), json!(["id"])),
+        }),
+        json!({
+            "name": "playlist_status",
+            "description": "轮播状态：当前列表/进度/间隔/是否暂停与下次切换时间（nextAtMs）。",
+            "inputSchema": obj(json!({}), json!([])),
+        }),
+        json!({
+            "name": "playlist_stop",
+            "description": "停止轮播（清除激活的切换列表；壁纸停在当前这张不动）。",
+            "inputSchema": obj(json!({}), json!([])),
+        }),
+        json!({
+            "name": "wallpaper_next",
+            "description": "切换列表：下一张（手动切换会重置轮播计时）。displayId 缺省按当前模式走（统一=全局；独立=各绑定屏各自前进），传值只切该屏。",
+            "inputSchema": obj(json!({
+                "displayId": { "type": "string", "description": "可选：只切该显示器的轮播" },
+            }), json!([])),
+        }),
+        json!({
+            "name": "wallpaper_prev",
+            "description": "切换列表：上一张（随机模式沿洗牌队列回退）。displayId 语义同 wallpaper_next。",
+            "inputSchema": obj(json!({
+                "displayId": { "type": "string", "description": "可选：只切该显示器的轮播" },
+            }), json!([])),
+        }),
+        json!({
+            "name": "display_binding_set",
+            "description": "绑定/解绑某显示器的轮播列表（独立模式的每屏上下文）。绑定后该屏立即开始轮播该列表；playlistId 不传=解绑（回到固定单张，壁纸保持不动）。",
+            "inputSchema": obj(json!({
+                "displayId": { "type": "string" },
+                "playlistId": { "type": "integer", "description": "要轮播的切换列表 id；不传=解绑" },
+            }), json!(["displayId"])),
+        }),
+        json!({
+            "name": "wallpaper_rotation_set",
+            "description": "暂停/恢复轮播的定时自动切换（不影响壁纸渲染本身）。",
+            "inputSchema": obj(json!({ "paused": { "type": "boolean" } }), json!(["paused"])),
         }),
         json!({
             "name": "library_list",
@@ -323,8 +404,9 @@ async fn call_inner(app: &AppHandle, name: &str, args: &Value) -> Result<Value, 
         "wallpaper_apply" => {
             let app = app.clone();
             let item_id = req_str(args, "itemId")?;
+            let display = opt_str(args, "displayId");
             let id2 = item_id.clone();
-            blocking(move || crate::wallpaper::apply_item(app, id2)).await?;
+            blocking(move || crate::wallpaper::apply_item(app, id2, display)).await?;
             Ok(json!({ "applied": item_id }))
         }
         "wallpaper_stop" => {
@@ -345,6 +427,99 @@ async fn call_inner(app: &AppHandle, name: &str, args: &Value) -> Result<Value, 
         }
         "wallpaper_screenshot" => screenshot(app, args).await,
         "list_sessions" => list_sessions(app),
+        "displays_list" => crate::wallpaper::displays_list(app.clone()),
+        "playlist_list" => {
+            let app = app.clone();
+            let v = blocking(move || crate::wallpaper::playlist_list(app)).await?;
+            Ok(json!({ "playlists": v }))
+        }
+        "playlist_create" => {
+            let app = app.clone();
+            let name = req_str(args, "name")?;
+            let ids: Vec<String> = args
+                .get("itemIds")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let interval = args
+                .get("intervalSec")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(600);
+            let shuffle = args.get("shuffle").and_then(|v| v.as_bool());
+            let id = blocking(move || {
+                crate::wallpaper::playlist_create(app, name, ids, interval, shuffle)
+            })
+            .await?;
+            Ok(json!({ "id": id }))
+        }
+        "playlist_update" => {
+            let app = app.clone();
+            let id = args.get("id").and_then(|v| v.as_i64()).ok_or("缺少 id")?;
+            let name = opt_str(args, "name");
+            let ids: Option<Vec<String>> = args.get("itemIds").and_then(|v| v.as_array()).map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            });
+            let interval = args.get("intervalSec").and_then(|v| v.as_i64());
+            let shuffle = args.get("shuffle").and_then(|v| v.as_bool());
+            let p = blocking(move || {
+                crate::wallpaper::playlist_update(app, id, name, ids, interval, shuffle)
+            })
+            .await?;
+            Ok(json!(p))
+        }
+        "playlist_delete" => {
+            let app = app.clone();
+            let id = args.get("id").and_then(|v| v.as_i64()).ok_or("缺少 id")?;
+            blocking(move || crate::wallpaper::playlist_delete(app, id)).await?;
+            Ok(json!({ "deleted": true }))
+        }
+        "playlist_apply" => {
+            let app = app.clone();
+            let id = args.get("id").and_then(|v| v.as_i64()).ok_or("缺少 id")?;
+            blocking(move || crate::wallpaper::playlist_apply(app, id)).await
+        }
+        "playlist_status" => {
+            let app = app.clone();
+            blocking(move || crate::wallpaper::playlist_status(app)).await
+        }
+        "playlist_stop" => {
+            let app = app.clone();
+            blocking(move || crate::wallpaper::playlist_stop(app)).await?;
+            Ok(json!({ "stopped": true }))
+        }
+        "wallpaper_next" => {
+            let app = app.clone();
+            let display = opt_str(args, "displayId");
+            blocking(move || crate::wallpaper::next(app, display)).await
+        }
+        "wallpaper_prev" => {
+            let app = app.clone();
+            let display = opt_str(args, "displayId");
+            blocking(move || crate::wallpaper::prev(app, display)).await
+        }
+        "display_binding_set" => {
+            let app = app.clone();
+            let display = req_str(args, "displayId")?;
+            let pid = args.get("playlistId").and_then(|v| v.as_i64());
+            let bound = pid.is_some();
+            blocking(move || crate::wallpaper::display_binding_set(app, display, pid)).await?;
+            Ok(json!({ "bound": bound }))
+        }
+        "wallpaper_rotation_set" => {
+            let app = app.clone();
+            let paused = args
+                .get("paused")
+                .and_then(|v| v.as_bool())
+                .ok_or("缺少 paused")?;
+            blocking(move || crate::wallpaper::rotation_set(app, paused)).await?;
+            Ok(json!({ "paused": paused }))
+        }
         "active_items" => {
             let app = app.clone();
             let ids = blocking(move || crate::wallpaper::active_items(app)).await?;
@@ -544,7 +719,7 @@ async fn screenshot(app: &AppHandle, args: &Value) -> Result<Value, String> {
     if apply && !skip_apply {
         let app2 = app.clone();
         let id = item_id.clone();
-        blocking(move || crate::wallpaper::apply_item(app2, id)).await?;
+        blocking(move || crate::wallpaper::apply_item(app2, id, None)).await?;
     }
     let png = crate::system_wallpaper::capture_wallpaper_png(app, t0, settle, timeout).await?;
 

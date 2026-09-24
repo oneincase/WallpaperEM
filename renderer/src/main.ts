@@ -131,23 +131,39 @@ const state: {
 // 挂载容器：库的 mountLib 与本文件的 canvas/降级页都挂在它下面。
 // renderer/index.html 里没有这个节点，运行时创建 —— 重构时误删过这段，
 // 后果是 wrap 为 null、所有壁纸静默不显示，故这里用函数保证一定拿到元素。
-// 页面背景必须是纯黑而非透明：缩放（contain）模式下画布/视频留边的区域
-// 由页面背景兜底。壁纸窗口是 .transparent(true) 的，透明背景会直接漏出
-// 后层的系统壁纸；WebGL 侧 contain 留边也是 clearColor(0,0,0,0) 的透明像素，
-// 合成时同样落到页面背景上 —— 两处都靠这里的 #000 兜成黑边。
-document.documentElement.style.cssText = "margin:0;height:100%;background:#000;";
+// 纯黑「黑边兜底」在 wrap 上（不在页面背景上）：缩放（contain）模式下画布/视频
+// 留边的区域靠 wrap 的 #000 兜底 —— WebGL 侧 contain 留边是 clearColor(0,0,0,0)
+// 的透明像素，合成时落到 wrap 背景上，两处一起兜成黑边。页面背景保持**透明**：
+// 无缝切换时新窗口在旧窗口上方后台加载，首帧前必须透出旧壁纸（渐入也靠 wrap 的
+// opacity 0→1 完成）；reveal 之后 wrap 连同黑边一起显形，黑边语义不变。
+document.documentElement.style.cssText = "margin:0;height:100%;background:transparent;";
 document.body.style.cssText =
-  "margin:0;width:100vw;height:100vh;overflow:hidden;background:#000;position:relative;";
+  "margin:0;width:100vw;height:100vh;overflow:hidden;background:transparent;position:relative;";
 
 const wrap: HTMLDivElement = (() => {
   const existing = document.getElementById("wrap");
   if (existing instanceof HTMLDivElement) return existing;
   const el = document.createElement("div");
   el.id = "wrap";
-  el.style.cssText = "position:fixed;inset:0;overflow:hidden;";
+  el.style.cssText =
+    "position:fixed;inset:0;overflow:hidden;background:#000;opacity:0;transition:opacity .7s ease;";
   document.body.appendChild(el);
   return el;
 })();
+
+/**
+ * 首帧就绪后显形（0.7s 渐入）。整页生命周期只渐入一次：同一窗口内的热更新
+ * （setWallpaper 重挂）不该反复淡入淡出。无缝切换的宿主侧在 ready 后等渐入走完
+ * 才收旧窗，视觉上是叠化而不是跳变。
+ */
+let revealed = false;
+function reveal() {
+  if (revealed) return;
+  revealed = true;
+  requestAnimationFrame(() => {
+    wrap.style.opacity = "1";
+  });
+}
 
 // 屏蔽默认右键菜单（壁纸窗口应只响应用户自定义交互，不弹浏览器/调试菜单）。
 // __blockContextMenu 供 iframe 内容调用：库的 attachIframe 会在 load 后调它，
@@ -800,7 +816,7 @@ function mountViaLib(cfg: WallpaperConfig) {
   clear();
   const source = buildSource(cfg);
   if (!source) {
-    reportDiag(cfg, "缺少 src/mediaBase，降级到默认壁纸");
+    reportDiag(cfg, "failed: 缺少 src/mediaBase，降级到默认壁纸");
     mountDefaultWallpaper();
     return;
   }
@@ -871,7 +887,8 @@ function mountViaLib(cfg: WallpaperConfig) {
       if (!inst) {
         // 兜底：库内部卡死时别让壁纸窗口空着，也让截图侧立刻拿到明确原因。
         // 晚到的实例必须销毁，否则又是一次上下文泄漏。
-        reportDiag(cfg, `mount 超过 ${MOUNT_HARD_MS / 1000}s 仍未完成（疑似库内部卡住）`);
+        // 报 `failed:`：无缝切换据此中止替换、把旧壁纸留在屏上（别换上一张空白）。
+        reportDiag(cfg, `failed: mount 超过 ${MOUNT_HARD_MS / 1000}s 仍未完成（疑似库内部卡住）`);
         mountDefaultWallpaper();
         void mountPromise
           .then((late) => {
@@ -907,6 +924,7 @@ function mountViaLib(cfg: WallpaperConfig) {
       attachSystemAudio(inst, seq);
       attachSystemMedia(inst, seq);
       reportDiag(cfg, "ready");
+      reveal();
     } catch (e) {
       if (seq !== state.seq) return;
       const msg = String((e as Error)?.message || e).slice(0, 200);
@@ -927,6 +945,9 @@ function mountCanvas() {
   state.canvas = c;
   state.ctx = c.getContext("2d") ?? undefined;
   startCanvasLoop();
+  // canvas 是正式壁纸类型（测试面板）：与库路径同样报 ready + 渐入显形
+  reportDiag(state.cfg, "ready");
+  reveal();
 }
 
 function startCanvasLoop() {
@@ -987,6 +1008,9 @@ function mountDefaultWallpaper() {
     '<div style="text-align:center">壁纸无法加载' +
     '<br><span style="opacity:.55">Wallpaper unavailable</span></div>';
   wrap.appendChild(box);
+  // 降级页只是「别让窗口空着」的兜底，**不报 ready**（无缝切换据此把旧壁纸
+  // 留在屏上，而不是换成一张错误占位图）；但仍要显形，本窗口没有旧壁纸可看时可见。
+  reveal();
 }
 
 function mount(cfg: WallpaperConfig) {

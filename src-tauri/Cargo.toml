@@ -1,6 +1,6 @@
 [package]
 name = "WallpaperEM"
-version = "1.0.0"
+version = "1.1.0"
 description = "WallpaperEM —— 跨平台动态壁纸引擎（Tauri 2.11.2），支持 Steam 工坊视频/场景/网页/图片壁纸"
 license = "MIT"
 edition = "2021"
@@ -49,6 +49,10 @@ libc = "0.2"
 socket2 = "0.6"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 base64 = "0.22"
+# 封面转码（远端封面 png / 静态 webp → preview.jpg，见 cover_cache）：
+# 纯 Rust 无 C 依赖。tauri 本身就带了这个 crate（只开 png），这里只是多开
+# jpeg/webp 两个解码器，不额外引入第二套图像栈
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 
 # 全平台媒体桥接（正在播放元数据/封面/歌词 + 系统音频采集 + 反向控制）。
 # 与 webwallgl 一样走同级自有仓库 file: 依赖；default-features 关掉 http

@@ -3,7 +3,7 @@
 **壁纸引擎魔法 · Wallpaper Engine Magic**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.0.0-informational)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.1.0-informational)](CHANGELOG.md)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue)](#平台说明--platform-notes)
 [![Tauri](https://img.shields.io/badge/Tauri-2.x-24C8DB?logo=tauri&logoColor=white)](https://tauri.app/)
 [![Renderer](https://img.shields.io/badge/renderer-webwallgl-8A2BE2)](https://github.com/oneincase/webwallgl)

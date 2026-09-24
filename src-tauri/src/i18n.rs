@@ -84,6 +84,13 @@ fn en(zh: &str) -> Option<&'static str> {
         "帧率上限" => "FPS Limit",
         "滤镜效果" => "Filter",
         "退出" => "Quit",
+        // ---- 托盘 · 轮播子菜单 ----
+        "轮播" => "Slideshow",
+        "上一张" => "Previous",
+        "下一张" => "Next",
+        "暂停轮播" => "Pause Slideshow",
+        "恢复轮播" => "Resume Slideshow",
+        "轮播：未启用" => "Slideshow: off",
         // ---- macOS 应用菜单 ----
         "最小化主窗口" => "Minimize Main Window",
         // ---- 原生文件选择框 ----

@@ -235,6 +235,8 @@ export const api = {
     invoke<{ name: string; version: string; os: string; arch: string; description: string }>(
       "app_info"
     ),
+  /** 原生文件夹选择框（单选）：返回选中的绝对路径，用户取消返回 null */
+  appPickFolder: () => invoke<string | null>("app_pick_folder"),
   /** 检查更新（读 GitHub Releases 最新版并与当前版本比对） */
   appUpdateCheck: () => invoke<UpdateInfo>("app_update_check"),
   /** 下载匹配当前平台的安装包到缓存目录，返回落地路径（进度走 update:progress 事件） */
@@ -367,12 +369,15 @@ export const api = {
     invoke<{ cancelled?: boolean; value?: string }>("library_set_item_prop_file", { itemId, propName }),
   libraryResetItemProps: (itemId: string) =>
     invoke<void>("library_reset_item_props", { itemId }),
-  wallpaperApplyItem: (itemId: string) => invoke<void>("wallpaper_apply_item", { itemId }),
+  wallpaperApplyItem: (itemId: string, displayId?: string) =>
+    invoke<void>("wallpaper_apply_item", { itemId, displayId }),
   libraryPreview: (itemId: string) => invoke<WallpaperConfig>("library_preview", { itemId }),
   wallpaperApply: (config: WallpaperConfig, displayId?: string) =>
     invoke<void>("wallpaper_apply", { config, displayId }),
   wallpaperStop: (displayId?: string) => invoke<void>("wallpaper_stop", { displayId }),
   wallpaperListSessions: () => invoke<{ active: boolean; paused: boolean; sessions: Record<string, WallpaperConfig> }>("wallpaper_list_sessions"),
+  /** 显示器列表 + 每屏当前会话摘要（id 即 apply/stop 的 displayId） */
+  wallpaperDisplaysList: () => invoke<DisplaysListResult>("wallpaper_displays_list"),
   /** 内容服务器地址 + token（拼壁纸包内文件 URL 用，如 file 属性缩略图） */
   contentServerStatus: () =>
     invoke<{ port: number; token: string; base: string }>("content_server_status"),
@@ -412,16 +417,34 @@ export const api = {
     invoke<void>("wallpaper_we_assets_dir_set", { dir }),
   wallpaperLocalAssetsStatus: () =>
     invoke<LocalAssetsStatus>("wallpaper_local_assets_status"),
-  wallpaperNext: () => invoke<{ itemId: string; index: number }>("wallpaper_next"),
+  wallpaperNext: (displayId?: string) =>
+    invoke<{ itemId: string; index: number; steps: unknown[] }>("wallpaper_next", { displayId }),
   favoritesList: () => invoke<FavoriteItem[]>("favorites_list"),
   favoriteAdd: (itemId: string) => invoke<boolean>("favorite_add", { itemId }),
   favoriteRemove: (itemId: string) => invoke<boolean>("favorite_remove", { itemId }),
   favoriteStatus: (itemId: string) => invoke<boolean>("favorite_status", { itemId }),
   playlistList: () => invoke<Playlist[]>("playlist_list"),
-  playlistCreate: (name: string, itemIds: string[], intervalSec: number) =>
-    invoke<number>("playlist_create", { name, itemIds, intervalSec }),
+  playlistGet: (id: number) => invoke<Playlist>("playlist_get", { id }),
+  playlistCreate: (name: string, itemIds: string[], intervalSec: number, shuffle?: boolean) =>
+    invoke<number>("playlist_create", { name, itemIds, intervalSec, shuffle }),
+  /** 局部更新（缺省字段不改）；条目/随机变化会重建轮播队列 */
+  playlistUpdate: (
+    id: number,
+    patch: { name?: string; itemIds?: string[]; intervalSec?: number; shuffle?: boolean },
+  ) => invoke<Playlist>("playlist_update", { id, ...patch }),
   playlistDelete: (id: number) => invoke<boolean>("playlist_delete", { id }),
   playlistApply: (id: number) => invoke<Playlist>("playlist_apply", { id }),
+  /** 停止轮播（清除激活列表；壁纸停在当前这张） */
+  playlistStop: () => invoke<void>("playlist_stop"),
+  playlistStatus: () => invoke<PlaylistStatus>("playlist_status"),
+  /** 上一张（手动切换会重置轮播计时）。displayId = 只切该屏（独立模式） */
+  wallpaperPrev: (displayId?: string) =>
+    invoke<{ itemId: string; index: number; steps: unknown[] }>("wallpaper_prev", { displayId }),
+  /** 暂停/恢复轮播的定时自动切换（不影响壁纸渲染） */
+  wallpaperRotationSet: (paused: boolean) => invoke<void>("wallpaper_rotation_set", { paused }),
+  /** 绑定/解绑某屏的轮播列表（null = 解绑，回到固定单张） */
+  displayBindingSet: (displayId: string, playlistId: number | null) =>
+    invoke<void>("display_binding_set", { displayId, playlistId }),
   // 订阅同步（网页会话登录 Steam → 拉取已订阅工坊列表）
   subscriptionsStatus: () =>
     invoke<{ configured: boolean; username?: string; hasSession: boolean }>(
@@ -512,6 +535,65 @@ export interface Playlist {
   name: string;
   itemIds: string[];
   intervalSec: number;
+  /** 随机播放（洗牌队列：一轮内不重复、可回退） */
+  shuffle: boolean;
+}
+
+/** 轮播运行状态（无激活列表时仅 active/paused 两字段） */
+export interface PlaylistStatus {
+  active: boolean;
+  paused: boolean;
+  /** unified=全局一份；independent=每屏各自绑定 */
+  mode?: string;
+  id?: number;
+  name?: string;
+  shuffle?: boolean;
+  /** 当前项下标（0 起） */
+  index?: number;
+  total?: number;
+  intervalSec?: number;
+  /** 下次自动切换时刻（ms）；暂停中为 null */
+  nextAtMs?: number | null;
+}
+
+// ---------- 多显示器 ----------
+
+/** 某屏的轮播绑定摘要（独立模式每屏上下文） */
+export interface DisplayBinding {
+  playlistId: number;
+  playlistName: string;
+  /** 当前项下标（0 起） */
+  index: number;
+  total: number;
+  intervalSec: number;
+  /** 下次自动切换时刻（ms）；暂停中为 null */
+  nextAtMs: number | null;
+}
+
+/** 一块显示器及其当前壁纸会话摘要 */
+export interface DisplayInfo {
+  /** 稳定显示器 id（apply/stop 的 displayId） */
+  id: string;
+  name: string;
+  /** 逻辑坐标帧（左上原点，可为负） */
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  scale: number;
+  isPrimary: boolean;
+  /** 当前会话的本地库条目（无会话/非库壁纸为 null） */
+  itemId: string | null;
+  title: string | null;
+  previewUrl: string | null;
+  /** 该屏的轮播绑定（未绑定为 null） */
+  binding: DisplayBinding | null;
+}
+
+export interface DisplaysListResult {
+  /** unified=所有屏同壁纸；independent=每屏各自指定 */
+  mode: "unified" | "independent" | (string & {});
+  displays: DisplayInfo[];
 }
 
 // ---------- WE 网页壁纸用户属性 ----------

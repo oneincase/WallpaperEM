@@ -2,6 +2,7 @@
 //!
 //! 各后端（macos.rs / linux.rs）对外提供完全一致的函数集：
 //! - `ScreenInfo` / `active_screens` / `display_asleep`：屏幕枚举与睡眠检测
+//! - `legacy_display_ids` / `refresh_display_meta`：显示器稳定 id 迁移映射与名称缓存刷新
 //! - `set_frame` / `apply_desktop_window`：窗口几何与桌面层级
 //! - `set_movable_by_background`：背景拖动（仅 macOS 有效，其余平台空实现）
 //! - `start_auto_pause_observer`：前台应用切换观察（自动暂停数据源）
@@ -29,11 +30,24 @@ mod fallback {
     #[derive(Debug, Clone)]
     pub struct ScreenInfo {
         pub id: u32,
+        pub name: String,
         pub x: f64,
         pub y: f64,
         pub w: f64,
         pub h: f64,
+        pub scale: f64,
+        pub is_primary: bool,
     }
+
+    pub fn legacy_display_ids() -> Vec<(String, String)> {
+        Vec::new()
+    }
+
+    pub fn on_ac_power() -> Option<bool> {
+        None
+    }
+
+    pub fn refresh_display_meta() {}
 
     pub fn active_screens() -> Vec<ScreenInfo> {
         Vec::new()

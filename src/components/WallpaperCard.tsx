@@ -16,6 +16,9 @@ export function WallpaperCard({
   actions,
   alt,
   eager = false,
+  selectMode,
+  selected,
+  onToggleSelect,
 }: {
   /** 预览图 URL（1:1 裁切充满整卡）；空则显示占位 */
   imageUrl?: string;
@@ -40,20 +43,39 @@ export function WallpaperCard({
    * 这类列表本来就只挂视口内十几个格子，全部立即加载反而更稳。
    */
   eager?: boolean;
+  /** 选择模式：点卡片 = 切换选中（切换列表批量加入用，全程无弹框） */
+  selectMode?: boolean;
+  selected?: boolean;
+  onToggleSelect?: () => void;
 }) {
   // 抽屉内的点击/键盘操作不应冒泡到卡片主体（避免误触打开详情）
   const stop = (e: SyntheticEvent) => e.stopPropagation();
 
   return (
     <div
-      className="card group relative aspect-square overflow-hidden transition-transform duration-200 hover:-translate-y-0.5"
+      className={`card group relative aspect-square overflow-hidden transition-transform duration-200 hover:-translate-y-0.5 ${
+        selected
+          ? "ring-2 ring-[var(--accent-strong)] ring-offset-2 ring-offset-[var(--content)]"
+          : ""
+      }`}
     >
       {/* 1:1 预览图：充满整卡，点击打开详情；悬停轻微放大 */}
       <button
-        onClick={onOpen}
+        onClick={selectMode ? onToggleSelect : onOpen}
         className="absolute inset-0 block h-full w-full cursor-default focus:outline-none"
         aria-label={title}
       >
+        {selectMode && (
+          <span
+            className={`absolute right-2 top-2 z-20 flex h-6 w-6 items-center justify-center rounded-full border-2 text-[12px] font-bold transition-colors ${
+              selected
+                ? "border-[var(--accent-strong)] bg-[var(--accent-strong)] text-[var(--content)]"
+                : "border-white/80 bg-black/25 text-transparent"
+            }`}
+          >
+            ✓
+          </span>
+        )}
         {imageUrl ? (
           <img
             src={imageUrl}

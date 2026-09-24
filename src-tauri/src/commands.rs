@@ -29,6 +29,24 @@ pub fn app_info(app: AppHandle) -> Value {
     })
 }
 
+/// 原生文件夹选择框：只返回选中的文件夹绝对路径（取消返回 null），不做任何写入。
+/// 通用入口（设置页「自定义素材目录」等处复用）。与 library_pick_folders 的区别是
+/// 单选、且不带任何导入语义。
+#[tauri::command]
+pub async fn app_pick_folder(app: AppHandle) -> Result<Option<String>, String> {
+    // blocking 对话框不能阻塞主线程/async 执行器 → spawn_blocking（同 library.rs 各选择框）
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        use tauri_plugin_dialog::DialogExt;
+        app.dialog()
+            .file()
+            .blocking_pick_folder()
+            .and_then(|f| f.as_path().map(|p| p.to_string_lossy().into_owned()))
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(picked)
+}
+
 #[tauri::command]
 pub fn db_status(db: State<'_, Arc<Mutex<rusqlite::Connection>>>) -> Result<Value, String> {
     let conn = db.lock().map_err(|e| e.to_string())?;
@@ -61,17 +79,22 @@ pub fn settings_get(
 
 #[tauri::command]
 pub fn settings_set(
+    app: AppHandle,
     db: State<'_, Arc<Mutex<rusqlite::Connection>>>,
     key: String,
     value: String,
 ) -> Result<(), String> {
-    let conn = db.lock().map_err(|e| e.to_string())?;
-    conn.execute(
-        "INSERT INTO settings(key, value) VALUES (?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET value = ?2",
-        [&key, &value],
-    )
-    .map_err(|e| e.to_string())?;
+    {
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = ?2",
+            [&key, &value],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    // 托盘勾选/其它窗口控件跟上（如托盘「自动暂停」↔ 设置页同名开关）
+    crate::notify_setting_changed(&app, &key, &value);
     Ok(())
 }
 

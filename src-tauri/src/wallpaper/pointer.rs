@@ -215,7 +215,7 @@ fn poll_loop(app: AppHandle) {
             g.insert(label.clone(), (u, v, buttons));
         }
 
-        if let Some(w) = app.get_webview_window(&label) {
+        for w in super::wallpaper_windows(&app, &label) {
             let js = format!("window.__wp&&window.__wp.pushPointer({u:.5},{v:.5},{buttons})");
             let _ = w.eval(&js);
         }
@@ -223,7 +223,7 @@ fn poll_loop(app: AppHandle) {
 }
 
 fn emit_leave(app: &AppHandle, label: &str) {
-    if let Some(w) = app.get_webview_window(label) {
+    for w in super::wallpaper_windows(app, label) {
         let _ = w.eval("window.__wp&&window.__wp.pointerLeave()");
     }
 }

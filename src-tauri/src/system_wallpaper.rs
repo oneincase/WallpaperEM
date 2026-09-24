@@ -150,7 +150,8 @@ fn spawn_snapshot_sync(app: &AppHandle, cfg_type: &str, item_id: &str, dir: &Pat
         // ready 时首帧刚上屏；再等一拍让场景多渲染几帧，避免截到半成品画面
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
-        let Some(window) = app2.get_webview_window(&label) else {
+        // 无缝切换后现役窗可能是 `-b` 变体：按基 label 过解析层拿现役的那扇
+        let Some(window) = crate::wallpaper::wallpaper_window(&app2, &label) else {
             tracing::warn!("system wallpaper: 壁纸窗口 {label} 已不存在，跳过截图");
             return;
         };
@@ -814,8 +815,7 @@ pub async fn capture_wallpaper_png(
         tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
     }
 
-    let window = app
-        .get_webview_window(&label)
+    let window = crate::wallpaper::wallpaper_window(app, &label)
         .ok_or_else(|| format!("壁纸窗口 {label} 已不存在"))?;
     let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
     window

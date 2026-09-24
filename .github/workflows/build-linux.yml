@@ -20,8 +20,10 @@ jobs:
   build-linux:
     # 两个架构都用**对应架构的原生 runner**，不做交叉编译（交叉到 arm64 需要整套
     # arm64 sysroot + webkit2gtk 库，成本远高于直接用 arm runner）。
-    #   x64   → ubuntu-22.04（glibc 基线更老，deb/AppImage 兼容更多发行版）
-    #   arm64 → ubuntu-24.04-arm（公共仓库可用的原生 arm64 runner）
+    # 两行都用 22.04 底座（x64 → ubuntu-22.04、arm64 → ubuntu-22.04-arm，
+    # 公共仓库均可用的原生 arm64 runner）：glibc 基线 2.35，deb/AppImage 在
+    # **Ubuntu 22.04 及以上**（22.04 / 24.04 / 26.04…）都能直接装。
+    # 24.04 底座编出来的要 glibc 2.39，22.04 用户装不上，故 arm64 也不用它。
     strategy:
       fail-fast: false
       matrix:
@@ -29,7 +31,7 @@ jobs:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             label: x64
-          - os: ubuntu-24.04-arm
+          - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             label: arm64
 
@@ -48,9 +50,20 @@ jobs:
           repository: oneincase/webwallgl
           path: webwallgl-github-src
 
+      # media-bridge 同样是同级自有仓库（src-tauri/Cargo.toml 里
+      # path = "../../media-bridge/crates/media-bridge"），缺了它 cargo 直接报
+      # 找不到 path 依赖；纯 Rust 依赖，检出即可，无需额外构建步骤
+      - name: 检出 media-bridge
+        uses: actions/checkout@v4
+        with:
+          repository: oneincase/media-bridge
+          path: media-bridge-src
+
       # actions/checkout 不允许直接检出到 workspace 外，先落到子目录再移到平级
       - name: 移动到仓库平级目录
-        run: mv webwallgl-github-src ../webwallgl-github
+        run: |
+          mv webwallgl-github-src ../webwallgl-github
+          mv media-bridge-src ../media-bridge
 
       - name: 安装 Tauri Linux 依赖
         run: |

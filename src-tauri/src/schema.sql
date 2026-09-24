@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS downloads (
   error_code TEXT,
   error_msg TEXT,
   waiting_guard INTEGER NOT NULL DEFAULT 0,
+  attempts INTEGER NOT NULL DEFAULT 0,  -- 自动重试轮数（瞬断类失败自愈）
   target_dir TEXT,
   file_hash TEXT,
   created_at INTEGER NOT NULL DEFAULT (unixepoch()),
@@ -91,5 +92,7 @@ CREATE TABLE IF NOT EXISTS playlists (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
   item_ids TEXT NOT NULL,             -- JSON
-  interval_sec INTEGER NOT NULL DEFAULT 600
+  interval_sec INTEGER NOT NULL DEFAULT 600,
+  shuffle INTEGER NOT NULL DEFAULT 0, -- 1=随机（洗牌队列，一轮内不重复）
+  updated_at INTEGER NOT NULL DEFAULT (unixepoch())
 );

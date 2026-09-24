@@ -17,6 +17,11 @@ export function DownloadsPage() {
   const [loading, setLoading] = useState(true);
 
   const [confirmClear, setConfirmClear] = useState(false);
+  // 壁纸 ID 直下载：内联输入（不弹框）。元数据零依赖入队，steamcmd 按 ID 直取，
+  // 国内免代理也能下（详情接口被墙不影响）
+  const [idOpen, setIdOpen] = useState(false);
+  const [idInput, setIdInput] = useState("");
+  const [idBusy, setIdBusy] = useState(false);
   const msg = useMessage();
   // 正在等待手机 Steam App 确认登录的任务（steamcmd 推手机确认时无需输码，只需提示）
   const [mobileConfirm, setMobileConfirm] = useState<Set<number>>(new Set());
@@ -24,6 +29,26 @@ export function DownloadsPage() {
   // 否则每次进度更新都会拆装 IPC 监听器。
   const tasksRef = useRef<DownloadTask[]>([]);
   tasksRef.current = tasks;
+
+  const enqueueById = async () => {
+    const id = idInput.trim();
+    if (!/^\d{3,}$/.test(id)) {
+      msg.error(tr("请输入数字壁纸 ID（创意工坊条目 ID）"));
+      return;
+    }
+    setIdBusy(true);
+    try {
+      await api.downloadEnqueue(id);
+      msg.success(tr("已加入下载队列：{id}", { id }));
+      setIdOpen(false);
+      setIdInput("");
+      await refresh();
+    } catch (e) {
+      msg.error(String(e));
+    } finally {
+      setIdBusy(false);
+    }
+  };
 
   const refresh = useCallback(async () => {
     try {
@@ -94,14 +119,49 @@ export function DownloadsPage() {
             {tr("下载需在「设置 → 账号」登录 Steam 账号（需拥有 Wallpaper Engine）")}
           </p>
         </div>
-        {tasks.some((t) => t.status === "done" || t.status === "failed") && (
-          <button
-            className="btn"
-            onClick={() => setConfirmClear(true)}
-          >
-            {tr("清空已完成")}
-          </button>
-        )}
+        <div className="flex items-center gap-2">
+          {idOpen ? (
+            <span className="flex items-center gap-1.5 rounded-lg border border-[var(--accent-strong)]/50 bg-[var(--card)] px-2 py-1 shadow-sm">
+              <input
+                autoFocus
+                value={idInput}
+                onChange={(e) => setIdInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") void enqueueById();
+                  if (e.key === "Escape") setIdOpen(false);
+                }}
+                placeholder={tr("壁纸 ID（创意工坊数字 ID）")}
+                className="w-52 bg-transparent text-[13px] outline-none placeholder:text-[var(--text-2)]"
+              />
+              <button
+                className="btn btn-primary !py-0.5 text-[11.5px]"
+                disabled={idBusy}
+                onClick={() => void enqueueById()}
+              >
+                {idBusy ? "…" : tr("下载")}
+              </button>
+            </span>
+          ) : (
+            <button
+              className="btn"
+              title={tr("输入创意工坊壁纸 ID 直接下载（无需搜索，网络受限时也能用）")}
+              onClick={() => {
+                setIdInput("");
+                setIdOpen(true);
+              }}
+            >
+              {tr("壁纸ID下载")}
+            </button>
+          )}
+          {tasks.some((t) => t.status === "done" || t.status === "failed") && (
+            <button
+              className="btn"
+              onClick={() => setConfirmClear(true)}
+            >
+              {tr("清空已完成")}
+            </button>
+          )}
+        </div>
       </div>
 
       {loading && (

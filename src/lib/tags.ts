@@ -44,7 +44,13 @@ export const TAG_GROUPS: TagGroup[] = [
       { name: "Scene", label: "场景" },
       { name: "Video", label: "视频" },
       { name: "Web", label: "网页" },
-      // 刻意不放 Application：本地 12k 条工坊缓存里零条，选了必然空结果
+      // 预设类内容（可玩预设壁纸，如载具预设场景）：Steam 侧就是 `Preset` 标签，
+      // 与 场景/视频/网页 同级并列（WE 工坊的类型维度）。与下方「分类」组的
+      // 预设同值 —— 官方 Type / Category 两个维度都含它，选中态自然联动。
+      { name: "Preset", label: "预设" },
+      // 刻意不放 Application：本地 12k 条工坊缓存里零条，选了必然空结果。
+      // 也不放 Vehicle：它是官方「题材/Genre」维度（载具主题壁纸），
+      // 入口在下方题材组的「载具」
     ],
   },
   {

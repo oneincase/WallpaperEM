@@ -13,6 +13,9 @@ mkdir -p /build/WallpaperEM /build/webwallgl-github
   -cf - .) | (cd /build/WallpaperEM && tar xf -)
 # webwallgl 的 dist/lib 是纯 JS 构建产物（跨平台），直接复用宿主编译结果
 cp -a /src/webwallgl/dist /build/webwallgl-github/dist
+# media-bridge 是 Cargo path 依赖（src-tauri/Cargo.toml 里 ../../media-bridge），
+# 必须与 WallpaperEM 平级落在 /build 下，否则 cargo 解析不到（源码很小，整棵拷）
+cp -a /src/media-bridge /build/media-bridge
 
 cd /build/WallpaperEM
 echo "==> pnpm install"

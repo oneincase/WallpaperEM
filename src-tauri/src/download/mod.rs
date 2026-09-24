@@ -717,7 +717,45 @@ impl DownloadService {
         Ok(pw)
     }
 
+    /// 单任务自动重试上限：网络抖动 / steamcmd 瞬断自行恢复。国内免代理环境下
+    /// CDN/登录节点偶发失败是常态，靠手动点重试体验太差
+    const AUTO_RETRY_MAX: i64 = 2;
+
+    /// 失败收尾：瞬断类错误自动重排两轮（[`Self::AUTO_RETRY_MAX`]），其余直接判失败。
+    /// 不重试：验证码（GUARD）/ 登录凭据（NEED_CREDENTIALS）/ 取消（CANCELLED）/
+    /// 安装失败（INSTALL_FAILED，内容问题重下也没用）。
     fn fail(&self, id: i64, code: &str, msg: &str) {
+        let transient = matches!(code, "DOWNLOAD_FAILED" | "SPAWN_FAILED" | "IO_ERROR");
+        if transient {
+            let attempts: i64 = self
+                .db
+                .lock()
+                .ok()
+                .and_then(|c| {
+                    c.query_row("SELECT attempts FROM downloads WHERE id = ?1", [id], |r| {
+                        r.get(0)
+                    })
+                    .ok()
+                })
+                .unwrap_or(0);
+            if attempts < Self::AUTO_RETRY_MAX {
+                self.guard_waiters.lock().unwrap().remove(&id);
+                if let Ok(conn) = self.db.lock() {
+                    let _ = conn.execute(
+                        "UPDATE downloads SET attempts = attempts + 1, status = 'queued',
+                         error_code = NULL, error_msg = NULL, progress = 0 WHERE id = ?1",
+                        [id],
+                    );
+                }
+                tracing::warn!(
+                    "download task {id} failed ({code}: {msg})，自动重试第 {} / {} 次",
+                    attempts + 1,
+                    Self::AUTO_RETRY_MAX
+                );
+                self.emit_progress(id, "queued", 0.0);
+                return;
+            }
+        }
         tracing::error!("download task {id} failed: {code} {msg}");
         self.guard_waiters.lock().unwrap().remove(&id);
         self.update(id, "failed", 0.0, Some(code), Some(msg), false);
@@ -1430,8 +1468,9 @@ pub fn download_cancel(app: AppHandle, id: i64) -> Result<bool, String> {
 pub fn download_retry(app: AppHandle, id: i64) -> Result<bool, String> {
     let db = app.state::<Arc<Mutex<Connection>>>();
     let conn = db.lock().map_err(|e| e.to_string())?;
+    // 手动重试 = 重新给满自动重试额度
     conn.execute(
-        "UPDATE downloads SET status='queued', error_code=NULL, error_msg=NULL, progress=0 WHERE id = ?1",
+        "UPDATE downloads SET status='queued', error_code=NULL, error_msg=NULL, progress=0, attempts=0 WHERE id = ?1",
         [id],
     )
     .map_err(|e| e.to_string())?;
