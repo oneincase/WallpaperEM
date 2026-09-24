@@ -207,8 +207,9 @@ see [Build from Source](#从源码构建--build-from-source).
 - **Xcode Command Line Tools**
 - 仅本地构建 Intel 切片时需要 `rustup target add x86_64-apple-darwin`（发布包由 CI 出 universal）
 
-**Linux**（主路径：X11 会话 + GNOME / KDE / Cinnamon / MATE / XFCE；x64 / ARM64 均可，
-arm64 需在 arm64 机器或 arm64 容器里构建以免交叉编译缺 sysroot）
+**Linux**（**Ubuntu 22.04 及以上** / glibc 2.35+ —— 发布包即按此基线构建，Debian 12+
+等同代发行版同样可用；主路径：X11 会话 + GNOME / KDE / Cinnamon / MATE / XFCE；
+x64 / ARM64 均可，arm64 需在 arm64 机器或 arm64 容器里构建以免交叉编译缺 sysroot）
 
 ```bash
 # Debian / Ubuntu 示例
@@ -230,11 +231,26 @@ sudo apt install libwebkit2gtk-4.1-dev build-essential curl wget file \
 
 ### 安装依赖 / Install dependencies
 
+WallpaperEM 依赖两个同作者的自维护仓库，都以**仓库平级目录**的形式接入（即克隆到
+WallpaperEM 旁边），缺一个就装不上 / 编译不过：
+
 ```bash
+git clone https://github.com/oneincase/webwallgl.git     # 渲染库（file: 依赖）
+git clone https://github.com/oneincase/media-bridge.git  # 媒体桥接（Cargo path 依赖）
 git clone https://github.com/oneincase/WallpaperEM.git
 cd WallpaperEM
 pnpm install
 ```
+
+- `webwallgl` 需**先构建出库产物**（前端依赖 `file:../webwallgl-github/dist/lib`，
+  注意目录名是 `webwallgl-github`，克隆后请保持或改 `package.json` 里的路径）：
+
+  ```bash
+  cd ../webwallgl && pnpm install && pnpm run build:lib
+  ```
+
+- `media-bridge` 无需构建，但必须与 WallpaperEM 平级（`src-tauri/Cargo.toml` 里是
+  `path = "../../media-bridge/crates/media-bridge"`）。
 
 ### 开发运行 / Run in development
 
@@ -254,7 +270,8 @@ pnpm tauri build
 >     `src-tauri/target/universal-apple-darwin/release/bundle/` 下；CI 默认出这个
 > - Linux：`bundle/deb/*.deb`、`bundle/appimage/*.AppImage`
 >   - ARM64：加 `--target aarch64-unknown-linux-gnu`，产物在 `src-tauri/target/aarch64-unknown-linux-gnu/release/bundle/` 下
->     （CI 用原生 `ubuntu-24.04-arm` runner，不做交叉编译）
+>     （CI 用原生 `ubuntu-22.04-arm` runner，不做交叉编译）
+>   - x64 / arm64 都用 **22.04 底座**构建（glibc 2.35），产物在 **Ubuntu 22.04 及以上**可直接安装
 > - Windows：`bundle/nsis/*.exe`、`bundle/msi/*.msi`
 >   - ARM64：加 `--target aarch64-pc-windows-msvc`，产物在 `src-tauri/target/aarch64-pc-windows-msvc/release/bundle/` 下
 >   - 见 `.github/workflows/build-windows.yml`（x64 / arm64 矩阵）
