@@ -181,13 +181,13 @@ see [Build from Source](#从源码构建--build-from-source).
 | 壁纸渲染 / Renderer | WKWebView / WebView2 / WebKitGTK 渲染页 + [`webwallgl`](https://github.com/oneincase/webwallgl)（WebGL 场景渲染器） |
 | 存储 / Storage | SQLite（rusqlite）· 本地加密凭据 |
 | 下载 / Download | steamcmd（Valve 官方，运行时安装）· 串行队列 + Steam Guard |
-| 媒体 / Media | ffmpeg（抽帧，可选）· MediaRemote / GSMTC / MPRIS（正在播放）· ScreenCaptureKit / WASAPI（音频频谱） |
+| 媒体 / Media | ffmpeg（抽帧，可选）· [media-bridge](https://github.com/oneincase/media-bridge)（正在播放 / 封面 / 控制 / 音频频谱，三平台统一，进程内依赖） |
 | 扩展 / Extension | 内置 MCP 服务（axum，JSON-RPC over HTTP） |
 
 | 平台 / Platform | 桌面层 / Desktop layer | 正在播放 / Now Playing | 音频频谱 / Audio spectrum |
 | --- | --- | --- | --- |
-| macOS 13+ | 原生桌面层窗口（图标之下 / 之上两档） | MediaRemote（经 [mediaremote-adapter](https://github.com/ungive/mediaremote-adapter)） | ScreenCaptureKit loopback（需屏幕录制权限） |
-| Linux（X11，x64 / ARM64） | X11 桌面层窗口 | MPRIS（D-Bus） | 暂未接入（待 PipeWire） |
+| macOS 13+ | 原生桌面层窗口（图标之下 / 之上两档） | MediaRemote（15.4+ 经内嵌 helper + `/usr/bin/perl` 权限通道） | CoreAudio 进程 Tap（需「系统音频录制」授权） |
+| Linux（X11，x64 / ARM64） | X11 桌面层窗口 | MPRIS（D-Bus） | PulseAudio / PipeWire monitor（`parec` / `pw-record` 自动探测） |
 | Windows 10/11（x64 / ARM64） | `Progman` / `WorkerW` 桌面层（含 Win11 raised-desktop 适配）/ Z 序置底 | GSMTC（`Windows.Media.Control`） | WASAPI loopback（免权限） |
 
 ---
@@ -377,8 +377,9 @@ WallpaperEM/
 │  │  │  ├─ macos.rs · linux.rs · windows.rs   # 各平台桌面层实现
 │  │  │  └─ pointer.rs          # 外部指针轮询注入
 │  │  ├─ content_server.rs      # 本地内容服务器（渲染器 / 媒体 / 属性 / SSE）
-│  │  ├─ audio_capture/         # 系统音频频谱（macOS ScreenCaptureKit · Windows WASAPI）
-│  │  ├─ now_playing/           # 正在播放（macOS MediaRemote · Windows GSMTC · Linux MPRIS）
+│  │  ├─ media_bridge.rs        # 全平台媒体桥接单例（进程内依赖 ../media-bridge）
+│  │  ├─ audio_capture.rs       # 系统音频门面：相位机 + AGC 后处理（三平台采集在 media-bridge）
+│  │  ├─ now_playing.rs         # 正在播放门面：快照映射 / 封面 data URL / 控制转发
 │  │  ├─ download/              # steamcmd 下载引擎（队列 / Guard / 安装）
 │  │  ├─ mcp/                   # 内置 MCP 服务（tools / resources / prompts）
 │  │  ├─ steam/                 # Steam 客户端：工坊浏览 / 详情 / 类型
@@ -388,7 +389,6 @@ WallpaperEM/
 │  │  ├─ system_wallpaper.rs    # 系统静态壁纸同步
 │  │  ├─ db.rs · secure_store.rs# SQLite / 本地加密凭据
 │  │  └─ i18n.rs                # 原生文案（托盘 / 窗口标题）
-│  ├─ vendor/mediaremote-adapter# 第三方：系统「正在播放」数据源（BSD-3-Clause）
 │  └─ tauri.conf.json
 ├─ scripts/                     # 构建 / 同步 / 校验脚本
 ├─ CHANGELOG.md · LICENSE
@@ -436,14 +436,14 @@ If WallpaperEM is useful to you, consider buying the author a coffee — your su
 
 This project is released under the **MIT** license — see [LICENSE](LICENSE).
 
-本项目内含第三方组件 `src-tauri/vendor/mediaremote-adapter`
-（[mediaremote-adapter](https://github.com/ungive/mediaremote-adapter)，BSD-3-Clause，
-Copyright (c) 2025 Jonas van den Berg and contributors），用于读取系统「正在播放」信息；
-完整许可见该目录下的 `LICENSE`。
+系统「正在播放」与系统音频采集基于同作者的开源组件
+[media-bridge](https://github.com/oneincase/media-bridge)（MIT，以 file 依赖形式接入，
+构建时自动内嵌其 macOS 权限通道 helper，无需随包分发额外文件）。
 
-This project bundles the third-party component `src-tauri/vendor/mediaremote-adapter`
-([mediaremote-adapter](https://github.com/ungive/mediaremote-adapter), BSD-3-Clause) for reading
-system Now Playing information; see the `LICENSE` file in that directory.
+System Now Playing and system audio capture are built on
+[media-bridge](https://github.com/oneincase/media-bridge) (MIT) by the same author. It is
+integrated as a file dependency; its macOS permission-channel helper is embedded at build
+time, so no extra files are shipped.
 
 ---
 
@@ -451,9 +451,9 @@ system Now Playing information; see the `LICENSE` file in that directory.
 
 - [Tauri](https://tauri.app/) · [React](https://react.dev/) · [Vite](https://vite.dev/) · [Tailwind CSS](https://tailwindcss.com/)
 - [webwallgl](https://github.com/oneincase/webwallgl) —— WE 场景壁纸的 WebGL 渲染库
+- [media-bridge](https://github.com/oneincase/media-bridge) —— 全平台系统媒体桥接（正在播放 / 封面 / 控制 / 音频频谱）
 - [SteamCMD](https://developer.valvesoftware.com/wiki/SteamCMD)（Valve）与 [Steam 创意工坊](https://steamcommunity.com/workshop/)
 - [Wallpaper Engine](https://www.wallpaperengine.io/) 及其壁纸作者
-- [mediaremote-adapter](https://github.com/ungive/mediaremote-adapter)（BSD-3-Clause，系统「正在播放」数据源）
 
 ---
 

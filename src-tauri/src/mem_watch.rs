@@ -10,9 +10,11 @@
 //! **归属判定**（第一版这里踩过坑）：macOS 上 WebKit 的这些进程是 launchd 通过 XPC
 //! 起来的，`proc_listchildpids` **一个都看不到**（实测子进程列表里只有媒体适配器的
 //! perl）。归属改用 libsystem 的 `responsibility_get_pid_responsible_for_pid` ——
-//! WebKit 自己就是用这个把进程归到宿主 App 的：实测我们这 4 个 WebKit 进程都回我们的
-//! pid，别的 App 的回它们自己的。它是 SPI，用 dlsym 取，取不到就只报本进程与直接
-//! 子进程（并在日志里说明读数不完整）。
+//! WebKit 自己就是用这个把进程归到宿主 App 的。**参照值是「我们自己的归属 pid」**
+//! 而不是我们的 pid：Release（.app 启动）时两者一致；dev（pnpm tauri dev 的裸
+//! 二进制）时归属链上溯到终端，我们与我们的 WebKit 子进程归到的都是终端的 pid ——
+//! 拿自己的 pid 做参照会一个都观测不到（2026-09-20 实测）。它是 SPI，用 dlsym 取，
+//! 取不到就只报本进程与直接子进程（并在日志里说明读数不完整）。
 //!
 //! 纯只读、无副作用；只在 macOS 上有实现，其它平台是空操作（日志里没有这一段）。
 
@@ -50,6 +52,15 @@ mod imp {
             }
         }
         if let Some(responsible_of) = responsible_of() {
+            // 归属参照值是「我们自己的归属 pid」而不是我们的 pid：responsibility
+            // 把进程归到祖先链上最近的「责任 App」—— Release（Finder/Dock 启动
+            // .app）时就是我们自己；dev（pnpm tauri dev / cargo run 的裸二进制
+            // 没有 App bundle）时链路继续上溯到终端，我们与我们的 WebKit 子进程
+            // 归到的都是终端的 pid。若拿自己的 pid 做参照，dev 构建一个 WebKit
+            // 进程都观测不到（实测归终端），换壁纸的内存预算回收也随之失效。
+            // 参照取不到（返回 ≤0，如查询瞬间的异常）时退回自己的 pid（Release 语义）。
+            let my_resp_raw = unsafe { responsible_of(me) };
+            let my_resp = if my_resp_raw > 0 { my_resp_raw } else { me };
             let known = out.len();
             for pid in all_pids() {
                 if out[..known].iter().any(|p| p.pid == pid) {
@@ -60,7 +71,8 @@ mod imp {
                 }
                 // SAFETY: 取到的是 libsystem 里同签名的函数（WebKit 的
                 // ResponsibilitySPI.h 用的就是它），只读一个 pid 的归属
-                if unsafe { responsible_of(pid) } != me {
+                let r = unsafe { responsible_of(pid) };
+                if r != my_resp && r != me {
                     continue;
                 }
                 if let Some(m) = read_pid(pid) {
@@ -230,19 +242,6 @@ pub fn report(tag: &str) {
     } else {
         tracing::info!("内存观测（{tag}）: {line}");
     }
-}
-
-/// 当前全部 WebKit **WebContent** 进程的合计占用（字节）；非 macOS 返回 0。
-///
-/// 给「复用进程占用超预算就改走销毁重建」这条策略用（见 `wallpaper::schedule_window_reload`）——
-/// 只要 WebContent，不算 GPU / Networking：那两份是全局共享、不随换壁纸累积，
-/// 算进来会让预算一直被 GPU 的正常占用顶穿。
-pub fn webcontent_footprint() -> u64 {
-    imp::snapshot()
-        .iter()
-        .filter(|p| classify(&p.name) == "WebContent")
-        .map(|p| p.bytes)
-        .sum()
 }
 
 /// 这个 pid 现在是不是一个 WebKit 进程。

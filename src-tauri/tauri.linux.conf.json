@@ -8,7 +8,6 @@
     "resources": {
       "../dist/renderer": "renderer",
       "../dist/assets": "assets",
-      "vendor/mediaremote-adapter": "mediaremote-adapter",
       "bundled/libsteam_api.so": "libsteam_api.so"
     }
   }

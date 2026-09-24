@@ -1,25 +1,28 @@
-//! 主窗口生命周期：内存压力下回收 + 按需重建
+//! 主窗口生命周期：关闭 / 最小化即释放 + 按需重建
 //!
-//! 应用主窗口（React UI，独立 WKWebView）隐藏/最小化后**不再按时间回收** ——
-//! 只有系统真的报告内存压力（[`crate::mem_pressure`]）时才销毁窗口，让 WebKit
-//! 回收其 WebContent 进程；桌面壁纸窗口（label = `wallpaper-*`）不受影响。
+//! 应用主窗口（React UI，独立 WKWebView）的生命周期：
+//! - **用户关闭（红色按钮/⌘W）→ 立即销毁并结束 WebContent 进程**
+//!   （[`register_close_to_release`]）：用户点关就是「退出主界面」，桌面上只留
+//!   壁纸渲染进程。
+//! - **黄色最小化 / ⌘H（已自定义为最小化）→ 同样立即释放**（与关闭同一语义）：
+//!   主界面那一整页 React UI 压着几十～几百 MB，最小化即「此刻不看了」，内存
+//!   立刻归还，而不是把窗口藏着等系统内存压力。重开走托盘 / Dock(Reopen) 的
+//!   重建路径（页面重载一次，换内存即时回收）。
+//! - 桌面壁纸窗口（label = `wallpaper-*`）独占数据存储，不受本文件任何动作影响。
 //!
-//! 为什么放弃「隐藏 X 秒就销毁」：那一步在 macOS 上**回收不了内存**。主窗口用的是
-//! 默认（共享）`WKWebsiteDataStore` —— 没有按标识删除的 API，`destroy()` 只是把
-//! WKWebView 从窗口上摘下来，WebContent 进程连页面一起留在 WebKit 的进程池里，
-//! 下次重建又落回同一个池子（壁纸窗口那边是同一个机制，靠「每窗口独占一份存储 +
-//! 销毁时删除」才绕开）。实测（2026-09-11 日志 + 活动监视器）「3s 闲置回收」的
-//! 收益接近于零，代价却是每次重开都付一次页面重载，外加隐藏瞬间的主线程停顿 ——
-//! 当天日志里 30 次 `UI event loop wedged?` 全部落在窗口被隐藏的那一刻（逐条对照
-//! 上下文可知是 WebKit 的百毫秒级抖动，不是卡死）。改成「压力下才回收」：这时把
-//! 几百 MB 还回去，才值得付一次重建。
+//! 为什么「隐藏后按时间回收」被放弃（历史上试过）：那一步在 macOS 上**回收不了
+//! 内存**。主窗口用的是默认（共享）`WKWebsiteDataStore` —— 没有按标识删除的 API，
+//! `destroy()` 只是把 WKWebView 从窗口上摘下来，WebContent 进程连页面一起留在
+//! WebKit 的进程池里，下次重建又落回同一个池子。所以释放必须走「先问 pid、再
+//! destroy、再按 pid 结束进程」（[`exclusive_web_content_pid`] +
+//! [`release_web_content`]，与壁纸窗口的 [`crate::wallpaper`] 同一套思路）。
 //!
-//! 隐藏判定覆盖三种用户路径：
+//! 隐藏判定覆盖三种用户路径（压力回收那条路用）：
 //! - 黄色按钮最小化（miniaturized 时 isVisible 仍为 true，故必须查 is_minimized）
-//! - 关闭按钮（CloseRequested -> hide，见 lib.rs setup）
-//! - ⌘H 隐藏整个应用（窗口 orderOut，is_visible 变 false）
+//! - 关闭按钮 → v1.0.2 起立即释放（见上），不再进入隐藏态
+//! - ⌘H 自定义为最小化主窗口（lib.rs setup，避免 NSApp hide 连壁纸窗口一起藏）
 //!
-//! 回收后用户从 托盘菜单 / 托盘左键 / Dock 图标(Reopen) / 二次启动(single-instance)
+//! 释放/回收后用户从 托盘菜单 / 托盘左键 / Dock 图标(Reopen) / 二次启动(single-instance)
 //! 唤起时，由 [`ensure_main_window`] 按 tauri.conf.json 原配置重建窗口。
 //!
 //! 已知边界：压力下若主窗口**可见**，我们不动它（销毁用户正在看的窗口更糟）。
@@ -124,25 +127,34 @@ fn is_hidden(w: &WebviewWindow) -> bool {
     w.is_minimized().unwrap_or(false) || !w.is_visible().unwrap_or(true)
 }
 
-/// 主窗口的 WebContent 进程 pid（不该动或拿不到时 None）。**必须在主线程、且在销毁前调用。**
+/// 被关闭窗口的 WebContent 进程 pid（不该动或拿不到时 None）。**必须在主线程、且在销毁前调用。**
 ///
-/// 例外：主窗口用的是默认（共享）存储，与 props-* 设置窗**可能是同一个 WebContent
-/// 进程**（同存储同进程），那种时候踢进程会把设置窗的页面一起打掉 —— 所以只有除了
-/// 壁纸窗口以外没有别的共享窗口时才返回 pid，其余情况返回 None，调用方退回原来的 destroy。
+/// `closing` 是本次要销毁的窗口 label：主窗口与 props-* 设置窗共用默认（共享）
+/// `WKWebsiteDataStore`，**可能是同一个 WebContent 进程**（同存储同进程），那种
+/// 时候踢进程会把其它 UI 窗口的页面一起打掉 —— 所以只有「除它以外只剩壁纸窗口」
+/// 时才返回 pid，其余情况返回 None，调用方退回单纯的 destroy。
 ///
 /// pid 用 `i32` 而不是 `libc::pid_t`：这个文件三平台都要编，而 `libc::pid_t` 只在
 /// Unix 上存在（Windows 上没有，CI 会直接编译失败）。macOS 上 `pid_t` 就是 `i32`。
 #[cfg(target_os = "macos")]
-fn own_web_content_pid(app: &AppHandle, w: &WebviewWindow) -> Option<i32> {
+pub(crate) fn exclusive_web_content_pid(
+    app: &AppHandle,
+    w: &WebviewWindow,
+    closing: &str,
+) -> Option<i32> {
     app.webview_windows()
         .keys()
-        .all(|label| label == "main" || label.starts_with("wallpaper-"))
+        .all(|label| label == closing || label.starts_with("wallpaper-"))
         .then(|| crate::wallpaper::macos::web_content_pid(w))
         .flatten()
 }
 
 #[cfg(not(target_os = "macos"))]
-fn own_web_content_pid(_app: &AppHandle, _w: &WebviewWindow) -> Option<i32> {
+pub(crate) fn exclusive_web_content_pid(
+    _app: &AppHandle,
+    _w: &WebviewWindow,
+    _closing: &str,
+) -> Option<i32> {
     None
 }
 
@@ -150,8 +162,8 @@ fn own_web_content_pid(_app: &AppHandle, _w: &WebviewWindow) -> Option<i32> {
 ///
 /// 发信号 + 等进程从进程表消失是阻塞的（上限 500ms），而调用点在主线程上，所以整件事
 /// 交给后台任务；读数也放在进程真消失之后 —— 那一行读到的才是「回收后」的占用。
-/// 非 macOS 没有可结束的进程（[`own_web_content_pid`] 恒为 None），只有读数这一步。
-fn release_web_content(pid: Option<i32>, tag: &'static str) {
+/// 非 macOS 没有可结束的进程（[`exclusive_web_content_pid`] 恒为 None），只有读数这一步。
+pub(crate) fn release_web_content(pid: Option<i32>, tag: &'static str) {
     tauri::async_runtime::spawn(async move {
         #[cfg(target_os = "macos")]
         if let Some(pid) = pid {
@@ -212,7 +224,7 @@ fn on_tick(app: &AppHandle, pressure: Option<&mem_pressure::Reading>) {
             // 池子里且不保证还内存 —— 而这一步的全部目的就是还内存，所以能踢就踢。
             // pid 得**在销毁之前**问（窗口一没，WKWebView 就没了），销毁后再在后台
             // 发 SIGKILL 并等它真消失。
-            let pid = own_web_content_pid(app, &w);
+            let pid = exclusive_web_content_pid(app, &w, "main");
             match w.destroy() {
                 Ok(_) => {
                     // 注意：此处不可再 lock()——本函数开头拿到的 st guard 仍存活，
@@ -282,8 +294,8 @@ pub fn ensure_main_window(app: &AppHandle) {
         let built = builder.build();
         match built {
             Ok(w) => {
-                // 装饰与初始窗口一致：关闭=隐藏 + 侧栏 vibrancy
-                register_close_to_hide(&w);
+                // 装饰与初始窗口一致：关闭=立即释放 + 侧栏 vibrancy
+                register_close_to_release(&w);
                 // vibrancy 只能在主线程调用；重建可能由非主线程入口触发
                 //（single-instance 回调），直接调用会失败并丢失侧栏磨砂效果
                 let app2 = app.clone();
@@ -324,14 +336,128 @@ pub fn ensure_main_window(app: &AppHandle) {
     }
 }
 
-/// 关闭主窗口 = 隐藏（壁纸继续运行；托盘/Dock 重新显示）。
+/// 关闭 / 最小化主窗口 = 立即释放（销毁窗口 + 尽力结束其 WebContent 进程）。
 /// setup（初始窗口）与 ensure_main_window（重建窗口）共用。
-pub fn register_close_to_hide(w: &WebviewWindow) {
+///
+/// 主界面那一大页 React UI 压着几十～几百 MB：用户点关或点最小化都是「退出
+/// 主界面 / 此刻不看了」，窗口销毁、内存立刻归还。重开走托盘 / Dock Reopen 的
+/// 重建路径（页面重载一次，换内存即时回收）。
+pub fn register_close_to_release(w: &WebviewWindow) {
     let w2 = w.clone();
     w.on_window_event(move |event| {
         if let tauri::WindowEvent::CloseRequested { api, .. } = event {
             api.prevent_close();
-            let _ = w2.hide();
+            release_main(&w2, "关闭");
         }
     });
+
+    // macOS：最小化（黄色按钮 / Cmd+M）只触发 NSWindow 的 miniaturize（窗口
+    // orderOut，逻辑尺寸不变），**tauri 不发 Resized 事件**（2026-09-24 实测）。
+    // 直接注册 NSWindowDidMiniaturizeNotification 才能在最小化时释放。
+    #[cfg(target_os = "macos")]
+    observe_minimize(w);
+}
+
+/// macOS：注册 NSWindowDidMiniaturizeNotification，窗口最小化时立即释放。
+#[cfg(target_os = "macos")]
+fn observe_minimize(w: &WebviewWindow) {
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::NSNotificationCenter;
+    use std::ptr::NonNull;
+
+    let win_ptr = match w.ns_window() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("observe_minimize: 拿不到 NSWindow: {e}");
+            return;
+        }
+    };
+
+    // block 回调里持有窗口克隆（释放用）。NSNotificationCenter 要求 Sendable
+    // block：用 RcBlock 的 Send 变体 StackBlock→copy；这里用 block2::RcBlock
+    // 并以 DynBlock 形式传（签名 NonNull<NSNotification>）。
+    let weak_w = w.clone();
+    let block = block2::RcBlock::new(move |note: NonNull<objc2_foundation::NSNotification>| {
+        let _ = note; // 只需要「最小化了」这个信号
+        tracing::info!("main window did miniaturize → releasing");
+        release_main(&weak_w, "最小化");
+    });
+
+    let center = NSNotificationCenter::defaultCenter();
+    let name = unsafe { objc2_app_kit::NSWindowDidMiniaturizeNotification };
+    // 只观察这一个窗口（object = 该 NSWindow）
+    let obj: Retained<AnyObject> = unsafe { Retained::retain(win_ptr.cast()) }
+        .expect("NSWindow 必然存活");
+    let observer = unsafe {
+        center.addObserverForName_object_queue_usingBlock(Some(name), Some(&obj), None, &block)
+    };
+
+    // observer 与 block 必须存活整个窗口生命周期，否则通知静默失效 —— 交给
+    // 进程级缓存持有（主窗口重建时会重新注册新的观察者）
+    MINIMIZE_TOKENS.with(|tokens| {
+        if let Ok(mut v) = tokens.lock() {
+            v.push(MinimizeToken {
+                _block: block,
+                _observer: observer,
+            });
+        }
+    });
+}
+
+/// 存活中的最小化观察者令牌（observer 对象 + block），防止提前失效。
+#[cfg(target_os = "macos")]
+struct MinimizeToken {
+    _block: block2::RcBlock<dyn Fn(std::ptr::NonNull<objc2_foundation::NSNotification>)>,
+    _observer: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_foundation::NSObjectProtocol>,
+    >,
+}
+
+#[cfg(target_os = "macos")]
+thread_local! {
+    static MINIMIZE_TOKENS: std::sync::Mutex<Vec<MinimizeToken>> =
+        const { std::sync::Mutex::new(Vec::new()) };
+}
+
+/// 销毁主窗口并结束其 WebContent 进程；失败退回隐藏，不阻塞用户操作。
+fn release_main(w: &WebviewWindow, why: &str) {
+    let app = w.app_handle().clone();
+    match destroy_and_release(&app, w, "main") {
+        Ok(()) => {
+            // released 标志确保托盘/Dock 重开时走清场重建（僵尸条目
+            // 对 show() 静默失败，主窗口会永远出不来）
+            if let Some(st) = app.try_state::<Arc<Mutex<MainWindowState>>>() {
+                let mut g = st.lock().unwrap();
+                g.released = true;
+                g.hidden_since = None;
+            }
+            tracing::info!("main window released（{why}）");
+        }
+        Err(e) => {
+            // 销毁失败兜底：退回隐藏，至少不挡着用户操作
+            let _ = w.hide();
+            tracing::warn!("main window release failed（{why}）: {e}（已退回隐藏）");
+        }
+    }
+}
+
+/// 销毁一个 UI 窗口并尽力结束它的 WebContent 进程（立即释放内存）。
+///
+/// pid 必须在销毁**之前**问（窗口一没，WKWebView 就没了）；且只在「除它以外
+/// 只剩壁纸窗口」时才结束进程 —— 共享存储的其它 UI 窗口（主窗口/props-*）可能
+/// 挂在同一个 WebContent 进程上，踢了会连累。结束后台执行（发信号 + 等进程
+/// 消失是阻塞的），并量一次内存观测。
+/// props-* 设置窗关闭时复用本函数（[`crate::props_window`]）。
+pub(crate) fn destroy_and_release(
+    app: &AppHandle,
+    w: &WebviewWindow,
+    label: &str,
+) -> Result<(), tauri::Error> {
+    let pid = exclusive_web_content_pid(app, w, label);
+    w.destroy()?;
+    let process = if pid.is_some() { "，WebContent 进程已结束" } else { "（进程与其它 UI 窗口共享，保留）" };
+    tracing::info!("window {label} closed: 窗口已销毁{process}");
+    release_web_content(pid, "关闭 UI 窗口后");
+    Ok(())
 }

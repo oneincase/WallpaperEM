@@ -5,6 +5,7 @@
 // 就是应用后的效果。之前各类型分头用 <video>/<img>/<iframe> 直接渲染，
 // 预览与实际观感会有差异（缺 fit 归一化、缺 WE shim 的属性与音频注入）。
 import { useEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { api, type LibraryItem, type WallpaperConfig } from "../api/steam";
 import { tr, trMsg } from "../lib/i18n";
 
@@ -17,6 +18,8 @@ export function PreviewModal({
 }) {
   const [cfg, setCfg] = useState<WallpaperConfig | null>(null);
   const [err, setErr] = useState("");
+  // WE 官方素材通路：预览应与应用后观感一致，跟随全局开关（默认开）
+  const [localAssets, setLocalAssets] = useState(true);
 
   useEffect(() => {
     setErr("");
@@ -25,6 +28,9 @@ export function PreviewModal({
       .libraryPreview(item.itemId)
       .then(setCfg)
       .catch((e) => setErr(String(e)));
+    invoke<string | null>("settings_get", { key: "wallpaper_local_assets" })
+      .then((v) => setLocalAssets(v == null || v === "true" || v === "1"))
+      .catch(() => {});
   }, [item.itemId]);
 
   // 关闭前先把 iframe 导航到 about:blank：WKWebView 对带活动文档的 iframe 回收
@@ -69,6 +75,8 @@ export function PreviewModal({
       renderDpr: "0.8",
       sceneFps: "30",
     });
+    // 官方素材通路跟随全局开关（库只在场景挂载时读这个参数，生产构建需显式带参）
+    if (localAssets) q.set("localAssets", "1");
     return (
       <iframe
         ref={frameRef}

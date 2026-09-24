@@ -63,8 +63,23 @@ pub fn open(app: &AppHandle, item_id: &str) -> tauri::Result<()> {
     //  窗口带原生标题栏，直接拖标题栏即可）
     crate::wallpaper::platform::set_movable_by_background(&win, true);
 
-    // 独立窗口的关闭是真关闭（不像主窗口 close-to-hide）：窗口销毁即可，
-    // 下次托盘点击重建。不需要注册 close_to_hide。
+    // 关闭 = 立即销毁并尽力结束其 WebContent 进程（与主窗口同语义）：设置窗
+    // 关掉后桌面上应当只剩壁纸渲染进程。进程只在「除它以外只剩壁纸窗口」时才
+    // 结束 —— 它与主窗口共用默认（共享）存储，可能同进程，踢了会连累主界面。
+    {
+        let label2 = label.clone();
+        let w2 = win.clone();
+        win.on_window_event(move |event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let app = w2.app_handle().clone();
+                if let Err(e) = crate::main_window::destroy_and_release(&app, &w2, &label2) {
+                    let _ = w2.hide();
+                    tracing::warn!("props window {label2} release failed: {e}（已退回隐藏）");
+                }
+            }
+        });
+    }
     Ok(())
 }
 

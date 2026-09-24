@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- 仅供 `tauri dev`（裸二进制）内嵌进可执行文件的 __TEXT __info_plist 段：
+         没有它 TCC 无法弹出归属明确的授权框，进程 Tap 会被静默给零数据。
+         打包版（tauri build）不用这份 —— bundler 会把 src-tauri/Info.plist
+         合并进 App bundle 的 Info.plist。 -->
+    <key>CFBundleIdentifier</key>
+    <string>io.github.oneincase.wallpaperem</string>
+    <key>CFBundleName</key>
+    <string>WallpaperEM</string>
+    <key>CFBundleExecutable</key>
+    <string>WallpaperEM</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundleVersion</key>
+    <string>1.0.0</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.2</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>用于读取系统音频以驱动音频可视化壁纸（不会录音或上传任何内容）。</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>用于读取系统音频以驱动音频可视化壁纸（不会录音或上传任何内容）。</string>
+</dict>
+</plist>

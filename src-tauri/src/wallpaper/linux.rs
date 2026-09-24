@@ -97,6 +97,15 @@ pub fn active_screens() -> Vec<ScreenInfo> {
     out.into_iter().map(|(s, _)| s).collect()
 }
 
+/// 全局逻辑坐标点落在哪台显示器（滚轮派发用；Linux 暂无系统滚轮源，备平台接口一致）。
+#[allow(dead_code)]
+pub fn hit_screen_id(x: f64, y: f64) -> Option<u32> {
+    active_screens()
+        .into_iter()
+        .find(|s| x >= s.x && x < s.x + s.w && y >= s.y && y < s.y + s.h)
+        .map(|s| s.id)
+}
+
 /// 经 Tauri/GTK 枚举显示器，返回（逻辑坐标屏幕信息, scale_factor）
 fn query_monitors() -> Vec<(ScreenInfo, f64)> {
     let Some(app) = APP.get() else {

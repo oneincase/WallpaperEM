@@ -13,12 +13,45 @@ fn main() {
     // 必须先于 tauri_build::build()：它会校验 resources 里引用的文件是否存在
     //（Linux 的 bundled/libsteam_api.so 就是由这里生成的）
     copy_steam_api_dylib();
+    embed_dev_info_plist();
     tauri_build::build();
     // 图标/配置变更时强制重跑 build.rs，否则 cargo 不会因 icon 文件变化而重新嵌入，
     // 导致 Dock/托盘图标仍是旧的（仅重启不生效）。
     println!("cargo:rerun-if-changed=icons");
     println!("cargo:rerun-if-changed=tauri.conf.json");
     println!("cargo:rerun-if-changed=capabilities");
+    println!("cargo:rerun-if-changed=bin-info.plist");
+}
+
+/// 把 bin-info.plist 内嵌进可执行文件的 `__TEXT __info_plist` 段（仅 macOS bin 目标）。
+///
+/// `tauri dev` / 裸 `cargo build` 产出的是没有 App bundle 的裸二进制 —— 没有
+/// Info.plist 时 TCC 弹不出归属明确的授权框，麦克风/系统音频权限永远拿不到，
+/// CoreAudio 进程 Tap 只会静默送全零样本。内嵌后系统授权提示正常弹出。
+/// 打包版（tauri build）不走这里：bundler 会把 src-tauri/Info.plist 合并进
+/// bundle 的 Info.plist（多嵌一段也无害，这里用 -arg-bins 只对 bin 生效，干净）。
+///
+/// 不用 .cargo/config.toml 的 rustflags：那会应用到包括依赖 build script 在内的
+/// 一切链接（它们的 cwd 不在包目录，相对路径直接炸），也无法拿到 CARGO_MANIFEST_DIR。
+fn embed_dev_info_plist() {
+    let triple = std::env::var("TARGET").unwrap_or_default();
+    if !triple.contains("darwin") {
+        return;
+    }
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+    let plist = std::path::Path::new(&manifest).join("bin-info.plist");
+    if !plist.is_file() {
+        println!("cargo:warning=缺少 bin-info.plist，dev 二进制将无法弹出音频授权框");
+        return;
+    }
+    for arg in [
+        "-sectcreate".to_string(),
+        "__TEXT".to_string(),
+        "__info_plist".to_string(),
+        plist.to_string_lossy().into_owned(),
+    ] {
+        println!("cargo:rustc-link-arg-bins={arg}");
+    }
 }
 
 /// 把 Steam API 动态库复制到可执行文件旁边。

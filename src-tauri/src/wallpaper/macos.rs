@@ -119,6 +119,15 @@ pub fn active_screens() -> Vec<ScreenInfo> {
     out
 }
 
+/// 全局点（points，左上原点）落在哪块活动显示器上，返回其 id。
+/// 滚轮事件派发用：CGEventGetLocation 与 CGDisplayBounds 同一坐标系。
+pub fn hit_screen_id(x: f64, y: f64) -> Option<u32> {
+    active_screens()
+        .into_iter()
+        .find(|s| x >= s.x && x < s.x + s.w && y >= s.y && y < s.y + s.h)
+        .map(|s| s.id)
+}
+
 /// 主显示器是否睡眠
 pub fn display_asleep() -> bool {
     unsafe { CGDisplayIsAsleep(CGMainDisplayID()) }
@@ -750,7 +759,7 @@ fn on_frontmost_changed(app: &tauri::AppHandle, bundle_id: &str, own_bundle: &st
     if !auto_pause_enabled(app) || *st.paused.lock().unwrap() {
         return;
     }
-    if super::pause_all(app.clone()).is_ok() {
+    if super::auto_pause_enter(app).is_ok() {
         *st.auto_paused.lock().unwrap() = true;
         tracing::info!("auto-pause: 切到 {bundle_id}，壁纸已自动暂停");
     }

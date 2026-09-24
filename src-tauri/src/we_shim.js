@@ -25,7 +25,7 @@
       w.document.documentElement.setAttribute("data-we-shim", "1");
     }
   } catch (_) {
-    /* 忽略 */
+    
   }
 
   var audioListener = null;
@@ -502,6 +502,7 @@
     liveMedia.push(new w.WeakRef(el));
   }
   function applyMediaVolume(el) {
+    if (!mediaVolDesc || !mediaMutedDesc) return;
     if (el.__weBaseVol != null) {
       mediaVolDesc.set.call(el, el.__weBaseVol * hostVolume);
     } else {
@@ -579,6 +580,33 @@
     }
   }
   installMediaVolumeHooks();
+
+  // —— 新建媒体元素的音量收敛 ——
+  // 属性 hook 只拦得到「作者用 JS 赋 .volume/.muted」与新 Audio() 构造；
+  // createElement + innerHTML 插入、且从未赋过值的 <audio>/<video>（autoplay
+  // 直接开走）既没登记也没刷新，主音量为 0 时照样出声——表现为「恢复播放/挂
+  // 后台一段时间后冒一小段音乐」。对插入 DOM 的媒体元素立即按当前主音量落
+  // 一次真实属性；不进 DOM的元素观察不到（罕见，接受）。
+  try {
+    var mediaObserver = new w.MutationObserver(function (records) {
+      for (var i = 0; i < records.length; i++) {
+        var added = records[i].addedNodes;
+        for (var j = 0; j < added.length; j++) {
+          var n = added[j];
+          if (!n || n.nodeType !== 1) continue;
+          if (n.tagName === "AUDIO" || n.tagName === "VIDEO") {
+            applyMediaVolume(n);
+          } else if (n.querySelectorAll) {
+            var inner = n.querySelectorAll("audio,video");
+            for (var k = 0; k < inner.length; k++) applyMediaVolume(inner[k]);
+          }
+        }
+      }
+    });
+    mediaObserver.observe(w.document, { childList: true, subtree: true });
+  } catch (_) {
+    /* 旧引擎无 MutationObserver：退化为仅属性 hook，行为同旧版 */
+  }
 
   // —— 父页控制面 ——
   // 官方 setPaused 只在暂停状态实际变化时调用一次；重复调用去重。
@@ -806,31 +834,25 @@
   };
 
   // —— 外部指针注入（桌面 underlay 层收不到鼠标事件，父页经 __wp.pushPointer 推入）——
-  //
   // 场景壁纸那条通道是「写一个状态对象、渲染器每帧读」（render/pointer.js）；网页壁纸
   // 没有这样的单一消费点 —— 作者代码就是**监听 DOM 事件**的，所以这里必须把推送
   // 还原成一串合成事件。语料（本机 49 张 web）：mousemove 24 张、click 29 张、
   // mouseover/out 17 张、mouseenter/leave 8 张、pointer* 16 张（createjs 系一律走
   // pointerdown/move/up）、.button 18 张、.which 17 张、pointerId/relatedTarget 15 张。
-  //
   // 三条要点（都有语料依据，改错了会静默失效）：
-  //
   //   1. **必须 elementFromPoint 按命中元素派发**，不能一律打 document。作者既有挂
   //      document/window 的（15 张，靠冒泡收到），也有挂 canvas 上读 `event.offsetX`
   //      的（1748506393 流体 `pointers[0].dx = (e.offsetX - …)`）。offsetX/offsetY 由
   //      浏览器按 target 的 padding box 现算 —— target 打错就是错的偏移，且无任何报错。
   //      pageX/pageY 同理由 clientX + 滚动量现算，不用我们填。
-  //
   //   2. **over/out/enter/leave 链要按 W3C 语义补全**。1748506393 靠 canvas 的
   //      `mouseenter` 把 `pointers[0].down` 置 true（不进这个分支则鼠标怎么动都不出染料）、
   //      靠 window 的 `mouseleave` 复位；1081733658 animatedGrid 靠 `document.body` 的
   //      mouseover/mouseleave 起停整个网格动画。leave/enter 不冒泡，必须自己沿祖先链走到
   //      最近公共祖先，只发生变化的那一段。
-  //
   //   3. **click 要靠 down/up 边缘合成**，且 down 与 up 的 target 不同（拖拽）时不发。
   //      29 张听 click 是最大的消费方；轮询推送里没有「点击」这个事件，只有按键掩码的
   //      跳变，边缘丢了就等于整类交互消失。
-  //
   // 硬限制（写在这里避免反复试）：CSS `:hover` 由浏览器自己的 hit-test 驱动，合成事件
   // 永远点不亮它（18 张含 `:hover`）—— 纯 CSS hover 动画的壁纸无法用注入通道响应，
   // 这不是实现缺陷，是合成事件的固有边界。

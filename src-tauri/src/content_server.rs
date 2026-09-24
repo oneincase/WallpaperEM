@@ -516,7 +516,7 @@ async fn handle_conn(
             )
             .await;
         };
-        let body: &[u8] = match crate::now_playing::send_command(cmd) {
+        let body: &[u8] = match crate::now_playing::send_command_async(cmd).await {
             Ok(()) => b"ok",
             Err(e) => {
                 tracing::warn!("media command failed: {e}");
@@ -577,6 +577,26 @@ async fn handle_conn(
             None,
         )
         .await;
+    }
+
+    // WE 官方素材树（webwallgl 1.4.1 local-assets 通路）：
+    //   GET /api/local-assets                              → {ok, roots:[{id}]}
+    //   GET /api/local-assets/{id}/materials/index.json    → {names:[引擎名...]}
+    //   GET /api/local-assets/{id}/materials/<name>.tex    → 原始贴图字节
+    //   GET /api/local-assets/{id}/fonts/<file>            → 文字层字体后备
+    // 库在渲染器 URL 带 ?localAssets=1 时才发这些请求；素材根不存在则回 ok:false，
+    // 库整条路径静默跳过、走程序化复刻。端点只监听本机回环，与上游 bench 同样不带
+    // token（库把 URL 硬编码为相对路径，无注入 token 的位置）。
+    if path == "/api/local-assets" || path.starts_with("/api/local-assets/") {
+        let range = lines
+            .find_map(|l| {
+                let l = l.trim();
+                l.to_ascii_lowercase()
+                    .strip_prefix("range:")
+                    .map(|v| v.trim().to_string())
+            })
+            .unwrap_or_default();
+        return local_assets_route(stream, path, &range, state).await;
     }
 
     // 解析路径 /media/{token}/{item_id}/{path...} 或 /web/{token}/{item_id}/{path...}
@@ -1465,6 +1485,85 @@ fn normalize(base: &Path, rel: &str) -> Option<PathBuf> {
         return None;
     }
     Some(base.join(rel))
+}
+
+/// `/api/local-assets` 路由：喂给 webwallgl 的官方素材通路（见路由处的契约注释）。
+///
+/// 只暴露库实际消费的两类字节：`materials/**.tex`（贴图/法线/渐变）与
+/// `fonts/*.ttf|otf|woff2?`（文字层字体后备）；素材名清单单独走 index.json。
+/// 其余相对路径一律 404，不把整个 WE 安装目录变成开放文件服务。
+async fn local_assets_route(
+    stream: &mut tokio::net::TcpStream,
+    path: &str,
+    range: &str,
+    state: &ContentServerState,
+) -> Result<(), String> {
+    // 用户自定义素材根（设置 wallpaper_we_assets_dir）；自动探测 Steam 库作为兜底
+    let custom = state
+        .db
+        .lock()
+        .ok()
+        .and_then(|conn| crate::db::get_setting(&conn, "wallpaper_we_assets_dir"));
+    let Some(root) = crate::we_assets::resolve_root(custom.as_deref()) else {
+        return respond(stream, 200, "OK", "application/json", br#"{"ok":false,"roots":[]}"#, None).await;
+    };
+
+    // 探测：根可用。id 固定 "we"（消费方只用 roots[0].id 拼后续 URL）
+    if path == "/api/local-assets" {
+        return respond(
+            stream,
+            200,
+            "OK",
+            "application/json",
+            br#"{"ok":true,"roots":[{"id":"we"}]}"#,
+            None,
+        )
+        .await;
+    }
+
+    // /api/local-assets/we/<rel...>，各段已由浏览器做过百分号编码，逐段解码
+    let rel = path.strip_prefix("/api/local-assets/").unwrap_or("");
+    let segs: Vec<String> = rel.split('/').map(percent_decode).collect();
+    if segs.len() < 2 || segs[0] != "we" {
+        return respond(stream, 404, "Not Found", "text/plain", b"", None).await;
+    }
+    let rel_path = segs[1..].join("/");
+
+    if rel_path == "materials/index.json" {
+        let names = crate::we_assets::material_names(&root);
+        let body = serde_json::to_vec(&json!({ "names": names })).unwrap_or_default();
+        // 清单按目录 mtime 有 60s 缓存，HTTP 层允许浏览器/HTTP 缓存复用
+        return respond(
+            stream,
+            200,
+            "OK",
+            "application/json",
+            &body,
+            Some("Cache-Control: max-age=60"),
+        )
+        .await;
+    }
+
+    let Some(target) = normalize(&root, &rel_path) else {
+        return respond(stream, 403, "Forbidden", "text/plain", b"", None).await;
+    };
+    if !target.starts_with(&root) || !target.is_file() {
+        return respond(stream, 404, "Not Found", "text/plain", b"", None).await;
+    }
+
+    // 消费面白名单：materials 下只要 .tex；fonts 下只要字体文件
+    let ext_ok = target
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| matches!(e.as_str(), "tex" | "ttf" | "otf" | "woff" | "woff2"));
+    let under_allowed = rel_path.starts_with("materials/") || rel_path.starts_with("fonts/");
+    if !ext_ok || !under_allowed {
+        return respond(stream, 404, "Not Found", "text/plain", b"", None).await;
+    }
+
+    let mime = mime_for(&target);
+    serve_file_stream(stream, &target, mime, range).await
 }
 
 /// 目录内（非递归）随机挑一个普通文件，返回「相对壁纸根」的路径（URL 时按段再编码）。

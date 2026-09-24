@@ -12,6 +12,7 @@ pub mod macos;
 pub mod windows;
 pub mod platform;
 pub mod pointer;
+pub mod wheel;
 
 use crate::audio_capture;
 use crate::db;
@@ -50,10 +51,20 @@ pub const AA_CHOICES: [&str; 4] = ["off", "fxaa", "msaa2", "msaa4"];
 /// 粒子质量档：high 默认 / medium / low（按倍率同缩数量上限与发射率）/ off（不渲染不推进）。
 pub const DEFAULT_PARTICLES: &str = "high";
 pub const PARTICLE_QUALITY_CHOICES: [&str; 4] = ["off", "low", "medium", "high"];
-/// 后处理质量档：high 默认 / medium / low（压效果链 FBO 分辨率）/ off
-/// （效果链直通 + 跳整屏后期层 + 关 Bloom）。
+/// 后处理质量档：high 默认 / medium / low（压效果链 FBO 分辨率）。
+/// 不提供 off：整屏关后处理会让辉光/水波类壁纸直接失去画面效果（v1.0.1 起
+/// 从档位里移除；历史存量为 off 的读取时归一到 low）。
 pub const DEFAULT_POST: &str = "high";
-pub const POST_QUALITY_CHOICES: [&str; 4] = ["off", "low", "medium", "high"];
+pub const POST_QUALITY_CHOICES: [&str; 3] = ["low", "medium", "high"];
+
+/// 读取后处理档时的归一化：旧版本允许存 off，现归一到 low（不再有关档）
+fn normalize_post(v: Option<String>) -> String {
+    match v.as_deref() {
+        Some("off") => "low".into(),
+        Some(x) if POST_QUALITY_CHOICES.contains(&x) => v.unwrap(),
+        _ => DEFAULT_POST.into(),
+    }
+}
 
 /// 全局滤镜（帧率上限下面的那组）。**id 白名单本身就是契约**：
 /// 托盘菜单、设置项、URL query、`__wp.setFilter` 传的都只是这份 id，
@@ -170,13 +181,19 @@ fn global_particles(conn: Option<&Connection>) -> String {
     }
 }
 
-/// 全局后处理质量档（读设置 `wallpaper_post`），白名单外回退默认 high。
+/// 全局后处理质量档（读设置 `wallpaper_post`），白名单外回退默认 high；
+/// 旧版本存过 off 的归一到 low（off 档已移除，后处理不再允许整屏关闭）。
 fn global_post(conn: Option<&Connection>) -> String {
-    let raw = conn.and_then(|c| db::get_setting(c, "wallpaper_post"));
-    match raw.as_deref() {
-        Some(v) if POST_QUALITY_CHOICES.contains(&v) => v.to_string(),
-        _ => DEFAULT_POST.into(),
-    }
+    normalize_post(conn.and_then(|c| db::get_setting(c, "wallpaper_post")))
+}
+
+/// WE 官方素材通路开关（设置 `wallpaper_local_assets`）。
+/// 默认开启：本机装了 Wallpaper Engine 就用官方原版像素（效果链/粒子/渐变/字体），
+/// 没装时内容服务器探测返回 ok:false、库只多一次轻量请求并回落到程序化复刻。
+fn global_local_assets(conn: Option<&Connection>) -> bool {
+    conn.and_then(|c| db::get_setting(c, "wallpaper_local_assets"))
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(true)
 }
 
 // ---------- 每壁纸播放设置（对标 WE 的「壁纸配置」）----------
@@ -275,6 +292,7 @@ fn apply_play_config(app: &AppHandle, cfg: &mut WallpaperConfig, item_id: Option
         cfg.aa = DEFAULT_AA.into();
         cfg.particles = DEFAULT_PARTICLES.into();
         cfg.post_processing = DEFAULT_POST.into();
+        cfg.local_assets = true;
         return;
     };
     let Ok(conn) = state.lock() else {
@@ -285,6 +303,7 @@ fn apply_play_config(app: &AppHandle, cfg: &mut WallpaperConfig, item_id: Option
         cfg.aa = DEFAULT_AA.into();
         cfg.particles = DEFAULT_PARTICLES.into();
         cfg.post_processing = DEFAULT_POST.into();
+        cfg.local_assets = true;
         return;
     };
     // 先铺全局
@@ -295,6 +314,7 @@ fn apply_play_config(app: &AppHandle, cfg: &mut WallpaperConfig, item_id: Option
     cfg.aa = global_aa(Some(&conn));
     cfg.particles = global_particles(Some(&conn));
     cfg.post_processing = global_post(Some(&conn));
+    cfg.local_assets = global_local_assets(Some(&conn));
     // 再叠本壁纸覆盖
     if let Some(id) = item_id {
         let ov = item_play_config(&conn, id);
@@ -312,7 +332,10 @@ fn apply_play_config(app: &AppHandle, cfg: &mut WallpaperConfig, item_id: Option
             }
         }
         if let Some(v) = ov.volume {
-            // muted 是 renderer 侧的开关；音量 0 即静音，非 0 则取消静音
+            // 精确音量随配置下发：渲染器挂载时先静音，加载完成后按它起音量；
+            // muted 是旧布尔近似，同步保持一致（老渲染器/旧会话仍读它）
+            let v = v.clamp(0.0, 1.0);
+            cfg.volume = Some(v);
             cfg.muted = v <= 0.0;
         }
         if let Some(v) = ov.aa.as_deref() {
@@ -326,6 +349,8 @@ fn apply_play_config(app: &AppHandle, cfg: &mut WallpaperConfig, item_id: Option
             }
         }
         if let Some(v) = ov.post_processing.as_deref() {
+            // 旧数据可能存过 off（该档已移除）：归一到 low
+            let v = if v == "off" { "low" } else { v };
             if POST_QUALITY_CHOICES.contains(&v) {
                 cfg.post_processing = v.to_string();
             }
@@ -354,8 +379,31 @@ pub fn item_play_config_get(app: AppHandle, item_id: String) -> Result<serde_jso
     }))
 }
 
-/// 写某壁纸的播放设置并立即生效（该壁纸正在播放时才重下发）
-#[tauri::command(rename = "wallpaper_item_play_config_set")]
+/// 播放相关字段重置为库默认（下一步重新合成「全局默认 + 本壁纸覆盖」用）。
+/// 播放覆盖变更后刷新正在使用的配置（state.windows 与持久化会话）时用：
+/// 直接在旧配置上叠加会让被删掉的覆盖值（如音量）一直留在会话里，重启后复活。
+fn reset_play_fields(cfg: &mut WallpaperConfig) {
+    cfg.fit = DEFAULT_FIT.into();
+    cfg.render_dpr = DEFAULT_RENDER_DPR;
+    cfg.scene_fps = DEFAULT_SCENE_FPS;
+    cfg.filter = DEFAULT_FILTER.into();
+    cfg.aa = DEFAULT_AA.into();
+    cfg.particles = DEFAULT_PARTICLES.into();
+    cfg.post_processing = DEFAULT_POST.into();
+    cfg.local_assets = true;
+    cfg.volume = None;
+    cfg.muted = default_muted();
+}
+
+/// 配置的生效音量（下发渲染器用）：精确值优先，缺省回落 muted 布尔。
+fn effective_volume(cfg: &WallpaperConfig) -> f32 {
+    cfg.volume
+        .filter(|v| (0.0..=1.0).contains(v))
+        .unwrap_or(if cfg.muted { 0.0 } else { 1.0 })
+}
+
+/// 写某壁纸的播放设置并立即生效（该壁纸正在播放时才下发）
+#[tauri::command(async, rename = "wallpaper_item_play_config_set")]
 pub fn item_play_config_set(
     app: AppHandle,
     item_id: String,
@@ -368,65 +416,86 @@ pub fn item_play_config_set(
         let conn = db.lock().map_err(|e| e.to_string())?;
         set_item_play_config(&conn, &item_id, &config)?;
     }
-    // 只有这张壁纸正在某个屏幕上播放时才需要即时下发；否则下次应用时自然生效
-    let playing = active_items(app.clone()).unwrap_or_default();
-    if !playing.iter().any(|i| i == &item_id) {
+    // 只有这张壁纸正在某个屏幕上播放时才需要即时下发；否则下次应用时自然生效。
+    // 按 item 过滤窗口而不是 eval_all：多显示器各放各的壁纸时，把 A 的音量
+    // 下发给 B 会改掉 B 的生效值。
+    let Some(state) = app.try_state::<WallpaperEngineState>() else {
+        return Ok(());
+    };
+    let db = app.try_state::<Arc<Mutex<Connection>>>();
+    let labels: Vec<String> = {
+        let windows = state.windows.lock().unwrap();
+        windows
+            .iter()
+            .filter(|(_, c)| item_id_of(c).as_deref() == Some(item_id.as_str()))
+            .map(|(l, _)| l.clone())
+            .collect()
+    };
+    if labels.is_empty() {
         return Ok(());
     }
-    if let Some(f) = config.fit.as_deref() {
-        eval_all(
-            &app,
-            &format!(
+    for label in labels {
+        // 重算这块窗口的生效配置（全局默认 + 刚写入的覆盖）：
+        // 「恢复全局设置」时覆盖字段全是 None，旧实现只下发 Some 字段 → 什么都不
+        // 发 → 渲染器还留着被删掉的音量，壁纸继续出声。改为把生效值整个下发。
+        let mut cfg2 = {
+            let windows = state.windows.lock().unwrap();
+            match windows.get(&label) {
+                Some(c) => c.clone(),
+                None => continue,
+            }
+        };
+        let display_id_key = label.strip_prefix("wallpaper-").unwrap_or(&label).to_string();
+        reset_play_fields(&mut cfg2);
+        apply_play_config(&app, &mut cfg2, Some(&item_id));
+        if let Some(w) = app.get_webview_window(&label) {
+            let _ = w.eval(&format!(
                 "window.__wp && window.__wp.setFit({})",
-                serde_json::json!(f)
-            ),
-        );
-    }
-    if let Some(d) = config.render_dpr {
-        let d = d.clamp(RENDER_DPR_MIN, RENDER_DPR_MAX);
-        eval_all(
-            &app,
-            &format!("window.__wp && window.__wp.setRenderDpr({d})"),
-        );
-    }
-    if let Some(f) = config.scene_fps {
-        eval_all(
-            &app,
-            &format!("window.__wp && window.__wp.setSceneFps({f})"),
-        );
-    }
-    if let Some(v) = config.volume {
-        let v = v.clamp(0.0, 1.0);
-        eval_all(&app, &format!("window.__wp && window.__wp.setVolume({v})"));
-    }
-    // 质量三项：渲染器 setQuality 接受部分更新，分键下发（None=跟随全局，
-    // 与 fit/dpr/fps 同语义——不即时下发，下次应用壁纸时按全局值生效）
-    if let Some(v) = config.aa.as_deref() {
-        eval_all(
-            &app,
-            &format!(
+                serde_json::json!(cfg2.fit)
+            ));
+            let _ = w.eval(&format!(
+                "window.__wp && window.__wp.setRenderDpr({})",
+                cfg2.render_dpr
+            ));
+            let _ = w.eval(&format!(
+                "window.__wp && window.__wp.setSceneFps({})",
+                cfg2.scene_fps
+            ));
+            let _ = w.eval(&format!(
+                "window.__wp && window.__wp.setVolume({})",
+                effective_volume(&cfg2)
+            ));
+            let _ = w.eval(&format!(
                 "window.__wp && window.__wp.setQuality({{antiAliasing:{}}})",
-                serde_json::json!(v)
-            ),
-        );
-    }
-    if let Some(v) = config.particles.as_deref() {
-        eval_all(
-            &app,
-            &format!(
+                serde_json::json!(cfg2.aa)
+            ));
+            let _ = w.eval(&format!(
                 "window.__wp && window.__wp.setQuality({{particles:{}}})",
-                serde_json::json!(v)
-            ),
-        );
-    }
-    if let Some(v) = config.post_processing.as_deref() {
-        eval_all(
-            &app,
-            &format!(
+                serde_json::json!(cfg2.particles)
+            ));
+            let _ = w.eval(&format!(
                 "window.__wp && window.__wp.setQuality({{postProcessing:{}}})",
-                serde_json::json!(v)
-            ),
-        );
+                serde_json::json!(cfg2.post_processing)
+            ));
+        }
+        // 同步内存态与持久化会话：否则 state.windows/会话里的旧覆盖值（volume/
+        // muted 等）要等下次「应用」才被冲掉，期间重启会带着旧音量回来
+        state.windows.lock().unwrap().insert(label.clone(), cfg2.clone());
+        if let Some(db) = &db {
+            if let Ok(conn) = db.lock() {
+                let _ = conn.execute(
+                    "INSERT INTO wallpaper_sessions(display_id, item_id, config_json, updated_at)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(display_id) DO UPDATE SET item_id = ?2, config_json = ?3, updated_at = ?4",
+                    rusqlite::params![
+                        display_id_key,
+                        item_id,
+                        serde_json::to_string(&cfg2).unwrap_or_default(),
+                        chrono::Utc::now().timestamp()
+                    ],
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -470,8 +539,21 @@ pub struct WallpaperConfig {
     pub post_processing: String,
     #[serde(default = "default_muted")]
     pub muted: bool,
+    /// 音量 0..1 的精确值（0 即静音）。挂载时一律先静音，渲染器在壁纸完全
+    /// 加载完成后再按这个值统一起音量（muted 只是旧字段的布尔近似，保留兼容）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<f32>,
     #[serde(default = "default_loop")]
     pub r#loop: bool,
+    /// 场景壁纸的 scene.pkg 相对路径（project.json `file` 声明且非默认布局时）；
+    /// 渲染器优先按它拉取，找不到再走默认的 scene.pkg / scenes/scene.pkg 回退链
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene_pkg: Option<String>,
+    /// 启用 WE 官方素材通路（渲染器 URL 带 ?localAssets=1，库 1.4.1+）：本机安装
+    /// Wallpaper Engine 时，效果链/粒子/渐变/文字字体引用官方原版像素；未安装或
+    /// 关闭时库静默回落到内置程序化复刻。挂载时生效，切换后需重新应用壁纸。
+    #[serde(default)]
+    pub local_assets: bool,
     /// 内容服务器基址（scene/web 资源拉取；由引擎注入）
     #[serde(default)]
     pub media_base: Option<String>,
@@ -490,7 +572,10 @@ impl Default for WallpaperConfig {
             particles: default_particles(),
             post_processing: default_post(),
             muted: default_muted(),
+            volume: None,
             r#loop: default_loop(),
+            scene_pkg: None,
+            local_assets: false,
             media_base: None,
         }
     }
@@ -505,6 +590,14 @@ pub struct WallpaperEngineState {
     /// 「自动暂停」自己挂上的暂停（区别于用户手动暂停）：回到桌面时只恢复
     /// 这个标志置位的暂停，用户手动暂停不受前台切换影响
     pub auto_paused: Mutex<bool>,
+    /// 「暂停释放内存」已把壁纸渲染器整个销毁（自动暂停的加强形态）。
+    ///
+    /// 置位期间壁纸窗口不存在、但 `windows` 里的会话配置**保留** ——
+    /// `ensure_windows` 见此标志不建窗（否则 2s 一轮的监控会把刚杀掉的
+    /// 渲染进程立刻建回来），恢复播放时清标志并按配置整窗重建
+    /// （[`resume_all`]）。这是比 `__wp.release()`（页面内 JS 释放）更彻底的
+    /// 一档：进程直接结束，内存实打实归还。
+    pub released: Mutex<bool>,
     /// macOS：label -> 该窗口**独占**的 WKWebsiteDataStore 标识。
     ///
     /// 窗口被销毁（stop / 显示器移除 / 换纸降级到重建）时按它
@@ -525,6 +618,7 @@ impl Default for WallpaperEngineState {
             default: Mutex::new(None),
             paused: Mutex::new(false),
             auto_paused: Mutex::new(false),
+            released: Mutex::new(false),
             #[cfg(target_os = "macos")]
             data_stores: Mutex::new(HashMap::new()),
         }
@@ -711,6 +805,14 @@ static NO_CONFIG_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// 复合判定（CGDisplayIsAsleep 的进程内状态在合盖唤醒后可能卡死在 true，
 /// 样本恢复流动即证明系统实际已唤醒）。
 fn ensure_windows_inner(app: &AppHandle, display_asleep: bool) {
+    // 「暂停释放内存」挂起期间不建窗：自动暂停已把壁纸渲染器整个销毁，
+    // 这里若照常同步会把刚结束的进程立刻建回来（等于没释放）。恢复播放时
+    // 由 resume_all 清标志后主动重建。
+    if let Some(st) = app.try_state::<WallpaperEngineState>() {
+        if *st.released.lock().unwrap() {
+            return;
+        }
+    }
     // 显示器睡眠/唤醒切换期间不做任何窗口增删：此时 CGGetActiveDisplayList
     // 可能返回空列表（显示器从「活动」列表暂时消失），若照常执行下方清理逻辑，
     // 会把所有壁纸窗口误判为「已断开的显示器」全部销毁 —— 主窗口此时通常也是
@@ -1079,53 +1181,38 @@ fn create_desktop_window(
 /// 快速连切时后一次 apply 只更新 `state.windows`，由这个唯一任务收敛到最后一张，
 /// 不会出现两个任务抢建同一 label（一个建成功后另一个报 already exists，最终
 /// 停在中间某张的错误画面上）。
+// 非 macOS：仅作为就地导航失败时的兜底重建（macOS 换壁纸走 replace_wallpaper_window）
+#[cfg(not(target_os = "macos"))]
 static RECREATING: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
     std::sync::OnceLock::new();
 
-/// 正在就地重载的 label 集合（防抖 + 单飞，语义同 [`RECREATING`]）。
+/// 正在换壁纸的 label 集合（防抖 + 单飞，所有平台共用）。
 static RELOADING: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
     std::sync::OnceLock::new();
 
-/// 换壁纸：在**同一块窗口里整页导航**到新的渲染器 URL（所有平台）。
+/// 换壁纸（防抖 + 单飞）：连切时等目标稳定后只加载最后一张。
 ///
-/// macOS 一度改成「销毁窗口 + 重建」（[`schedule_window_recreate`]），指望靠删掉
-/// 窗口独占的 WKWebsiteDataStore（[`new_data_store_id`]）让旧 WebContent 进程退出。
-/// 实测（macOS 26，2026-09-11 日志）这条路**只有三成兑现**：11 次换壁纸里 7 次
-/// `removeDataStoreForIdentifier` 报 `Data store is in use` —— 只要 UI 进程里还活着
-/// 一个引用那份存储的 `WKWebsiteDataStore`（销毁后的 WKWebView 及其 configuration
-/// 仍被 WebKit 攥着），该 API 就拒绝删除 —— 40 行 ObjC 最小复现里，把 webview 与
-/// configuration 都置空后等 12s，那对象依旧活着、删除依旧被拒。于是每换一张壁纸就
-/// 多留一个几百 MB～1GB 的渲染进程。既然删存储这条路不可靠，就回到和其它平台一样
-/// 的做法：**换文档而不是换窗口**，每个显示器恒为 1 个渲染进程，内存不再随切换
-/// 次数累积。
+/// ## macOS：销毁旧窗口 + 显式结束 WebContent 进程 + 同名重建
 ///
-/// 为什么曾经不选「销毁窗口 + 同名重建」（v0.5 之前一直那么做）：销毁并不能让那
-/// 份内存真的回来。`destroy()` 只是把 WKWebView 从窗口上摘下来；WebKit 随后
-/// 会把这个 WebContent 进程留进进程缓存（页面的 JS 堆、WebGL 上下文、解析好的
-/// scene.pkg、视频解码器都还压在里面），于是**每换一张壁纸就多留一个几百 MB
-/// ～1GB 的 `http://127.0.0.1:<port>` 进程**。用户侧看到的就是「应用了几张场景
-/// 壁纸后，活动监视器里挂着好几个壁纸渲染进程，旧的都不释放」。实测证据：
-/// `wallpaper_sessions` 里只有 1 条会话、桌面上只有 1 块壁纸窗口，却同时存在
-/// 3 个渲染器 WebContent 进程（= 最近 3 次切换留下的），且 PID 显示它们诞生于
-/// 很久以前 —— 不是「刚销毁还在回收中」。
+/// 不能在**同一个 WKWebView 里整页导航**（实测 macOS 26）：连续切换（尤其
+/// 视频↔场景）时，`window.navigate()` 会返回成功，但旧页的 WebGL 上下文 / JS
+/// 堆没被干净回收，新页随后加载失败、渲染器永久不上报 ready，主线程最终卡死
+/// （2026-09-24 真机复现：场景→视频正常，视频→4K 场景即冻死）。就地导航是
+/// 「换文档不换进程」，回收全靠 WebKit 自觉，而它在重内容页上不可靠。
 ///
-/// 换成整页导航后，进程数不再随切换次数增长（每个显示器恒为 1 个）：换壁纸 =
-/// 换文档，旧文档连同它的 GPU 资源一起被 WebKit 销毁，新文档按新 query 重新挂载。
-/// 这条路能成立的前提是渲染器**配置全在 URL query 里**（渲染器 `initialCfg`），
-/// 并且 `pagehide` 里已经有完整 teardown —— 两件事本项目都具备
-/// （`spawn_force_reload` 早就用 `location.replace` 做过同样的事）。
+/// 可靠路径是把旧进程**显式结束**（[`destroy_wallpaper_window`] 内部走「主线程
+/// 取 pid → destroy → 按 pid SIGKILL」，见 [`macos::kill_web_content_process`]），
+/// 等 label 释放后再建一个干净的新窗口。旧壁纸占的内存这时是实打实还回去的，
+/// 也不会留下以 `http://127.0.0.1:<port>` 记名的残留 WebContent 进程。
 ///
-/// 仍保留销毁重建那条路作为兜底（窗口不在了 / 导航连续报错），语义同样是
-/// 「防抖 + 单飞」：连切时只加载最后一张。
+/// ## 非 macOS：同窗口整页导航
+///
+/// WebView2 / WebKitGTK 的导航会连带销毁旧文档与渲染资源，实测健康，无需重付
+/// 建窗（GL 上下文、桌面层重挂）的代价。
 fn schedule_window_reload(app: &AppHandle, label: &str, frame: (f64, f64, f64, f64)) {
     use std::time::Duration;
     /// 连切合并窗口：目标稳定这么久才动手
     const DEBOUNCE: Duration = Duration::from_millis(350);
-    /// 复用进程的占用超过这个值，这次就改走「销毁 + 重建」把内存还回去。
-    /// 换文档只能让 WebKit 自己决定何时归还旧文档的内存（实测会长期停在峰值），
-    /// 而销毁这条路现在能显式结束旧进程（见 [`destroy_wallpaper_window`]）。
-    /// 1.2GB ≈ 一张 4K 场景 + 留量：正常换完壁纸应远低于此，只在失控时才付重建代价。
-    const MEM_BUDGET: u64 = 1200 * 1024 * 1024;
 
     let set = RELOADING.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
     {
@@ -1164,48 +1251,126 @@ fn schedule_window_reload(app: &AppHandle, label: &str, frame: (f64, f64, f64, f
             done();
             return;
         };
-
-        // 复用进程超预算：立刻转「销毁 + 重建」把内存实打实还回去（只影响这一次换壁纸）
-        let footprint = crate::mem_watch::webcontent_footprint();
-        if footprint > MEM_BUDGET {
-            tracing::info!(
-                "wallpaper window {label}: 复用进程已占 {}MB（预算 {}MB），改为销毁重建回收内存",
-                footprint / (1024 * 1024),
-                MEM_BUDGET / (1024 * 1024)
-            );
+        // 「暂停释放内存」挂起期间不加载：配置已登记进 state.windows，
+        // 恢复播放时按最新配置整窗重建；轮播也不该在后台把渲染进程建回来
+        if is_released(&app) {
             done();
-            schedule_window_recreate(&app, &label, frame);
             return;
         }
 
-        // 3 次机会：窗口刚被销毁（stop → 立刻重新应用）时头一次会扑空
-        for attempt in 0..3 {
-            if let Some(w) = app.get_webview_window(&label) {
-                match navigate_to_config(&app, &w, &target) {
-                    Ok(()) => {
-                        tracing::info!(
-                            "wallpaper window {label} 就地重载（type={}），复用原 WebContent 进程",
-                            target.r#type
-                        );
-                        // 换完立刻量一次：是复用的那个 WebContent 涨了，还是没动
-                        crate::mem_watch::report("换壁纸（就地重载）");
-                        done();
-                        return;
-                    }
-                    Err(e) => tracing::debug!(
-                        "wallpaper window {label} 就地重载失败（第 {} 次）：{e}",
-                        attempt + 1
-                    ),
-                }
-            } else {
-                tracing::debug!("wallpaper window {label} 不在（第 {} 次尝试）", attempt + 1);
-            }
-            tokio::time::sleep(Duration::from_millis(120)).await;
+        #[cfg(target_os = "macos")]
+        {
+            replace_wallpaper_window(&app, &label, frame, &target, current).await;
+            done();
         }
-        tracing::warn!("wallpaper window {label} 就地重载未成功，回退销毁重建");
-        done();
-        schedule_window_recreate(&app, &label, frame);
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            // 3 次机会：窗口刚被销毁（stop → 立刻重新应用）时头一次会扑空
+            let mut navigated = false;
+            for attempt in 0..3 {
+                if let Some(w) = app.get_webview_window(&label) {
+                    match navigate_to_config(&app, &w, &target) {
+                        Ok(()) => {
+                            tracing::info!(
+                                "wallpaper window {label} 就地重载（type={}），复用原渲染进程",
+                                target.r#type
+                            );
+                            crate::mem_watch::report("换壁纸（就地重载）");
+                            navigated = true;
+                            break;
+                        }
+                        Err(e) => tracing::debug!(
+                            "wallpaper window {label} 就地重载失败（第 {} 次）：{e}",
+                            attempt + 1
+                        ),
+                    }
+                } else {
+                    tracing::debug!(
+                        "wallpaper window {label} 不在（第 {} 次尝试）",
+                        attempt + 1
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(120)).await;
+            }
+            done();
+            if !navigated {
+                // 导航始终不成（窗口没了等）：回退销毁重建兜底
+                tracing::warn!(
+                    "wallpaper window {label}: 就地重载未成功，回退销毁重建"
+                );
+                schedule_window_recreate(&app, &label, frame);
+            }
+        }
     });
+}
+
+/// macOS：销毁旧壁纸窗口（结束其 WebContent 进程）→ 等 label 释放 → 同名重建。
+///
+/// 重建带重试：若期间又切了壁纸，重读最新目标再来一轮，最终收敛到当前配置。
+#[cfg(target_os = "macos")]
+async fn replace_wallpaper_window(
+    app: &AppHandle,
+    label: &str,
+    frame: (f64, f64, f64, f64),
+    target: &WallpaperConfig,
+    current: impl Fn(&AppHandle) -> Option<WallpaperConfig>,
+) {
+    for _ in 0..20 {
+        // 销毁旧窗口：destroy_wallpaper_window 会取 pid 并在后台结束其 WebContent 进程
+        if let Some(w) = app.get_webview_window(label) {
+            let before = w.url().ok();
+            destroy_wallpaper_window(app, &w);
+            // 等窗口真的从注册表消失（destroy 是异步投递），再重建 —— 同轮次
+            // create 会撞 WebviewLabelAlreadyExists
+            for _ in 0..40 {
+                match app.get_webview_window(label) {
+                    None => break,
+                    // 等待期间窗口可能已被别处的新壁纸接管（navigate 而非销毁），
+                    // 那就别再建，交给那条路径
+                    Some(w) => {
+                        let taken_over = w.url().map(|now_url| {
+                            before.as_ref().is_some_and(|b| *b != now_url)
+                                && now_url.scheme() != "about"
+                        }).unwrap_or(false);
+                        if taken_over {
+                            tracing::debug!(
+                                "wallpaper window {label}: 替换前已被新壁纸接管，取消重建"
+                            );
+                            return;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        // 主线程建一个干净的新窗口（新进程、新 GL 上下文）
+        let app2 = app.clone();
+        let label2 = label.to_string();
+        let target2 = target.clone();
+        let _ = app.run_on_main_thread(move || {
+            if let Err(e) = create_desktop_window(&app2, &label2, &target2, frame) {
+                tracing::debug!(
+                    "wallpaper window {label2} recreate attempt failed: {e}"
+                );
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        if app.get_webview_window(label).is_none() {
+            continue; // 没建起来，重试
+        }
+        // 建好了；若期间又切了壁纸，重读最新目标再来一轮
+        if item_id_of(&current(app).unwrap_or_else(|| target.clone())) == item_id_of(target) {
+            tracing::info!(
+                "wallpaper window {label}: 已换为新壁纸（销毁旧进程后重建，type={}）",
+                target.r#type
+            );
+            crate::mem_watch::report("换壁纸（销毁重建）");
+            return;
+        }
+    }
+    tracing::error!("wallpaper window {label}: 销毁重建多次失败");
 }
 
 /// 销毁前那次主线程调用的结果（决定销毁后走哪条路）。
@@ -1241,8 +1406,9 @@ enum KillPlan {
 ///    `WKWebsiteDataStore`，WebKit 就报 `Data store is in use`），所以它只是尽力
 ///    而为：失败交给 [`sweep_stale_data_stores`] 与下次启动的清理。
 ///
-/// 注意：**日常换壁纸不走这里**（走 [`schedule_window_reload`] 的同窗口换文档，
-/// 不销毁窗口），只有 stop、显示器移除、以及导航失败降级到重建时才走到。
+/// 日常换壁纸：非 macOS 走 [`schedule_window_reload`] 的同窗口导航、不经本函数；
+/// macOS 换壁纸销毁旧窗口时也走这里（取 pid + 结束进程）。另外 stop、显示器
+/// 移除、非 macOS 导航失败降级重建也会调用。
 ///
 /// 其它平台不需要这一圈：WebView2 / WebKitGTK 的 destroy 会连带销毁渲染进程。
 #[cfg(target_os = "macos")]
@@ -1445,8 +1611,8 @@ fn custom_data_store_available() -> bool {
 /// 独占意味着不会误伤别的窗口，也不必等 WebKit 哪天心情好才肯回收。删掉存储本身
 /// 只是顺带清磁盘（[`reap_data_store`] 那条老路 + [`sweep_stale_data_stores`]）。
 ///
-/// 顺带一提，**换壁纸本身不销毁窗口**，走 [`schedule_window_reload`] 的同窗口换
-/// 文档 —— 独占存储只服务于 stop / 显示器移除 / 重建降级这些真正销毁窗口的场合。
+/// 独占存储服务于真正销毁窗口的场合：macOS 换壁纸（旧窗口销毁后重建）、stop、
+/// 显示器移除、非 macOS 导航失败降级重建；非 macOS 的日常换壁纸走同窗口导航。
 ///
 /// 代价：壁纸页的 localStorage / IndexedDB 每块窗口（每次重建）都是全新的。WE 的
 /// 用户属性走 project.json + `/props` 注入，不依赖它；网页壁纸自己写
@@ -1522,22 +1688,12 @@ async fn reap_data_store(app: &AppHandle, label: &str, uuid: [u8; 16]) {
     }
 }
 
-/// 换壁纸后的窗口重建：**防抖 + 单飞**。
+/// 非 macOS 兜底：就地导航始终不成（窗口没了等）时，销毁后同名重建。
+/// 防抖 + 单飞（语义见 [`crate::wallpaper`] 换壁纸任务）。
 ///
-/// 唯一的入口是 [`schedule_window_reload`] 的就地导航兜底（窗口不在 / 导航连续
-/// 报错）—— macOS 曾经把这里当换壁纸主路径，实测靠「销毁窗口 + 删独占数据存储」
-/// 回收 WebContent 进程只有三成兑现（见 [`new_data_store_id`]），已改回同窗口换文档。
-///
-/// - 防抖：连切时不重建，等目标稳定 `DEBOUNCE` 后再动手一次。重建整块 WebView
-///   意味着新建 GL 上下文、重编 shader、重传全部纹理，逐张都做会把 GPU 顶成
-///   连续尖峰；合并成一次只付一次代价。
-/// - 单飞：每个 label 同时只有一个任务；它每次都读 `state.windows` 的最新配置，
-///   所以连切自然收敛到最后一张，不会两个任务抢建同一 label。
-/// - 跨轮次：`destroy()` 走的是 `proxy.send_event(Message::Window(.., Destroy))`
-///   （不像其它窗口操作走 `send_user_message` 的「主线程内联」快路径），**总是
-///   异步投递**；同一主线程轮次里重建必撞 `WebviewLabelAlreadyExists`，主线程
-///   sleep 也等不到（事件循环正被占着）。所以这里先等 label 从注册表消失，再回
-///   主线程 create。
+/// `destroy()` 走的是异步投递，同一主线程轮次里重建必撞
+/// `WebviewLabelAlreadyExists`，所以先等 label 从注册表消失，再回主线程 create。
+#[cfg(not(target_os = "macos"))]
 fn schedule_window_recreate(app: &AppHandle, label: &str, frame: (f64, f64, f64, f64)) {
     use std::time::Duration;
     /// 连切合并窗口：目标稳定这么久才动手
@@ -1580,6 +1736,11 @@ fn schedule_window_recreate(app: &AppHandle, label: &str, frame: (f64, f64, f64,
             done();
             return;
         };
+        // 「暂停释放内存」挂起期间不重建（同 schedule_window_reload 的说明）
+        if is_released(&app) {
+            done();
+            return;
+        }
         let target_item = item_id_of(&target);
 
         for _ in 0..20 {
@@ -1652,12 +1813,10 @@ fn apply_on_main(
         // 305M→3085M），切到轻量视频也不回落。热更新换的是实例不是文档，回收
         // 全靠库自觉。
         //
-        // 换文档有两条路，按平台分（见各自的注释）：
-        //   - 非 macOS：原地整页导航（[`schedule_window_reload`]）—— 换文档即可，
-        //     WebView2 / WebKitGTK 的 destroy 会连带销毁渲染进程。
-        //   - macOS：销毁 + 同名重建（[`schedule_window_recreate`]）—— 只有进程
-        //     **退出**才回收得掉内存，而让进程退出的开关是那块窗口独占的
-        //     WKWebsiteDataStore（[`new_data_store_id`]）。
+        // 换壁纸（[`schedule_window_reload`]）按平台分两条路（见该函数注释）：
+        //   - 非 macOS：同窗口整页导航 —— WebView2 / WebKitGTK 会连带销毁旧文档
+        //   - macOS：销毁旧窗口（结束 WebContent 进程）→ 同名重建 —— 就地导航在
+        //     重内容页上回收不可靠、会冻死
         //
         // 同一条目改 fit / dpr / fps / 属性时 item 不变 → 仍走热更新，不换页。
         let switched = state
@@ -1677,11 +1836,7 @@ fn apply_on_main(
                 .lock()
                 .unwrap()
                 .insert(label.clone(), cfg2.clone());
-            // 就地导航换文档：渲染器的全部配置都在 URL query 里（`initialCfg`），
-            // `pagehide` 里也有完整 teardown，所以换一张壁纸 = 换一个文档。
-            // macOS 曾经改用「销毁窗口 + 删独占数据存储」来回收 WebContent 进程，
-            // 但那条路不可靠（详见 [`schedule_window_reload`] 与
-            // [`new_data_store_id`] 的说明），最终统一回这条路。
+            // 防抖 + 单飞：连切时任务读最新配置、收敛到最后一张
             schedule_window_reload(app, label, *frame);
         } else {
             let window = match app.get_webview_window(label) {
@@ -1797,6 +1952,7 @@ fn start_monitor(app: &AppHandle) {
         let mut last_audio_seq: u64 = 0;
         let mut audio_stale_ticks: u32 = 0;
         let mut failed_retry_ticks: u32 = 0;
+        let mut audio_perm_last: Option<bool> = None;
         let mut web_stall_ticks: u32 = 0;
         let mut ticks: u64 = 0;
         tracing::debug!("wallpaper monitor started");
@@ -1812,6 +1968,7 @@ fn start_monitor(app: &AppHandle) {
                     &mut last_audio_seq,
                     &mut audio_stale_ticks,
                     &mut failed_retry_ticks,
+                    &mut audio_perm_last,
                     &mut web_stall_ticks,
                 )
             }));
@@ -1865,6 +2022,7 @@ fn monitor_tick(
     last_audio_seq: &mut u64,
     audio_stale_ticks: &mut u32,
     failed_retry_ticks: &mut u32,
+    #[allow(unused_variables)] audio_perm_last: &mut Option<bool>,
     web_stall_ticks: &mut u32,
 ) -> TickActions {
     let mut action = TickActions::default();
@@ -1961,7 +2119,9 @@ fn monitor_tick(
         } else if shared.phase() == crate::audio_capture::PHASE_FAILED {
             // FAILED：本次启动失败（如合盖期间 SCStream 以「流播放无法启动音频」
             // 拒绝）。若此前曾成功工作过（权限必然已授予），每 ~30s 自动重试，
-            // 开盖后自行恢复；从未成功过（无权限等永久性问题）不重试。
+            // 开盖后自行恢复；从未成功过（无权限等永久性问题）不重试 —— 但
+            // 例外是「用户刚在授权框点了允许」：权限从无到有的瞬间自动重试一次
+            // （首次创建 Tap 时弹的授权框，允许后不必重启应用）。
             *audio_stale_ticks = 0;
             if shared
                 .ever_received
@@ -1971,6 +2131,16 @@ fn monitor_tick(
                 if *failed_retry_ticks >= 15 {
                     *failed_retry_ticks = 0;
                     action.restart_audio = true;
+                }
+            } else {
+                #[cfg(target_os = "macos")]
+                {
+                    let granted = crate::audio_capture::macos_permission_granted();
+                    if granted && *audio_perm_last == Some(false) {
+                        tracing::info!("audio permission granted after failure; retrying capture");
+                        action.restart_audio = true;
+                    }
+                    *audio_perm_last = Some(granted);
                 }
             }
         } else {
@@ -2083,7 +2253,20 @@ fn config_query_with_audio(cfg: &WallpaperConfig, audio_token: Option<&str>) -> 
     parts.push(format!("pq={}", url_encode(&cfg.particles)));
     parts.push(format!("pp={}", url_encode(&cfg.post_processing)));
     parts.push(format!("muted={}", cfg.muted));
+    // 精确音量（0..1）：有壁纸专属音量记录时下发；渲染器加载完成后按它起音量
+    if let Some(v) = cfg.volume {
+        parts.push(format!("volume={v}"));
+    }
     parts.push(format!("loop={}", cfg.r#loop));
+    // WE 官方素材通路（库 1.4.1+）：1 时库挂载场景前探测 /api/local-assets，
+    // 本机有官方 assets 树就用原版像素；生产构建不带该参数时库不会发探测
+    if cfg.local_assets {
+        parts.push("localAssets=1".to_string());
+    }
+    // 场景壁纸 project.json 声明的 pkg 入口（非默认命名/布局时给渲染器指路）
+    if let Some(pkg) = &cfg.scene_pkg {
+        parts.push(format!("scenePkg={}", url_encode(pkg)));
+    }
     if let Some(base) = &cfg.media_base {
         // 渲染器与 PreviewModal 均读取 `mediaBase`，保持命名一致
         parts.push(format!("mediaBase={}", url_encode(base)));
@@ -2182,6 +2365,11 @@ pub fn stop(app: AppHandle, display_id: Option<String>) -> Result<(), String> {
         if display_id.is_none() {
             *state.default.lock().unwrap() = None;
         }
+        // 「暂停释放内存」挂起标志一并清零：壁纸已停，恢复路径不会再走，
+        // 留着 true 会让监控的 ensure_windows 永久不建窗（显示器布局变化
+        // 无法同步）。部分停止只清对应 label 的话，全停之外的场景由
+        // resume_all 的重建兜底，这里不必精细区分。
+        *state.released.lock().unwrap() = false;
         let _ = tx.send(Ok(()));
     })
     .map_err(|e| e.to_string())?;
@@ -2244,12 +2432,90 @@ pub fn pause_all(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// 「暂停释放内存」是否处于挂起态（壁纸窗口已销毁、等恢复时重建）
+fn is_released(app: &AppHandle) -> bool {
+    app.try_state::<WallpaperEngineState>()
+        .map(|st| *st.released.lock().unwrap())
+        .unwrap_or(false)
+}
+
+/// 「自动暂停」触发时的统一入口（macOS/Windows 的前台切换观察者都走这里）：
+/// 与手动 [`pause_all`] 的区别是会按设置叠加「暂停释放内存」——开关开启时
+/// 直接销毁全部壁纸窗口（渲染进程随之结束，内存实打实归还），回桌面时由
+/// [`resume_all`] 按保留的会话配置整窗重建。调用方负责置 `auto_paused` 标志。
+pub fn auto_pause_enter(app: &AppHandle) -> Result<(), String> {
+    pause_all(app.clone())?;
+    if pause_release_enabled(app) {
+        release_wallpaper_windows(app);
+    }
+    Ok(())
+}
+
+/// 「暂停释放内存」开关：`wallpaper_auto_pause_release`，默认关。
+/// 与自动暂停一样由前台切换时直读 DB（低频事件，免缓存同步）。
+fn pause_release_enabled(app: &AppHandle) -> bool {
+    app.try_state::<Arc<Mutex<Connection>>>()
+        .and_then(|db| {
+            db.lock()
+                .ok()
+                .and_then(|c| db::get_setting(&c, "wallpaper_auto_pause_release"))
+        })
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+}
+
+/// 销毁全部壁纸窗口（「暂停释放内存」的释放动作）。
+///
+/// 会话配置（`state.windows` / `wallpaper_sessions`）**保留**：恢复播放时按它
+/// 整窗重建。macOS 上 [`destroy_wallpaper_window`] 会连带结束每块窗口独占的
+/// WebContent 进程 —— 这正是本开关的目的（页面内 release 只能还一部分，
+/// 进程级 JS 堆/解码器/GPU 缓存要进程退出才彻底）。
+fn release_wallpaper_windows(app: &AppHandle) {
+    let Some(st) = app.try_state::<WallpaperEngineState>() else {
+        return;
+    };
+    // 先置标志再动手：destroy 是异步投递的，2s 一轮的监控若插在「销毁完成」
+    // 与「标志置位」之间，会按仍登记的配置把窗口原样建回来（等于没释放）
+    *st.released.lock().unwrap() = true;
+    let labels: Vec<String> = st.windows.lock().unwrap().keys().cloned().collect();
+    for label in &labels {
+        if let Some(w) = app.get_webview_window(label) {
+            destroy_wallpaper_window(app, &w);
+        }
+    }
+    tracing::info!(
+        "auto-pause (release): 已销毁 {} 块壁纸窗口（渲染进程结束；回桌面时整窗重建）",
+        labels.len()
+    );
+    crate::mem_watch::report("自动暂停释放内存（销毁壁纸窗口）");
+}
+
 #[tauri::command(rename = "wallpaper_resume_all")]
 pub fn resume_all(app: AppHandle) -> Result<(), String> {
     if let Some(st) = app.try_state::<WallpaperEngineState>() {
         *st.paused.lock().unwrap() = false;
     }
     eval_all(&app, "window.__wp && window.__wp.resume()");
+    // 「暂停释放内存」挂起期间的恢复 = 按保留的会话配置整窗重建（完全重新
+    // 加载壁纸）。所有恢复路径（回桌面/托盘关开关/应用新壁纸/全局快捷键）
+    // 都汇到本函数，重建逻辑放这一处即可全覆盖。
+    let rebuild = {
+        let Some(st) = app.try_state::<WallpaperEngineState>() else {
+            return Ok(());
+        };
+        let mut g = st.released.lock().unwrap();
+        std::mem::replace(&mut *g, false)
+    };
+    if rebuild {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let app2 = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            ensure_windows(&app2);
+            let _ = tx.send(());
+        });
+        let _ = rx.recv_timeout(Duration::from_secs(5));
+        tracing::info!("auto-pause (release): 壁纸窗口已按会话配置重建");
+    }
     Ok(())
 }
 
@@ -2392,7 +2658,8 @@ pub fn set_particles(app: AppHandle, quality: String) -> Result<(), String> {
     Ok(())
 }
 
-/// 设置全局后处理质量档（off/low/medium/high，库 1.3.23+），持久化并对所有壁纸窗口实时生效。
+/// 设置全局后处理质量档（low/medium/high，库 1.3.23+；不提供 off —— 完全关掉
+/// 后处理会让辉光/水波类壁纸失去画面效果），持久化并对所有壁纸窗口实时生效。
 #[tauri::command(rename = "wallpaper_set_post")]
 pub fn set_post(app: AppHandle, quality: String) -> Result<(), String> {
     if !POST_QUALITY_CHOICES.contains(&quality.as_str()) {
@@ -2487,6 +2754,115 @@ pub fn interactive_set(app: AppHandle, enabled: bool) -> Result<(), String> {
     rx.recv().map_err(|e| format!("壁纸引擎未响应: {e}"))?
 }
 
+/// 切换 WE 官方素材通路 / 自定义素材根后，让所有壁纸窗口按最新配置整页重载。
+///
+/// 与抗锯齿/滤镜不同，localAssets 只在挂载时读取（库内 installLocalAssets 的
+/// eagerDone 按文档缓存），eval 热更无效，只能整页导航。导航必须在主线程执行。
+fn renavigate_all_windows(app: &AppHandle) -> Result<(), String> {
+    let st = app
+        .try_state::<WallpaperEngineState>()
+        .ok_or("壁纸引擎未就绪")?;
+    let configs: Vec<(String, WallpaperConfig)> =
+        st.windows.lock().unwrap().iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    for (label, cfg) in configs {
+        let target = prepare_cfg(app, &cfg);
+        let Some(w) = app.get_webview_window(&label) else { continue };
+        navigate_to_config(app, &w, &target)?;
+        st.windows.lock().unwrap().insert(label, target);
+    }
+    Ok(())
+}
+
+fn run_on_main_and_wait<F>(app: &AppHandle, f: F) -> Result<(), String>
+where
+    F: FnOnce(&AppHandle) -> Result<(), String> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    let app2 = app.clone();
+    app.run_on_main_thread(move || {
+        let _ = tx.send(f(&app2));
+    })
+    .map_err(|e| e.to_string())?;
+    rx.recv().map_err(|e| format!("壁纸引擎未响应: {e}"))?
+}
+
+/// 开关 WE 官方素材通路（设置 `wallpaper_local_assets`，默认开）。
+/// 挂载时生效，这里持久化后让现有壁纸窗口整页重载一次。
+#[tauri::command(async, rename = "wallpaper_local_assets_set")]
+pub fn local_assets_set(app: AppHandle, enabled: bool) -> Result<(), String> {
+    {
+        let db = app
+            .try_state::<Arc<Mutex<Connection>>>()
+            .ok_or("DB 未就绪")?;
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        db::set_setting(
+            &conn,
+            "wallpaper_local_assets",
+            if enabled { "true" } else { "false" },
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    run_on_main_and_wait(&app, renavigate_all_windows)
+}
+
+/// 设置自定义 WE assets 根目录（其下需直接有 materials/）；传空串清除，回到
+/// Steam 库自动探测。路径不含可用素材树时仍允许保存，状态查询会回报 available:false。
+#[tauri::command(async, rename = "wallpaper_we_assets_dir_set")]
+pub fn we_assets_dir_set(app: AppHandle, dir: String) -> Result<(), String> {
+    let dir = dir.trim().to_string();
+    if !dir.is_empty() {
+        let p = std::path::Path::new(&dir);
+        if !p.is_dir() {
+            return Err(format!("目录不存在：{dir}"));
+        }
+        if !p.join("materials").is_dir() {
+            return Err("该目录下没有 materials/ 子目录（应选择 Wallpaper Engine 的 assets 根）".into());
+        }
+    }
+    {
+        let db = app
+            .try_state::<Arc<Mutex<Connection>>>()
+            .ok_or("DB 未就绪")?;
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        if dir.is_empty() {
+            let _ = conn.execute("DELETE FROM settings WHERE key = 'wallpaper_we_assets_dir'", []);
+        } else {
+            db::set_setting(&conn, "wallpaper_we_assets_dir", &dir).map_err(|e| e.to_string())?;
+        }
+    }
+    // 素材索引按根路径缓存，路径变了顺手清掉避免短时读到旧根清单
+    run_on_main_and_wait(&app, renavigate_all_windows)
+}
+
+/// 官方素材通路状态（设置页用）：开关、素材根是否探测到、根路径、.tex 数量。
+#[tauri::command(rename = "wallpaper_local_assets_status")]
+pub fn local_assets_status(app: AppHandle) -> Result<serde_json::Value, String> {
+    let (enabled, custom) = {
+        let db = app
+            .try_state::<Arc<Mutex<Connection>>>()
+            .ok_or("DB 未就绪")?;
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        let enabled = db::get_setting(&conn, "wallpaper_local_assets")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(true);
+        let custom = db::get_setting(&conn, "wallpaper_we_assets_dir");
+        (enabled, custom)
+    };
+    // 关闭时也告诉设置页「本机有没有素材」，方便解释开关为何看不出区别
+    let root = crate::we_assets::resolve_root(custom.as_deref());
+    let (available, root_str, tex_count) = match &root {
+        Some(p) => (true, p.to_string_lossy().to_string(), crate::we_assets::material_names(p).len()),
+        None => (false, String::new(), 0),
+    };
+    Ok(serde_json::json!({
+        "enabled": enabled,
+        "available": available,
+        "root": root_str,
+        "customDir": custom.unwrap_or_default(),
+        "texCount": tex_count,
+    }))
+}
+
 // ---------- 本地库条目应用 + 轮播（T3） ----------
 
 /// project.json 声明的入口 HTML（相对壁纸根）。WE 用 `file` 字段指定入口，
@@ -2543,6 +2919,79 @@ pub(crate) fn find_first_html(dir: &std::path::Path) -> Option<String> {
     found.into_iter().next().map(|(_, rel)| rel)
 }
 
+/// 查找壁纸目录里第一个 .pkg 文件（场景 pkg 的最后兜底；排序纪律同 find_first_html）。
+pub(crate) fn find_first_pkg(dir: &std::path::Path) -> Option<String> {
+    fn walk(d: &std::path::Path, base: &std::path::Path, found: &mut Vec<(u8, String)>) {
+        let Ok(entries) = std::fs::read_dir(d) else {
+            return;
+        };
+        let mut names: Vec<_> = entries.flatten().collect();
+        names.sort_by_key(|e| e.file_name());
+        for e in names {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, base, found);
+            } else if let Some(ext) = p.extension().and_then(|x| x.to_str()) {
+                if ext.eq_ignore_ascii_case("pkg") {
+                    if let Ok(rel) = p.strip_prefix(base) {
+                        let rel = rel.to_string_lossy().into_owned();
+                        let prio = if rel.starts_with("scenes/") {
+                            0u8
+                        } else if !rel.contains('/') {
+                            1u8
+                        } else {
+                            2u8
+                        };
+                        found.push((prio, rel));
+                    }
+                }
+            }
+        }
+    }
+    let mut found: Vec<(u8, String)> = Vec::new();
+    walk(dir, dir, &mut found);
+    found.sort();
+    found.into_iter().next().map(|(_, rel)| rel)
+}
+
+/// 场景壁纸的 pkg 入口（相对壁纸根）。WE 的场景工程主 pkg 命名五花八门，
+/// 按优先级逐级回退：
+/// ① project.json `file` 直接指向 .pkg（声明即真相）
+/// ② `file` 指向 .json（WE 的 GIF 场景模板工程：file=gifscene.json，
+///    编译产物是同目录同名 .pkg —— 843532366 就是这种）
+/// ③ 默认布局 scenes/scene.pkg / scene.pkg / gifscene.pkg
+/// ④ 目录里第一个 .pkg（兜底，命名再不规范也能用）
+pub(crate) fn scene_pkg_entry(dir: &std::path::Path) -> Option<String> {
+    let declared = project_json_entry(dir);
+    if let Some(rel) = declared
+        .as_ref()
+        .filter(|p| p.to_ascii_lowercase().ends_with(".pkg"))
+    {
+        return Some(rel.clone());
+    }
+    if let Some(json_rel) = declared
+        .as_ref()
+        .filter(|p| p.to_ascii_lowercase().ends_with(".json"))
+    {
+        // ".json" 是 ASCII 后缀，按字节截断不会切进多字节字符
+        let pkg_rel = format!("{}.pkg", &json_rel[..json_rel.len() - 5]);
+        if dir.join(&pkg_rel).is_file() {
+            return Some(pkg_rel);
+        }
+    }
+    for rel in [
+        "scenes/scene.pkg",
+        "scene.pkg",
+        "gifscene.pkg",
+        "scenes/gifscene.pkg",
+    ] {
+        if dir.join(rel).is_file() {
+            return Some(rel.to_string());
+        }
+    }
+    find_first_pkg(dir)
+}
+
 /// 解析本地库壁纸文件 → 渲染器配置（src 指向内容服务器媒体 URL）
 fn resolve_item_config(app: &AppHandle, item_id: &str) -> Result<WallpaperConfig, String> {
     let db = app
@@ -2582,10 +3031,22 @@ fn resolve_item_config(app: &AppHandle, item_id: &str) -> Result<WallpaperConfig
         }
         None
     };
+    // project.json 声明的主资源（`file` 字段）优先于目录枚举 —— 很多工程的主文件
+    // 命名并不规范（视频不叫 video.mp4、pkg 不叫 scene.pkg），按名字枚举会挑错文件。
+    // project_json_entry 已做安全校验（拒绝绝对路径/.. 穿越、要求文件存在）。
+    let declared = |exts: &[&str]| -> Option<String> {
+        let rel = crate::wallpaper::project_json_entry(&dir)?;
+        let lower = rel.to_ascii_lowercase();
+        exts.iter()
+            .any(|x| lower.ends_with(x))
+            .then(|| format!("{media}/{item_id}/{rel}"))
+    };
 
     let mut cfg = match wtype.as_str() {
         "video" => {
-            let src = find_first(&[".mp4", ".webm", ".mov"]).ok_or("未找到视频文件")?;
+            let src = declared(&[".mp4", ".webm", ".mov", ".m4v", ".mkv", ".avi"])
+                .or_else(|| find_first(&[".mp4", ".webm", ".mov"]))
+                .ok_or("未找到视频文件")?;
             WallpaperConfig {
                 r#type: "video".into(),
                 src: Some(src),
@@ -2593,7 +3054,9 @@ fn resolve_item_config(app: &AppHandle, item_id: &str) -> Result<WallpaperConfig
             }
         }
         "gif" => {
-            let src = find_first(&[".gif"]).ok_or("未找到 GIF 文件")?;
+            let src = declared(&[".gif"])
+                .or_else(|| find_first(&[".gif"]))
+                .ok_or("未找到 GIF 文件")?;
             WallpaperConfig {
                 r#type: "gif".into(),
                 src: Some(src),
@@ -2627,9 +3090,12 @@ fn resolve_item_config(app: &AppHandle, item_id: &str) -> Result<WallpaperConfig
             }
         }
         "scene" => {
-            let has_pkg = dir.join("scenes/scene.pkg").is_file() || dir.join("scene.pkg").is_file();
-            if !has_pkg {
-                // 缺 scene.pkg：先用本地已有的依赖内容补齐；仍缺的自动加入下载队列
+            // pkg 入口解析（声明 .pkg / 模板 json 同名 .pkg / 默认布局 / 目录兜底，
+            // 见 scene_pkg_entry）：不少工程的主 pkg 命名/位置不标准，
+            // 只认 scene.pkg 会误报缺失（843532366 的 gifscene.pkg 就是这类）
+            let mut pkg_entry = scene_pkg_entry(&dir);
+            if pkg_entry.is_none() {
+                // 缺 pkg：先用本地已有的依赖内容补齐；仍缺的自动加入下载队列
                 let dep_ids = crate::download::read_project_json(&dir.join("project.json"))
                     .map(|v| crate::download::parse_dependency_ids(&v, item_id))
                     .unwrap_or_default();
@@ -2652,15 +3118,15 @@ fn resolve_item_config(app: &AppHandle, item_id: &str) -> Result<WallpaperConfig
                         ));
                     }
                 }
-                let has_pkg =
-                    dir.join("scenes/scene.pkg").is_file() || dir.join("scene.pkg").is_file();
-                if !has_pkg {
+                pkg_entry = scene_pkg_entry(&dir);
+                if pkg_entry.is_none() {
                     return Err("未找到 scene.pkg（依赖内容已合并但仍缺入口文件）".into());
                 }
             }
             WallpaperConfig {
                 r#type: "scene".into(),
                 src: Some(item_id.to_string()),
+                scene_pkg: pkg_entry,
                 ..Default::default()
             }
         }
@@ -3042,7 +3508,10 @@ mod tests {
             particles: "low".into(),
             post_processing: "medium".into(),
             muted: false,
+            volume: Some(0.35),
             r#loop: true,
+            scene_pkg: Some("scenes/my.pkg".into()),
+            local_assets: true,
             media_base: Some("http://127.0.0.1:1/media/tok".into()),
         };
         let url = renderer_url_on("http://127.0.0.1:57810", &cfg, Some("audiotok")).unwrap();
@@ -3065,7 +3534,13 @@ mod tests {
             "pq=low",
             "pp=medium",
             "muted=false",
+            // 精确音量（0..1）：渲染器挂载时先静音，加载完成后按它起音量
+            "volume=0.35",
             "loop=true",
+            // WE 官方素材通路（库 1.4.1+）：生产构建必须显式带参库才会探测
+            "localAssets=1",
+            // project.json 声明的场景 pkg 入口（非默认命名时给渲染器指路）
+            "scenePkg=scenes%2Fmy.pkg",
             "mediaBase=http%3A%2F%2F127.0.0.1%3A1%2Fmedia%2Ftok",
             "audioToken=audiotok",
         ] {
@@ -3092,9 +3567,45 @@ mod tests {
         dir
     }
 
+    /// 场景 pkg 入口解析（843532366 的 gifscene 工程就是 ② 那类）
     #[test]
-    fn project_json_entry_priority_and_safety() {
-        // 声明的入口存在 → 采用（该壁纸没有任何 index.html）
+    fn scene_pkg_entry_prefers_declared_then_known_layouts() {
+        // ① file 直接指向 .pkg
+        let d = fixture("pkg-declared");
+        std::fs::write(d.join("my.pkg"), b"p").unwrap();
+        std::fs::write(d.join("project.json"), r#"{"file":"my.pkg"}"#).unwrap();
+        assert_eq!(scene_pkg_entry(&d).as_deref(), Some("my.pkg"));
+
+        // ② file 指向模板 json（GIF 场景工程）→ 同目录同名 .pkg
+        let d = fixture("pkg-gifscene");
+        std::fs::write(d.join("gifscene.pkg"), b"p").unwrap();
+        std::fs::write(
+            d.join("project.json"),
+            r#"{"description":"x","file":"gifscene.json"}"#,
+        )
+        .unwrap();
+        assert_eq!(scene_pkg_entry(&d).as_deref(), Some("gifscene.pkg"));
+
+        // ③ 默认布局（含子目录）
+        let d = fixture("pkg-default");
+        std::fs::create_dir_all(d.join("scenes")).unwrap();
+        std::fs::write(d.join("scenes/scene.pkg"), b"p").unwrap();
+        assert_eq!(scene_pkg_entry(&d).as_deref(), Some("scenes/scene.pkg"));
+
+        // ④ 兜底：目录里第一个 .pkg（无 project.json 也能找到）
+        let d = fixture("pkg-fallback");
+        std::fs::write(d.join("weird-name.pkg"), b"p").unwrap();
+        std::fs::write(d.join("preview.jpg"), b"i").unwrap();
+        assert_eq!(scene_pkg_entry(&d).as_deref(), Some("weird-name.pkg"));
+
+        // 什么都没有 → None
+        let d = fixture("pkg-none");
+        std::fs::write(d.join("preview.jpg"), b"i").unwrap();
+        assert_eq!(scene_pkg_entry(&d), None);
+    }
+
+    #[test]
+    fn project_json_entry_priority_and_safety() {        // 声明的入口存在 → 采用（该壁纸没有任何 index.html）
         let d = fixture("declared");
         std::fs::write(d.join("bb.html"), "x").unwrap();
         std::fs::write(d.join("project.json"), r#"{"type":"web","file":"bb.html"}"#).unwrap();

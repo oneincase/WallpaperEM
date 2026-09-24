@@ -4,6 +4,60 @@
 
 ## [Unreleased]
 
+### ✨ 新增 / Added
+
+- **同步 webwallgl 1.4.1 渲染核心**：
+  - **WE 官方素材通路（local-assets）**：本机安装 Wallpaper Engine 时，场景壁纸的
+    粒子精灵、光效/渐变贴图、法线参考与文字字体改用官方原版像素渲染（此前为内置程序化
+    复刻，观感接近但不完全一致）。自动探测所有 Steam 库的
+    `wallpaper_engine/assets`（支持 libraryfolders.vdf 多库），也可在「设置 → 性能」
+    手动指定 assets 根；默认开启，探测不到素材时仅一次轻量请求、零额外开销，可随时关闭。
+  - 随库更新获得：资源分辨率倍率与压缩纹理直传（最坏单墙纹理显存 1721MB → 332MB
+    @省电档）、CPU 副本上传即释放；程序化粒子贴图（雨/雾/水花/涟漪/光轴/气泡）按官方
+    素材实测重建、序列帧帧间混合与 3D 旋转对齐官方；TEXV0004 旧容器、合成源层缩放、
+    DXT1 透明黑块、BGM 静音失效/重挂丢音量、帧率上限相位调度等一批观感与稳定性修复。
+- **网页壁纸外部滚轮 / 触控板手势注入（pushWheel）**：壁纸在桌面图标下方时收不到
+  滚轮事件，网页壁纸（全景、OrbitControls、幻灯片等）的滚动/缩放/翻页此前全部不可用。
+  现在由宿主捕获系统级滚轮推进渲染器：macOS 走 CGEventTap（触控板双指滚动给像素级
+  连续 delta；**双指捏合缩放**以系统合成的 ctrl+滚轮原样转发，首次使用网页壁纸时按需
+  启动并请求「输入监控」权限，拒绝后可随时在系统设置授权、自动重试自愈），Windows 走
+  WH_MOUSE_LL 低级钩子（无需权限，同样识别捏合）；仅在播放网页壁纸、非交互态且桌面
+  活动时转发，交互态仍走窗口真实事件。Linux 暂无全局手势源。
+
+### 🔧 变更 / Changed
+
+- **全平台媒体桥接统一为 [media-bridge](https://github.com/oneincase/media-bridge)**：
+  「正在播放」元数据/封面与系统音频频谱改由同一个进程内 Rust 引擎提供，对壁纸侧
+  契约（`/now-playing`、`/audio-stream`、`/media-command`）零改动。
+  - **Linux 新支持**：MPRIS「正在播放」此前已接入但封面/可用性不稳，系统音频采集
+    （频谱可视化）此前完全不支持；现在 Linux 走 MPRIS + PulseAudio/PipeWire
+    monitor（`parec`/`pw-record` 自动探测，无需虚拟声卡或立体声混音），三平台
+    元数据 / 封面 / 播放控制 / 频谱行为统一。Windows「正在播放」此前因可用性闸口
+    未打开实际不生效，现随统一引擎一并生效。
+  - macOS 15.4+ 的 MediaRemote 权限通道改为内嵌 helper（运行时落盘经
+    `/usr/bin/perl` 代读），不再随包分发第三方 `mediaremote-adapter`；
+    构建时由 cargo 自动先编 helper，应用包仍是单文件。
+  - 播放控制改为「能力位 + 回执」：播放器不支持的操作不会假成功；频谱保留旧版
+    AGC 动态增益与峰值保持观感（FFT/采集下沉到 media-bridge）。
+  - 新增能力储备：歌词（本地/内嵌/LRCLIB 在线）、循环/随机/定位/音量等扩展
+    控制命令、远端封面下载（Linux），后续版本接到壁纸 wire。
+
+### 🐛 修复 / Fixes
+
+- **主窗口最小化现在与关闭一样立即释放内存**：黄色最小化按钮 / ⌘M 此前只把
+  窗口藏起（主界面那几十～几百 MB 的 React WebContent 进程常驻），要等系统内存
+  压力才回收。现在最小化即销毁窗口、结束其 WebContent 进程，内存立刻归还；从
+  Dock（Reopen）/ 托盘重开时按原配置重建。macOS 上最小化只触发 NSWindow
+  miniaturize、tauri 不发 Resized 事件，故改用 `NSWindowDidMiniaturizeNotification`
+  通知监听（已验证重建后的主窗口正常渲染、不空白）。
+- **切换壁纸后旧 WebContent 进程与内存可靠回收**：macOS 日常换壁纸此前走
+  「同窗口整页导航」，连续切换（尤其视频↔4K 场景）时旧页的 WebGL 上下文 / JS
+  堆回收不干净，新页加载失败、渲染器最终卡死（真机复现：场景→视频正常，
+  视频→4K 场景即冻死），残留以 `http://127.0.0.1:<port>` 记名的 WebContent
+  进程只能手动杀。现改为「销毁旧窗口（显式结束其 WebContent 进程）→ 同名
+  重建」，进程数恒定、旧内存实打实归还。非 macOS（WebView2 / WebKitGTK 的导航
+  会连带销毁旧文档）仍走同窗口导航，导航失败时兜底销毁重建。
+
 ## [v1.0.0] - 2026-09-15
 
 ### ✨ 新增 / Added

@@ -752,7 +752,7 @@ fn on_foreground_changed(app: &tauri::AppHandle, hwnd: HWND) {
     if !auto_pause_enabled(app) || *st.paused.lock().unwrap() {
         return;
     }
-    if super::pause_all(app.clone()).is_ok() {
+    if super::auto_pause_enter(app).is_ok() {
         *st.auto_paused.lock().unwrap() = true;
         tracing::info!("auto-pause: 前台切换，壁纸已自动暂停");
     }
@@ -829,6 +829,19 @@ fn monitor_scale_at(px: i32, py: i32) -> Option<f64> {
         })
         .or_else(|| mons.first())
         .map(|m| m.scale)
+}
+
+/// 全局物理像素点（GetCursorPos / 低级钩子坐标）落在哪台显示器，返回其 id。
+/// 滚轮派发用；不在任何屏内返回 None（这次事件丢弃）。
+pub fn hit_screen_id(x: f64, y: f64) -> Option<u32> {
+    let (xi, yi) = (x as i32, y as i32);
+    // 不能在这里调 active_screens()（先 fill 再取会重复加锁同一把非重入锁）；
+    // 缓存由指针轮询以 30Hz 保鲜，启动瞬间 miss 只是丢一次滚轮事件
+    let cache = SCREENS_CACHE.lock().ok()?;
+    let (_, mons) = cache.as_ref()?;
+    mons.iter()
+        .find(|m| xi >= m.px.0 && xi < m.px.0 + m.px.2 && yi >= m.px.1 && yi < m.px.1 + m.px.3)
+        .map(|m| m.info.id)
 }
 
 /// 未被 Windows 后端使用的占位：`GetForegroundWindow` 供排障日志用

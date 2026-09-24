@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- 系统音频捕获（音频可视化）：macOS 14.2+ 用 CoreAudio 进程 Tap，
+         只需要麦克风/系统音频录制授权（创建 Tap 时系统自动弹窗），
+         不再需要屏幕录制权限（旧 ScreenCaptureKit 方案已弃用）。
+         两个键都带上：14.x 走麦克风口径，15+ 走独立的「系统音频录制」口径。 -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>用于读取系统音频以驱动音频可视化壁纸（需要「麦克风/系统音频录制」权限；不会录音或上传任何内容）。</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>用于读取系统音频以驱动音频可视化壁纸（需要「系统音频录制」权限；不会录音或上传任何内容）。</string>
+</dict>
+</plist>

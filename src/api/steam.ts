@@ -404,6 +404,14 @@ export const api = {
     invoke<AudioProcessingStatus>("wallpaper_audio_processing_set", { enabled }),
   wallpaperAudioProcessingStatus: () =>
     invoke<AudioProcessingStatus>("wallpaper_audio_processing_status"),
+  /** WE 官方素材通路开关（挂载时生效，切换后现有壁纸整页重载） */
+  wallpaperLocalAssetsSet: (enabled: boolean) =>
+    invoke<void>("wallpaper_local_assets_set", { enabled }),
+  /** 自定义 WE assets 根目录（传空串清除，回到 Steam 库自动探测） */
+  wallpaperWeAssetsDirSet: (dir: string) =>
+    invoke<void>("wallpaper_we_assets_dir_set", { dir }),
+  wallpaperLocalAssetsStatus: () =>
+    invoke<LocalAssetsStatus>("wallpaper_local_assets_status"),
   wallpaperNext: () => invoke<{ itemId: string; index: number }>("wallpaper_next"),
   favoritesList: () => invoke<FavoriteItem[]>("favorites_list"),
   favoriteAdd: (itemId: string) => invoke<boolean>("favorite_add", { itemId }),
@@ -659,6 +667,20 @@ export interface AudioProcessingStatus {
   granted: boolean;
   /** 当前平台是否支持系统音频捕获（macOS CoreAudio / Windows WASAPI 支持；Linux 待接入 PipeWire） */
   supported: boolean;
+}
+
+/** WE 官方素材通路状态（webwallgl 1.4.1 local-assets） */
+export interface LocalAssetsStatus {
+  /** 开关（持久化，默认开） */
+  enabled: boolean;
+  /** 本机是否探测到可用的 WE assets 根（含 materials/） */
+  available: boolean;
+  /** 探测到的素材根绝对路径 */
+  root: string;
+  /** 用户自定义素材根（空串 = Steam 库自动探测） */
+  customDir: string;
+  /** materials 树下 .tex 数量（素材规模） */
+  texCount: number;
 }
 
 /** 一次 MCP 工具调用记录（内存环形缓冲，最多 50 条） */

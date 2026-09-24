@@ -45,9 +45,16 @@ axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["fs"] }
 libc = "0.2"
+# MCP 回环监听绑定：SO_REUSEADDR（TIME_WAIT 残留导致改端口必报占用的解法）
+socket2 = "0.6"
 zip = { version = "2", default-features = false, features = ["deflate"] }
-rustfft = "6"
 base64 = "0.22"
+
+# 全平台媒体桥接（正在播放元数据/封面/歌词 + 系统音频采集 + 反向控制）。
+# 与 webwallgl 一样走同级自有仓库 file: 依赖；default-features 关掉 http
+# （宿主有自己的内容服务器），audio 提供三平台采集，embedded/online 提供
+# 本地内嵌标签与在线歌词/远端封面（Linux MPRIS 常见）
+media-bridge = { path = "../../media-bridge/crates/media-bridge", default-features = false, features = ["audio", "embedded", "online"] }
 
 # Steamworks SDK 没有 ARM64 版的 Windows steam_api 库：Windows ARM64 上不编译
 # 工坊上传（steamworks / workshop_upload 模块整体关闭），其余平台照常
@@ -60,14 +67,9 @@ objc2 = "0.6"
 objc2-app-kit = "0.3"
 objc2-foundation = { version = "0.3", features = ["NSArray"] }
 objc2-core-graphics = "0.3"
-# 系统全局音频捕获（二期）：ScreenCaptureKit 音频 loopback（macOS 13+）
-objc2-screen-capture-kit = { version = "0.3", features = [
-    "SCStream",
-    "SCShareableContent",
-    "objc2-core-media",
-    "dispatch2",
-    "block2",
-] }
+# 系统全局音频捕获（二期）：macOS 走 CoreAudio 进程 Tap（14.2+，纯 C ABI +
+# 裸 msg_send，无需 ScreenCaptureKit 专属 crate）。下面四个供抽帧（core_media）、
+# 桌面窗口事件监听（dispatch2/block2）等其它 macOS 原生路径使用
 objc2-core-media = { version = "0.3", features = ["objc2-core-audio-types"] }
 objc2-core-audio-types = "0.3"
 dispatch2 = { version = "0.3", default-features = false, features = ["alloc", "objc2", "block2"] }
@@ -78,8 +80,7 @@ block2 = { version = "0.6", default-features = false, features = ["alloc"] }
 # 注：主凭据走 secure_store 本地加密文件，keychain.rs 仅为旧版回退/迁移来源，
 # keyutils 非持久化的限制不影响主流程。
 keyring = { version = "3", features = ["linux-native"] }
-# 「正在播放」：MPRIS D-Bus 客户端（Linux 桌面媒体控制标准接口）
-mpris = "2"
+# 「正在播放」/ 系统音频统一走 media-bridge（Linux 侧由其经 zbus 接 MPRIS）
 # gtk 直依赖：与 tao/desktop-underlay 同一大版本（0.18），用于壁纸窗口 realize 状态检测
 gtk = "0.18"
 # 主窗口模糊（KDE KWin，见 blur.rs）：X11 设 _KDE_NET_WM_BLUR_BEHIND_REGION；

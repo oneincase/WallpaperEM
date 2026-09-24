@@ -190,7 +190,7 @@ fn bind_loopback(port: u16) -> Result<std::net::TcpListener, String> {
     const ATTEMPTS: u32 = 8;
     let mut last = String::new();
     for i in 0..ATTEMPTS {
-        match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        match bind_loopback_once(port) {
             Ok(l) => return Ok(l),
             Err(e) => {
                 last = e.to_string();
@@ -203,6 +203,31 @@ fn bind_loopback(port: u16) -> Result<std::net::TcpListener, String> {
         }
     }
     Err(format!("端口 {port} 绑定失败: {last}"))
+}
+
+/// 单次绑定。Unix 上开 SO_REUSEADDR：重启应用 / 改端口 / 轮换令牌后的快速重绑
+/// 常撞上旧监听留下的 TIME_WAIT 连接（macOS 上残留 15~30s，比下面的重试窗口长
+/// 一个量级）——std 的 bind 不开这个选项就必报「端口被占用」，这就是
+/// 「改啥端口都被占用」的根源。SO_REUSEADDR 只放行 TIME_WAIT/无主残留，
+/// 不能绑走别的进程正在 LISTEN 的端口，安全。
+fn bind_loopback_once(port: u16) -> std::io::Result<std::net::TcpListener> {
+    let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+    #[cfg(unix)]
+    {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )?;
+        socket.set_reuse_address(true)?;
+        socket.bind(&addr.into())?;
+        socket.listen(128)?;
+        Ok(socket.into())
+    }
+    #[cfg(not(unix))]
+    {
+        std::net::TcpListener::bind(addr)
+    }
 }
 
 /// 启动 HTTP 服务。端口被占用等失败会写进状态（设置页可见），不 panic。

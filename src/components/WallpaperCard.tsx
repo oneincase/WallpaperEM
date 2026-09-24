@@ -87,16 +87,17 @@ export function WallpaperCard({
         <div className="border-t border-[var(--separator)] bg-[var(--card)]/95 p-2.5 backdrop-blur-md">
           <button
             onClick={onOpen}
-            className="w-full text-left text-[12.5px] font-medium leading-snug hover:text-[var(--accent-strong)]"
+            // card-title-btn：标题块的**外层**两行硬封顶（普通块级盒，max-height
+            // 稳定生效）。内层 span 的 -webkit-line-clamp 负责省略号，但它在
+            // WKWebView 的抽屉动画/虚拟列表重挂场景偶发按未截断高度排版（就是
+            // 「标题下面多出空行」的元凶），外层这层把高度钉死。见 index.css。
+            className="card-title-btn w-full text-left text-[12.5px] font-medium leading-snug hover:text-[var(--accent-strong)]"
             title={title}
           >
             {/* 截断落在外层按钮里的 span 上，而不是按钮自己：
                 ① -webkit-line-clamp 要求 display:-webkit-box，而 <button> 在
                    WebKit 里会把内容包进匿名块，clamp 不保证生效；
-                ② 不用 Tailwind 的 line-clamp-2 工具类：它只给 -webkit-line-clamp，
-                   悬浮抽屉动画/虚拟列表重挂时 WebKit 偶发按未截断高度排版，两行
-                   之下会露出第三行空行。改用 index.css 里带 max-height 硬封顶的
-                   .card-title-clamp（见该类注释），span 上别再叠加 display 工具类 */}
+                ② span 上的 clamp 只负责省略号，高度封顶交给外层 card-title-btn */}
             <span className="card-title-clamp">{title}</span>
           </button>
           {(metaLeft || metaRight) && (

@@ -58,6 +58,8 @@ export function VirtualGrid<T>({
   onNearEnd,
   nearEndThreshold = 400,
   footer,
+  initialScrollTop,
+  onScrollTop,
 }: {
   items: T[];
   /** 单列最小宽度（对应原 minmax(minW, 1fr)） */
@@ -75,6 +77,10 @@ export function VirtualGrid<T>({
   nearEndThreshold?: number;
   /** 网格之后的固定内容（如「正在加载更多…」），仍在同一个滚动容器内 */
   footer?: ReactNode;
+  /** 挂载后恢复到的滚动位置（会话快照还原用）；只在首次布局生效一次 */
+  initialScrollTop?: number;
+  /** 滚动偏移上报（rAF 节流；调用方应写 ref 而非 state，避免逐帧重渲染） */
+  onScrollTop?: (top: number) => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -93,6 +99,10 @@ export function VirtualGrid<T>({
   /** 前瞻 / 滞回撑大的窗口：滑块停手前只扩不缩，避免来回抖动反复挂载卸载 */
   const stickyRef = useRef<Range | null>(null);
   const measureRef = useRef<() => void>(() => {});
+  /** 快照滚动位置只在首次布局生效一次；onScrollTop 回调走 ref 避免监听器重绑 */
+  const initialScrollRef = useRef(initialScrollTop ?? 0);
+  const onScrollTopRef = useRef(onScrollTop);
+  onScrollTopRef.current = onScrollTop;
 
   // 列宽由容器宽度推导，容器宽度又取决于窗口大小 —— 用 ResizeObserver 同时盯
   // 滚动容器（高度）与内容区（宽度，已扣掉 padding）
@@ -191,6 +201,7 @@ export function VirtualGrid<T>({
     // 只在真的比常规窗口更大时才记为「滞回窗口」，否则停手后收不回来
     stickyRef.current = first < base.first || last > base.last ? next : null;
     commit(next);
+    onScrollTopRef.current?.(top);
     if (
       nearEndRef.current &&
       el.scrollHeight - top - el.clientHeight < thresholdRef.current
@@ -208,6 +219,13 @@ export function VirtualGrid<T>({
     // 条目变少后旧 scrollTop 会落到滚动范围之外，必须自己夹回（见文件头 ④）
     const max = Math.max(0, el.scrollHeight - el.clientHeight);
     if (el.scrollTop > max) el.scrollTop = max;
+    // 快照还原的滚动位置：等首次有效布局（行高/条目就绪）后应用一次。
+    // 放在这里而不是 mount effect，是因为 mount 时 box 还是 0、行高未知，
+    // 直接设 scrollTop 会被随后的窗口重算覆盖
+    if (initialScrollRef.current > 0) {
+      el.scrollTop = Math.min(initialScrollRef.current, max);
+      initialScrollRef.current = 0;
+    }
     scrollTopRef.current = el.scrollTop;
     stickyRef.current = null;
     syncRef.current();

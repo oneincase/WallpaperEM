@@ -39,6 +39,10 @@ mod fallback {
         Vec::new()
     }
 
+    pub fn hit_screen_id(_x: f64, _y: f64) -> Option<u32> {
+        None
+    }
+
     pub fn display_asleep() -> bool {
         false
     }

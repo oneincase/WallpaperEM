@@ -47,10 +47,19 @@ type WallpaperConfig = {
   aa?: string;
   particles?: string;
   postProcessing?: string;
+  /**
+   * 本壁纸的精确音量（0..1；0 即静音）。挂载时一律先静音（muted），壁纸完全
+   * 加载完成（首帧/ready）后再按这个值统一起音量 —— 避免「静音壁纸在暂停
+   * 恢复/唤醒重挂后先响一段」以及加载途中就出声。
+   * 缺省（旧会话无记录）时回落 muted 布尔：false=1，true=0。
+   */
+  volume?: number;
   muted?: boolean;
   loop?: boolean;
   /** 内容服务器媒体基址：http://127.0.0.1:<port>/media/<token>（scene 拉取 pkg 用） */
   mediaBase?: string;
+  /** project.json `file` 声明的场景 pkg 相对路径（命名/布局不规范时给拉取指路） */
+  scenePkg?: string;
 };
 
 // 规范化显示模式：兼容旧会话里的 fill（=拉伸）与 fit（=适应）。
@@ -163,7 +172,7 @@ function reportDiag(cfg: WallpaperConfig, msg: string) {
 
 // ---------- 系统音频注入 ----------
 //
-// 内容服务器以 ~30Hz 通过 SSE 推送 64 段频谱（ScreenCaptureKit 系统 loopback → FFT）。
+// 内容服务器以 ~30Hz 通过 SSE 推送 64 段频谱（CoreAudio 进程 Tap / WASAPI 系统 loopback → FFT）。
 // 库的 AudioSource 只要求一个同步的 snapshot()，所以这里做「SSE 异步写入 → 快照同步读出」
 // 的桥：EventSource 收到帧就更新缓冲，库的音频泵逐帧来取最新值。
 //
@@ -551,10 +560,13 @@ function buildSource(cfg: WallpaperConfig): Source | null {
     const base = `${cfg.mediaBase.replace(/\/+$/, "")}/${cfg.src}`;
     return {
       key: base,
-      // scene.pkg 的三种布局逐个回退。每次 fetch 单独 try/catch：Tauri 自定义
+      // scene.pkg 逐个回退，project.json 声明的入口最优先（主 pkg 命名/布局
+      // 不规范的工程只有它指得到）。每次 fetch 单独 try/catch：Tauri 自定义
       // 协议对不存在的路径抛 TypeError 而非返回 404，逐个 try 才不会一抛就整场失败
       async scenePkg(signal) {
-        const paths = ["scene.pkg", "scenes/scene.pkg", "gifscene.pkg"];
+        const paths = [cfg.scenePkg, "scene.pkg", "scenes/scene.pkg", "gifscene.pkg"].filter(
+          (p): p is string => typeof p === "string" && p.length > 0,
+        );
         let lastStatus: number | null = null;
         for (const p of paths) {
           try {
@@ -603,6 +615,36 @@ function buildSource(cfg: WallpaperConfig): Source | null {
     project: async () => ({ type }),
     mediaEntry: async () => ({ url: cfg.src as string, type }),
   };
+}
+
+/**
+ * 本壁纸的目标音量（0..1）。cfg.volume 是播放设置里按壁纸记忆的精确值；
+ * 旧会话没有它时回落 muted 布尔（false=1 / true=0）。
+ */
+function targetVolume(cfg: WallpaperConfig): number {
+  const v = cfg.volume;
+  if (typeof v === "number" && Number.isFinite(v)) return Math.min(1, Math.max(0, v));
+  return cfg.muted === false ? 1 : 0;
+}
+
+/**
+ * 对刚就绪（或刚重挂/恢复）的实例应用本壁纸的目标音量。
+ *
+ * 挂载/重挂一律先静音起播（mountOpts.volume = 0），完全加载后再由这里起音量：
+ *   - 静音壁纸在任何时刻都不出声（此前唤醒重挂/无缝循环兜底路径会先按元素
+ *     默认音量出一段声，再等宿主补 setVolume 才安静）；
+ *   - 非静音壁纸也不会在加载途中以错误音量（元素默认 1.0）抢跑。
+ * 静音视频例外：元素创建时就是静音态（mountOpts.volume=0），而库对视频的
+ * setVolume(0) 会触发 WebCodecs 路径整段重挂（昂贵且无声可纠），跳过不补。
+ */
+function applyWallpaperVolume(inst: SceneInstance) {
+  const v = targetVolume(state.cfg);
+  if (v <= 0 && state.cfg.type === "video") return;
+  try {
+    inst.setVolume(v);
+  } catch {
+    /* 某些类型的实例在特定阶段可能拒绝 setVolume，静默即可 */
+  }
 }
 
 /** 卸载当前壁纸（库实例 / canvas 循环 / 降级 iframe），为下一次挂载腾干净 */
@@ -804,7 +846,9 @@ function mountViaLib(cfg: WallpaperConfig) {
         fit: normalizeFit(cfg.fit),
         renderDpr: toAbsoluteDpr(cfg.renderDpr ?? 0),
         fps: cfg.sceneFps ?? 24,
-        volume: cfg.muted === false ? 1 : 0,
+        // 音量策略：挂载一律 0（静音）起播，加载完成后由 applyWallpaperVolume
+        // 按本壁纸的设置值起音量（见其注释）——不能在这里直接给目标音量
+        volume: 0,
         // 渲染质量档位（库 1.3.23+）：键缺省/非法值由库 normalizeQuality 落默认
         quality: {
           antiAliasing: cfg.aa as QualityOptions["antiAliasing"],
@@ -855,6 +899,9 @@ function mountViaLib(cfg: WallpaperConfig) {
       state.inst = inst;
       // 库首帧后恒为播放态；若当前处于全局暂停（睡眠/用户暂停）需补上
       if (state.paused) inst.pause();
+      // 壁纸已完全加载（mount 等到首帧才返回）：此刻起音量。
+      // 放在 pause() 之后 —— setVolume 的取消静音路径不该把暂停中的壁纸播响
+      applyWallpaperVolume(inst);
       // SSE 常在 mount 之后才首次收到帧；库的音频泵逐帧选源，此时补装也生效。
       // 每次挂载都要重来一遍 —— 切壁纸会换新实例，旧实例上的音频源不会继承
       attachSystemAudio(inst, seq);
@@ -982,6 +1029,12 @@ declare global {
       pushPointer(u: number, v: number, buttons: number): void;
       /** 指针离开本窗口（跨屏或停止注入） */
       pointerLeave(): void;
+      /**
+       * 外部滚轮 / 触控板手势注入（只有 web 壁纸消费；scene 静默无效）。
+       * 原生侧已把方向对齐 WheelEvent（dy 正=向下；双指捏合=ctrl 位 mods bit0）。
+       * 位置沿用最后一次 pushPointer 的坐标。
+       */
+      pushWheel(dx: number, dy: number, mode?: number, mods?: number): void;
     };
   }
 }
@@ -1001,6 +1054,10 @@ window.__wp = {
   },
   resume() {
     state.paused = false;
+    // 先落音量再放行播放：恢复会重放媒体（场景 BGM / 网页 shim 解冻），虽然
+    // 库侧已保证 muted 跨重挂存活，这里仍按「先静音后出声」的纪律再兜一层，
+    // 避免恢复路径里任何一环以默认音量抢跑
+    if (state.inst) applyWallpaperVolume(state.inst);
     state.inst?.resume();
     if (state.cfg.type === "canvas") startCanvasLoop();
   },
@@ -1010,6 +1067,8 @@ window.__wp = {
   },
   setVolume(volume: number) {
     const v = Math.max(0, Math.min(1, volume));
+    // 记住精确值（重挂后按它起音量）；muted 同步保持旧字段一致
+    state.cfg.volume = v;
     state.cfg.muted = v <= 0;
     state.inst?.setVolume(v);
   },
@@ -1027,6 +1086,8 @@ window.__wp = {
     if (state.inst) {
       state.inst.restore();
       if (state.paused) state.inst.pause();
+      // 重挂会重建媒体元素（音量回元素默认值）：先静音起播的纪律在这里补一次
+      applyWallpaperVolume(state.inst);
       return;
     }
     if (state.cfg) mount(state.cfg);
@@ -1039,6 +1100,8 @@ window.__wp = {
     if (state.inst) {
       state.inst.setRenderDpr(absolute);
       if (state.paused) state.inst.pause();
+      // 库内部重挂重建了媒体元素，音量同样要补
+      applyWallpaperVolume(state.inst);
       return;
     }
     mount(state.cfg);
@@ -1100,6 +1163,9 @@ window.__wp = {
   pointerLeave() {
     state.inst?.pointerLeave();
   },
+  pushWheel(dx: number, dy: number, mode = 0, mods = 0) {
+    state.inst?.pushWheel(dx, dy, mode, mods);
+  },
 };
 
 // 初始配置优先取自 URL query（壁纸引擎窗口创建时注入，同步无竞态）
@@ -1116,9 +1182,12 @@ const initialCfg: WallpaperConfig = {
   aa: params.get("aa") ?? undefined,
   particles: params.get("pq") ?? undefined,
   postProcessing: params.get("pp") ?? undefined,
+  // 精确音量（0..1）：有壁纸专属记录时随 query 下发；缺省回落 muted 布尔
+  volume: params.get("volume") != null ? Number(params.get("volume")) : undefined,
   muted: params.get("muted") !== "false",
   loop: params.get("loop") !== "false",
   mediaBase: params.get("mediaBase") ?? undefined,
+  scenePkg: params.get("scenePkg") ?? undefined,
 };
 state.cfg = initialCfg;
 

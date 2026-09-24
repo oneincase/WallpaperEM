@@ -286,6 +286,7 @@ export const EN_US: Record<string, string> = {
   "全选未下载（{n}）": "Select all not downloaded ({n})",
   "该账号还没有订阅任何壁纸": "This account has no workshop subscriptions yet",
   "正在加载更多…": "Loading more…",
+  "已显示全部": "That's everything",
   "已加载全部 {n} 项订阅": "All {n} subscriptions loaded",
   "点选卡片可多选": "Click cards to select multiple",
   "已选 {n} 项": "{n} selected",
@@ -419,10 +420,53 @@ export const EN_US: Record<string, string> = {
     "macOS dynamic wallpaper engine · Browse, download and apply Steam Workshop wallpapers",
   "跨平台动态壁纸引擎 · 浏览/下载并应用 Steam 创意工坊壁纸":
     "Cross-platform dynamic wallpaper engine · Browse, download and apply Steam Workshop wallpapers",
-  "以 MIT 许可开源。内含第三方组件 mediaremote-adapter（BSD-3-Clause），用于读取系统「正在播放」信息。":
-    "Open source under the MIT license. Bundles the third-party component mediaremote-adapter (BSD-3-Clause) for reading system Now Playing information.",
+  "以 MIT 许可开源。系统「正在播放」与系统音频采集基于同作者的开源组件 media-bridge（MIT）。":
+    "Open source under the MIT license. System Now Playing and system audio capture are built on media-bridge (MIT), an open-source component by the same author.",
   "AI / MCP": "AI / MCP",
   "按标签切换设置分类": "Switch settings categories with the tabs",
+  // ---- 设置 → 性能（渲染质量三档） ----
+  "性能": "Performance",
+  "抗锯齿": "Anti-aliasing",
+  "关闭（默认，最省性能）": "Off (default, lowest cost)",
+  "FXAA：帧末一次后处理，平滑所有边缘（含贴图边缘），成本低":
+    "FXAA: one post-processing pass at the end of the frame, smooths every edge (including texture edges); cheap",
+  "MSAA 2x：多重采样，只平滑几何边缘（图层/粒子边缘），画质最正":
+    "MSAA 2x: multisampling, smooths geometry edges only (layer/particle edges); most faithful image",
+  "MSAA 4x：多重采样 4 倍，几何边缘最平滑，GPU 占用最高":
+    "MSAA 4x: 4× multisampling, smoothest geometry edges, highest GPU cost",
+  "粒子": "Particles",
+  "高（默认）：完整粒子数量（雨/雪/火花/雾/光轴）":
+    "High (default): full particle counts (rain/snow/sparks/fog/light shafts)",
+  "中：粒子数量与发射率 ×0.7，GPU/CPU 占用降低":
+    "Medium: particle count and emission rate ×0.7, lower GPU/CPU load",
+  "低：粒子数量与发射率 ×0.4，明显省性能":
+    "Low: particle count and emission rate ×0.4, noticeably cheaper",
+  "关：不渲染也不模拟粒子，最省性能":
+    "Off: particles are neither rendered nor simulated; cheapest",
+  "后处理": "Post-processing",
+  "高（默认）：效果链全分辨率（辉光/模糊/水波等画面效果）":
+    "High (default): effect chains at full resolution (bloom/blur/water ripples and other effects)",
+  "中：效果链分辨率压到屏幕尺寸以内，显存占用降低":
+    "Medium: effect-chain resolution capped at the screen size, lower VRAM use",
+  "低：效果链分辨率减半，显存占用约 1/4":
+    "Low: effect-chain resolution halved, roughly 1/4 the VRAM use",
+  "高": "High",
+  "中": "Medium",
+  "低": "Low",
+  "关": "Off",
+  // ---- 设置 → 性能（WE 官方素材通路） ----
+  "官方素材（Wallpaper Engine）": "Official assets (Wallpaper Engine)",
+  "已探测到 Wallpaper Engine 官方素材树：粒子/光效/渐变与文字字体按原版像素渲染（{count} 张贴图）。关闭后使用内置程序化复刻":
+    "Wallpaper Engine's official asset tree was found: particles/effects/gradients and text fonts render with original pixels ({count} textures). Turn off to use the built-in procedural replicas",
+  "本机安装 Wallpaper Engine 后，粒子/光效/渐变与文字字体可按官方原版像素渲染；未安装时使用内置程序化复刻，观感接近但不完全一致。默认开启，探测不到素材时无额外开销":
+    "With Wallpaper Engine installed, particles/effects/gradients and text fonts can render with official original pixels; without it, built-in procedural replicas are used — close-looking but not pixel-identical. On by default; no overhead when assets aren't found",
+  "素材根": "Assets root",
+  "未探测到官方素材树（Steam 库的 wallpaper_engine/assets）；可在下方手动指定 assets 目录":
+    "Official asset tree not found (wallpaper_engine/assets in your Steam library); you can specify the assets folder manually below",
+  "自定义素材目录": "Custom assets folder",
+  "可选。直接包含 materials/ 子目录的 Wallpaper Engine assets 根；留空则自动探测所有 Steam 库。修改后壁纸重载一次":
+    "Optional. The Wallpaper Engine assets root that directly contains a materials/ subfolder; leave empty to auto-detect across Steam libraries. Wallpapers reload once after changing it",
+  "自动探测，可手动填写绝对路径": "Auto-detected; you can type an absolute path",
   "已清除 {size}": "Cleared {size}",
   "缓存已经是空的": "Cache is already empty",
   "请填写用户名与密码": "Enter the username and password",
@@ -540,12 +584,12 @@ export const EN_US: Record<string, string> = {
     "120 FPS: smoothest, highest GPU load (only visible on a high-refresh display)",
   "60 FPS：画质与 GPU 占用均衡": "60 FPS: balanced quality and GPU load",
   "音频可视化（系统声音）": "Audio visualisation (system sound)",
-  "开启后壁纸可响应整个系统的声音（如音乐软件），与 WE 桌面端一致；macOS 需授予屏幕录制权限，Windows 无需授权。壁纸自带的音乐无需此开关也会可视化":
-    "When on, wallpapers can react to sound from the whole system (e.g. a music player), matching WE's desktop app. macOS requires Screen Recording permission; Windows needs none. A wallpaper's own music is visualised regardless.",
-  "当前平台暂不支持系统音频捕获（Linux 待接入 PipeWire）；壁纸自带的音乐无需此开关也会可视化":
-    "System audio capture is not supported on this platform yet (Linux awaits PipeWire); a wallpaper's own music is visualised regardless.",
-  "当前平台暂不支持系统音频捕获（macOS CoreAudio / Windows WASAPI 已支持；Linux 待后续版本接入 PipeWire）":
-    "System audio capture is not supported on this platform yet (macOS CoreAudio and Windows WASAPI are supported; Linux will get PipeWire in a later release)",
+  "开启后壁纸可响应整个系统的声音（如音乐软件），与 WE 桌面端一致；macOS 需在「隐私与安全性 → 录屏与系统录音 → 仅系统录音」中允许（无自动弹框，改动后需重新开关或重启应用），Windows / Linux 无需授权（Linux 需系统带有 PulseAudio 或 PipeWire）。壁纸自带的音乐无需此开关也会可视化":
+    "When on, wallpapers can react to sound from the whole system (e.g. a music player), matching WE's desktop app. On macOS allow it under “Privacy & Security → Screen & System Audio Recording → System Audio only” (no automatic prompt; re-toggle or restart after changes); Windows and Linux need no permission (Linux requires PulseAudio or PipeWire). A wallpaper's own music is visualised regardless.",
+  "当前平台暂不支持系统音频捕获（macOS CoreAudio / Windows WASAPI / Linux PulseAudio·PipeWire 均已支持）；壁纸自带的音乐无需此开关也会可视化":
+    "System audio capture is not supported on this platform (supported on macOS via CoreAudio, Windows via WASAPI, and Linux via PulseAudio/PipeWire); a wallpaper's own music is visualised regardless.",
+  "当前平台暂不支持系统音频捕获（macOS CoreAudio / Windows WASAPI / Linux PulseAudio·PipeWire 均已支持）":
+    "System audio capture is not supported on this platform (supported on macOS via CoreAudio, Windows via WASAPI, and Linux via PulseAudio/PipeWire)",
   "自动设置系统壁纸": "Set the system wallpaper automatically",
   "应用动态壁纸后，自动抽首帧（scene/web 用工坊预览图）设为 macOS 静态壁纸：锁屏、登录窗口与壁纸引擎未运行时保持视觉一致":
     "After applying a dynamic wallpaper, extract its first frame (scene/web use the workshop preview) and set it as the macOS wallpaper, so the lock screen, login window and desktop stay consistent while the engine is not running",
@@ -568,6 +612,11 @@ export const EN_US: Record<string, string> = {
   "自动暂停": "Auto pause",
   "切到非桌面应用时自动暂停壁纸，切回桌面时自动播放（手动暂停不受影响）":
     "Pause the wallpaper while a non-desktop app is focused and resume when the desktop comes back (manual pauses are unaffected)",
+  "暂停释放内存": "Release memory on pause",
+  "开启：自动暂停时直接结束桌面壁纸渲染器以释放内存，回到桌面后完全重新加载壁纸（需开启「自动暂停」）":
+    "On: auto pause kills the wallpaper renderer processes to free memory; returning to the desktop fully reloads the wallpaper (requires \"Auto pause\")",
+  "关闭：自动暂停仅暂停渲染，壁纸保持在内存中（默认，回到桌面立即恢复）":
+    "Off: auto pause only pauses rendering and keeps the wallpaper in memory (default; instant resume on the desktop)",
   "隐藏图标": "Hide desktop icons",
   "开启：壁纸窗口位于桌面图标之上（会盖住桌面图标，用于场景视差/网页互动）":
     "On: the wallpaper window sits above the desktop icons (covers them; used for scene parallax and web interaction)",
@@ -616,8 +665,8 @@ export const EN_US: Record<string, string> = {
   "将删除预览图/网页缓存与壁纸首帧封面，并清空工坊、发现页的列表快照。":
     "Deletes preview/web cache and wallpaper first-frame covers, and clears the workshop/discover list snapshots.",
   "清除": "Clear",
-  "⚠️ 权限尚未生效：① 系统设置 → 隐私与安全性 → 屏幕录制 → 允许 WallpaperEM；② 完全退出应用（⌘Q）再重新打开（运行中的进程不会自动获得新授权）；③ 若列表里已开启但重启后仍无效，先在列表中选中 WallpaperEM 按「−」移除，再重新添加并允许":
-    "⚠️ Permission not effective yet: ① System Settings → Privacy & Security → Screen Recording → allow WallpaperEM; ② fully quit the app (⌘Q) and reopen it (a running process never picks up a new grant); ③ if it is already enabled in the list but still fails after a restart, remove WallpaperEM with “−” and add it again, then allow",
+  "⚠️ 尚未授权：系统设置 → 隐私与安全性 → 录屏与系统录音 → 「仅系统录音」分组 → 打开 WallpaperEM，然后重新关闭/打开本开关（或重启应用）":
+    "⚠️ Not authorized yet: System Settings → Privacy & Security → Screen & System Audio Recording → “System Audio only” → enable WallpaperEM, then re-toggle this switch (or restart the app)",
   "⚠️ 权限尚未生效：请在系统设置中允许本应用捕获系统音频，然后完全退出应用再重新打开":
     "⚠️ Permission not effective yet: allow this app to capture system audio in your system settings, then fully quit and reopen the app",
 };
@@ -626,14 +675,25 @@ export const EN_US_BACKEND: Record<string, string> = {
   // ⚠️ 键 = Rust 侧**格式化后**会产出的中文原文（含 {} 占位符的位置，与后端 format!
   // 的写法逐字对齐；Rust 的 {:?} 这类格式说明符在译文里写成 {} 即可）。
   // 值里的 {} 按出现顺序回填捕获到的片段，片段本身若还是中文会再翻一次（嵌套消息）。
-  // 音频捕获
-  "获取可捕获内容超时": "Timed out getting shareable content",
-  "获取可捕获内容失败（可能未授权屏幕录制）": "Failed to get shareable content (screen recording may not be authorized)",
-  "屏幕录制权限未生效：① 系统设置 → 隐私与安全性 → 屏幕录制 允许 WallpaperEM；② 完全退出（⌘Q）重开应用；③ 仍无效则在列表中移除 WallpaperEM 后重新添加": "Screen recording permission is not in effect yet: ① System Settings → Privacy & Security → Screen Recording → allow WallpaperEM; ② fully quit (⌘Q) and reopen the app; ③ if it still fails, remove WallpaperEM from the list and add it again",
-  "注册音频输出失败: {}": "Failed to register audio output: {}",
-  "启动音频捕获超时": "Timed out starting audio capture",
-  "系统音频捕获暂不支持当前平台（macOS 用 ScreenCaptureKit、Windows 用 WASAPI，Linux 待接入 PipeWire）": "System audio capture is not available on this platform yet (macOS uses ScreenCaptureKit, Windows uses WASAPI, Linux still needs a PipeWire backend)",
+  // WE 官方素材通路
+  "目录不存在：{}": "Folder does not exist: {}",
+  "该目录下没有 materials/ 子目录（应选择 Wallpaper Engine 的 assets 根）":
+    "That folder has no materials/ subfolder (choose the Wallpaper Engine assets root)",
+  // 音频捕获（macOS CoreAudio 进程 Tap / Windows WASAPI）
+  "系统音频捕获需要 macOS 14.2 或更高版本（进程 Tap API）":
+    "System audio capture requires macOS 14.2 or newer (the process-tap API)",
+  "系统音频捕获需要 macOS 14.2 或更高版本（CATapDescription 不可用）":
+    "System audio capture requires macOS 14.2 or newer (CATapDescription is unavailable)",
+  "创建 Tap 描述失败": "Failed to create the tap description",
+  "创建系统音频 Tap 失败（错误码 {}）。请到 系统设置 → 隐私与安全性 → 录屏与系统录音 → 「仅系统录音」检查 WallpaperEM 是否已开启（该面板没有自动弹框），改完后重启应用":
+    "Failed to create the system audio tap (code {}). Check that WallpaperEM is enabled under System Settings → Privacy & Security → Screen & System Audio Recording → “System Audio only” (this pane never prompts automatically), then restart the app",
+  "读取 Tap 标识失败: {}": "Failed to read the tap identifier: {}",
+  "系统音频格式不支持（错误码 {}）": "The system audio format is unsupported (code {})",
+  "创建音频聚合设备失败: {}": "Failed to create the audio aggregate device: {}",
+  "注册音频回调失败: {}": "Failed to register the audio callback: {}",
+  "启动音频捕获失败: {}": "Failed to start audio capture: {}",
   "启动音频捕获线程失败: {e}": "Failed to start the audio capture thread: {}",
+  "系统音频捕获暂不支持当前平台（macOS 用 CoreAudio 进程 Tap、Windows 用 WASAPI，Linux 待接入 PipeWire）": "System audio capture is not available on this platform yet (macOS uses a CoreAudio process tap, Windows uses WASAPI, Linux still needs a PipeWire backend)",
   "启动音频捕获超时（未能在 10 秒内打开默认输出设备）": "Timed out starting audio capture (could not open the default output device within 10 seconds)",
   "音频设备枚举器不可用: {e}": "Audio device enumerator unavailable: {}",
   "没有可用的默认输出设备: {e}": "No usable default output device: {}",

@@ -14,6 +14,7 @@ mod keychain;
 mod library;
 mod main_window;
 mod mcp;
+mod media_bridge;
 mod mem_pressure;
 mod mem_watch;
 mod misc;
@@ -26,6 +27,7 @@ mod system_wallpaper;
 mod update;
 mod util;
 mod wallpaper;
+mod we_assets;
 #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
 mod workshop_upload;
 mod workspace;
@@ -173,9 +175,10 @@ pub fn run() {
             ffmpeg::init(app.handle());
             // 音频捕获状态须先于内容服务器（SSE 端点读取其共享频谱帧）
             audio_capture::init(app.handle())?;
-            // 「正在播放」订阅同理：/now-playing SSE 读它的共享快照。
-            // 常驻子进程，起不来只是媒体集成不可用，不影响其他功能
-            now_playing::start(app.handle());
+            // 全平台媒体桥接（正在播放元数据 + 系统音频采集的统一引擎）：
+            // /now-playing SSE 与 audio_capture 都从这一个 bridge 取数据。
+            // 起不来只是媒体集成不可用，不影响其他功能
+            media_bridge::start(app.handle());
             content_server::init(app.handle()).map_err(|e| e.to_string())?;
             // 视频封面后台补齐：不在列表路径里做（历史版本在列表里惰性抽帧，
             // 解不动的格式每次刷新重试一遍，直接把库页面冻死）
@@ -231,8 +234,9 @@ pub fn run() {
             if let Some(w) = app.get_webview_window("main") {
                 let visible = w.is_visible().unwrap_or(false);
                 tracing::info!("main window visible={visible}");
-                // 关闭主窗口 = 隐藏（壁纸继续运行；点 Dock 图标重新显示）
-                main_window::register_close_to_hide(&w);
+                // 关闭主窗口 = 立即销毁并结束其 WebContent 进程（释放内存，
+                // 桌面只留壁纸渲染进程）；点 Dock 图标/托盘按需重建
+                main_window::register_close_to_release(&w);
             }
             // 主窗口按需回收：只在系统内存压力下销毁隐藏中的窗口，回收它的
             // WebContent 进程（壁纸窗口不受影响）；唤起时按需重建
@@ -283,6 +287,9 @@ pub fn run() {
             wallpaper::item_play_config_get,
             wallpaper::item_play_config_set,
             wallpaper::interactive_set,
+            wallpaper::local_assets_set,
+            wallpaper::we_assets_dir_set,
+            wallpaper::local_assets_status,
             wallpaper::next,
             wallpaper::playlist_list,
             wallpaper::playlist_create,
@@ -371,7 +378,7 @@ pub fn run() {
                 tracing::info!("all windows destroyed; keep running in tray");
             }
             tauri::RunEvent::Exit => {
-                crate::now_playing::stop();
+                crate::media_bridge::stop();
             }
             _ => {}
         });

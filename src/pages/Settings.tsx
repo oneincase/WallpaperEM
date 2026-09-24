@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -8,6 +8,7 @@ import {
   type DownloadToolStatus,
   type FfmpegInstallProgress,
   type FfmpegStatus,
+  type LocalAssetsStatus,
   type McpConfigSnippet,
   type McpStatus,
   type SteamcmdInstallProgress,
@@ -37,6 +38,9 @@ export function SettingsPage() {
   const [interactive, setInteractive] = useState(false);
   const [autoSystemStatic, setAutoSystemStatic] = useState(true);
   const [autoPause, setAutoPause] = useState(false);
+  // 暂停释放内存：自动暂停的加强形态（默认关）。开启后自动暂停会直接销毁
+  // 壁纸渲染窗口（渲染进程结束、内存归还），回到桌面时按会话配置整窗重建
+  const [autoPauseRelease, setAutoPauseRelease] = useState(false);
   const [audioProcessing, setAudioProcessing] = useState(false);
   const [audioMsg, setAudioMsg] = useState("");
   // 全局壁纸显示模式（cover/contain/stretch），默认 cover 等比铺满裁切
@@ -59,6 +63,13 @@ export function SettingsPage() {
   // 后处理质量档 high 默认 / medium / low / off
   const [post, setPost] = useState<string>("high");
   const [postMsg, setPostMsg] = useState("");
+  // WE 官方素材通路（webwallgl 1.4.1 local-assets）：本机装了 WE 时用官方原版贴图
+  const [localAssets, setLocalAssets] = useState<LocalAssetsStatus | null>(null);
+  const [localAssetsMsg, setLocalAssetsMsg] = useState("");
+  const [localAssetsBusy, setLocalAssetsBusy] = useState(false);
+  const [weAssetsDir, setWeAssetsDir] = useState("");
+  // 首次拿到状态后才把自定义路径灌进输入框，避免编辑中途被覆盖
+  const weAssetsDirHydrated = useRef(false);
   // 壁纸语言（只影响壁纸的 language 属性，不是软件本体语言）。默认英文
   const [language, setLanguage] = useState<string>("english");
   // 界面语言（i18n）：这里只是订阅，取词走模块级 tr()；订阅是为了本页文案跟着变
@@ -123,6 +134,9 @@ export function SettingsPage() {
     invoke<string | null>("settings_get", { key: "wallpaper_auto_pause" })
       .then((v) => setAutoPause(v === "true" || v === "1"))
       .catch(() => { });
+    invoke<string | null>("settings_get", { key: "wallpaper_auto_pause_release" })
+      .then((v) => setAutoPauseRelease(v === "true" || v === "1"))
+      .catch(() => { });
     // 默认开启：键未写入过视为 true
     invoke<string | null>("settings_get", { key: "wallpaper_auto_system_static" })
       .then((v) => setAutoSystemStatic(v == null || v === "true" || v === "1"))
@@ -147,8 +161,19 @@ export function SettingsPage() {
       .then((v) => setParticles(v || "high"))
       .catch(() => { });
     invoke<string | null>("settings_get", { key: "wallpaper_post" })
-      .then((v) => setPost(v || "high"))
+      // 旧版本存过 off（该档已移除，后处理不再允许整屏关闭）：归一到 low
+      .then((v) => setPost(v === "off" ? "low" : v || "high"))
       .catch(() => { });
+    api
+      .wallpaperLocalAssetsStatus()
+      .then((s) => {
+        setLocalAssets(s);
+        if (!weAssetsDirHydrated.current) {
+          setWeAssetsDir(s.customDir);
+          weAssetsDirHydrated.current = true;
+        }
+      })
+      .catch(console.warn);
     invoke<string | null>("settings_get", { key: "language" })
       .then((v) => v && setLanguage(v))
       .catch(() => { });
@@ -453,6 +478,21 @@ export function SettingsPage() {
     }
   };
 
+  // 暂停释放内存：自动暂停时销毁壁纸渲染器、回桌面完全重载（默认关）。
+  // 只写设置——下一次自动暂停生效（已在暂停中不会 retroactive 触发）
+  const toggleAutoPauseRelease = async () => {
+    const next = !autoPauseRelease;
+    try {
+      await invoke("settings_set", {
+        key: "wallpaper_auto_pause_release",
+        value: next ? "true" : "false",
+      });
+      setAutoPauseRelease(next);
+    } catch {
+      // 失败则不变
+    }
+  };
+
   const toggleInteractive = async () => {
     const next = !interactive;
     try {
@@ -463,15 +503,17 @@ export function SettingsPage() {
     }
   };
 
-  // 音频可视化（系统音频处理）：macOS 需屏幕录制授权（走系统音频 tap），
-  // Windows 走 WASAPI loopback（无需任何授权），Linux 待接入 PipeWire
+  // 音频可视化（系统音频处理）：三平台统一由 media-bridge 采集 —— macOS 走
+  // CoreAudio 进程 Tap，需要「系统音频录制」授权（系统设置 → 隐私与安全性 →
+  // 录屏与系统录音 → 仅系统录音分组），该面板没有自动弹框，需手动开启；
+  // Windows 走 WASAPI loopback、Linux 走 PulseAudio/PipeWire monitor，均无需授权
   const toggleAudioProcessing = async () => {
     const next = !audioProcessing;
     setAudioMsg("");
     if (next && !audioSupported) {
       setAudioMsg(
         tr(
-          "当前平台暂不支持系统音频捕获（macOS CoreAudio / Windows WASAPI 已支持；Linux 待后续版本接入 PipeWire）",
+          "当前平台暂不支持系统音频捕获（macOS CoreAudio / Windows WASAPI / Linux PulseAudio·PipeWire 均已支持）",
         ),
       );
       return;
@@ -483,7 +525,7 @@ export function SettingsPage() {
         setAudioMsg(
           isMac
             ? tr(
-                "⚠️ 权限尚未生效：① 系统设置 → 隐私与安全性 → 屏幕录制 → 允许 WallpaperEM；② 完全退出应用（⌘Q）再重新打开（运行中的进程不会自动获得新授权）；③ 若列表里已开启但重启后仍无效，先在列表中选中 WallpaperEM 按「−」移除，再重新添加并允许",
+                "⚠️ 尚未授权：系统设置 → 隐私与安全性 → 录屏与系统录音 → 「仅系统录音」分组 → 打开 WallpaperEM，然后重新关闭/打开本开关（或重启应用）",
               )
             : tr("⚠️ 权限尚未生效：请在系统设置中允许本应用捕获系统音频，然后完全退出应用再重新打开"),
         );
@@ -562,6 +604,40 @@ export function SettingsPage() {
     }
   };
 
+  // WE 官方素材通路：挂载时生效，切换后现有壁纸整页重载一次
+  const toggleLocalAssets = async (enabled: boolean) => {
+    setLocalAssetsMsg("");
+    setLocalAssetsBusy(true);
+    const prev = localAssets?.enabled ?? true;
+    setLocalAssets((s) => (s ? { ...s, enabled } : s));
+    try {
+      await api.wallpaperLocalAssetsSet(enabled);
+      const s = await api.wallpaperLocalAssetsStatus();
+      setLocalAssets(s);
+    } catch (e) {
+      setLocalAssets((s) => (s ? { ...s, enabled: prev } : s));
+      setLocalAssetsMsg(String(e));
+    } finally {
+      setLocalAssetsBusy(false);
+    }
+  };
+
+  // 保存自定义 assets 根（其下需直接有 materials/）；空串清除并回到自动探测
+  const saveWeAssetsDir = async () => {
+    setLocalAssetsMsg("");
+    setLocalAssetsBusy(true);
+    try {
+      await api.wallpaperWeAssetsDirSet(weAssetsDir.trim());
+      const s = await api.wallpaperLocalAssetsStatus();
+      setLocalAssets(s);
+      setWeAssetsDir(s.customDir);
+    } catch (e) {
+      setLocalAssetsMsg(String(e));
+    } finally {
+      setLocalAssetsBusy(false);
+    }
+  };
+
   // 语言在挂载时才注入（壁纸 project.json 没有自带 language 属性时生效），
   // 改完需要重新应用壁纸；不像清晰度/帧率能实时热切
   const changeLanguage = async (next: string) => {
@@ -620,6 +696,13 @@ export function SettingsPage() {
     void applyMcp(() => api.mcpSetEnabled(next), next ? tr("MCP 服务已启用") : tr("MCP 服务已关闭"));
   };
 
+  // 双触发防抖：Enter 提交后紧接着的 blur 会再触发一次 commit —— 此刻 mcp 状态
+  // 还没被响应刷新（旧 port 守卫放行），第二次 mcpSetPort 会把刚绑好的监听拆掉
+  // 重绑同一端口，撞上 TIME_WAIT 就误报「端口被占用」。记下最近提交的端口，
+  // 同值重复提交直接忽略；提交失败（状态没到新端口）时清掉允许原样重试
+  const lastPortCommitRef = useRef<number | null>(null);
+  const mcpRef = useRef(mcp);
+  mcpRef.current = mcp;
   const commitMcpPort = () => {
     const port = Number(mcpPort.trim());
     if (!Number.isInteger(port) || port <= 1024 || port > 65535) {
@@ -627,8 +710,12 @@ export function SettingsPage() {
       setMcpPort(String(mcp?.port ?? ""));
       return;
     }
+    if (port === lastPortCommitRef.current) return;
+    lastPortCommitRef.current = port;
     if (mcp && port === mcp.port) return;
-    void applyMcp(() => api.mcpSetPort(port), tr("端口已改为 {port}", { port }));
+    void applyMcp(() => api.mcpSetPort(port), tr("端口已改为 {port}", { port })).then(() => {
+      if (mcpRef.current?.port !== port) lastPortCommitRef.current = null;
+    });
   };
 
   const rotateMcpToken = () => {
@@ -1029,9 +1116,9 @@ export function SettingsPage() {
                 desc={
                   audioSupported
                     ? tr(
-                        "开启后壁纸可响应整个系统的声音（如音乐软件），与 WE 桌面端一致；macOS 需授予屏幕录制权限，Windows 无需授权。壁纸自带的音乐无需此开关也会可视化",
+                        "开启后壁纸可响应整个系统的声音（如音乐软件），与 WE 桌面端一致；macOS 需在「隐私与安全性 → 录屏与系统录音 → 仅系统录音」中允许（无自动弹框，改动后需重新开关或重启应用），Windows 无需授权。壁纸自带的音乐无需此开关也会可视化",
                       )
-                    : tr("当前平台暂不支持系统音频捕获（Linux 待接入 PipeWire）；壁纸自带的音乐无需此开关也会可视化")
+                    : tr("当前平台暂不支持系统音频捕获（macOS CoreAudio / Windows WASAPI / Linux PulseAudio·PipeWire 均已支持）；壁纸自带的音乐无需此开关也会可视化")
                 }
                 control={<Switch checked={audioProcessing} onChange={toggleAudioProcessing} />}
               />
@@ -1113,6 +1200,15 @@ export function SettingsPage() {
                 label={tr("自动暂停")}
                 desc={tr("切到非桌面应用时自动暂停壁纸，切回桌面时自动播放（手动暂停不受影响）")}
                 control={<Switch checked={autoPause} onChange={toggleAutoPause} />}
+              />
+              <Row
+                label={tr("暂停释放内存")}
+                desc={
+                  autoPauseRelease
+                    ? tr("开启：自动暂停时直接结束桌面壁纸渲染器以释放内存，回到桌面后完全重新加载壁纸（需开启「自动暂停」）")
+                    : tr("关闭：自动暂停仅暂停渲染，壁纸保持在内存中（默认，回到桌面立即恢复）")
+                }
+                control={<Switch checked={autoPauseRelease} onChange={toggleAutoPauseRelease} />}
               />
               <Row
                 label={tr("隐藏图标")}
@@ -1288,9 +1384,7 @@ export function SettingsPage() {
                     ? tr("高（默认）：效果链全分辨率（辉光/模糊/水波等画面效果）")
                     : post === "medium"
                       ? tr("中：效果链分辨率压到屏幕尺寸以内，显存占用降低")
-                      : post === "low"
-                        ? tr("低：效果链分辨率减半，显存占用约 1/4")
-                        : tr("关：图层效果链直通 + 跳过整屏后期 + 关辉光，最省性能")
+                      : tr("低：效果链分辨率减半，显存占用约 1/4")
                 }
                 control={
                   <div className="flex items-center gap-2">
@@ -1302,12 +1396,73 @@ export function SettingsPage() {
                       <option value="high">{tr("高")}</option>
                       <option value="medium">{tr("中")}</option>
                       <option value="low">{tr("低")}</option>
-                      <option value="off">{tr("关")}</option>
                     </select>
                     {postMsg && <span className="text-[12px] text-red-500">{postMsg}</span>}
                   </div>
                 }
               />
+              <Row
+                label={tr("官方素材（Wallpaper Engine）")}
+                desc={
+                  localAssets?.available
+                    ? tr(
+                        "已探测到 Wallpaper Engine 官方素材树：粒子/光效/渐变与文字字体按原版像素渲染（{count} 张贴图）。关闭后使用内置程序化复刻",
+                        { count: localAssets.texCount },
+                      )
+                    : tr(
+                        "本机安装 Wallpaper Engine 后，粒子/光效/渐变与文字字体可按官方原版像素渲染；未安装时使用内置程序化复刻，观感接近但不完全一致。默认开启，探测不到素材时无额外开销",
+                      )
+                }
+                control={
+                  <Switch
+                    checked={localAssets?.enabled ?? true}
+                    disabled={localAssetsBusy}
+                    onChange={(v) => void toggleLocalAssets(v)}
+                  />
+                }
+              />
+              {localAssets?.enabled && (
+                <>
+                  <div className="flex items-center gap-2 px-3 pb-1 text-[12px]">
+                    {localAssets?.available ? (
+                      <span className="break-all text-green-600 dark:text-green-400">
+                        {tr("素材根")}: {localAssets.root}
+                      </span>
+                    ) : (
+                      <span className="text-[var(--text-2)]">
+                        {tr("未探测到官方素材树（Steam 库的 wallpaper_engine/assets）；可在下方手动指定 assets 目录")}
+                      </span>
+                    )}
+                  </div>
+                  <Row
+                    label={tr("自定义素材目录")}
+                    desc={tr("可选。直接包含 materials/ 子目录的 Wallpaper Engine assets 根；留空则自动探测所有 Steam 库。修改后壁纸重载一次")}
+                    control={
+                      <div className="flex w-64 items-center gap-2">
+                        <input
+                          type="text"
+                          value={weAssetsDir}
+                          spellCheck={false}
+                          placeholder={tr("自动探测，可手动填写绝对路径")}
+                          onChange={(e) => setWeAssetsDir(e.target.value)}
+                          className="min-w-0 flex-1 rounded-lg border border-[var(--separator)] bg-[var(--content)] px-2 py-1 text-[12px] outline-none focus:border-[var(--accent-strong)]"
+                        />
+                        <button
+                          type="button"
+                          className="btn !py-1 text-[11.5px] disabled:opacity-50"
+                          disabled={localAssetsBusy}
+                          onClick={() => void saveWeAssetsDir()}
+                        >
+                          {tr("保存")}
+                        </button>
+                      </div>
+                    }
+                  />
+                </>
+              )}
+              {localAssetsMsg && (
+                <div className="px-3 pb-1 text-[12px] text-red-500">{trMsg(localAssetsMsg)}</div>
+              )}
             </Group>
           )}
 
@@ -1505,7 +1660,7 @@ const RELEASES_URL = `${REPO_URL}/releases`;
 const CHANGELOG_URL = `${REPO_URL}/blob/main/CHANGELOG.md`;
 const ISSUES_URL = `${REPO_URL}/issues`;
 const LICENSE_URL = `${REPO_URL}/blob/main/LICENSE`;
-const MEDIAREMOTE_URL = "https://github.com/ungive/mediaremote-adapter";
+const MEDIA_BRIDGE_URL = "https://github.com/oneincase/media-bridge";
 
 /** 「关于」面板上次的检查结果：切标签会重挂组件，缓存一下避免每次进页面都打 GitHub API */
 let aboutCheckCache: UpdateInfo | null = null;
@@ -1755,12 +1910,12 @@ function AboutPanel() {
           <button className={linkBtn} onClick={() => void openUrl(LICENSE_URL)}>
             {tr("开源许可")}
           </button>
-          <button className={linkBtn} onClick={() => void openUrl(MEDIAREMOTE_URL)}>
+          <button className={linkBtn} onClick={() => void openUrl(MEDIA_BRIDGE_URL)}>
             {tr("第三方组件")}
           </button>
         </div>
         <div className="mt-3 text-[11.5px] leading-relaxed text-[var(--text-2)] opacity-80">
-          {tr("以 MIT 许可开源。内含第三方组件 mediaremote-adapter（BSD-3-Clause），用于读取系统「正在播放」信息。")}
+          {tr("以 MIT 许可开源。系统「正在播放」与系统音频采集基于同作者的开源组件 media-bridge（MIT）。")}
         </div>
         <div className="mt-2 text-[11.5px] text-[var(--text-2)] opacity-60">
           © {new Date().getFullYear()} oneincase · MIT License
@@ -1839,17 +1994,20 @@ function Row({
 function Switch({
   checked,
   onChange,
+  disabled,
 }: {
   checked: boolean;
   onChange: (v: boolean) => void;
+  disabled?: boolean;
 }) {
   return (
     <button
       type="button"
       role="switch"
       aria-checked={checked}
+      disabled={disabled}
       onClick={() => onChange(!checked)}
-      className={`relative inline-flex h-[22px] w-[38px] shrink-0 items-center rounded-full transition-colors ${checked ? "bg-[var(--accent-strong)]" : "bg-[var(--separator)]"
+      className={`relative inline-flex h-[22px] w-[38px] shrink-0 items-center rounded-full transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${checked ? "bg-[var(--accent-strong)]" : "bg-[var(--separator)]"
         }`}
     >
       <span

@@ -196,13 +196,21 @@ body {
   box-shadow: var(--shadow);
 }
 
-/* 卡片抽屉标题：最多两行，超出省略。
-   不直接用 Tailwind 的 line-clamp-2 —— 它只给 -webkit-line-clamp，截断高度完全
-   依赖 WebKit 对「悬浮抽屉 transform 动画 + 虚拟列表重挂」时的行数测量；实测在
-   WKWebView 里这类合成上下文切换会让 -webkit-box 偶发按未截断高度排版，长标题
-   被截成两行后下面仍露出第三行的空白。这里在 line-clamp 之外再加一个与两行行高
-   严格相等的 max-height 硬封顶（font-size 12.5 × leading 1.375 × 2 = 2.75em）：
-   一行标题仍只占一行，两行封顶，任何测量异常都不可能再露出第三行空行。 */
+/* 卡片抽屉标题：最多两行，超出省略。双层保险，各自堵一种 WebKit 失效：
+   ① 内层 .card-title-clamp（-webkit-box + line-clamp）负责两行截断与省略号。
+      实测 WKWebView 在「悬浮抽屉 transform 动画 + 虚拟列表重挂」的合成上下文里，
+      -webkit-box 偶发按未截断高度排版 —— 标题明明只有两行，盒子却占四五行的
+      高度，下面空出一大段（就是「标题多余空行」的来源），且它自己的
+      max-height 在这种场景下也一起失灵。
+   ② 外层 .card-title-btn（普通块级按钮）再压一个与两行行高严格相等的
+      max-height + overflow:hidden。按钮不是 -webkit-box，max-height 在任何
+      场景都稳定生效；即便内层盒子抽风撑高，外层也把标题块钉死在两行。
+   行高账：font-size 12.5 × leading 1.375（leading-snug）× 2 行 = 2.75em。 */
+.card-title-btn {
+  display: block;
+  max-height: 2.75em;
+  overflow: hidden;
+}
 .card-title-clamp {
   display: -webkit-box;
   -webkit-box-orient: vertical;

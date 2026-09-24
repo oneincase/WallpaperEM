@@ -1756,8 +1756,16 @@ fn has_preview_file(dir: &Path) -> bool {
         .any(|e| dir.join(format!("preview.{e}")).is_file())
 }
 
-/// 目录内第一个视频文件（按文件名排序，与 read_dir 枚举顺序无关，结果可复现）
+/// 目录内第一个视频文件（按文件名排序，与 read_dir 枚举顺序无关，结果可复现）。
+/// project.json 的 `file` 声明了主视频时优先采用 —— 很多工程的主文件命名不规范，
+/// 按名字枚举会在多视频目录里挑错（预览抽帧/工坊上传都取这里的结果）。
 pub(crate) fn first_video_file(dir: &Path) -> Option<PathBuf> {
+    if let Some(rel) = wallpaper::project_json_entry(dir) {
+        let p = dir.join(&rel);
+        if VIDEO_EXTS.contains(&ext_lower(&p).as_str()) {
+            return Some(p);
+        }
+    }
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .ok()?
         .flatten()
@@ -1776,7 +1784,11 @@ fn infer_type(dir: &Path) -> String {
     if dir.join("index.html").is_file() || dir.join("web/index.html").is_file() {
         return "web".into();
     }
-    if dir.join("scenes/scene.pkg").is_file() || dir.join("scene.pkg").is_file() {
+    // gifscene.pkg 是 WE 的 GIF 场景模板产物（与 scene.pkg 同级的一员）
+    let scene_pkg = ["scenes/scene.pkg", "scene.pkg", "gifscene.pkg", "scenes/gifscene.pkg"]
+        .iter()
+        .any(|rel| dir.join(rel).is_file());
+    if scene_pkg {
         return "scene".into();
     }
     let rank = |t: &str| match t {

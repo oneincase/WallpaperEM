@@ -88,6 +88,14 @@ fn cursor_state() -> Option<(f64, f64, u32)> {
     super::platform::cursor_state()
 }
 
+/// 取 CGEvent 的全局位置（滚轮 tap 复用本处唯一的 extern 声明，避免同符号两处
+/// 以不同结构体签名重复声明）。
+#[cfg(target_os = "macos")]
+pub(super) unsafe fn cg_event_location(event: *const std::ffi::c_void) -> (f64, f64) {
+    let p = CGEventGetLocation(event);
+    (p.x, p.y)
+}
+
 /// 设置「隐藏图标」开关：
 /// 开启（true）→ 窗口在图标之上收真实事件 → 不注入；
 /// 关闭（false，默认）→ 窗口在图标之下收不到事件 → 注入（还需桌面活动）。
@@ -123,6 +131,13 @@ fn refresh_injecting() {
     }
 }
 
+/// 当前是否应向壁纸窗口注入输入（非交互态 + 桌面活动）。
+/// 滚轮捕获（wheel 模块）复用同一门控，避免两条路径判断漂移。
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+pub fn is_injecting() -> bool {
+    INJECTING.load(Ordering::SeqCst)
+}
+
 /// 启动轮询线程。重复调用无副作用（进程内只跑一条）。
 pub fn start(app: &AppHandle, interactive: bool) {
     static STARTED: AtomicBool = AtomicBool::new(false);
@@ -144,9 +159,16 @@ fn poll_loop(app: AppHandle) {
         Arc::new(Mutex::new(std::collections::HashMap::new()));
     // 上一帧光标所在的窗口 label，用于在跨屏时给旧窗口补一次 pointerLeave
     let mut prev_inside: Option<String> = None;
+    // 每秒看一眼当前有没有网页壁纸：滚轮捕获（系统事件 tap / 钩子，macOS 会
+    // 触发「输入监控」授权）只为网页壁纸服务，没播网页壁纸就不创建
+    let mut tick: u32 = 0;
 
     loop {
         std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
+        tick = tick.wrapping_add(1);
+        if tick % 30 == 0 && INJECTING.load(Ordering::Relaxed) && any_web_wallpaper(&app) {
+            super::wheel::ensure_started(&app);
+        }
         if !INJECTING.load(Ordering::Relaxed) {
             // 关注入的瞬间要把「指针已离开」这个终态送到，否则壁纸会停在
             // 最后一次注入的位置上（视差歪着不回正）
@@ -204,4 +226,16 @@ fn emit_leave(app: &AppHandle, label: &str) {
     if let Some(w) = app.get_webview_window(label) {
         let _ = w.eval("window.__wp&&window.__wp.pointerLeave()");
     }
+}
+
+/// 任一壁纸窗口当前配置是网页壁纸（滚轮捕获只对它有意义）。
+fn any_web_wallpaper(app: &AppHandle) -> bool {
+    app.try_state::<super::WallpaperEngineState>()
+        .map(|st| {
+            st.windows
+                .lock()
+                .map(|g| g.values().any(|c| c.r#type == "web"))
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
 }
