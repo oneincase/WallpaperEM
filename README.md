@@ -18,6 +18,39 @@
 
 ---
 
+## ✨ 动态效果预览 / Live Previews
+
+<p align="center">
+  <img src="promo/gifs/01-hero-saturn-3d.gif" width="420" alt="Sci-fi 3D Saturn scene (HDR)"/>
+  &nbsp;&nbsp;
+  <img src="promo/gifs/02-frieren-petals-4k.gif" width="420" alt="Anime scene with petals"/><br/>
+  <sub>科幻 3D 场景 · HDR 实时渲染 — Sci-fi 3D scene &nbsp;·&nbsp; 动漫场景 · 花瓣动效 — Anime scene</sub>
+</p>
+
+<p align="center">
+  <img src="promo/gifs/03-web-3d-solar-system.gif" width="420" alt="Web wallpaper: 3D solar system"/>
+  &nbsp;&nbsp;
+  <img src="promo/gifs/04-lonely-cat-visualizer.gif" width="420" alt="Relaxing water flow + audio visualizer"/><br/>
+  <sub><b>Web 壁纸</b> · 3D 太阳系 — Web wallpaper &nbsp;·&nbsp; 音频可视化 · 治愈系 — Audio visualizer</sub>
+</p>
+
+<p align="center">
+  <img src="promo/gifs/05-audio-particles-pixel.gif" width="420" alt="Audio-reactive pixel particles"/>
+  &nbsp;&nbsp;
+  <img src="promo/gifs/06-initial-d-ae86-retro.gif" width="420" alt="Retro vehicle system panel"/><br/>
+  <sub>像素粒子 · 音频互动 — Audio-reactive particles &nbsp;·&nbsp; 复古载具 · 系统面板风 — Retro vehicle</sub>
+</p>
+
+<p align="center">
+  <img src="promo/gifs/07-seamless-switching-demo.gif" width="420" alt="Seamless wallpaper switching"/><br/>
+  <sub><b>无缝切换</b>功能演示 · 16 秒连切 4 张 — Seamless switching demo</sub>
+</p>
+
+<p align="center"><sub>以上画面为 macOS 真机实拍；示例壁纸来自 Steam 创意工坊第三方作者作品，仅作渲染效果演示。</sub></p>
+<p align="center"><sub>Captured live on macOS; sample wallpapers are third-party Workshop works shown for rendering demo only.</sub></p>
+
+---
+
 ## 🖼️ 界面截图 / Screenshots
 
 <p align="center">
@@ -31,11 +64,19 @@
 <p align="center"><sub>发现 · 随机推荐，点缩略图或箭头切换 — Discover: random wallpaper picks</sub></p>
 
 <p align="center">
-  <img src="docs/img/shot-settings.jpg" width="424" alt="Settings — General"/>
-  &nbsp;&nbsp;
-  <img src="docs/img/shot-about.jpg" width="424" alt="Settings — About & updates"/>
+  <img src="docs/img/shot-displays.jpg" width="860" alt="Displays management"/>
 </p>
-<p align="center"><sub>设置 · 通用（帧率 / 清晰度 / 音频可视化）— General &nbsp;&nbsp;·&nbsp;&nbsp; 设置 · 关于（软件更新）— About (updates)</sub></p>
+<p align="center"><sub>显示器 · 多屏管理（统一 / 独立模式 · 轮播列表）— Displays: multi-monitor management</sub></p>
+
+<p align="center">
+  <img src="docs/img/shot-settings.jpg" width="860" alt="Settings — General"/>
+</p>
+<p align="center"><sub>设置 · 通用（自启 / 语言 / 音频可视化）— General</sub></p>
+
+<p align="center">
+  <img src="docs/img/shot-about.jpg" width="860" alt="Settings — About & updates"/>
+</p>
+<p align="center"><sub>设置 · 关于（软件更新）— About (updates)</sub></p>
 
 ---
 
