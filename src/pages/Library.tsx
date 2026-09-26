@@ -38,8 +38,10 @@ import {
   IconOpenFile,
   IconTrash,
   IconUpload,
+  IconShare,
 } from "../components/icons";
 import { AnchoredMenu, MenuItem, MenuInputRow } from "../components/AnchoredMenu";
+import { ShareModal } from "../components/ShareModal";
 import { formatCountdown } from "../lib/format";
 import { SubscriptionsModal } from "../components/SubscriptionsModal";
 import { LibraryImportModal } from "../components/LibraryImportModal";
@@ -120,6 +122,8 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
   const msg = useMessage();
   const [previewItem, setPreviewItem] = useState<LibraryItem | null>(null);
   const [deleteItem, setDeleteItem] = useState<LibraryItem | null>(null);
+  // 分享弹窗目标（卡片分享按钮 → ShareModal）
+  const [shareItem, setShareItem] = useState<LibraryItem | null>(null);
   const [appliedItems, setAppliedItems] = useState<Set<string>>(new Set());
   const [importing, setImporting] = useState(false);
   const [pruning, setPruning] = useState(false);
@@ -499,8 +503,8 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
         <button
           className={`rounded-lg border px-3 py-1.5 text-[12.5px] font-medium transition-colors ${
             selectMode
-              ? "border-[var(--accent-strong)] bg-[var(--accent-strong)] text-[var(--content)]"
-              : "border-[var(--separator)] hover:bg-black/5 dark:hover:bg-white/10"
+              ? "border-[var(--accent-strong)] bg-[var(--accent-fill)] text-[var(--text-1)]"
+              : "border-[var(--separator)] hover:bg-white/10"
           }`}
           onClick={() => {
             setSelectMode((v) => !v);
@@ -517,14 +521,14 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
         )}
         <div className="ml-auto flex shrink-0 items-center gap-1.5">
           <button
-            className="rounded-lg border border-[var(--separator)] px-3 py-1.5 text-[12.5px] font-medium hover:bg-black/5 disabled:opacity-60 dark:hover:bg-white/10"
+            className="rounded-lg border border-[var(--separator)] px-3 py-1.5 text-[12.5px] font-medium hover:bg-white/10 disabled:opacity-60"
             onClick={() => setSubsOpen(true)}
             title={tr("拉取登录账号的全部订阅，一键下载缺失壁纸（也可多选下载）")}
           >
             ⇓ {tr("同步订阅")}
           </button>
           <button
-            className="rounded-lg border border-[var(--separator)] px-3 py-1.5 text-[12.5px] font-medium hover:bg-black/5 disabled:opacity-60 dark:hover:bg-white/10"
+            className="rounded-lg border border-[var(--separator)] px-3 py-1.5 text-[12.5px] font-medium hover:bg-white/10 disabled:opacity-60"
             onClick={() => setImportOpen(true)}
             title={tr("添加壁纸目录 / 导入文件夹 / 导入文件")}
           >
@@ -542,7 +546,7 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
           onClick={() => setListFilter(null)}
           className={`rounded-full border px-2.5 py-0.5 text-[12px] transition-colors ${
             listFilter === null
-              ? "border-[var(--accent-strong)] bg-[var(--accent-strong)] text-[var(--content)]"
+              ? "border-[var(--accent-strong)] bg-[var(--accent-fill)] text-[var(--text-1)]"
               : "border-[var(--separator)] text-[var(--text-2)] hover:border-[var(--accent-strong)]/50"
           }`}
         >
@@ -561,7 +565,7 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
             }}
             className={`rounded-full border px-2.5 py-0.5 text-[12px] transition-colors ${
               listFilter === p.id
-                ? "border-[var(--accent-strong)] bg-[var(--accent-strong)] text-[var(--content)]"
+                ? "border-[var(--accent-strong)] bg-[var(--accent-fill)] text-[var(--text-1)]"
                 : "border-[var(--separator)] text-[var(--text-2)] hover:border-[var(--accent-strong)]/50"
             }`}
           >
@@ -717,7 +721,7 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
           <button
             className={`rounded-full border px-2.5 py-0.5 text-[11.5px] transition-colors ${
               activeList.shuffle
-                ? "border-[var(--accent-strong)] bg-[var(--accent-strong)] text-[var(--content)]"
+                ? "border-[var(--accent-strong)] bg-[var(--accent-fill)] text-[var(--text-1)]"
                 : "border-[var(--separator)] text-[var(--text-2)] hover:border-[var(--accent-strong)]/50"
             }`}
             title={tr("随机播放（一轮内不重复）")}
@@ -767,7 +771,7 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
           setSearch("");
         }}
       >
-        <label className="mb-2.5 flex cursor-pointer items-center gap-2 rounded-lg px-1 py-1 text-[12px] hover:bg-black/5 dark:hover:bg-white/8">
+        <label className="mb-2.5 flex cursor-pointer items-center gap-2 rounded-lg px-1 py-1 text-[12px] hover:bg-white/8">
           <input
             type="checkbox"
             checked={onlyMissing}
@@ -802,13 +806,13 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
       <div className="flex min-h-0 flex-1 flex-col">
         {missingItems.length > 0 && (
           <div className="mb-3 flex shrink-0 items-center gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-2.5">
-            <span className="text-[12.5px] text-amber-700 dark:text-amber-300">
+            <span className="text-[12.5px] text-amber-300">
               {tr("有 {n} 个壁纸的本地文件已丢失（可能被手动删除），仅剩数据库记录。", {
                 n: missingItems.length,
               })}
             </span>
             <button
-              className="ml-auto shrink-0 rounded-lg border border-amber-500/40 px-3 py-1 text-[12px] font-medium text-amber-700 hover:bg-amber-500/15 disabled:opacity-60 dark:text-amber-300"
+              className="ml-auto shrink-0 rounded-lg border border-amber-500/40 px-3 py-1 text-[12px] font-medium text-amber-300 hover:bg-amber-500/15 disabled:opacity-60"
               onClick={() => setConfirmPrune(true)}
               disabled={pruning}
             >
@@ -918,7 +922,7 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
                 selectMode ? undefined : (
                 <div className="grid grid-cols-4 gap-1">
                   <button
-                    className="flex items-center justify-center rounded-lg border border-[var(--separator)] px-0.5 py-1 text-[var(--text-2)] hover:text-[var(--accent-strong)] hover:bg-black/5 dark:hover:bg-white/10"
+                    className="flex items-center justify-center rounded-lg border border-[var(--separator)] px-0.5 py-1 text-[var(--text-2)] hover:text-[var(--accent-strong)] hover:bg-white/10"
                     onClick={() => setPreviewItem(item)}
                     data-tip={tr("预览（可在预览中配置）")}
                   >
@@ -934,7 +938,7 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
                     </button>
                   ) : appliedItems.has(item.itemId) ? (
                     <button
-                      className="flex items-center justify-center rounded-lg border border-green-500/30 px-0.5 py-1 !text-green-600 dark:!text-green-400 bg-green-500/10 hover:opacity-80"
+                      className="flex items-center justify-center rounded-lg border border-green-500/30 px-0.5 py-1 !text-green-400 bg-green-500/10 hover:opacity-80"
                       onClick={(e) => void apply(item.itemId, e.currentTarget)}
                       data-tip={tr("已应用到桌面（可点击重新应用或指定屏）")}
                     >
@@ -950,11 +954,18 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
                     </button>
                   )}
                   <button
-                    className="flex items-center justify-center rounded-lg border border-[var(--separator)] px-0.5 py-1 text-[var(--text-2)] hover:text-[var(--accent-strong)] hover:bg-black/5 dark:hover:bg-white/10"
+                    className="flex items-center justify-center rounded-lg border border-[var(--separator)] px-0.5 py-1 text-[var(--text-2)] hover:text-[var(--accent-strong)] hover:bg-white/10"
                     onClick={() => api.libraryOpenFolder(item.itemId)}
                     data-tip={tr("打开文件所在位置")}
                   >
                     <IconOpenFile />
+                  </button>
+                  <button
+                    className="flex items-center justify-center rounded-lg border border-[var(--separator)] px-0.5 py-1 text-[var(--text-2)] hover:text-[var(--accent-strong)] hover:bg-white/10"
+                    onClick={() => setShareItem(item)}
+                    data-tip={tr("分享")}
+                  >
+                    <IconShare />
                   </button>
                   <button
                     className="flex items-center justify-center rounded-lg border border-[var(--separator)] px-0.5 py-1 text-[var(--text-2)] hover:text-red-500 hover:border-red-500/40 hover:bg-red-500/10"
@@ -972,6 +983,15 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
       </div>
 
       {previewItem && <PreviewModal item={previewItem} onClose={() => setPreviewItem(null)} />}
+
+      {shareItem && (
+        <ShareModal
+          itemId={shareItem.itemId}
+          title={shareItem.title}
+          wtype={shareItem.type}
+          onClose={() => setShareItem(null)}
+        />
+      )}
 
       {uploadItem && !uploadMethodItem && (
         <WorkshopUploadChoiceModal

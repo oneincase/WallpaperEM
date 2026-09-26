@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState } from "react";
 import { HomePage } from "./pages/Home";
 import { WorkshopPage } from "./pages/Workshop";
 import { DetailPage } from "./pages/Detail";
@@ -6,62 +6,23 @@ import { DownloadsPage } from "./pages/Downloads";
 import { LibraryPage } from "./pages/Library";
 import { FavoritesPage } from "./pages/Favorites";
 import { DisplaysPage } from "./pages/Displays";
+import { SharesPage } from "./pages/Shares";
+import { HotkeysPage } from "./pages/Hotkeys";
 import { SettingsPage } from "./pages/Settings";
-import {
-  IconHome,
-  IconGrid,
-  IconDownload,
-  IconLibrary,
-  IconHeart,
-  IconMonitor,
-  IconGear,
-  IconSidebarCollapse,
-  IconSidebarExpand,
-  IconSun,
-  IconMoon,
-  IconAuto,
-} from "./components/icons";
-import { applySidebarAlpha, getSidebarAlpha } from "./lib/sidebar";
+import { TopBar, type PageId } from "./components/TopBar";
 import { GuardDialogs } from "./components/GuardDialogs";
+import { ResizeHandles } from "./components/ResizeHandles";
+import { useWallpaperBackdrop } from "./hooks/useWallpaperBackdrop";
+import { useWindowRounded } from "./lib/platform";
 import { readState, writeState } from "./lib/cache-snapshots";
-import { applyDocumentLang, pushLocaleToBackend, tr, useLocale } from "./lib/i18n";
-import { applyTheme, readStoredTheme, THEME_STORAGE_KEY, type Theme } from "./lib/theme";
-
-type PageId =
-  | "home"
-  | "workshop"
-  | "downloads"
-  | "library"
-  | "favorites"
-  | "displays"
-  | "settings";
+import { pushLocaleToBackend, useLocale } from "./lib/i18n";
 
 const PAGE_STORAGE_KEY = "nav.page";
-
-const NAV: { id: PageId; label: string; icon: ReactNode; group: string }[] = [
-  { id: "home", label: "发现", icon: <IconHome />, group: "浏览" },
-  { id: "workshop", label: "工坊", icon: <IconGrid />, group: "浏览" },
-  { id: "downloads", label: "下载", icon: <IconDownload />, group: "浏览" },
-  { id: "library", label: "本地库", icon: <IconLibrary />, group: "库" },
-  { id: "favorites", label: "收藏", icon: <IconHeart />, group: "库" },
-  { id: "displays", label: "显示器", icon: <IconMonitor />, group: "系统" },
-  { id: "settings", label: "设置", icon: <IconGear />, group: "系统" },
-];
-
-const SIDEBAR_STORAGE_KEY = "we.sidebar.collapsed";
-
-function readInitialCollapsed(): boolean {
-  try {
-    return localStorage.getItem(SIDEBAR_STORAGE_KEY) === "1";
-  } catch {
-    return false;
-  }
-}
 
 /**
  * 恢复上次所在页面。窗口被释放后重建是全新 JS 上下文，不持久化就必然落回
  * 发现页 —— 而发现页恰好是最慢的链路（workshop_random 三次串行网络请求）。
- * 「设置」刻意不恢复：那是一次性操作页，下次进来想看的多半是内容。
+ * 「设置」与「分享」刻意不恢复：那是一次性操作页，下次进来想看的多半是内容。
  */
 function readInitialPage(): PageId {
   const p = readState<string>(PAGE_STORAGE_KEY, "home");
@@ -75,6 +36,8 @@ function readInitialPage(): PageId {
   ];
   return (valid as string[]).includes(p) ? (p as PageId) : "home";
 }
+
+/** 浏览器直开渲染器页（无 Tauri IPC）时不接窗口事件 —— 见 lib/platform.ts */
 
 export default function App() {
   return <Shell />;
@@ -90,35 +53,10 @@ function Shell() {
   const [detailId, setDetailId] = useState<string | null>(null);
   const [detailShown, setDetailShown] = useState(false);
   const detailCloseTimer = useRef<number | null>(null);
-  // 侧边栏是否收缩成图标栏；由用户手动切换，并持久化
-  const [collapsed, setCollapsed] = useState<boolean>(readInitialCollapsed);
-
-  const groups: { group: string; items: typeof NAV }[] = ["浏览", "库", "系统"].map((g) => ({
-    group: g,
-    items: NAV.filter((n) => n.group === g),
-  }));
-
-  // 主题：system / light / dark，默认跟随系统；应用到 <html data-theme>
-  const [theme, setTheme] = useState<Theme>(readStoredTheme);
-
-  useEffect(() => {
-    applyTheme(theme);
-    try {
-      localStorage.setItem(THEME_STORAGE_KEY, theme);
-    } catch {
-      /* ignore */
-    }
-  }, [theme]);
-
-  // 应用侧边栏透明度
-  useEffect(() => {
-    applySidebarAlpha(getSidebarAlpha());
-  }, []);
-
-  // 启动时把语言推给后端一次：后端默认跟随系统语言，可能与用户上次的选择不同
-  useEffect(() => {
-    pushLocaleToBackend();
-  }, []);
+  // 最大化/全屏时根容器去圆角（透明窗口 + CSS 圆角，铺满时不能露角）
+  const rounded = useWindowRounded();
+  // 页内玻璃背景 + 自适应 tint（见 hooks/useWallpaperBackdrop.ts）
+  const backdrop = useWallpaperBackdrop();
 
   // 冻结自检：系统睡眠/合盖后 WebKit 可能恢复出一个「卡死」的页面（定时器全部
   // 停摆）。定时器恢复触发时若发现实际流逝时间远超定时周期，说明页面曾被长时间
@@ -135,10 +73,6 @@ function Shell() {
     }, 5_000);
     return () => window.clearInterval(t);
   }, []);
-
-  const cycleTheme = () => {
-    setTheme((t) => (t === "system" ? "light" : t === "light" ? "dark" : "system"));
-  };
 
   const navigate = (p: PageId) => {
     if (detailCloseTimer.current) {
@@ -186,180 +120,70 @@ function Shell() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- closeDetail 依赖 detailId，与之同步重建
   }, [detailId]);
 
-  const toggleCollapsed = () => {
-    setCollapsed((c) => {
-      const next = !c;
-      try {
-        localStorage.setItem(SIDEBAR_STORAGE_KEY, next ? "1" : "0");
-      } catch {
-        /* ignore */
-      }
-      return next;
-    });
-  };
-
-  // 收缩态宽度对齐 macOS 红绿灯按钮组（三个按钮 + 左右留白约 78px）。
-  // 窄于此值时红绿灯会越过侧边栏边界压到内容区上，看起来像浮在网格里。
-  const width = collapsed ? "w-[78px]" : "w-60";
+  // 玻璃圆角壳（全平台无边框）：透明窗口 + CSS 圆角 + 白描边交代边界；
+  // 最大化/全屏时去圆角。macOS 的窗口阴影由 Tauri shadow(true) 提供
+  const chrome = rounded
+    ? "rounded-[12px] overflow-hidden ring-1 ring-[var(--card-border)]"
+    : "overflow-hidden";
 
   return (
-    <div className="flex h-full">
-      {/* 侧边栏（半透明 + 磨砂质感） */}
-      <aside
-        className={`${width} shrink-0 flex flex-col bg-[var(--sidebar)] backdrop-blur-[20px] backdrop-saturate-150 border-r border-[var(--separator)] transition-[width] duration-200 ease-out`}
-      >
-        <div data-tauri-drag-region className="h-10 shrink-0" />
+    <div className={`relative flex h-full flex-col ${chrome} ${backdrop ? "" : "bg-[rgba(18,18,22,0.92)]"}`}>
+      {/* 无边框窗口的边缘缩放把手（Win/Linux；macOS 靠系统） */}
+      <ResizeHandles enabled={rounded} />
+      {/* 页内玻璃背景：当前壁纸高斯模糊 + 深色 tint（样式见 index.css .app-backdrop）。
+          绝对定位垫底，TopBar 与内容区各抬一层（z-10） */}
+      <div
+        className="app-backdrop"
+        aria-hidden
+        style={backdrop ? ({ "--backdrop-img": `url("${backdrop}")` } as React.CSSProperties) : undefined}
+      />
 
-        {/* 顶部：展开态显示 logo+名称+收缩按钮；收缩态 logo 悬浮变展开按钮 */}
-        <div
-          className={
-            collapsed
-              ? "px-3 pt-2 pb-2 flex justify-center"
-              : "px-3 pt-2 pb-2 flex items-center gap-2"
-          }
-        >
-          {collapsed ? (
-            <button
-              onClick={toggleCollapsed}
-              title={tr("展开侧边栏")}
-              aria-label={tr("展开侧边栏")}
-              className="group relative flex h-8 w-8 items-center justify-center rounded-[8px] overflow-hidden text-[var(--text-2)] transition-all duration-150 active:scale-90 hover:bg-black/5 hover:text-[var(--text-1)] dark:hover:bg-white/8"
+      <TopBar activeId={detailId ? null : page} onNavigate={navigate} />
+
+      <div className="relative z-10 flex-1 flex flex-col min-h-0">
+        {page === "home" ? (
+          <HomePage onOpenDetail={openDetail} />
+        ) : page === "workshop" ? (
+          <WorkshopPage onOpenDetail={openDetail} />
+        ) : page === "downloads" ? (
+          <DownloadsPage />
+        ) : page === "library" ? (
+          <LibraryPage onOpenDetail={openDetail} />
+        ) : page === "favorites" ? (
+          <FavoritesPage onOpenDetail={openDetail} />
+        ) : page === "displays" ? (
+          <DisplaysPage onNavigate={navigate} />
+        ) : page === "shares" ? (
+          <SharesPage onNavigate={navigate} />
+        ) : page === "hotkeys" ? (
+          <HotkeysPage />
+        ) : (
+          <SettingsPage />
+        )}
+
+        {/* 详情页以右侧抽屉展示：遮罩淡入 + 面板向左滑入覆盖，关闭时向右滑回隐藏。
+            底下列表保持挂载，关闭抽屉后滚动位置/数据不重置 */}
+        {detailId && (
+          <>
+            <div
+              onClick={closeDetail}
+              className={`absolute inset-0 z-20 bg-black/25 transition-opacity duration-300 ${
+                detailShown ? "opacity-100" : "opacity-0"
+              }`}
+            />
+            <div
+              className={`glass-panel absolute inset-y-0 right-0 z-30 w-[420px] max-w-[88%] shadow-2xl ring-1 ring-inset ring-[var(--card-border)] transition-transform duration-300 ease-out ${
+                detailShown ? "translate-x-0" : "translate-x-full"
+              }`}
             >
-              <img
-                src="/icon/icon_32x32@2x.png"
-                alt=""
-                className="h-full w-full object-contain transition-opacity group-hover:opacity-0"
-              />
-              <span className="absolute inset-0 flex items-center justify-center opacity-0 transition-opacity group-hover:opacity-100">
-                <IconSidebarExpand />
-              </span>
-            </button>
-          ) : (
-            <>
-              <div className="h-8 w-8 shrink-0 rounded-[8px] overflow-hidden shadow-sm">
-                <img src="/icon/icon_32x32@2x.png" alt="" className="h-full w-full object-contain" />
-              </div>
-              <span className="text-[13.5px] font-semibold tracking-tight">WallpaperEM</span>
-              <button
-                onClick={toggleCollapsed}
-                title={tr("收起侧边栏")}
-                aria-label={tr("收起侧边栏")}
-                className="ml-auto flex h-6 w-6 items-center justify-center rounded-[6px] text-[var(--text-2)] transition-all duration-150 active:scale-90 hover:bg-black/5 hover:text-[var(--text-1)] dark:hover:bg-white/8"
-              >
-                <IconSidebarCollapse />
-              </button>
-            </>
-          )}
-        </div>
-
-        <nav className="flex-1 overflow-y-auto px-3 py-2 space-y-4">
-          {groups.map(({ group, items }) => (
-            <div key={group}>
-              {!collapsed && (
-                <div className="px-2 pb-1 text-[11px] font-semibold uppercase tracking-wide text-[var(--text-2)]/70">
-                  {tr(group)}
-                </div>
-              )}
-              <div className="space-y-0.5">
-                {items.map((item) => (
-                  <button
-                    key={item.id}
-                    onClick={() => navigate(item.id)}
-                    title={collapsed ? tr(item.label) : undefined}
-                    className={`${
-                      collapsed ? "w-full justify-center" : "w-full justify-start gap-2.5 px-2.5"
-                    } flex items-center rounded-[7px] py-[5px] text-[13.5px] transition-all duration-150 active:scale-[0.97] ${
-                      page === item.id && !detailId
-                        ? "bg-[var(--sidebar-sel)] text-[var(--accent-fg)] shadow-sm"
-                        : "text-[var(--text-1)] hover:bg-black/5 dark:hover:bg-white/8"
-                    }`}
-                  >
-                    {item.icon}
-                    {!collapsed && tr(item.label)}
-                  </button>
-                ))}
-              </div>
+              <DetailPage id={detailId} onBack={closeDetail} />
             </div>
-          ))}
-        </nav>
-
-        {/* 底部：主题切换（system → light → dark 循环） */}
-        <div className="shrink-0 border-t border-[var(--separator)] px-3 py-2">
-          <button
-            onClick={cycleTheme}
-            data-tip={
-              theme === "system"
-                ? tr("主题：跟随系统")
-                : theme === "light"
-                  ? tr("主题：浅色")
-                  : tr("主题：深色")
-            }
-            aria-label={tr("切换主题")}
-            className={`${
-              collapsed ? "w-full justify-center" : "w-full justify-start gap-2.5 px-2.5"
-            } flex items-center rounded-[7px] py-[5px] text-[13.5px] transition-all duration-150 text-[var(--text-2)] hover:text-[var(--text-1)] hover:bg-black/5 dark:hover:bg-white/8 active:scale-[0.97]`}
-          >
-            {theme === "system" ? (
-              <IconAuto />
-            ) : theme === "light" ? (
-              <IconSun />
-            ) : (
-              <IconMoon />
-            )}
-            {!collapsed && (
-              <span>
-                {theme === "system" ? tr("跟随系统") : theme === "light" ? tr("浅色") : tr("深色")}
-              </span>
-            )}
-          </button>
-        </div>
-      </aside>
-
-      {/* 内容区 */}
-      <main className="flex-1 flex flex-col bg-[var(--content)] min-w-0">
-        <header data-tauri-drag-region className="h-10 shrink-0 flex items-center px-4">
-          <div data-tauri-drag-region className="flex-1" />
-        </header>
-        <div className="flex-1 flex flex-col min-h-0 relative">
-          {page === "home" ? (
-            <HomePage onOpenDetail={openDetail} />
-          ) : page === "workshop" ? (
-            <WorkshopPage onOpenDetail={openDetail} />
-          ) : page === "downloads" ? (
-            <DownloadsPage />
-          ) : page === "library" ? (
-            <LibraryPage onOpenDetail={openDetail} />
-          ) : page === "favorites" ? (
-            <FavoritesPage onOpenDetail={openDetail} />
-          ) : page === "displays" ? (
-            <DisplaysPage onNavigate={navigate} />
-          ) : (
-            <SettingsPage />
-          )}
-
-          {/* 详情页以右侧抽屉展示：遮罩淡入 + 面板向左滑入覆盖，关闭时向右滑回隐藏。
-              底下列表保持挂载，关闭抽屉后滚动位置/数据不重置 */}
-          {detailId && (
-            <>
-              <div
-                onClick={closeDetail}
-                className={`absolute inset-0 z-20 bg-black/25 transition-opacity duration-300 ${
-                  detailShown ? "opacity-100" : "opacity-0"
-                }`}
-              />
-              <div
-                className={`absolute inset-y-0 right-0 z-30 w-[420px] max-w-[88%] border-l border-[var(--separator)] bg-[var(--card)] shadow-2xl transition-transform duration-300 ease-out ${
-                  detailShown ? "translate-x-0" : "translate-x-full"
-                }`}
-              >
-                <DetailPage id={detailId} onBack={closeDetail} />
-              </div>
-            </>
-          )}
-        </div>
-      </main>
+          </>
+        )}
+      </div>
 
       {/* 全局 Steam Guard 验证码 / 手机确认弹窗（不依附下载页） */}
       <GuardDialogs />

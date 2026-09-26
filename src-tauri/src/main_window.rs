@@ -276,7 +276,8 @@ pub fn ensure_main_window(app: &AppHandle) {
         let _ = zombie.destroy();
     }
 
-    // 重建：属性与 tauri.conf.json app.windows[0] 保持一致。
+    // 重建：属性与 tauri.conf.json app.windows[0] 保持一致（全平台无边框 +
+    // 自绘窗口控制；shadow 在 borderless 窗口上仍由系统提供投影）。
     // 刚释放后 "main" label 可能仍被僵尸占用：destroy 的注册表清理是异步的，
     // 短间隔重试等其真正释放（避免一次失败后主窗口彻底出不来）。
     for attempt in 0..10 {
@@ -285,12 +286,13 @@ pub fn ensure_main_window(app: &AppHandle) {
             .inner_size(1240.0, 800.0)
             .min_inner_size(940.0, 600.0)
             .center()
-            .transparent(true);
-        // Overlay 标题栏/隐藏标题是 macOS-only API；Linux 下窗口带原生标题栏
-        #[cfg(target_os = "macos")]
-        let builder = builder
-            .title_bar_style(tauri::TitleBarStyle::Overlay)
-            .hidden_title(true);
+            .transparent(true)
+            .decorations(false)
+            .shadow(true)
+            // 关掉 WebKit 开发者附加（devtools:false）：不关的话 WKWebView 右键会
+            // 弹「Reload / Inspect Element」菜单，正式界面不该有（与 tauri.conf.json
+            // 的 devtools:false 保持同步 —— 这里是回收重建的第三份窗口配置）
+            .devtools(false);
         let built = builder.build();
         match built {
             Ok(w) => {

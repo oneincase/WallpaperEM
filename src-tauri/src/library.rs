@@ -1833,6 +1833,50 @@ fn has_preview_file(dir: &Path) -> bool {
         .any(|e| dir.join(format!("preview.{e}")).is_file())
 }
 
+/// 封面平均亮度（0..1，Rec.709 加权）：主界面自适应 tint 用。
+/// 解码失败（文件缺失/损坏/格式不支持）返回 None，调用方按「不抬 tint」处理。
+/// 结果按 item_id 记忆 —— 换壁纸才重算，页面刷新等重复调用零成本。
+/// **失败结果也短缓存 10s**：封面可能还在后台生成，但绝不能让两次刷新拿到
+/// 「一次 None 一次有值」—— 那正是自适应浓度自己跳变的来源。
+pub fn cover_luminance(app: &AppHandle, item_id: &str) -> Option<f32> {
+    type LumCache = std::collections::HashMap<String, (Option<f32>, std::time::Instant)>;
+    const NEG_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+    static CACHE: std::sync::OnceLock<Mutex<LumCache>> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    if let Ok(map) = cache.lock() {
+        if let Some((v, at)) = map.get(item_id) {
+            match v {
+                Some(lum) => return Some(*lum),
+                // 失败缓存只信 10s，过期重算（封面可能刚生成好）
+                None if at.elapsed() < NEG_TTL => return None,
+                None => {}
+            }
+        }
+    }
+    let dir = item_dir(app, item_id).ok()?;
+    let path = PREVIEW_EXTS.iter().find_map(|e| {
+        let p = dir.join(format!("preview.{e}"));
+        p.is_file().then_some(p)
+    })?;
+    let img = image::open(&path).ok()?;
+    // 缩到 16x16 再平均：足以代表整体明暗，任意尺寸封面都是毫秒级
+    let thumb = img.thumbnail(16, 16).to_rgb8();
+    let (mut sum, mut n) = (0f32, 0f32);
+    for px in thumb.pixels() {
+        sum += 0.2126 * px[0] as f32 + 0.7152 * px[1] as f32 + 0.0722 * px[2] as f32;
+        n += 1.0;
+    }
+    let lum = if n == 0.0 { None } else { Some((sum / n / 255.0).clamp(0.0, 1.0)) };
+    if let Ok(mut map) = cache.lock() {
+        // 简单防膨胀：攒了一批旧条目后整体清空（命中率远大于占用的价值）
+        if map.len() > 128 {
+            map.clear();
+        }
+        map.insert(item_id.to_string(), (lum, std::time::Instant::now()));
+    }
+    lum
+}
+
 /// 目录内第一个视频文件（按文件名排序，与 read_dir 枚举顺序无关，结果可复现）。
 /// project.json 的 `file` 声明了主视频时优先采用 —— 很多工程的主文件命名不规范，
 /// 按名字枚举会在多视频目录里挑错（预览抽帧/工坊上传都取这里的结果）。
@@ -2202,6 +2246,12 @@ fn apply_live(app: &AppHandle, item_id: &str) -> Result<(), String> {
         rows
     };
     drop(conn);
+    // 分享访客的属性实时推送（P4）：无论桌面有没有在播这张，只要有分享订阅
+    // 就推（推送端内部无订阅者时零成本）。必须在 displays 早退之前
+    crate::mcp::shares::publish_props(
+        item_id,
+        serde_json::to_string(&props).unwrap_or_else(|_| "{}".into()),
+    );
     if displays.is_empty() {
         return Ok(());
     }

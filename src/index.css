@@ -1,72 +1,39 @@
 @import "tailwindcss";
 
-/* 默认浅色 */
+/* ============ 玻璃主题（唯一主题，深色磨砂 + 白字） ============
+   磨砂的实现分层（docs/ui-glass-refactor-plan.md §2）：
+   - 真模糊由系统窗口材质提供：macOS NSVisualEffectView / Windows Acrylic /
+     Linux KWin blur（lib.rs apply_backdrop、blur.rs）；
+   - 这里的 token 只是「深色玻璃 tint」：rgba 深底 + alpha，叠在材质上。
+   ⚠️ 禁止用 backdrop-filter 造磨砂：透明 WKWebView 里 backdrop 层不稳定
+   （实测「刚开是磨砂、一两秒后变纯半透明」，玻璃一律走页内 .app-backdrop）。 */
 :root {
-  color-scheme: light;
-  --sidebar-alpha: 0.78;
-  --content: #ffffff;
-  /* 活动栏（左侧导航）两级：底色用「浮动灰」，选中项再用更浅的一层浮上去。
-     和深色主题方向一致 —— 深色下也是选中项比栏底色亮（30,30,32 → #343434），
-     选中项才立得起来。 */
-  --sidebar: rgba(240, 240, 240, var(--sidebar-alpha));
-  --sidebar-sel: #ffffff;
-  /* 浮动面（卡片 / 弹层 / 抽屉 / 吐司）——比内容区亮或暗取决于主题，
-     浅色下用浅灰从纯白内容区里“浮”出来 */
-  --card: #f0f0f0;
-  --separator: rgba(0, 0, 0, 0.09);
-  --text-1: #1d1d1f;
-  --text-2: #6e6e73;
-  /* 主题色：中性石墨。--accent 是「填充色」，用在选中背景、浮动面、徽标底；
-     叠字用 --accent-fg；需要在浅底上自己可见的前景（文字/图标/描边/控件填充/
-     聚焦环）用 --accent-strong —— 纯填充色当文字用会直接看不见。 */
-  --accent: #f0f0f0;
-  --accent-fg: #1d1d1f;
-  --accent-strong: #48484a;
-  --shadow: 0 1px 2px rgba(0, 0, 0, 0.06), 0 4px 16px rgba(0, 0, 0, 0.08);
-}
-/* 跟随系统：系统深色 → 深色 */
-:root:not([data-theme="light"]):not([data-theme="dark"]) {
-  color-scheme: light dark;
-}
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]):not([data-theme="dark"]) {
-    /* 深色下的明度关系：侧边栏（导航，最沉） < 内容区 < 卡片（最浅，浮在内容上）。
-       内容区已改为不透明纯色，只有侧边栏透桌面壁纸；alpha 默认 0.78 ——
-       过低（0.55 档）浅色壁纸会几乎整片透上来，把导航冲得比内容区还亮。 */
-    --sidebar-alpha: 0.78;
-    --content: #181818;
-    --sidebar: rgba(30, 30, 32, var(--sidebar-alpha));
-    --sidebar-sel: #343434;
-    --card: #343434;
-    --separator: rgba(255, 255, 255, 0.1);
-    --text-1: #f5f5f7;
-    --text-2: #98989d;
-    --accent: #343434;
-    --accent-fg: #f5f5f7;
-    --accent-strong: #aeaeb2;
-    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 6px 20px rgba(0, 0, 0, 0.45);
-  }
-}
-/* 强制深色：不管系统，都用深色 */
-:root[data-theme="dark"] {
   color-scheme: dark;
-  /* 同上：侧边栏最沉 < 内容区 < 卡片最浅 */
-  --sidebar-alpha: 0.78;
-  --content: #181818;
-  --sidebar: rgba(30, 30, 32, var(--sidebar-alpha));
-  --sidebar-sel: #343434;
-  --card: #343434;
+  /* 玻璃分级（对齐聚焦搜索/启动台观感：面板明暗 1:1 跟随壁纸，tint 极轻，
+     分层全靠白描边）。三个 alpha 都挂在 --glass-lift（0..1，App.tsx 按壁纸
+     封面亮度写入）上：暗壁纸保持轻透，亮壁纸自动抬浓度保白字可读 ——
+     即「自适应 tint」。手动校准基准时改这三个基数即可 */
+  --content: rgba(16, 16, 20, calc(0.22 + var(--glass-lift, 0) * 0.22));
+  --sidebar: rgba(20, 20, 26, calc(0.38 + var(--glass-lift, 0) * 0.18));
+  --card: rgba(26, 26, 32, calc(0.34 + var(--glass-lift, 0) * 0.22));
+  /* 容器白描边：玻璃面彼此区分的主要手段（分隔线仍用 --separator，别混用） */
+  --card-border: rgba(255, 255, 255, 0.16);
   --separator: rgba(255, 255, 255, 0.1);
+  /* 白字两级：主文字近白，次要文字压到 62% —— 壁纸再亮也由上面的 tint 压住 */
   --text-1: #f5f5f7;
-  --text-2: #98989d;
-  --accent: #343434;
-  --accent-fg: #f5f5f7;
-  --accent-strong: #aeaeb2;
-  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 6px 20px rgba(0, 0, 0, 0.45);
-}
-/* 强制浅色 */
-:root[data-theme="light"] {
-  color-scheme: light;
+  --text-2: rgba(245, 245, 247, 0.62);
+  /* 主题色：中性石墨的玻璃版。--accent 是「填充色」（选中底/徽标底）；
+     --accent-fill 是「激活填充」（主按钮/开关/选中/进度条，玻璃白，全站
+     统一——近白实色只留给聚焦环与浅灰文字）；--accent-strong 是近白实色
+     （聚焦环/前景文字），叠深字 */
+  --accent: rgba(255, 255, 255, 0.12);
+  --accent-fill: rgba(255, 255, 255, 0.22);
+  --accent-fg: #ffffff;
+  --accent-strong: #e8e8ed;
+  --shadow: 0 2px 8px rgba(0, 0, 0, 0.35), 0 12px 40px rgba(0, 0, 0, 0.4);
+  /* 交互态玻璃（胶囊导航/悬浮面）：底 tint 极轻，交互态靠白alpha 立起来 */
+  --glass-hover: rgba(255, 255, 255, 0.12);
+  --glass-active: rgba(255, 255, 255, 0.2);
 }
 
 html,
@@ -87,34 +54,62 @@ body {
   cursor: default;
 }
 
-/* 独立「壁纸设置」窗口：半透明底色 + 原生窗口材质 = 磨砂质感。
-   不要用 backdrop-filter 磨砂——透明 WKWebView 里 backdrop 层不稳定，
-   内容绘制一两次后会被 WebKit 丢弃，表现为"刚开是磨砂、一两秒后变纯半透明"。
-   macOS 的真模糊由原生 vibrancy 提供（props_window.rs），CSS 只需把 alpha
-   降到与主界面侧边栏一致的 0.78 让材质透出来；其他平台没有窗口材质，
-   保持 0.88 高 alpha 兜底可读性（props-main.tsx 会给 <html> 标 data-os）。 */
-.props-tint {
-  background: rgba(240, 240, 240, 0.88);
+/* ---------- 主界面页内玻璃背景 ----------
+   系统窗口材质（NSVisualEffectView / Acrylic / KWin blur）自重着色严重
+   （实测暗色材质 ~75% 不透明），叠 rgba 只能调"更黑"，且聚焦/失焦表现
+   有差异 —— 主界面的磨砂改为页内自绘：当前壁纸封面做高斯模糊。
+   磨砂值 = 下面两个变量：--backdrop-blur 越大越模糊（吃细节），brightness
+   越低越沉（保白字对比度）。封面由 App.tsx 经 wallpaper_ui_backdrop 注入，
+   应用/停止/轮播（sessions-changed）与显示器变化（displays-changed）时刷新；
+   没有壁纸时退回系统材质透出（::before 无图即透明）。 */
+.app-backdrop {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  z-index: 0;
+  pointer-events: none;
 }
-:root[data-os="macos"] .props-tint,
-:root[data-os="windows"] .props-tint {
-  background: rgba(240, 240, 240, 0.78);
+.app-backdrop::before {
+  content: "";
+  position: absolute;
+  /* 外扩吃掉模糊边缘的透明晕边 */
+  inset: -56px;
+  background-image: var(--backdrop-img, none);
+  background-size: cover;
+  background-position: center;
+  /* Spotlight/启动台校准：brightness(1) = 面板明暗完全跟随壁纸，只重模糊不压亮度；
+     亮壁纸白字吃力时往回压 brightness 或抬 --content，两个旋钮二选一 */
+  filter: blur(var(--backdrop-blur, 64px)) saturate(1.15) brightness(1);
+  transform: translateZ(0);
 }
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) .props-tint {
-    background: rgba(52, 52, 52, 0.88);
+.app-backdrop::after {
+  /* 深色 tint：压住壁纸颜色，保证白字与白描边的可读性。
+     alpha 随 --glass-lift 自适应（见 :root），换壁纸时平滑过渡 */
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: var(--content);
+  transition: background-color 0.6s ease;
+}
+
+/* 独立「壁纸设置」窗口：与主窗口同一套页内玻璃（.app-backdrop 壁纸模糊背景 +
+   --glass-lift 自适应 tint，见 props-main.tsx / hooks/useWallpaperBackdrop.ts），
+   整面板 props-slide 从右缘滑入（窗口本体贴屏幕右侧，见 props_window.rs）。 */
+@keyframes props-slide-in {
+  from {
+    transform: translateX(100%);
   }
-  :root:not([data-theme="light"])[data-os="macos"] .props-tint,
-  :root:not([data-theme="light"])[data-os="windows"] .props-tint {
-    background: rgba(52, 52, 52, 0.78);
+  to {
+    transform: translateX(0);
   }
 }
-:root[data-theme="dark"] .props-tint {
-  background: rgba(52, 52, 52, 0.88);
+.props-slide {
+  animation: props-slide-in 0.32s cubic-bezier(0.22, 1, 0.36, 1);
 }
-:root[data-theme="dark"][data-os="macos"] .props-tint,
-:root[data-theme="dark"][data-os="windows"] .props-tint {
-  background: rgba(52, 52, 52, 0.78);
+@media (prefers-reduced-motion: reduce) {
+  .props-slide {
+    animation: none;
+  }
 }
 
 /* 系统风按钮 */
@@ -128,23 +123,21 @@ body {
   font-size: 13px;
   font-weight: 500;
   border: 1px solid var(--separator);
-  background: var(--card);
+  background: var(--accent);
   color: var(--text-1);
   transition: filter 0.15s ease, transform 0.1s ease;
 }
 .btn:hover {
-  filter: brightness(1.06);
+  filter: brightness(1.25);
 }
 .btn:active {
   transform: scale(0.97);
 }
 .btn-primary {
-  /* 主按钮要能同时立在内容区（--content）和浮动面（--card）上：用 --accent-strong
-     填充（纯 --accent 在浅色下与卡片同色、按钮会“消失”），文字取内容区底色 ——
-     浅色下白字压深灰、深色下深字压浅灰，两个主题都够对比 */
-  background: var(--accent-strong);
-  border-color: transparent;
-  color: var(--content);
+  /* 主按钮：玻璃白填充 + 白字 + 白描边，与开关/选中态同一套填充（--accent-fill） */
+  background: var(--accent-fill);
+  border-color: var(--card-border);
+  color: var(--text-1);
 }
 .btn-danger {
   color: #ff453a;
@@ -154,6 +147,71 @@ body {
 :focus-visible {
   outline: 2px solid var(--accent-strong);
   outline-offset: 1px;
+}
+
+/* ---------- 顶部胶囊导航（docs/ui-glass-refactor-plan.md §3） ----------
+   标签展开用 grid-template-columns 0fr→1fr 过渡：宽度随文字自适应，无需测量
+   文本、不会裁切（比 width/max-width 过渡稳，字体度量无关）。
+   三层结构缺一不可：.pill-label（轨道层，overflow 兜底）> .pill-clip（轨道项，
+   真正的裁剪层，**不能带 padding** —— border-box 压不掉 padding，轨道最小宽度
+   会被 padding 撑住，折叠态漏出 2px 文字残影）> 内层 span（文字 + 间距）。 */
+.pill-label {
+  display: grid;
+  grid-template-columns: 0fr;
+  min-width: 0;
+  overflow: hidden;
+  transition: grid-template-columns 0.32s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.pill-item:hover .pill-label,
+.pill-item[data-active="true"] .pill-label {
+  grid-template-columns: 1fr;
+}
+.pill-clip {
+  overflow: hidden;
+  min-width: 0;
+}
+.pill-clip > span {
+  white-space: nowrap;
+}
+/* 段的底色/文字/高度分层缓动：宽度交给上面的 grid，弹性感交给高度与阴影 */
+.pill-item {
+  transition: background-color 0.2s ease, color 0.2s ease,
+    height 0.32s cubic-bezier(0.22, 1, 0.36, 1), box-shadow 0.25s ease;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pill-label,
+  .pill-item {
+    transition: none;
+  }
+}
+
+/* ---------- 自绘窗口控制（Win/Linux 无边框，macOS 用原生红绿灯） ---------- */
+.win-ctrl {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  color: var(--text-2);
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+.win-ctrl:hover {
+  background: var(--glass-hover);
+  color: var(--text-1);
+}
+.win-ctrl:active {
+  background: var(--glass-active);
+}
+.win-ctrl-close:hover {
+  background: #e81123;
+  color: #fff;
+}
+.win-ctrl-close:active {
+  background: #f1707a;
+  color: #fff;
+}
+/* macOS 红绿灯节奏：三颗挨紧（3×26px ≈ 78px，与原生红绿灯组同宽） */
+.win-ctrl-traffic {
+  width: 26px;
 }
 
 /* 弹层入场动效：遮罩淡入 + 面板轻弹（缩放回弹 + 轻微上浮） */
@@ -188,12 +246,25 @@ body {
   }
 }
 
-/* 卡片 */
+/* 卡片（页面内容器 / 弹窗面板统一走这里）：玻璃底 + 白描边区分层 */
 .card {
   background: var(--card);
-  border: 1px solid var(--separator);
+  border: 1px solid var(--card-border);
   border-radius: 14px;
   box-shadow: var(--shadow);
+}
+
+/* 悬浮面板统一磨砂底（弹窗 / 抽屉 / 菜单）：与筛选抽屉（FilterDrawer）同一套
+   配方 —— 92% 玻璃 tint + 页内 backdrop 模糊（blur 40px / saturate 1.5）。
+   backdrop-filter 是文件头「透明 WKWebView 禁令」的例外：只允许用在身后有
+   页面内容的浮层上（详情抽屉压网格、弹窗压页面），tint 的 alpha 就是模糊
+   失效时的可读兜底。定义在 .card 之后，组合使用时覆盖 .card 的实底背景；
+   color-mix 不支持的旧 WebKit 退回上面的 var(--card) 兜底声明。 */
+.glass-panel {
+  background: var(--card);
+  background: color-mix(in oklab, var(--card) 92%, transparent);
+  -webkit-backdrop-filter: blur(40px) saturate(1.5);
+  backdrop-filter: blur(40px) saturate(1.5);
 }
 
 /* 卡片抽屉标题：最多两行，超出省略。双层保险，各自堵一种 WebKit 失效：

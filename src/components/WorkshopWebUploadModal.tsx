@@ -47,11 +47,11 @@ export function WorkshopWebUploadModal({
 
   return (
     <div
-      className="animate-overlay fixed inset-0 z-[60] flex items-center justify-center bg-black/30"
+      className="animate-overlay fixed inset-0 z-[60] flex items-center justify-center bg-black/25"
       onClick={phase === "preparing" ? undefined : onClose}
     >
       <div
-        className="card animate-modal-pop w-[420px] p-5"
+        className="card glass-panel animate-modal-pop w-[420px] p-5"
         onClick={(e) => e.stopPropagation()}
       >
         <h3 className="text-[14.5px] font-semibold">

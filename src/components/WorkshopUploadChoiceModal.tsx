@@ -17,15 +17,15 @@ export function WorkshopUploadChoiceModal({
   const isUpdate = Boolean(item.publishedFileId);
 
   const cardCls =
-    "group flex w-full items-start gap-3 rounded-xl border border-[var(--separator)] p-3.5 text-left transition-colors hover:border-[var(--accent-strong)] hover:bg-black/5 dark:hover:bg-white/10";
+    "group flex w-full items-start gap-3 rounded-xl border border-[var(--separator)] p-3.5 text-left transition-colors hover:border-[var(--accent-strong)] hover:bg-white/10";
 
   return (
     <div
-      className="animate-overlay fixed inset-0 z-[60] flex items-center justify-center bg-black/30"
+      className="animate-overlay fixed inset-0 z-[60] flex items-center justify-center bg-black/25"
       onClick={onClose}
     >
       <div
-        className="card animate-modal-pop w-[440px] p-5"
+        className="card glass-panel animate-modal-pop w-[440px] p-5"
         onClick={(e) => e.stopPropagation()}
       >
         <h3 className="text-[14.5px] font-semibold">{tr("上传到创意工坊")}</h3>

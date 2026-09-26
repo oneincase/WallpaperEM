@@ -13,12 +13,13 @@ pub mod windows;
 pub mod platform;
 pub mod pointer;
 pub mod wheel;
+pub mod auto_pause;
 
 use crate::audio_capture;
 use crate::db;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
@@ -39,10 +40,12 @@ pub const RENDER_DPR_MAX: f32 = 1.0;
 /// 0 = 自动（跟随设备像素比，默认）。
 pub const DEFAULT_RENDER_DPR: f32 = 0.0;
 /// 场景壁纸帧率上限（帧/秒）：越低 GPU 占用越低。
-/// 可选 15 / 24 / 30 / 45 / 60 / 120，默认 24（低功耗，多数场景 24fps 观感足够）。
+/// 值域 [15,60] 任意整数（设置页滑条），默认 24（低功耗，多数场景 24fps 观感足够）。
 pub const DEFAULT_SCENE_FPS: u32 = 24;
-/// 允许的全局帧率档位（托盘、设置页、`wallpaper_set_scene_fps` 共用同一份白名单）
-pub const SCENE_FPS_CHOICES: [u32; 6] = [15, 24, 30, 45, 60, 120];
+/// 帧率上限的取值范围（设置页滑条最小/最大值与命令校验共用同一份限制）。
+/// 历史值可能存着 120（旧托盘菜单写的）：读取时按上限钳制，不整值丢弃。
+pub const SCENE_FPS_MIN: u32 = 15;
+pub const SCENE_FPS_MAX: u32 = 60;
 
 /// 抗锯齿模式（webwallgl 库 1.3.23+）：off 默认（=库旧行为）/ fxaa 帧末后处理
 /// （全画面边缘）/ msaa2 / msaa4 多重采样（只平滑几何边缘）。
@@ -51,18 +54,132 @@ pub const AA_CHOICES: [&str; 4] = ["off", "fxaa", "msaa2", "msaa4"];
 /// 粒子质量档：high 默认 / medium / low（按倍率同缩数量上限与发射率）/ off（不渲染不推进）。
 pub const DEFAULT_PARTICLES: &str = "high";
 pub const PARTICLE_QUALITY_CHOICES: [&str; 4] = ["off", "low", "medium", "high"];
-/// 后处理质量档：high 默认 / medium / low（压效果链 FBO 分辨率）。
-/// 不提供 off：整屏关后处理会让辉光/水波类壁纸直接失去画面效果（v1.0.1 起
-/// 从档位里移除；历史存量为 off 的读取时归一到 low）。
+/// 后处理质量档：high 默认 / medium / low（压效果链 FBO 分辨率）/ off
+/// （效果链直通，辉光/水波等画面效果全无，WebWallGL 原生支持）。
+/// v1.0.1 曾移除 off（怕误关丢效果），按用户要求恢复为可选档。
 pub const DEFAULT_POST: &str = "high";
-pub const POST_QUALITY_CHOICES: [&str; 3] = ["low", "medium", "high"];
+pub const POST_QUALITY_CHOICES: [&str; 4] = ["off", "low", "medium", "high"];
 
-/// 读取后处理档时的归一化：旧版本允许存 off，现归一到 low（不再有关档）
+/// 读取后处理档时的归一化：合法档（含 off）直通，缺失/非法回默认
 fn normalize_post(v: Option<String>) -> String {
     match v.as_deref() {
-        Some("off") => "low".into(),
         Some(x) if POST_QUALITY_CHOICES.contains(&x) => v.unwrap(),
         _ => DEFAULT_POST.into(),
+    }
+}
+
+/// 贴图资源倍率（webwallgl `?resources=`）：贴图解码/上传尺寸相对原图的倍率。
+/// `None` = 跟随清晰度档（库内按绝对 DPR 映射：高清→1 / 标准→0.8 / 省电→0.6）；
+/// `Some(0.5..=1)` = 强制倍率（1 = 原生不缩）。倍率在**挂载期**生效，改动后
+/// 壁纸窗口要整页重载（同 localAssets）。
+pub const RESOURCES_MIN: f32 = 0.5;
+pub const RESOURCES_MAX: f32 = 1.0;
+/// 法线/蒙版贴图的资源倍率（webwallgl `?resourcesNormal=`）：默认 1（不缩，
+/// 折射与光照对模糊敏感）。设置页滑条范围 [0.35, 1]。
+pub const RESOURCES_NORMAL_MIN: f32 = 0.35;
+pub const RESOURCES_NORMAL_MAX: f32 = 1.0;
+pub const DEFAULT_RESOURCES_NORMAL: f32 = 1.0;
+
+/// 视频纹理上传倍率（webwallgl `?vidscale=`）：**0 = 自动**（库内帧率守门按实测
+/// 帧率往下压，见 quality.ts 的第二段阶梯）；正数 = 固定倍率（1 = 不压最清晰、
+/// 0.5 = 半幅最省）。与上面几个参数不同，它**不参与画质档位反推**（是独立开关，
+/// 三个预设一律给 0=自动），所以 QUALITY_KEYS 里没有它。
+///
+/// 为什么需要这个开关：macOS WKWebView 下逐帧 `texImage2D(视频帧)` 要把像素
+/// **同步**取回页面进程，代价随像素数线性 —— 全屏视频层上传 2570×1446 时主线程
+/// 每帧堵 ~40ms（16fps / 上限 30），压到 1285×723 回到 29fps。自动档已经能自己
+/// 收敛（实测 17→30fps），这个开关给「我更在意视频清晰度 / 更在意流畅」的人一个
+/// 手动的档。
+pub const VIDEO_TEX_SCALE_MIN: f32 = 0.25;
+pub const VIDEO_TEX_SCALE_MAX: f32 = 1.0;
+
+/// 读设置归一：缺省/非法/≤0 → 0（自动）；其余钳到 [0.25, 1]。
+pub fn parse_video_tex_scale(raw: Option<&str>) -> f32 {
+    let v = raw
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .unwrap_or(0.0);
+    if !v.is_finite() || v <= 0.0 {
+        0.0
+    } else {
+        v.clamp(VIDEO_TEX_SCALE_MIN, VIDEO_TEX_SCALE_MAX)
+    }
+}
+
+/// 画质档位预设（设置页「画质档位」低/中/高）。选中即**整体覆盖**全局画质参数
+/// （清晰度/帧率/粒子/后处理/资源倍率/法线倍率，抗锯齿一律 off）。
+/// 与 `src/pages/Settings.tsx` 的 QUALITY_PRESETS 镜像 —— 那边用于显示当前档位
+/// 与联动判定（手调任意参数即视为「自定义」），两边取值必须逐字段一致。
+pub struct QualityPreset {
+    /// 清晰度（相对设备像素比倍率）
+    pub render_dpr: f32,
+    pub scene_fps: u32,
+    pub particles: &'static str,
+    pub post: &'static str,
+    /// 贴图资源倍率（预设一律显式给值，不吃「跟随清晰度」的自动映射）
+    pub resources: f32,
+    /// 法线/蒙版资源倍率
+    pub resources_normal: f32,
+}
+
+pub const PRESET_LOW: QualityPreset = QualityPreset {
+    render_dpr: 0.75,
+    scene_fps: 15,
+    particles: "low",
+    post: "low",
+    resources: 0.6,
+    resources_normal: 0.75,
+};
+pub const PRESET_MEDIUM: QualityPreset = QualityPreset {
+    render_dpr: 0.85,
+    scene_fps: 30,
+    particles: "medium",
+    post: "medium",
+    resources: 0.8,
+    resources_normal: 1.0,
+};
+pub const PRESET_HIGH: QualityPreset = QualityPreset {
+    render_dpr: 1.0,
+    scene_fps: 30,
+    particles: "high",
+    post: "high",
+    resources: 1.0,
+    resources_normal: 1.0,
+};
+
+/// 当前六个画质参数 → 反推档位 id（"low"/"medium"/"high"/"custom"）。
+/// 与设置页 QUALITY_PRESETS 的派生规则一致：**逐字段相等**才算档位，
+/// 手调任意参数即「自定义」。历史值先归一（清晰度 0=自动→1、贴图 auto→1、
+/// 帧率钳 15–60）再比，避免老数据永远判不出档位。
+/// 托盘「画质档位」勾选与设置页档位按钮共用这一个来源。
+pub fn derive_quality_preset_id(conn: &Connection) -> &'static str {
+    let read = |key: &str| db::get_setting(conn, key);
+    let dpr = parse_render_dpr(read("wallpaper_render_dpr").as_deref());
+    let fps = parse_scene_fps(read("wallpaper_scene_fps").as_deref());
+    let particles = read("wallpaper_particles").unwrap_or_default();
+    let post = read("wallpaper_post").unwrap_or_default();
+    let resources = parse_resources(read("wallpaper_resources").as_deref());
+    let resources_normal = read("wallpaper_resources_normal")
+        .as_deref()
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .filter(|v| (0.0..=1.0).contains(v))
+        .unwrap_or(DEFAULT_RESOURCES_NORMAL);
+
+    let hit = |p: &QualityPreset| {
+        (dpr - p.render_dpr).abs() < 0.001
+            && fps == p.scene_fps
+            && particles == p.particles
+            && post == p.post
+            && (resources - p.resources).abs() < 0.001
+            && (resources_normal - p.resources_normal).abs() < 0.001
+    };
+    if hit(&PRESET_LOW) {
+        "low"
+    } else if hit(&PRESET_MEDIUM) {
+        "medium"
+    } else if hit(&PRESET_HIGH) {
+        "high"
+    } else {
+        "custom"
     }
 }
 
@@ -89,6 +206,37 @@ pub const WALLPAPER_FILTERS: &[(&str, &str)] = &[
 /// 默认滤镜 id（= 不套任何 CSS filter）
 pub const DEFAULT_FILTER: &str = "none";
 
+/// 无缝切换的过渡效果（换壁纸时新窗在旧窗上方显形的方式）。**id 白名单同样是
+/// 契约**：托盘、设置页、URL query 传的都只是这份 id，动画实现只在渲染器里
+/// （与 WALLPAPER_FILTERS 同一套约定）。顺序 = 托盘菜单顺序；`fade` 是默认
+/// （= 沿用至今的 0.7s 叠化）。切换效果只在换壁纸的瞬间生效，改设置不影响
+/// 正在播放的壁纸，下一次切换自动生效 —— 所以 `set_reveal` 不热更活窗口。
+pub const REVEAL_FX: &[(&str, &str)] = &[
+    ("fade", "叠化"),
+    ("zoom", "推近"),
+    ("blur", "模糊"),
+    ("depth", "景深"),
+    ("circle", "圆形揭示"),
+    ("wipe", "横向擦除"),
+    ("slide", "滑入"),
+];
+/// 默认切换效果（= 叠化，旧行为）
+pub const DEFAULT_REVEAL: &str = "fade";
+
+/// 换壁纸收尾等待（毫秒）：等渲染器把切换效果动画走完再收旧窗。渲染器每效果
+/// 的动画时长见 renderer/src/main.ts 的 `REVEAL_MS` 表 —— **两边必须同步改**；
+/// 这里取「动画时长 + 400ms 裕量」（等待偏长没有视觉代价，只是旧窗多持有片刻）。
+fn reveal_fx_wait_ms(reveal: &str) -> u64 {
+    match reveal {
+        "zoom" | "blur" => 1300 + 400,
+        "depth" => 1400 + 400,
+        "circle" | "slide" => 1200 + 400,
+        "wipe" => 1000 + 400,
+        // fade 与未知值（旧配置/手改 DB）：0.7s 动画 + 裕量
+        _ => 700 + 200,
+    }
+}
+
 fn default_type() -> String {
     "canvas".into()
 }
@@ -104,6 +252,9 @@ fn default_scene_fps() -> u32 {
 fn default_filter() -> String {
     DEFAULT_FILTER.into()
 }
+fn default_reveal() -> String {
+    DEFAULT_REVEAL.into()
+}
 fn default_aa() -> String {
     DEFAULT_AA.into()
 }
@@ -112,6 +263,13 @@ fn default_particles() -> String {
 }
 fn default_post() -> String {
     DEFAULT_POST.into()
+}
+fn default_video_tex_scale() -> f32 {
+    0.0 // 自动（交给库内帧率守门）
+}
+
+fn default_resources_normal() -> f32 {
+    DEFAULT_RESOURCES_NORMAL
 }
 
 /// 全局壁纸显示模式（覆盖到每次应用/恢复），非法值回退到默认 cover。
@@ -125,29 +283,42 @@ fn global_fit(conn: Option<&Connection>) -> String {
     }
 }
 
-/// 全局渲染分辨率上限（有效 dpr 封顶），读取设置 `wallpaper_render_dpr`，非法值回退到默认。
-fn global_render_dpr(conn: Option<&Connection>) -> f32 {
-    let raw = conn.and_then(|c| db::get_setting(c, "wallpaper_render_dpr"));
-    let parsed = raw
-        .as_deref()
+/// 字符串 → 清晰度倍率（相对设备像素比）。历史 0（「自动」档，已随选项移除）
+/// 归一为 1（自动恒等于设备 DPR = ×1.0，视觉无损）；非法/越界回退默认。
+pub(crate) fn parse_render_dpr(raw: Option<&str>) -> f32 {
+    let n = raw
         .and_then(|s| s.trim().parse::<f32>().ok())
         .unwrap_or(DEFAULT_RENDER_DPR);
-    parsed.clamp(RENDER_DPR_MIN, RENDER_DPR_MAX)
+    if n <= 0.0 {
+        1.0
+    } else {
+        n.clamp(RENDER_DPR_MIN, RENDER_DPR_MAX)
+    }
 }
 
-/// 全局场景帧率上限（读设置 `wallpaper_scene_fps`），只允许 [`SCENE_FPS_CHOICES`]，
-/// 非法值回退默认。
+/// 字符串 → 场景帧率上限。范围 [`SCENE_FPS_MIN`]–[`SCENE_FPS_MAX`]。
+/// 历史值可能写着 120（上限放宽到 120 的旧版本）——按上限钳制而不是回退默认，
+/// 用户调过的档位不至于整档丢掉。
+pub(crate) fn parse_scene_fps(raw: Option<&str>) -> u32 {
+    raw.and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_SCENE_FPS)
+        .clamp(SCENE_FPS_MIN, SCENE_FPS_MAX)
+}
+
+/// 全局渲染分辨率上限（有效 dpr 封顶），读取设置 `wallpaper_render_dpr`。
+fn global_render_dpr(conn: Option<&Connection>) -> f32 {
+    parse_render_dpr(
+        conn.and_then(|c| db::get_setting(c, "wallpaper_render_dpr"))
+            .as_deref(),
+    )
+}
+
+/// 全局场景帧率上限（读设置 `wallpaper_scene_fps`）。
 pub(crate) fn global_scene_fps(conn: Option<&Connection>) -> u32 {
-    let raw = conn.and_then(|c| db::get_setting(c, "wallpaper_scene_fps"));
-    let parsed = raw
-        .as_deref()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .unwrap_or(DEFAULT_SCENE_FPS);
-    if SCENE_FPS_CHOICES.contains(&parsed) {
-        parsed
-    } else {
-        DEFAULT_SCENE_FPS
-    }
+    parse_scene_fps(
+        conn.and_then(|c| db::get_setting(c, "wallpaper_scene_fps"))
+            .as_deref(),
+    )
 }
 
 /// 全局滤镜 id（读设置 `wallpaper_filter`）。不在白名单内（旧值/手改 DB）回退默认。
@@ -163,13 +334,20 @@ pub(crate) fn global_filter(conn: Option<&Connection>) -> String {
     }
 }
 
-/// 全局抗锯齿模式（读设置 `wallpaper_aa`），白名单外回退默认 off。
-fn global_aa(conn: Option<&Connection>) -> String {
-    let raw = conn.and_then(|c| db::get_setting(c, "wallpaper_aa"));
+/// 全局切换效果 id（读设置 `wallpaper_reveal`），白名单外（旧值/手改 DB）回退默认。
+fn global_reveal(conn: Option<&Connection>) -> String {
+    let raw = conn.and_then(|c| db::get_setting(c, "wallpaper_reveal"));
     match raw.as_deref() {
-        Some(v) if AA_CHOICES.contains(&v) => v.to_string(),
-        _ => DEFAULT_AA.into(),
+        Some(id) if REVEAL_FX.iter().any(|(k, _)| *k == id) => id.to_string(),
+        _ => DEFAULT_REVEAL.into(),
     }
+}
+
+/// 全局抗锯齿模式。**当前锁定为 off**：抗锯齿方案优化中（FXAA/MSAA 在部分
+/// 壁纸上有瑕疵），所有档位一律关闭、禁止更改 —— 这里恒回 off，历史存量值
+/// （含每壁纸覆盖）也不再生效；优化完成后放开此闸门即可恢复白名单读取。
+fn global_aa(_conn: Option<&Connection>) -> String {
+    DEFAULT_AA.into()
 }
 
 /// 全局粒子质量档（读设置 `wallpaper_particles`），白名单外回退默认 high。
@@ -185,6 +363,39 @@ fn global_particles(conn: Option<&Connection>) -> String {
 /// 旧版本存过 off 的归一到 low（off 档已移除，后处理不再允许整屏关闭）。
 fn global_post(conn: Option<&Connection>) -> String {
     normalize_post(conn.and_then(|c| db::get_setting(c, "wallpaper_post")))
+}
+
+/// 全局贴图资源倍率（读设置 `wallpaper_resources`）。
+/// 历史的 `auto`（跟随清晰度档，已随选项移除）归一为 1（原生）。
+fn global_resources(conn: Option<&Connection>) -> Option<f32> {
+    let raw = conn.and_then(|c| db::get_setting(c, "wallpaper_resources"));
+    Some(parse_resources(raw.as_deref()))
+}
+
+/// 字符串 → 贴图资源倍率。`auto`/空/非法 → 1（原生）：「跟随清晰度」档已移除，
+/// 界面只展示具体倍率，这里归一到同样的值，显示与实际生效一致。
+/// 仅接受 [RESOURCES_MIN, RESOURCES_MAX] 区间内的数字，越界同样回退 1。
+pub(crate) fn parse_resources(raw: Option<&str>) -> f32 {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "auto")
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && (RESOURCES_MIN..=RESOURCES_MAX).contains(v))
+        .unwrap_or(1.0)
+}
+
+/// 全局法线/蒙版资源倍率（读设置 `wallpaper_resources_normal`），默认 1（不缩），
+/// 越界/非法回退默认。
+/// 全局视频纹理上传倍率（读设置 `wallpaper_video_tex_scale`），默认 0 = 自动。
+fn global_video_tex_scale(conn: Option<&Connection>) -> f32 {
+    let raw = conn.and_then(|c| db::get_setting(c, "wallpaper_video_tex_scale"));
+    parse_video_tex_scale(raw.as_deref())
+}
+
+fn global_resources_normal(conn: Option<&Connection>) -> f32 {
+    conn.and_then(|c| db::get_setting(c, "wallpaper_resources_normal"))
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite() && (RESOURCES_NORMAL_MIN..=RESOURCES_NORMAL_MAX).contains(v))
+        .unwrap_or(DEFAULT_RESOURCES_NORMAL)
 }
 
 /// WE 官方素材通路开关（设置 `wallpaper_local_assets`）。
@@ -236,6 +447,12 @@ pub struct ItemPlayConfig {
     /// 后处理质量（off/low/medium/high，库 1.3.23+）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_processing: Option<String>,
+    /// 贴图资源倍率（0.5..=1，挂载期生效）。None = 跟随全局
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<f32>,
+    /// 法线/蒙版资源倍率（0.35..=1，挂载期生效）。None = 跟随全局
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources_normal: Option<f32>,
 }
 
 fn play_cfg_key(item_id: &str) -> String {
@@ -262,7 +479,9 @@ fn set_item_play_config(
         && v.volume.is_none()
         && v.aa.is_none()
         && v.particles.is_none()
-        && v.post_processing.is_none();
+        && v.post_processing.is_none()
+        && v.resources.is_none()
+        && v.resources_normal.is_none();
     if empty {
         // 留一个空 JSON 会让「跟随全局」和「曾经改过又还原」在 DB 里长得不一样，
         // 后续想按 key 存在性做统计就会错；直接删干净
@@ -289,9 +508,13 @@ fn apply_play_config(app: &AppHandle, cfg: &mut WallpaperConfig, item_id: Option
         cfg.render_dpr = DEFAULT_RENDER_DPR;
         cfg.scene_fps = DEFAULT_SCENE_FPS;
         cfg.filter = DEFAULT_FILTER.into();
+        cfg.reveal = DEFAULT_REVEAL.into();
         cfg.aa = DEFAULT_AA.into();
         cfg.particles = DEFAULT_PARTICLES.into();
         cfg.post_processing = DEFAULT_POST.into();
+        cfg.resources = None;
+        cfg.resources_normal = DEFAULT_RESOURCES_NORMAL;
+        cfg.video_tex_scale = 0.0;
         cfg.local_assets = true;
         return;
     };
@@ -300,9 +523,13 @@ fn apply_play_config(app: &AppHandle, cfg: &mut WallpaperConfig, item_id: Option
         cfg.render_dpr = DEFAULT_RENDER_DPR;
         cfg.scene_fps = DEFAULT_SCENE_FPS;
         cfg.filter = DEFAULT_FILTER.into();
+        cfg.reveal = DEFAULT_REVEAL.into();
         cfg.aa = DEFAULT_AA.into();
         cfg.particles = DEFAULT_PARTICLES.into();
         cfg.post_processing = DEFAULT_POST.into();
+        cfg.resources = None;
+        cfg.resources_normal = DEFAULT_RESOURCES_NORMAL;
+        cfg.video_tex_scale = 0.0;
         cfg.local_assets = true;
         return;
     };
@@ -311,9 +538,13 @@ fn apply_play_config(app: &AppHandle, cfg: &mut WallpaperConfig, item_id: Option
     cfg.render_dpr = global_render_dpr(Some(&conn));
     cfg.scene_fps = global_scene_fps(Some(&conn));
     cfg.filter = global_filter(Some(&conn));
+    cfg.reveal = global_reveal(Some(&conn));
     cfg.aa = global_aa(Some(&conn));
     cfg.particles = global_particles(Some(&conn));
     cfg.post_processing = global_post(Some(&conn));
+    cfg.resources = global_resources(Some(&conn));
+    cfg.resources_normal = global_resources_normal(Some(&conn));
+    cfg.video_tex_scale = global_video_tex_scale(Some(&conn));
     cfg.local_assets = global_local_assets(Some(&conn));
     // 再叠本壁纸覆盖
     if let Some(id) = item_id {
@@ -327,9 +558,8 @@ fn apply_play_config(app: &AppHandle, cfg: &mut WallpaperConfig, item_id: Option
             cfg.render_dpr = d.clamp(RENDER_DPR_MIN, RENDER_DPR_MAX);
         }
         if let Some(f) = ov.scene_fps {
-            if SCENE_FPS_CHOICES.contains(&f) {
-                cfg.scene_fps = f;
-            }
+            // 历史覆盖值可能写着 120（上限 120 的旧版本）：钳制到当前上限，不整项丢弃
+            cfg.scene_fps = f.clamp(SCENE_FPS_MIN, SCENE_FPS_MAX);
         }
         if let Some(v) = ov.volume {
             // 精确音量随配置下发：渲染器挂载时先静音，加载完成后按它起音量；
@@ -349,13 +579,25 @@ fn apply_play_config(app: &AppHandle, cfg: &mut WallpaperConfig, item_id: Option
             }
         }
         if let Some(v) = ov.post_processing.as_deref() {
-            // 旧数据可能存过 off（该档已移除）：归一到 low
-            let v = if v == "off" { "low" } else { v };
             if POST_QUALITY_CHOICES.contains(&v) {
                 cfg.post_processing = v.to_string();
             }
         }
+        // 贴图/法线倍率是挂载期 URL query：覆盖值只影响下一次导航（见
+        // item_play_config_set 的重载收尾），这里只合成生效配置
+        if let Some(r) = ov.resources {
+            if r.is_finite() && (RESOURCES_MIN..=RESOURCES_MAX).contains(&r) {
+                cfg.resources = Some(r);
+            }
+        }
+        if let Some(r) = ov.resources_normal {
+            if r.is_finite() && (RESOURCES_NORMAL_MIN..=RESOURCES_NORMAL_MAX).contains(&r) {
+                cfg.resources_normal = r;
+            }
+        }
     }
+    // 抗锯齿锁定为 off（方案优化中，禁止更改）：覆盖全局与每壁纸覆盖的任何历史值
+    cfg.aa = DEFAULT_AA.into();
 }
 
 /// 读某壁纸的播放设置（给前端：同时给出覆盖值与当前全局默认，便于显示「跟随全局」）
@@ -375,6 +617,8 @@ pub fn item_play_config_get(app: AppHandle, item_id: String) -> Result<serde_jso
             "aa": global_aa(Some(&conn)),
             "particles": global_particles(Some(&conn)),
             "postProcessing": global_post(Some(&conn)),
+            "resources": global_resources(Some(&conn)),
+            "resourcesNormal": global_resources_normal(Some(&conn)),
         }
     }))
 }
@@ -387,9 +631,12 @@ fn reset_play_fields(cfg: &mut WallpaperConfig) {
     cfg.render_dpr = DEFAULT_RENDER_DPR;
     cfg.scene_fps = DEFAULT_SCENE_FPS;
     cfg.filter = DEFAULT_FILTER.into();
+    cfg.reveal = DEFAULT_REVEAL.into();
     cfg.aa = DEFAULT_AA.into();
     cfg.particles = DEFAULT_PARTICLES.into();
     cfg.post_processing = DEFAULT_POST.into();
+    cfg.resources = None;
+    cfg.resources_normal = DEFAULT_RESOURCES_NORMAL;
     cfg.local_assets = true;
     cfg.volume = None;
     cfg.muted = default_muted();
@@ -422,7 +669,6 @@ pub fn item_play_config_set(
     let Some(state) = app.try_state::<WallpaperEngineState>() else {
         return Ok(());
     };
-    let db = app.try_state::<Arc<Mutex<Connection>>>();
     let labels: Vec<String> = {
         let windows = state.windows.lock().unwrap();
         windows
@@ -446,8 +692,21 @@ pub fn item_play_config_set(
             }
         };
         let display_id_key = label.strip_prefix("wallpaper-").unwrap_or(&label).to_string();
+        // 贴图/法线倍率只在挂载期读（URL query）：改了就得整页重载，热发 eval 不认。
+        // 先记住重载前的值，合成完对比，变了就走导航而不是热发
+        let res_before = (cfg2.resources, cfg2.resources_normal);
         reset_play_fields(&mut cfg2);
         apply_play_config(&app, &mut cfg2, Some(&item_id));
+        if res_before != (cfg2.resources, cfg2.resources_normal) {
+            for w in wallpaper_windows(&app, &label) {
+                if let Err(e) = navigate_to_config(&app, &w, &cfg2) {
+                    tracing::warn!("item_play_config_set reload[{label}]: {e}");
+                }
+            }
+            state.windows.lock().unwrap().insert(label.clone(), cfg2.clone());
+            persist_session(&app, &display_id_key, &item_id, &cfg2);
+            continue;
+        }
         for w in wallpaper_windows(&app, &label) {
             let _ = w.eval(&format!(
                 "window.__wp && window.__wp.setFit({})",
@@ -481,23 +740,29 @@ pub fn item_play_config_set(
         // 同步内存态与持久化会话：否则 state.windows/会话里的旧覆盖值（volume/
         // muted 等）要等下次「应用」才被冲掉，期间重启会带着旧音量回来
         state.windows.lock().unwrap().insert(label.clone(), cfg2.clone());
-        if let Some(db) = &db {
-            if let Ok(conn) = db.lock() {
-                let _ = conn.execute(
-                    "INSERT INTO wallpaper_sessions(display_id, item_id, config_json, updated_at)
-                     VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(display_id) DO UPDATE SET item_id = ?2, config_json = ?3, updated_at = ?4",
-                    rusqlite::params![
-                        display_id_key,
-                        item_id,
-                        serde_json::to_string(&cfg2).unwrap_or_default(),
-                        chrono::Utc::now().timestamp()
-                    ],
-                );
-            }
-        }
+        persist_session(&app, &display_id_key, &item_id, &cfg2);
     }
     Ok(())
+}
+
+/// 把某屏的当前配置写进持久化会话（重启恢复用）。失败只记日志 —— 会话是
+/// 体验优化不是数据正确性，别让一次磁盘抖动把播放设置的保存整单打回。
+fn persist_session(app: &AppHandle, display_id: &str, item_id: &str, cfg: &WallpaperConfig) {
+    let Some(db) = app.try_state::<Arc<Mutex<Connection>>>() else {
+        return;
+    };
+    let Ok(conn) = db.lock() else { return };
+    let _ = conn.execute(
+        "INSERT INTO wallpaper_sessions(display_id, item_id, config_json, updated_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(display_id) DO UPDATE SET item_id = ?2, config_json = ?3, updated_at = ?4",
+        rusqlite::params![
+            display_id,
+            item_id,
+            serde_json::to_string(cfg).unwrap_or_default(),
+            chrono::Utc::now().timestamp()
+        ],
+    );
 }
 
 fn default_muted() -> bool {
@@ -522,12 +787,16 @@ pub struct WallpaperConfig {
     /// 渲染分辨率上限（有效 dpr 封顶），越低越省内存
     #[serde(default = "default_render_dpr")]
     pub render_dpr: f32,
-    /// 场景壁纸帧率上限（15/24/30/45/60/120），越低 GPU 占用越低
+    /// 场景壁纸帧率上限（15–60 任意整数），越低 GPU 占用越低
     #[serde(default = "default_scene_fps")]
     pub scene_fps: u32,
     /// 全局滤镜 id（见 WALLPAPER_FILTERS 白名单）
     #[serde(default = "default_filter")]
     pub filter: String,
+    /// 无缝切换过渡效果 id（见 REVEAL_FX 白名单）。纯全局设置，没有每壁纸覆盖；
+    /// 只在换壁纸瞬间由渲染器读取，改了不影响正在播放的窗口
+    #[serde(default = "default_reveal")]
+    pub reveal: String,
     /// 抗锯齿模式（off/fxaa/msaa2/msaa4，库 1.3.23+）
     #[serde(default = "default_aa")]
     pub aa: String,
@@ -537,6 +806,16 @@ pub struct WallpaperConfig {
     /// 后处理质量档（off/low/medium/high，库 1.3.23+）
     #[serde(default = "default_post")]
     pub post_processing: String,
+    /// 贴图资源倍率（0.5..=1）：None = 跟随清晰度档。渲染器 URL 的 `?resources=`
+    /// 由它生成（库只认 URL query，挂载期解码/上传时生效，改后需整页重载）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<f32>,
+    /// 法线/蒙版资源倍率（0.35..=1，默认 1 不缩）。URL 的 `?resourcesNormal=`
+    #[serde(default = "default_resources_normal")]
+    pub resources_normal: f32,
+    /// 视频纹理上传倍率（0 = 自动/交给库内帧率守门，正数 = 固定）。URL 的 `?vidscale=`
+    #[serde(default = "default_video_tex_scale")]
+    pub video_tex_scale: f32,
     #[serde(default = "default_muted")]
     pub muted: bool,
     /// 音量 0..1 的精确值（0 即静音）。挂载时一律先静音，渲染器在壁纸完全
@@ -568,9 +847,13 @@ impl Default for WallpaperConfig {
             render_dpr: default_render_dpr(),
             scene_fps: default_scene_fps(),
             filter: default_filter(),
+            reveal: default_reveal(),
             aa: default_aa(),
             particles: default_particles(),
             post_processing: default_post(),
+            resources: None,
+            resources_normal: default_resources_normal(),
+            video_tex_scale: default_video_tex_scale(),
             muted: default_muted(),
             volume: None,
             r#loop: default_loop(),
@@ -587,17 +870,17 @@ pub struct WallpaperEngineState {
     /// 最近一次会话配置（显示器 ID 变更/新增屏时作为恢复兜底）
     pub default: Mutex<Option<WallpaperConfig>>,
     pub paused: Mutex<bool>,
-    /// 「自动暂停」自己挂上的暂停（区别于用户手动暂停）：回到桌面时只恢复
-    /// 这个标志置位的暂停，用户手动暂停不受前台切换影响
-    pub auto_paused: Mutex<bool>,
-    /// 「暂停释放内存」已把壁纸渲染器整个销毁（自动暂停的加强形态）。
+    /// 「自动暂停」挂起中的壁纸 label 集合（**按屏独立**；区别于用户手动暂停）：
+    /// 只恢复集合内 label 的暂停，用户手动暂停不受可见性变化影响
+    pub auto_paused: Mutex<HashSet<String>>,
+    /// 「暂停释放内存」已销毁的壁纸 label 集合（按屏独立；自动暂停的加强形态）。
     ///
-    /// 置位期间壁纸窗口不存在、但 `windows` 里的会话配置**保留** ——
-    /// `ensure_windows` 见此标志不建窗（否则 2s 一轮的监控会把刚杀掉的
-    /// 渲染进程立刻建回来），恢复播放时清标志并按配置整窗重建
-    /// （[`resume_all`]）。这是比 `__wp.release()`（页面内 JS 释放）更彻底的
-    /// 一档：进程直接结束，内存实打实归还。
-    pub released: Mutex<bool>,
+    /// 集合内的 label：壁纸窗口不存在、但 `windows` 里的会话配置**保留** ——
+    /// `ensure_windows` 见 label 在集合里不建窗（否则 2s 一轮的监控会把刚杀掉的
+    /// 渲染进程立刻建回来），恢复该屏时清掉并按配置重建（[`resume_label`]）。
+    /// 这是比 `__wp.release()`（页面内 JS 释放）更彻底的一档：进程直接结束，
+    /// 内存实打实归还。
+    pub released: Mutex<HashSet<String>>,
     /// macOS：label -> 该窗口**独占**的 WKWebsiteDataStore 标识。
     ///
     /// 窗口被销毁（stop / 显示器移除 / 换纸降级到重建）时按它
@@ -617,8 +900,8 @@ impl Default for WallpaperEngineState {
             windows: Mutex::new(HashMap::new()),
             default: Mutex::new(None),
             paused: Mutex::new(false),
-            auto_paused: Mutex::new(false),
-            released: Mutex::new(false),
+            auto_paused: Mutex::new(HashSet::new()),
+            released: Mutex::new(HashSet::new()),
             #[cfg(target_os = "macos")]
             data_stores: Mutex::new(HashMap::new()),
         }
@@ -680,11 +963,13 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
         });
     }
     start_monitor(app);
-    // 自动暂停（默认关）：监听前台应用切换，切到非桌面暂停、回桌面恢复
-    // （macOS/Windows 有前台应用观察者；Linux 后端是空实现，开关暂不生效果详见 linux.rs）
+    // 自动暂停（默认关）：判据是「壁纸可见性」而非前台焦点 —— 前台切换通知作
+    // 即时提示，250ms 对账循环兜底最小化/关窗/F11/切空桌面等不换前台的回桌面
+    // 路径（详见 auto_pause.rs 的判定表）
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     platform::store_app_handle(app);
     platform::start_auto_pause_observer(app);
+    auto_pause::start_ticker(app);
     // 交互态下点桌面不一定触发前台切换（壁纸窗无边框不能成为 key），
     // 补一条「点击落在壁纸窗口 = 回到桌面」的直接恢复信号（仅 macOS 有实现）
     platform::start_desktop_click_monitor(app);
@@ -902,14 +1187,8 @@ fn ensure_windows_inner(app: &AppHandle, display_asleep: bool) {
     // NSScreen 名称缓存刷新（本函数的正常调用方在主线程：2s 监控 tick 与 init；
     // 非主线程调用内部直接返回，名称读缓存兜底）
     platform::refresh_display_meta();
-    // 「暂停释放内存」挂起期间不建窗：自动暂停已把壁纸渲染器整个销毁，
-    // 这里若照常同步会把刚结束的进程立刻建回来（等于没释放）。恢复播放时
-    // 由 resume_all 清标志后主动重建。
-    if let Some(st) = app.try_state::<WallpaperEngineState>() {
-        if *st.released.lock().unwrap() {
-            return;
-        }
-    }
+    // 「暂停释放内存」挂起的屏（label 在 released 集合里）不建窗，见下方创建
+    // 循环内的逐 label 跳过 —— 自动暂停按屏独立，全局早退会让别的屏也同步不了。
     // 显示器睡眠/唤醒切换期间不做任何窗口增删：此时 CGGetActiveDisplayList
     // 可能返回空列表（显示器从「活动」列表暂时消失），若照常执行下方清理逻辑，
     // 会把所有壁纸窗口误判为「已断开的显示器」全部销毁 —— 主窗口此时通常也是
@@ -940,6 +1219,7 @@ fn ensure_windows_inner(app: &AppHandle, display_asleep: bool) {
         None => return,
     };
     let configs = state.windows.lock().unwrap().clone();
+    let released = state.released.lock().unwrap().clone();
     // 显示器 ID 变更/新增屏时，用最近一次会话配置兜底，保证壁纸仍能恢复
     let default_cfg = state.default.lock().unwrap().clone();
 
@@ -960,6 +1240,13 @@ fn ensure_windows_inner(app: &AppHandle, display_asleep: bool) {
             destroy_wallpaper_window(app, &w);
             if let Ok(mut windows) = state.windows.lock() {
                 windows.remove(&base);
+            }
+            // 断开的屏：自动暂停/释放挂起状态一并清掉（重插后按当前可见性重新判定）
+            if let Ok(mut g) = state.auto_paused.lock() {
+                g.remove(&base);
+            }
+            if let Ok(mut g) = state.released.lock() {
+                g.remove(&base);
             }
         }
     }
@@ -985,6 +1272,11 @@ fn ensure_windows_inner(app: &AppHandle, display_asleep: bool) {
             }
             continue;
         };
+        // 「暂停释放内存」挂起中的屏不建窗（渲染器已整窗销毁等恢复，照常同步
+        // 会把刚杀掉的进程立刻建回来）；该屏恢复时由 resume_label 清标志重建
+        if released.contains(label.as_str()) {
+            continue;
+        }
         let live = wallpaper_windows(app, label);
         if live.is_empty() {
             if let Err(e) = create_desktop_window(app, label, &cfg, (*x, *y, *w, *h)) {
@@ -1206,6 +1498,8 @@ fn create_desktop_window(
         .shadow(false)
         .visible(false)
         .resizable(false)
+        // 同主窗口：关 WebKit 开发者附加（dev 交互模式下右键不弹菜单）
+        .devtools(false)
         .minimizable(false)
         .maximizable(false)
         .closable(false)
@@ -1348,7 +1642,7 @@ fn schedule_window_reload(app: &AppHandle, label: &str, frame: (f64, f64, f64, f
         loop {
             // 「暂停释放内存」挂起期间不加载：配置已登记进 state.windows，
             // 恢复播放时按最新配置整窗重建；轮播也不该在后台把渲染进程建回来
-            if is_released(&app) {
+            if label_released(&app, &label) {
                 done();
                 return;
             }
@@ -1409,13 +1703,11 @@ async fn seamless_swap(
     target: &WallpaperConfig,
 ) -> SwapOutcome {
     use std::time::Duration;
-    /// 渐入时长（渲染器 wrap 的 transition 0.7s + 裕量）
-    const FADE: Duration = Duration::from_millis(900);
     /// 等首帧上限。渲染器自身的 90s 硬兜底会先报 failed（见 mountViaLib），
     /// 这里多留一拍只作最后防线 —— 播着旧壁纸远好过换上一张空白。
     const READY_TIMEOUT: Duration = Duration::from_secs(95);
 
-    if is_released(app) {
+    if label_released(app, base) {
         return SwapOutcome::KeptOld("「暂停释放内存」挂起中".into());
     }
     // 起点先于建窗：ready/failed 时间戳要「晚于它」才算本次的结果
@@ -1484,14 +1776,27 @@ async fn seamless_swap(
         }
     }
 
-    // 渐入收尾：旧窗先收音量，等渐入走完再销毁，叠化过渡
+    // 渐入收尾：旧窗先收音量，等切换效果动画走完再销毁，叠化过渡
     if let Some(w) = &old {
         let _ = w.eval("window.__wp && window.__wp.setVolume(0)");
     }
-    tokio::time::sleep(FADE).await;
+    tokio::time::sleep(Duration::from_millis(reveal_fx_wait_ms(&target.reveal))).await;
     if let Some(w) = old {
         if app.get_webview_window(w.label()).is_some() {
             destroy_wallpaper_window(app, &w);
+        }
+    }
+    // 换纸不改变播放状态：全局手动暂停 / 本屏自动暂停挂起中，把新页压回暂停
+    // （新窗加载完默认播放；首帧已 ready，此时 eval 一定落在页面脚本之后）
+    let keep_paused = app
+        .try_state::<WallpaperEngineState>()
+        .map(|st| {
+            *st.paused.lock().unwrap() || st.auto_paused.lock().unwrap().contains(base)
+        })
+        .unwrap_or(false);
+    if keep_paused {
+        if let Some(w) = app.get_webview_window(&incoming) {
+            let _ = w.eval("window.__wp && window.__wp.pause()");
         }
     }
     SwapOutcome::Swapped
@@ -1959,6 +2264,13 @@ fn eval_all(app: &AppHandle, js: &str) {
     }
 }
 
+/// 只对某个 label 的壁纸窗口注入 JS（按屏暂停/恢复用）。
+pub(crate) fn eval_label(app: &AppHandle, label: &str, js: &str) {
+    for w in wallpaper_windows(app, label) {
+        let _ = w.eval(js);
+    }
+}
+
 /// 通知所有壁纸窗口切换系统音频源。
 ///
 /// 开启时下发内容服务器 token，渲染器订阅 /audio-stream SSE 并把频谱注入库；
@@ -2147,6 +2459,14 @@ fn monitor_tick(
             *st.paused.lock().unwrap() = false;
         }
         eval_all(app, "window.__wp && window.__wp.restore()");
+        // 自动暂停挂起中的屏压回暂停：restore 会把所有页拉起来播放，播放
+        // 状态不归睡眠管（「暂停释放内存」挂起的屏没有窗口，eval 是空转）
+        if let Some(st) = app.try_state::<WallpaperEngineState>() {
+            let auto: Vec<String> = st.auto_paused.lock().unwrap().iter().cloned().collect();
+            for label in auto {
+                eval_label(app, &label, "window.__wp && window.__wp.pause()");
+            }
+        }
         tracing::info!("display woke: wallpapers restored");
     }
     // 音频捕获健康看门狗（仅 RUNNING 相位参与）。
@@ -2303,10 +2623,23 @@ fn config_query_with_audio(cfg: &WallpaperConfig, audio_token: Option<&str>) -> 
     parts.push(format!("renderDpr={}", cfg.render_dpr));
     parts.push(format!("sceneFps={}", cfg.scene_fps));
     parts.push(format!("filter={}", url_encode(&cfg.filter)));
+    // 无缝切换的过渡效果 id（渲染器 reveal() 按它选动画；缺省/未知回落叠化）
+    parts.push(format!("reveal={}", url_encode(&cfg.reveal)));
     // 渲染质量档位（库 1.3.23+；query 键 aa/pq/pp 与上游 bench 约定一致）
     parts.push(format!("aa={}", url_encode(&cfg.aa)));
     parts.push(format!("pq={}", url_encode(&cfg.particles)));
     parts.push(format!("pp={}", url_encode(&cfg.post_processing)));
+    // 贴图/法线资源倍率（库 1.4.2 resource-scale；query 键与上游 bench 一致）。
+    // 缺省 = 库默认（resources 跟随清晰度档、resourcesNormal 1）；只有覆盖时才下发
+    if let Some(r) = cfg.resources {
+        parts.push(format!("resources={r}"));
+    }
+    if (cfg.resources_normal - DEFAULT_RESOURCES_NORMAL).abs() > f32::EPSILON {
+        parts.push(format!("resourcesNormal={}", cfg.resources_normal));
+    }
+    // 视频纹理上传倍率（库 2.0.0+）：0 = 库内自动（帧率守门），正数 = 固定。
+    // 显式下发 0 也更清楚：渲染器一眼能看出「这个参数在自动档」。
+    parts.push(format!("vidscale={}", cfg.video_tex_scale));
     parts.push(format!("muted={}", cfg.muted));
     // 精确音量（0..1）：有壁纸专属音量记录时下发；渲染器加载完成后按它起音量
     if let Some(v) = cfg.volume {
@@ -2338,23 +2671,38 @@ fn content_token(app: &AppHandle) -> Option<String> {
         .map(|s| s.token.clone())
 }
 
-/// 显式应用新壁纸后，若当前暂停是「自动暂停」挂的则立即恢复播放。
+/// 显式应用新壁纸后，若该屏的暂停是「自动暂停」挂的则立即恢复播放。
 ///
 /// 用户在设置界面点「应用」是在主动要求「给我看这张壁纸」；自动暂停只是
-/// 切到后台时的临时状态，不该让新壁纸以暂停态挂载（看起来像壁纸坏了）。
-/// 用户手动暂停不受影响（auto_paused=false 时不动）；轮播走 apply_item_inner，
-/// 不触发本逻辑 —— 后台自动切换不该在用户看不见时恢复播放白烧 GPU。
-fn resume_if_auto_paused(app: &AppHandle) {
+/// 壁纸被遮住时的临时状态，不该让新壁纸以暂停态挂载（看起来像壁纸坏了）。
+/// `display_id` 缺省 = 全部显示器；传值 = 只恢复该屏。用户手动暂停不受影响
+/// （auto_paused 集合外的不动）；轮播走 apply_item_inner，不触发本逻辑 ——
+/// 后台自动切换不该在用户看不见时恢复播放白烧 GPU。
+fn resume_if_auto_paused(app: &AppHandle, display_id: Option<&str>) {
     let Some(st) = app.try_state::<WallpaperEngineState>() else {
         return;
     };
-    let was_auto = {
+    let labels: Vec<String> = {
         let mut g = st.auto_paused.lock().unwrap();
-        std::mem::replace(&mut *g, false)
+        match display_id {
+            Some(d) => {
+                let l = format!("wallpaper-{d}");
+                if g.remove(&l) {
+                    vec![l]
+                } else {
+                    Vec::new()
+                }
+            }
+            None => {
+                let v: Vec<String> = g.iter().cloned().collect();
+                g.clear();
+                v
+            }
+        }
     };
-    if was_auto {
-        let _ = resume_all(app.clone());
-        tracing::info!("auto-pause: 应用新壁纸，恢复播放");
+    for label in labels {
+        resume_label(app, &label);
+        tracing::info!("auto-pause: 应用新壁纸，{label} 恢复播放");
     }
 }
 
@@ -2370,14 +2718,15 @@ pub fn apply(
 ) -> Result<(), String> {
     let (tx, rx) = std::sync::mpsc::channel();
     let app2 = app.clone();
+    let display_id2 = display_id.clone();
     app.run_on_main_thread(move || {
-        let res = apply_on_main(&app2, display_id, config, None);
+        let res = apply_on_main(&app2, display_id2, config, None);
         let _ = tx.send(res);
     })
     .map_err(|e| e.to_string())?;
     let res = rx.recv().map_err(|e| format!("壁纸引擎未响应: {e}"))?;
     if res.is_ok() {
-        resume_if_auto_paused(&app);
+        resume_if_auto_paused(&app, display_id.as_deref());
     }
     res
 }
@@ -2405,6 +2754,10 @@ pub fn stop(app: AppHandle, display_id: Option<String>) -> Result<(), String> {
                 destroy_wallpaper_window(&app2, &w);
             }
             state.windows.lock().unwrap().remove(label);
+            // 自动暂停/释放挂起状态一并清掉：壁纸已停，恢复路径不会再走；
+            // 留着会让监控的 ensure_windows 永久不建窗（布局变化无法同步）
+            state.auto_paused.lock().unwrap().remove(label);
+            state.released.lock().unwrap().remove(label);
             if let Some(db) = &db {
                 if let Ok(conn) = db.lock() {
                     let key = label.strip_prefix("wallpaper-").unwrap_or(label);
@@ -2421,11 +2774,6 @@ pub fn stop(app: AppHandle, display_id: Option<String>) -> Result<(), String> {
         if display_id.is_none() {
             *state.default.lock().unwrap() = None;
         }
-        // 「暂停释放内存」挂起标志一并清零：壁纸已停，恢复路径不会再走，
-        // 留着 true 会让监控的 ensure_windows 永久不建窗（显示器布局变化
-        // 无法同步）。部分停止只清对应 label 的话，全停之外的场景由
-        // resume_all 的重建兜底，这里不必精细区分。
-        *state.released.lock().unwrap() = false;
         let _ = app2.emit("sessions-changed", ());
         let _ = tx.send(Ok(()));
     })
@@ -2588,36 +2936,155 @@ pub fn active_items(app: AppHandle) -> Result<Vec<String>, String> {
         .collect())
 }
 
+/// 主界面玻璃背景源 + 封面亮度：页内高斯模糊层（.app-backdrop）用。
+///
+/// 系统窗口材质（NSVisualEffectView / Acrylic）自重着色严重且模糊度不可调，
+/// 主界面的磨砂玻璃改为页内自绘：拿当前壁纸的静态封面做 CSS blur。多屏取
+/// 第一个会话；无会话或封面缺失时 url 为 None —— 前端退回系统材质透出。
+/// luminance 供前端做自适应 tint（亮壁纸抬玻璃浓度，见 App.tsx / index.css）。
+/// 应用/停止/轮播都会写 wallpaper_sessions 并广播 sessions-changed，前端据此刷新。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiBackdrop {
+    pub url: Option<String>,
+    /// 封面平均亮度 0..1；None = 无封面/解码失败（前端按不抬 tint 处理）
+    pub luminance: Option<f32>,
+    /// 当前会话的条目 id；None = 没有任何壁纸在应用。前端据此区分
+    /// 「真没壁纸」（清背景）与「有壁纸但封面暂缺」（保留旧背景，防黑闪）
+    pub item_id: Option<String>,
+}
+
+#[tauri::command(rename = "wallpaper_ui_backdrop")]
+pub fn ui_backdrop(app: AppHandle) -> Result<UiBackdrop, String> {
+    let item_id = {
+        let db = app
+            .try_state::<Arc<Mutex<rusqlite::Connection>>>()
+            .ok_or("DB 未就绪")?;
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        // 优先：主窗口所落在的显示器的会话 —— 窗口拖到另一块屏后，玻璃背景与
+        // 自适应浓度应跟随那块屏的壁纸。命中失败（映射不出/该屏没壁纸）再兜底
+        // 最近（re）apply 的会话；之前用 SELECT DISTINCT 不带序，多屏间会随写入
+        // 顺序漂移 —— 表现为背景图和浓度「自己变」。
+        window_screen_item_id(&app, &conn).or_else(|| {
+            conn.query_row(
+                "SELECT item_id FROM wallpaper_sessions
+                 WHERE item_id IS NOT NULL AND item_id != ''
+                 ORDER BY updated_at DESC LIMIT 1",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+        })
+    };
+    let Some(item_id) = item_id else {
+        return Ok(UiBackdrop {
+            url: None,
+            luminance: None,
+            item_id: None,
+        });
+    };
+    let covers = crate::library::item_cover_summary(&app, std::slice::from_ref(&item_id));
+    let url = covers
+        .get(&item_id)
+        .and_then(|(_, url)| url.clone())
+        .filter(|u| !u.is_empty());
+    let luminance = crate::library::cover_luminance(&app, &item_id);
+    Ok(UiBackdrop {
+        url,
+        luminance,
+        item_id: Some(item_id),
+    })
+}
+
+/// 主窗口中心点命中的显示器上当前应用的条目。坐标系换算：tauri `outer_position`
+/// 是物理像素、左上原点（主屏左上角为原点）；`hit_screen_id` 吃 macOS 全局逻辑点、
+/// 左下原点 —— 逻辑坐标 x 相同，y 取 `主屏高 - y` 翻转。
+fn window_screen_item_id(
+    app: &AppHandle,
+    conn: &std::sync::MutexGuard<'_, rusqlite::Connection>,
+) -> Option<String> {
+    let win = app.get_webview_window("main")?;
+    let pos = win.outer_position().ok()?;
+    let size = win.outer_size().ok()?;
+    let scale = win.scale_factor().ok().unwrap_or(1.0);
+    let cx = (pos.x as f64 + size.width as f64 / 2.0) / scale;
+    let cy_top = (pos.y as f64 + size.height as f64 / 2.0) / scale;
+    let screens = platform::active_screens();
+    // macOS 全局坐标里主屏左下角恒为 (0,0)
+    let primary_h = screens
+        .iter()
+        .find(|s| s.x == 0.0 && s.y == 0.0)
+        .or_else(|| screens.first())
+        .map(|s| s.h)?;
+    let id = platform::hit_screen_id(cx, primary_h - cy_top)?;
+    conn.query_row(
+        "SELECT item_id FROM wallpaper_sessions
+         WHERE display_id = ?1 AND item_id IS NOT NULL AND item_id != ''",
+        [id.to_string()],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+}
+
 #[tauri::command(rename = "wallpaper_pause_all")]
 pub fn pause_all(app: AppHandle) -> Result<(), String> {
     if let Some(st) = app.try_state::<WallpaperEngineState>() {
+        // 手动暂停优先：清掉自动暂停集合 —— 用户手动暂停后，遮挡解除/回桌面
+        // 不再代劳恢复（设置页「手动暂停不受影响」承诺的落地点）。
+        st.auto_paused.lock().unwrap().clear();
         *st.paused.lock().unwrap() = true;
     }
     eval_all(&app, "window.__wp && window.__wp.pause()");
     Ok(())
 }
 
-/// 「暂停释放内存」是否处于挂起态（壁纸窗口已销毁、等恢复时重建）
-fn is_released(app: &AppHandle) -> bool {
+/// 「暂停释放内存」是否对该屏挂起（壁纸窗口已销毁、等恢复时重建）
+pub(crate) fn label_released(app: &AppHandle, label: &str) -> bool {
     app.try_state::<WallpaperEngineState>()
-        .map(|st| *st.released.lock().unwrap())
+        .map(|st| st.released.lock().unwrap().contains(label))
         .unwrap_or(false)
 }
 
-/// 「自动暂停」触发时的统一入口（macOS/Windows 的前台切换观察者都走这里）：
-/// 与手动 [`pause_all`] 的区别是会按设置叠加「暂停释放内存」——开关开启时
-/// 直接销毁全部壁纸窗口（渲染进程随之结束，内存实打实归还），回桌面时由
-/// [`resume_all`] 按保留的会话配置整窗重建。调用方负责置 `auto_paused` 标志。
-pub fn auto_pause_enter(app: &AppHandle) -> Result<(), String> {
-    pause_all(app.clone())?;
+/// 单屏暂停（只停渲染，不销毁窗口）。全局手动暂停用 [`pause_all`]。
+pub(crate) fn pause_label(app: &AppHandle, label: &str) {
+    eval_label(app, label, "window.__wp && window.__wp.pause()");
+}
+
+/// 单屏恢复：只停了渲染的直接 resume；「暂停释放内存」挂起的清标志后按
+/// 会话配置重建该屏（[`ensure_windows`] 只会补缺失且不在 released 集合里的屏）。
+pub(crate) fn resume_label(app: &AppHandle, label: &str) {
+    let rebuild = app
+        .try_state::<WallpaperEngineState>()
+        .map(|st| st.released.lock().unwrap().remove(label))
+        .unwrap_or(false);
+    if rebuild {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let app2 = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            ensure_windows(&app2);
+            let _ = tx.send(());
+        });
+        let _ = rx.recv_timeout(Duration::from_secs(5));
+        tracing::info!("auto-pause (release): {label} 壁纸窗口已按会话配置重建");
+    } else {
+        eval_label(app, label, "window.__wp && window.__wp.resume()");
+    }
+}
+
+/// 「自动暂停」触发时的单屏入口（判定核心 [`super::auto_pause`] 走这里）：
+/// 与手动 [`pause_label`] 的区别是会按设置叠加「暂停释放内存」——开关开启时
+/// 直接销毁该屏壁纸窗口（渲染进程随之结束，内存实打实归还），恢复该屏时由
+/// [`resume_label`] 按保留的会话配置重建。调用方负责把 label 置入 auto_paused。
+pub(crate) fn auto_pause_enter_label(app: &AppHandle, label: &str) -> Result<(), String> {
+    pause_label(app, label);
     if pause_release_enabled(app) {
-        release_wallpaper_windows(app);
+        release_wallpaper_label(app, label);
     }
     Ok(())
 }
 
 /// 「暂停释放内存」开关：`wallpaper_auto_pause_release`，默认关。
-/// 与自动暂停一样由前台切换时直读 DB（低频事件，免缓存同步）。
+/// 与自动暂停一样低频直读 DB（免缓存同步）。
 fn pause_release_enabled(app: &AppHandle) -> bool {
     app.try_state::<Arc<Mutex<Connection>>>()
         .and_then(|db| {
@@ -2629,28 +3096,24 @@ fn pause_release_enabled(app: &AppHandle) -> bool {
         .unwrap_or(false)
 }
 
-/// 销毁全部壁纸窗口（「暂停释放内存」的释放动作）。
+/// 销毁单屏壁纸窗口（「暂停释放内存」的释放动作，按屏独立）。
 ///
-/// 会话配置（`state.windows` / `wallpaper_sessions`）**保留**：恢复播放时按它
-/// 整窗重建。macOS 上 [`destroy_wallpaper_window`] 会连带结束每块窗口独占的
+/// 会话配置（`state.windows` / `wallpaper_sessions`）**保留**：恢复该屏时按它
+/// 重建。macOS 上 [`destroy_wallpaper_window`] 会连带结束每块窗口独占的
 /// WebContent 进程 —— 这正是本开关的目的（页面内 release 只能还一部分，
 /// 进程级 JS 堆/解码器/GPU 缓存要进程退出才彻底）。
-fn release_wallpaper_windows(app: &AppHandle) {
+fn release_wallpaper_label(app: &AppHandle, label: &str) {
     let Some(st) = app.try_state::<WallpaperEngineState>() else {
         return;
     };
     // 先置标志再动手：destroy 是异步投递的，2s 一轮的监控若插在「销毁完成」
     // 与「标志置位」之间，会按仍登记的配置把窗口原样建回来（等于没释放）
-    *st.released.lock().unwrap() = true;
-    let labels: Vec<String> = st.windows.lock().unwrap().keys().cloned().collect();
-    for label in &labels {
-        for w in wallpaper_windows(app, label) {
-            destroy_wallpaper_window(app, &w);
-        }
+    st.released.lock().unwrap().insert(label.to_string());
+    for w in wallpaper_windows(app, label) {
+        destroy_wallpaper_window(app, &w);
     }
     tracing::info!(
-        "auto-pause (release): 已销毁 {} 块壁纸窗口（渲染进程结束；回桌面时整窗重建）",
-        labels.len()
+        "auto-pause (release): 已销毁 {label} 的壁纸窗口（渲染进程结束；恢复该屏时重建）"
     );
     crate::mem_watch::report("自动暂停释放内存（销毁壁纸窗口）");
 }
@@ -2658,18 +3121,22 @@ fn release_wallpaper_windows(app: &AppHandle) {
 #[tauri::command(rename = "wallpaper_resume_all")]
 pub fn resume_all(app: AppHandle) -> Result<(), String> {
     if let Some(st) = app.try_state::<WallpaperEngineState>() {
+        // 全局恢复是手动语义：清掉自动暂停集合（被遮住的屏由判定核心按需重新挂）
+        st.auto_paused.lock().unwrap().clear();
         *st.paused.lock().unwrap() = false;
     }
     eval_all(&app, "window.__wp && window.__wp.resume()");
-    // 「暂停释放内存」挂起期间的恢复 = 按保留的会话配置整窗重建（完全重新
-    // 加载壁纸）。所有恢复路径（回桌面/托盘关开关/应用新壁纸/全局快捷键）
-    // 都汇到本函数，重建逻辑放这一处即可全覆盖。
+    // 「暂停释放内存」挂起的屏 = 按保留的会话配置重建（完全重新加载壁纸）。
+    // 全局恢复路径（托盘关开关/全局快捷键/手动恢复命令）都汇到本函数；
+    // 单屏恢复走 [`resume_label`]。
     let rebuild = {
         let Some(st) = app.try_state::<WallpaperEngineState>() else {
             return Ok(());
         };
         let mut g = st.released.lock().unwrap();
-        std::mem::replace(&mut *g, false)
+        let was = !g.is_empty();
+        g.clear();
+        was
     };
     if rebuild {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2750,17 +3217,12 @@ pub fn set_language(app: AppHandle, language: String) -> Result<(), String> {
     Ok(())
 }
 
-/// 设置全局场景帧率上限（15/24/30/45/60/120），持久化并对所有壁纸窗口实时生效。
+/// 设置全局场景帧率上限（[15,60] 任意整数），持久化并对所有壁纸窗口实时生效。
 #[tauri::command(rename = "wallpaper_set_scene_fps")]
 pub fn set_scene_fps(app: AppHandle, fps: u32) -> Result<(), String> {
-    if !SCENE_FPS_CHOICES.contains(&fps) {
+    if !(SCENE_FPS_MIN..=SCENE_FPS_MAX).contains(&fps) {
         return Err(format!(
-            "场景帧率仅支持 {}（收到 {fps}）",
-            SCENE_FPS_CHOICES
-                .iter()
-                .map(|v| v.to_string())
-                .collect::<Vec<_>>()
-                .join("/")
+            "场景帧率超出范围: {fps}（{SCENE_FPS_MIN}–{SCENE_FPS_MAX}）"
         ));
     }
     if let Some(db) = app.try_state::<Arc<Mutex<Connection>>>() {
@@ -2776,14 +3238,32 @@ pub fn set_scene_fps(app: AppHandle, fps: u32) -> Result<(), String> {
     Ok(())
 }
 
-/// 设置全局抗锯齿模式（off/fxaa/msaa2/msaa4，库 1.3.23+），持久化并对所有壁纸窗口实时生效。
+/// 视频纹理上传倍率（0 = 自动交给库内帧率守门；>0 固定，1 = 不压）。
+/// **热更活窗口**（`__wp.setVideoTexScale`）：改完下一帧就按新倍率上传，不必等切壁纸。
+#[tauri::command]
+pub fn set_video_tex_scale(app: AppHandle, scale: f32) -> Result<(), String> {
+    let v = parse_video_tex_scale(Some(&format!("{scale}")));
+    if let Some(db) = app.try_state::<Arc<Mutex<Connection>>>() {
+        if let Ok(conn) = db.lock() {
+            let _ = db::set_setting(&conn, "wallpaper_video_tex_scale", &format!("{v}"));
+        }
+    }
+    crate::notify_setting_changed(&app, "wallpaper_video_tex_scale", &format!("{v}"));
+    tracing::info!("video tex scale set: {v}");
+    eval_all(
+        &app,
+        &format!("window.__wp && window.__wp.setVideoTexScale({v})"),
+    );
+    Ok(())
+}
+
+/// 设置全局抗锯齿模式。**当前锁定为 off**：抗锯齿方案优化中（FXAA/MSAA 在部分
+/// 壁纸上有瑕疵），所有档位默认关闭且禁止更改 —— 只接受 off，其余一律报错；
+/// 合并配置时也会强制 off（见 [`apply_play_config`]），历史存量值不生效。
 #[tauri::command(rename = "wallpaper_set_aa")]
 pub fn set_aa(app: AppHandle, mode: String) -> Result<(), String> {
-    if !AA_CHOICES.contains(&mode.as_str()) {
-        return Err(format!(
-            "未知的抗锯齿模式: {mode}（可选 {}）",
-            AA_CHOICES.join("/")
-        ));
+    if mode != DEFAULT_AA {
+        return Err("抗锯齿已锁定为关闭（方案优化中，暂不支持更改）".into());
     }
     if let Some(db) = app.try_state::<Arc<Mutex<Connection>>>() {
         if let Ok(conn) = db.lock() {
@@ -2828,8 +3308,8 @@ pub fn set_particles(app: AppHandle, quality: String) -> Result<(), String> {
     Ok(())
 }
 
-/// 设置全局后处理质量档（low/medium/high，库 1.3.23+；不提供 off —— 完全关掉
-/// 后处理会让辉光/水波类壁纸失去画面效果），持久化并对所有壁纸窗口实时生效。
+/// 设置全局后处理质量档（off/low/medium/high；off = 效果链直通），持久化
+/// 并对所有壁纸窗口实时生效。
 #[tauri::command(rename = "wallpaper_set_post")]
 pub fn set_post(app: AppHandle, quality: String) -> Result<(), String> {
     if !POST_QUALITY_CHOICES.contains(&quality.as_str()) {
@@ -2853,6 +3333,121 @@ pub fn set_post(app: AppHandle, quality: String) -> Result<(), String> {
         ),
     );
     Ok(())
+}
+
+/// 设置全局贴图资源倍率（`wallpaper_resources`）：`None` = 跟随清晰度档（库内
+/// 自动映射），`Some(0.5..=1)` = 强制倍率。倍率在贴图**挂载期**解码/上传时生效，
+/// 热更无效（库只在挂载时读 `?resources=`），所以持久化后让所有壁纸窗口整页
+/// 重载一次 —— 与官方素材开关同一取舍。
+#[tauri::command(async, rename = "wallpaper_set_resources")]
+pub fn set_resources(app: AppHandle, scale: Option<f32>) -> Result<(), String> {
+    // None（历史的「跟随清晰度」）不再由界面产生，按 1（原生）落盘归一
+    let value = match scale.unwrap_or(1.0) {
+        v if v.is_finite() && (RESOURCES_MIN..=RESOURCES_MAX).contains(&v) => v.to_string(),
+        v => {
+            return Err(format!(
+                "资源倍率超出范围: {v}（{RESOURCES_MIN}–{RESOURCES_MAX}）"
+            ))
+        }
+    };
+    {
+        let db = app
+            .try_state::<Arc<Mutex<Connection>>>()
+            .ok_or("DB 未就绪")?;
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        let unchanged =
+            db::get_setting(&conn, "wallpaper_resources").as_deref() == Some(value.as_str());
+        if unchanged {
+            return Ok(());
+        }
+        db::set_setting(&conn, "wallpaper_resources", &value).map_err(|e| e.to_string())?;
+    }
+    crate::notify_setting_changed(&app, "wallpaper_resources", &value);
+    tracing::info!("texture resource scale set: {value}");
+    run_on_main_and_wait(&app, renavigate_all_windows)
+}
+
+/// 设置全局法线/蒙版资源倍率（`wallpaper_resources_normal`，0.35..=1，默认 1 不缩）。
+/// 与 [`set_resources`] 同样只在挂载期生效，改完整页重载。
+#[tauri::command(async, rename = "wallpaper_set_resources_normal")]
+pub fn set_resources_normal(app: AppHandle, scale: f32) -> Result<(), String> {
+    if !scale.is_finite() || !(RESOURCES_NORMAL_MIN..=RESOURCES_NORMAL_MAX).contains(&scale) {
+        return Err(format!(
+            "法线资源倍率超出范围: {scale}（{RESOURCES_NORMAL_MIN}–{RESOURCES_NORMAL_MAX}）"
+        ));
+    }
+    let value = scale.to_string();
+    {
+        let db = app
+            .try_state::<Arc<Mutex<Connection>>>()
+            .ok_or("DB 未就绪")?;
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        let unchanged = db::get_setting(&conn, "wallpaper_resources_normal").as_deref()
+            == Some(value.as_str());
+        if unchanged {
+            return Ok(());
+        }
+        db::set_setting(&conn, "wallpaper_resources_normal", &value).map_err(|e| e.to_string())?;
+    }
+    crate::notify_setting_changed(&app, "wallpaper_resources_normal", &value);
+    tracing::info!("normal-map resource scale set: {value}");
+    run_on_main_and_wait(&app, renavigate_all_windows)
+}
+
+/// 一键套用画质档位（low/medium/high，见 [`PRESET_LOW`] 等预设表）。
+///
+/// 档位**整体覆盖**全局画质参数：清晰度/帧率/粒子/后处理/资源倍率/法线倍率
+/// （抗锯齿恒为 off）。批量写入是刻意的 —— 拆成逐项命令会让壁纸窗口连着
+/// 整页重载好几遍（资源倍率改一次就得重载一次），这里写完只重载一次。
+/// 每个键各广播一次 settings-changed，托盘与设置页同步跟上。
+#[tauri::command(async, rename = "wallpaper_set_quality_preset")]
+pub fn set_quality_preset(app: AppHandle, preset: String) -> Result<(), String> {
+    let p = match preset.as_str() {
+        "low" => &PRESET_LOW,
+        "medium" => &PRESET_MEDIUM,
+        "high" => &PRESET_HIGH,
+        _ => {
+            return Err(format!(
+                "未知的画质档位: {preset}（可选 low/medium/high）"
+            ))
+        }
+    };
+    // 键 → 值（与设置项一一对应）；aa 恒 off（锁定）
+    let writes: [(&str, String); 7] = [
+        ("wallpaper_render_dpr", p.render_dpr.to_string()),
+        ("wallpaper_scene_fps", p.scene_fps.to_string()),
+        ("wallpaper_particles", p.particles.to_string()),
+        ("wallpaper_post", p.post.to_string()),
+        ("wallpaper_aa", DEFAULT_AA.to_string()),
+        ("wallpaper_resources", p.resources.to_string()),
+        ("wallpaper_resources_normal", p.resources_normal.to_string()),
+    ];
+    let mut changed = false;
+    let mut changed_keys: Vec<(&str, String)> = Vec::new();
+    {
+        let db = app
+            .try_state::<Arc<Mutex<Connection>>>()
+            .ok_or("DB 未就绪")?;
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        for (key, value) in &writes {
+            if db::get_setting(&conn, key).as_deref() == Some(value.as_str()) {
+                continue;
+            }
+            db::set_setting(&conn, key, value).map_err(|e| e.to_string())?;
+            changed_keys.push((*key, value.clone()));
+            changed = true;
+        }
+    }
+    // 通知在 DB 锁外发：托盘同步档位勾选时要反查六参数（会再拿同一把锁）
+    for (key, value) in changed_keys {
+        crate::notify_setting_changed(&app, key, &value);
+    }
+    if !changed {
+        return Ok(());
+    }
+    tracing::info!("quality preset applied: {preset}");
+    // 资源倍率可能变了（贴图倍率只在挂载期生效）：统一整页重载一次
+    run_on_main_and_wait(&app, renavigate_all_windows)
 }
 
 /// 设置全局滤镜（托盘「滤镜效果」子菜单），持久化并对所有桌面壁纸窗口实时生效。
@@ -2886,6 +3481,31 @@ pub fn set_filter(app: AppHandle, filter: String) -> Result<(), String> {
             serde_json::json!(filter)
         ),
     );
+    Ok(())
+}
+
+/// 全局无缝切换效果（叠化/推近/模糊/景深/圆形揭示/横向擦除/滑入）。持久化 +
+/// 托盘/设置页广播同步；动画只在**下一次换壁纸**时发生（新窗按新效果显形），
+/// 不热更活窗口 —— 改这个设置不该让正在播放的壁纸抖一下。
+#[tauri::command(rename = "wallpaper_set_reveal")]
+pub fn set_reveal(app: AppHandle, reveal: String) -> Result<(), String> {
+    if !REVEAL_FX.iter().any(|(k, _)| *k == reveal) {
+        return Err(format!(
+            "未知的切换效果: {reveal}（可选 {}）",
+            REVEAL_FX
+                .iter()
+                .map(|(k, _)| *k)
+                .collect::<Vec<_>>()
+                .join("/")
+        ));
+    }
+    if let Some(db) = app.try_state::<Arc<Mutex<Connection>>>() {
+        if let Ok(conn) = db.lock() {
+            let _ = db::set_setting(&conn, "wallpaper_reveal", &reveal);
+        }
+    }
+    crate::notify_setting_changed(&app, "wallpaper_reveal", &reveal);
+    tracing::info!("wallpaper reveal fx set: {reveal}");
     Ok(())
 }
 
@@ -3170,7 +3790,10 @@ pub(crate) fn scene_pkg_entry(dir: &std::path::Path) -> Option<String> {
 }
 
 /// 解析本地库壁纸文件 → 渲染器配置（src 指向内容服务器媒体 URL）
-fn resolve_item_config(app: &AppHandle, item_id: &str) -> Result<WallpaperConfig, String> {
+pub(crate) fn resolve_item_config(
+    app: &AppHandle,
+    item_id: &str,
+) -> Result<WallpaperConfig, String> {
     let db = app
         .try_state::<Arc<Mutex<rusqlite::Connection>>>()
         .ok_or("DB 未就绪")?;
@@ -3379,7 +4002,7 @@ pub fn apply_item(
     let res = apply_item_inner(&app, &item_id, display_id.clone());
     if res.is_ok() {
         clear_display_bindings(&app, display_id.as_deref());
-        resume_if_auto_paused(&app);
+        resume_if_auto_paused(&app, display_id.as_deref());
     }
     res
 }
@@ -4407,6 +5030,18 @@ mod tests {
         ));
     }
 
+    /// 收尾等待覆盖渲染器动画时长（REVEAL_MS 同步表见 renderer/src/main.ts）：
+    /// 非 fade 档 = 动画 + 400ms 裕量；fade/未知值走旧 0.7s+200ms。
+    #[test]
+    fn reveal_wait_matches_renderer_durations() {
+        assert_eq!(reveal_fx_wait_ms("fade"), 900);
+        assert_eq!(reveal_fx_wait_ms("wipe"), 1400);
+        assert_eq!(reveal_fx_wait_ms("circle"), 1600);
+        assert_eq!(reveal_fx_wait_ms("zoom"), 1700);
+        assert_eq!(reveal_fx_wait_ms("depth"), 1800);
+        assert_eq!(reveal_fx_wait_ms("不存在"), 900);
+    }
+
     /// 渲染器 URL 的契约：换壁纸走的就是「导航到这个 URL」，所以**渲染器的
     /// 全部配置都必须落在 query 上**（渲染器只读 query，见 initialCfg）。
     /// 少一个字段 = 换了壁纸但设置没跟着换，而建窗与换页两条路径必须一致。
@@ -4419,9 +5054,12 @@ mod tests {
             render_dpr: 1.0,
             scene_fps: 45,
             filter: "blur".into(),
+            reveal: "zoom".into(),
             aa: "fxaa".into(),
             particles: "low".into(),
             post_processing: "medium".into(),
+            resources: Some(0.8),
+            resources_normal: 0.5,
             muted: false,
             volume: Some(0.35),
             r#loop: true,
@@ -4444,10 +5082,15 @@ mod tests {
             "renderDpr=1",
             "sceneFps=45",
             "filter=blur",
+            // 无缝切换的过渡效果 id（渲染器按它选显形动画）
+            "reveal=zoom",
             // 渲染质量档位（库 1.3.23+）：query 键 aa/pq/pp 与上游 bench 约定一致
             "aa=fxaa",
             "pq=low",
             "pp=medium",
+            // 贴图/法线资源倍率（库 1.4.2 resource-scale；query 键同上游 bench）
+            "resources=0.8",
+            "resourcesNormal=0.5",
             "muted=false",
             // 精确音量（0..1）：渲染器挂载时先静音，加载完成后按它起音量
             "volume=0.35",

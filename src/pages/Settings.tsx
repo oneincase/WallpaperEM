@@ -14,24 +14,82 @@ import {
   type SteamcmdInstallProgress,
   type UpdateInfo,
 } from "../api/steam";
-import { getSidebarAlpha, setSidebarAlpha } from "../lib/sidebar";
 import { formatBytes } from "../lib/format";
+import {
+  POST_STOPS,
+  PARTICLE_STOPS,
+  PRESET_LABELS,
+  QUALITY_PRESETS,
+  deriveQualityPreset,
+  type QualityPresetKey,
+} from "../lib/qualityPresets";
 import { clearSnapshotCaches } from "../lib/cache-snapshots";
 import { LOCALES, setLocale, tr, trMsg, useLocale, type Locale } from "../lib/i18n";
 import { ConfirmModal } from "../components/ConfirmModal";
+import { QrModal } from "../components/QrModal";
+import { Switch } from "../components/Switch";
 import { useMessage } from "../components/Message";
 
-// 设置页标签：账号 / 通用 / AI / MCP / 网络 / 关于
-// （id 沿用 "download"：该页内容是下载工具安装 + 下载账号登录，改 id 无收益）
-type SettingsTab = "download" | "general" | "performance" | "mcp" | "network" | "about";
+// 设置页标签：账号 / 通用 / 画质 / 网络 / 关于
+// （id 沿用 "download"：该页内容是下载工具安装 + 下载账号登录，改 id 无收益；
+//   "performance" 同理沿用，标签已改名「画质」；
+//   "network" 吸收了原「AI / MCP」标签 —— MCP/REST API/壁纸分享共用一个网络服务）
+type SettingsTab = "download" | "general" | "performance" | "network" | "about";
 const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
   { id: "download", label: "账号" },
   { id: "general", label: "通用" },
-  { id: "performance", label: "性能" },
-  { id: "mcp", label: "AI / MCP" },
-  { id: "network", label: "网络" },
+  { id: "performance", label: "画质" },
+  { id: "network", label: "网络与服务" },
   { id: "about", label: "关于" },
 ];
+
+// ---- 画质档位预设（与 Rust 的 PRESET_LOW/MEDIUM/HIGH 逐字段镜像）----
+// 选中即**整体覆盖**全局画质参数；手调下方任意参数后按值反推为「自定义」。
+// 抗锯齿不进表：锁定期恒为 off、禁止更改（方案优化中）。
+// 表本体在 lib/qualityPresets（与「壁纸设置」窗口的播放设置共用）。
+// 画质页滑条统一样式（range 一定带 min/max 限制）
+const SLIDER_CLS = "w-36 accent-[var(--accent-strong)] disabled:opacity-40";
+
+// 滤镜白名单（与 Rust 的 WALLPAPER_FILTERS 一一对应；CSS 表达式只存在于渲染器）
+const FILTER_OPTIONS: Array<{ id: string; label: string }> = [
+  { id: "none", label: "无" },
+  { id: "blur", label: "高斯模糊" },
+  { id: "grayscale", label: "黑白" },
+  { id: "sepia", label: "怀旧" },
+  { id: "vivid", label: "鲜艳" },
+  { id: "warm", label: "暖色" },
+  { id: "cool", label: "冷色" },
+  { id: "invert", label: "反色" },
+  { id: "brighten", label: "提亮" },
+  { id: "darken", label: "压暗" },
+  { id: "contrast", label: "高对比" },
+];
+
+/** 设置值 → 贴图资源倍率。历史的 `auto`/空/非法（「跟随清晰度」档已移除）回落 1（原生） */
+/** 视频纹理倍率设置解析：0/非法 = 自动（0）；其余钳到 [0.25, 1]。 */
+function parseVideoTexScaleSetting(raw: string | null | undefined): number {
+  const v = Number(raw);
+  if (!Number.isFinite(v) || v <= 0) return 0;
+  return Math.min(1, Math.max(0.25, v));
+}
+
+function parseResourcesSetting(v: string | null | undefined): number {
+  if (v == null || v === "" || v === "auto") return 1;
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0.5 && n <= 1 ? n : 1;
+}
+
+/** 设置值 → 清晰度倍率。历史的 0（自动档已移除）归一为 1（原生，视觉等价） */
+function parseRenderDprSetting(v: string | null | undefined): number {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 && n <= 1 ? n : 1;
+}
+
+/** 设置值 → 帧率上限。范围 15–60，越界（历史 120 等）钳到上限 */
+function parseSceneFpsSetting(v: string | null | undefined): number {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? Math.min(60, Math.max(15, n)) : 24;
+}
 
 export function SettingsPage() {
   const [autostart, setAutostart] = useState<boolean | null>(null);
@@ -50,23 +108,40 @@ export function SettingsPage() {
   // 全局壁纸显示模式（cover/contain/stretch），默认 cover 等比铺满裁切
   const [fit, setFit] = useState<"cover" | "contain" | "stretch">("cover");
   const [fitMsg, setFitMsg] = useState("");
-  // 全局清晰度（相对设备像素比的倍率）。四档：0 自动（=设备 DPR）/
-  // 0.75 省电 / 0.85 标准 / 1 高清（=原生），默认 0 自动（与 Rust
-  // DEFAULT_RENDER_DPR 一致）。renderer 会乘 devicePixelRatio 换算成绝对 DPR。
-  const [renderDpr, setRenderDpr] = useState<number>(0);
+  // 全局清晰度（相对设备像素比的倍率，0.50–1.00，1=原生）。renderer 会乘
+  // devicePixelRatio 换算成绝对 DPR。历史的「自动」（0）档已移除：载入时归一为 1
+  //（自动≈原生，视觉等价），此后滑条只写具体倍率。
+  const [renderDpr, setRenderDpr] = useState<number>(1);
   const [renderDprMsg, setRenderDprMsg] = useState("");
-  // 全局场景帧率上限（15/24/30/45/60/120，越低 GPU 占用越低），默认 24
+  // 视频纹理上传倍率：0 = 自动（库内帧率守门按实测帧率压）。独立开关，
+  // **不参与画质档位反推**（预设一律给自动档），所以不并进 QUALITY_PRESETS。
+  const [videoTexScale, setVideoTexScale] = useState<number>(0);
+  const [videoTexScaleMsg, setVideoTexScaleMsg] = useState("");
+  // 全局场景帧率上限（15–60 任意整数，越低 GPU 占用越低），默认 24
   const [sceneFps, setSceneFps] = useState<number>(24);
   const [sceneFpsMsg, setSceneFpsMsg] = useState("");
-  // 渲染质量档位（库 1.3.23+）：抗锯齿 off 默认 / fxaa / msaa2 / msaa4
-  const [aa, setAa] = useState<string>("off");
-  const [aaMsg, setAaMsg] = useState("");
   // 粒子质量档 high 默认 / medium / low / off
   const [particles, setParticles] = useState<string>("high");
   const [particlesMsg, setParticlesMsg] = useState("");
-  // 后处理质量档 high 默认 / medium / low / off
+  // 后处理质量档 high 默认 / medium / low
   const [post, setPost] = useState<string>("high");
   const [postMsg, setPostMsg] = useState("");
+  // 贴图资源倍率（0.5–1，1 = 原生不缩）。历史的「跟随清晰度」（auto）档已移除：
+  // 载入时归一为 1，滑条只写具体倍率。挂载期生效，改后壁纸整页重载
+  const [resources, setResources] = useState<number>(1);
+  const [resourcesMsg, setResourcesMsg] = useState("");
+  // 法线/蒙版资源倍率（0.35–1，默认 1 不缩）。同样挂载期生效
+  const [resourcesNormal, setResourcesNormal] = useState<number>(1);
+  const [resourcesNormalMsg, setResourcesNormalMsg] = useState("");
+  // 全局滤镜 id（白名单见 FILTER_OPTIONS；此前只有托盘菜单能改），热切生效
+  const [filter, setFilter] = useState<string>("none");
+  const [filterMsg, setFilterMsg] = useState("");
+  // 画质参数整组到齐后才反推档位（避免半路闪错档位）
+  const [qualityReady, setQualityReady] = useState(false);
+  const [presetMsg, setPresetMsg] = useState("");
+  // 无缝切换效果（叠化/推近/模糊/景深/圆形揭示/横向擦除/滑入），换壁纸瞬间生效
+  const [reveal, setReveal] = useState<string>("fade");
+  const [revealMsg, setRevealMsg] = useState("");
   // WE 官方素材通路（webwallgl 1.4.1 local-assets）：本机装了 WE 时用官方原版贴图
   const [localAssets, setLocalAssets] = useState<LocalAssetsStatus | null>(null);
   const [localAssetsMsg, setLocalAssetsMsg] = useState("");
@@ -78,7 +153,6 @@ export function SettingsPage() {
   const [language, setLanguage] = useState<string>("english");
   // 界面语言（i18n）：这里只是订阅，取词走模块级 tr()；订阅是为了本页文案跟着变
   const locale = useLocale();
-  const [sidebarAlpha, setSidebarAlphaState] = useState<number>(getSidebarAlpha);
   // 下载账号（steamcmd 只支持账号密码登录）
   const [cred, setCred] = useState<{ configured: boolean; username?: string } | null>(null);
   const [editingCred, setEditingCred] = useState(false);
@@ -115,6 +189,7 @@ export function SettingsPage() {
   const [mcpBusy, setMcpBusy] = useState(false);
   const [mcpShowToken, setMcpShowToken] = useState(false);
   const [mcpShowSnippet, setMcpShowSnippet] = useState(false);
+  const [mcpShowLanQr, setMcpShowLanQr] = useState(false);
   // 缓存占用（预览图/网页缓存 + 壁纸首帧封面），进入设置页时统计一次
   const [cache, setCache] = useState<CacheStats | null>(null);
   const [cacheMsg, setCacheMsg] = useState("");
@@ -161,25 +236,37 @@ export function SettingsPage() {
     invoke<string | null>("settings_get", { key: "wallpaper_fit" })
       .then((v) => setFit((v as "cover" | "contain" | "stretch") || "cover"))
       .catch(() => { });
-    invoke<string | null>("settings_get", { key: "wallpaper_render_dpr" })
-      // 未设置/非法值回落到 0（自动）
-      .then((v) => {
-        const n = Number(v);
-        setRenderDpr(Number.isFinite(n) && n >= 0 ? n : 0);
+    invoke<string | null>("settings_get", { key: "wallpaper_video_tex_scale" })
+      .then((v) => setVideoTexScale(parseVideoTexScaleSetting(v)))
+      .catch(() => { });
+    // 画质参数整组载入（清晰度/帧率/粒子/后处理/贴图倍率/法线倍率）：
+    // 档位要按整组值反推，逐个 setState 会在半路闪出错误档位，等全部到齐再落
+    void Promise.all([
+      invoke<string | null>("settings_get", { key: "wallpaper_render_dpr" }),
+      invoke<string | null>("settings_get", { key: "wallpaper_scene_fps" }),
+      invoke<string | null>("settings_get", { key: "wallpaper_particles" }),
+      invoke<string | null>("settings_get", { key: "wallpaper_post" }),
+      invoke<string | null>("settings_get", { key: "wallpaper_resources" }),
+      invoke<string | null>("settings_get", { key: "wallpaper_resources_normal" }),
+    ])
+      .then(([dpr, fps, particles, post, res, resn]) => {
+        // 未设置/非法值回落默认：1（原生）/ 24 / high / high / 1（原生）/ 1。
+        // 历史 0（清晰度自动）与 auto（贴图跟随清晰度）都归一为 1 —— 两档已移除
+        setRenderDpr(parseRenderDprSetting(dpr));
+        setSceneFps(parseSceneFpsSetting(fps));
+        setParticles(particles || "high");
+        setPost(post || "high");
+        setResources(parseResourcesSetting(res));
+        const rn = Number(resn);
+        setResourcesNormal(Number.isFinite(rn) && rn >= 0.35 && rn <= 1 ? rn : 1);
+        setQualityReady(true);
       })
+      .catch(() => setQualityReady(true));
+    invoke<string | null>("settings_get", { key: "wallpaper_filter" })
+      .then((v) => setFilter(v || "none"))
       .catch(() => { });
-    invoke<string | null>("settings_get", { key: "wallpaper_scene_fps" })
-      .then((v) => setSceneFps(Number(v) || 24))
-      .catch(() => { });
-    invoke<string | null>("settings_get", { key: "wallpaper_aa" })
-      .then((v) => setAa(v || "off"))
-      .catch(() => { });
-    invoke<string | null>("settings_get", { key: "wallpaper_particles" })
-      .then((v) => setParticles(v || "high"))
-      .catch(() => { });
-    invoke<string | null>("settings_get", { key: "wallpaper_post" })
-      // 旧版本存过 off（该档已移除，后处理不再允许整屏关闭）：归一到 low
-      .then((v) => setPost(v === "off" ? "low" : v || "high"))
+    invoke<string | null>("settings_get", { key: "wallpaper_reveal" })
+      .then((v) => setReveal(v || "fade"))
       .catch(() => { });
     api
       .wallpaperLocalAssetsStatus()
@@ -229,25 +316,34 @@ export function SettingsPage() {
         case "wallpaper_fit":
           if (value === "cover" || value === "contain" || value === "stretch") setFit(value);
           break;
-        case "wallpaper_render_dpr": {
-          const n = Number(value);
-          if (Number.isFinite(n) && n >= 0) setRenderDpr(n);
+        case "wallpaper_render_dpr":
+          setRenderDpr(parseRenderDprSetting(value));
           break;
-        }
-        case "wallpaper_scene_fps": {
-          const n = Number(value);
-          if (Number.isFinite(n) && n > 0) setSceneFps(n);
+        case "wallpaper_scene_fps":
+          setSceneFps(parseSceneFpsSetting(value));
           break;
-        }
-        case "wallpaper_aa":
-          setAa(value || "off");
+        case "wallpaper_video_tex_scale":
+          setVideoTexScale(parseVideoTexScaleSetting(value));
           break;
         case "wallpaper_particles":
           setParticles(value || "high");
           break;
         case "wallpaper_post":
-          // 旧版本存过 off（该档已移除）：归一到 low，与首载一致
-          setPost(value === "off" ? "low" : value || "high");
+          setPost(value || "high");
+          break;
+        case "wallpaper_resources":
+          setResources(parseResourcesSetting(value));
+          break;
+        case "wallpaper_resources_normal": {
+          const n = Number(value);
+          if (Number.isFinite(n) && n >= 0.35 && n <= 1) setResourcesNormal(n);
+          break;
+        }
+        case "wallpaper_filter":
+          setFilter(value || "none");
+          break;
+        case "wallpaper_reveal":
+          setReveal(value || "fade");
           break;
       }
     });
@@ -523,7 +619,7 @@ export function SettingsPage() {
     }
   };
 
-  // 自动暂停：切到非桌面应用自动暂停壁纸，切回桌面自动播放（默认关）
+  // 自动暂停：看得见就播——几乎被完全遮挡（全屏/最大化/屏保）才暂停，露出即恢复（默认关）
   const toggleAutoPause = async () => {
     const next = !autoPause;
     try {
@@ -637,12 +733,6 @@ export function SettingsPage() {
   };
 
 
-  // 侧边栏透明度：设置即生效 + 持久化
-  const changeSidebarAlpha = (v: number) => {
-    const next = setSidebarAlpha(v);
-    setSidebarAlphaState(next);
-  };
-
   const changeFit = async (next: "cover" | "contain" | "stretch") => {
     setFitMsg("");
     try {
@@ -653,53 +743,143 @@ export function SettingsPage() {
     }
   };
 
-  const changeRenderDpr = async (next: number) => {
+  // ---- 画质参数提交（滑条拖动会连续触发 onChange）----
+  // 本地值立即跟上让标签实时动，命令去抖 350ms 只发最后一次：清晰度改一次库内
+  // 要重挂场景，贴图/法线倍率改一次要整页重载，逐帧下发会把壁纸窗口卡爆。
+  const commitTimers = useRef<Record<string, number>>({});
+  const commitLater = (key: string, run: () => Promise<void>) => {
+    window.clearTimeout(commitTimers.current[key]);
+    commitTimers.current[key] = window.setTimeout(() => void run(), 350);
+  };
+
+  const changeRenderDpr = (next: number) => {
+    setRenderDpr(next);
     setRenderDprMsg("");
-    try {
-      await api.wallpaperSetRenderDpr(next);
-      setRenderDpr(next);
-    } catch (e) {
-      setRenderDprMsg(String(e));
-    }
+    commitLater("renderDpr", async () => {
+      try {
+        await api.wallpaperSetRenderDpr(next);
+      } catch (e) {
+        setRenderDprMsg(String(e));
+      }
+    });
   };
 
-  const changeSceneFps = async (next: number) => {
+  const changeVideoTexScale = (next: number) => {
+    setVideoTexScale(next);
+    setVideoTexScaleMsg("");
+    commitLater("videoTexScale", async () => {
+      try {
+        await api.wallpaperSetVideoTexScale(next);
+      } catch (e) {
+        setVideoTexScaleMsg(String(e));
+      }
+    });
+  };
+
+  const changeSceneFps = (next: number) => {
+    setSceneFps(next);
     setSceneFpsMsg("");
-    try {
-      await api.wallpaperSetSceneFps(next);
-      setSceneFps(next);
-    } catch (e) {
-      setSceneFpsMsg(String(e));
-    }
+    commitLater("sceneFps", async () => {
+      try {
+        await api.wallpaperSetSceneFps(next);
+      } catch (e) {
+        setSceneFpsMsg(String(e));
+      }
+    });
   };
 
-  const changeAa = async (next: string) => {
-    setAaMsg("");
-    try {
-      await api.wallpaperSetAa(next);
-      setAa(next);
-    } catch (e) {
-      setAaMsg(String(e));
-    }
-  };
-
-  const changeParticles = async (next: string) => {
+  const changeParticles = (next: string) => {
+    setParticles(next);
     setParticlesMsg("");
+    commitLater("particles", async () => {
+      try {
+        await api.wallpaperSetParticles(next);
+      } catch (e) {
+        setParticlesMsg(String(e));
+      }
+    });
+  };
+
+  const changePost = (next: string) => {
+    setPost(next);
+    setPostMsg("");
+    commitLater("post", async () => {
+      try {
+        await api.wallpaperSetPost(next);
+      } catch (e) {
+        setPostMsg(String(e));
+      }
+    });
+  };
+
+  const changeResources = (next: number) => {
+    setResources(next);
+    setResourcesMsg("");
+    commitLater("resources", async () => {
+      try {
+        await api.wallpaperSetResources(next);
+      } catch (e) {
+        setResourcesMsg(String(e));
+      }
+    });
+  };
+
+  const changeResourcesNormal = (next: number) => {
+    setResourcesNormal(next);
+    setResourcesNormalMsg("");
+    commitLater("resourcesNormal", async () => {
+      try {
+        await api.wallpaperSetResourcesNormal(next);
+      } catch (e) {
+        setResourcesNormalMsg(String(e));
+      }
+    });
+  };
+
+  // 滤镜是纯 CSS 合成层的事：热切、无需重挂/重载，直接提交
+  const changeFilter = async (next: string) => {
+    setFilterMsg("");
     try {
-      await api.wallpaperSetParticles(next);
-      setParticles(next);
+      await api.wallpaperSetFilter(next);
+      setFilter(next);
     } catch (e) {
-      setParticlesMsg(String(e));
+      setFilterMsg(String(e));
     }
   };
 
-  const changePost = async (next: string) => {
-    setPostMsg("");
+  // 画质档位：一键覆盖全部画质参数（Rust 侧批量写入、只整页重载一次）。
+  // 「自定义」是按当前值反推出来的状态，没有可套用的值，点它不做任何事
+  const applyQualityPreset = async (id: QualityPresetKey) => {
+    if (id === "custom") return;
+    setPresetMsg("");
     try {
-      await api.wallpaperSetPost(next);
-      setPost(next);
+      await api.wallpaperSetQualityPreset(id);
+      const v = QUALITY_PRESETS[id];
+      setRenderDpr(v.renderDpr);
+      setSceneFps(v.sceneFps);
+      setParticles(v.particles);
+      setPost(v.post);
+      setResources(v.resources);
+      setResourcesNormal(v.resourcesNormal);
     } catch (e) {
-      setPostMsg(String(e));
+      setPresetMsg(String(e));
+    }
+  };
+
+  // 当前画质参数 → 档位：与某个预设逐字段一致 = 该档位，否则「自定义」（手调
+  // 任意参数即进入自定义）。整组参数到齐前先按自定义显示，避免闪错档位
+  const preset: QualityPresetKey = !qualityReady
+    ? "custom"
+    : deriveQualityPreset({ renderDpr, sceneFps, particles, post, resources, resourcesNormal });
+
+  // 切换效果不热更活窗口：下一次换壁纸时新窗按新效果显形
+  const changeReveal = async (next: string) => {
+    setRevealMsg("");
+    try {
+      await api.wallpaperSetReveal(next);
+      setReveal(next);
+    } catch (e) {
+      setRevealMsg(String(e));
     }
   };
 
@@ -776,9 +956,9 @@ export function SettingsPage() {
     }
   }, []);
 
-  // 只在「AI / MCP」标签页里轮询：最近调用列表需要刷新，其余时间不必打扰后端
+  // 只在「网络与服务」标签页里轮询：最近调用列表需要刷新，其余时间不必打扰后端
   useEffect(() => {
-    if (tab !== "mcp") return;
+    if (tab !== "network") return;
     void refreshMcp();
     const t = setInterval(() => void refreshMcp(), 4000);
     return () => clearInterval(t);
@@ -804,7 +984,16 @@ export function SettingsPage() {
   };
 
   const toggleMcp = (next: boolean) => {
-    void applyMcp(() => api.mcpSetEnabled(next), next ? tr("MCP 服务已启用") : tr("MCP 服务已关闭"));
+    void applyMcp(
+      () => api.mcpSetEnabled(next),
+      next ? tr("网络服务已启用") : tr("网络服务已关闭"),
+    );
+  };
+
+  // 网络模式切换会换绑定地址（回环 ↔ 全接口），后端热重启监听
+  const changeMcpNetMode = (next: McpStatus["netMode"]) => {
+    const label = next === "loopback" ? tr("本机") : next === "lan" ? tr("局域网") : tr("任意");
+    void applyMcp(() => api.mcpSetNetMode(next), tr("网络模式已切换为 {mode}", { mode: label }));
   };
 
   // 双触发防抖：Enter 提交后紧接着的 blur 会再触发一次 commit —— 此刻 mcp 状态
@@ -873,7 +1062,7 @@ export function SettingsPage() {
             onClick={() => setTab(t.id)}
             className={`rounded-[7px] px-4 py-[5px] text-[13px] font-medium transition-colors ${tab === t.id
               ? "bg-[var(--accent)] text-[var(--accent-fg)] shadow-sm"
-              : "text-[var(--text-2)] hover:bg-black/5 dark:hover:bg-white/8"
+              : "text-[var(--text-2)] hover:bg-white/8"
               }`}
           >
             {tr(t.label)}
@@ -1095,6 +1284,184 @@ export function SettingsPage() {
 
           {tab === "network" && (
             <>
+              <Group title={tr("网络服务")}>
+                <Row
+                  label={tr("网络服务")}
+                  desc={
+                    mcpState === "未启动"
+                      ? tr(
+                          "已关闭：AI 客户端（Codex / Claude 等）与 REST API 无法连接。开启后按下方网络模式监听，连接需带访问令牌",
+                        )
+                      : mcpState === "运行中"
+                        ? mcp?.netMode === "loopback"
+                          ? `${tr("运行中")} · ${mcp?.url}${tr("（仅本机，需令牌）")}`
+                          : `${tr("运行中")} · ${tr("本机")}: ${mcp?.url}${mcp?.lanUrl ? ` · ${tr("局域网")}: ${mcp.lanUrl}` : ""}`
+                        : mcpState === "启动失败"
+                          ? `${tr("启动失败")}: ${trMsg(mcp?.lastError ?? "")}`
+                          : tr("正在启动…")
+                  }
+                  control={<Switch checked={mcp?.enabled === true} onChange={toggleMcp} />}
+                />
+                {mcp?.enabled && (
+                  <>
+                    <Row
+                      label={tr("网络模式")}
+                      desc={
+                        mcp.netMode === "loopback"
+                          ? tr("本机（默认）：仅本机可访问")
+                          : mcp.netMode === "lan"
+                            ? tr("局域网：同一网络内的设备可访问（跨设备调用 API、打开分享链接）；公网来源一律拒绝，访问仍需令牌")
+                            : tr("任意：不限来源（公网可达与否取决于路由器/防火墙）。仅建议在防火墙保护下使用；首次对外监听时系统防火墙会弹授权框")
+                      }
+                      control={
+                        <select
+                          value={mcp.netMode}
+                          onChange={(e) =>
+                            changeMcpNetMode(e.target.value as McpStatus["netMode"])
+                          }
+                          disabled={mcpBusy}
+                          className="rounded-lg border border-[var(--separator)] bg-[var(--content)] px-2 py-1 text-[12.5px] outline-none focus:border-[var(--accent-strong)]"
+                        >
+                          <option value="loopback">{tr("本机")}</option>
+                          <option value="lan">{tr("局域网")}</option>
+                          <option value="any">{tr("任意")}</option>
+                        </select>
+                      }
+                    />
+                    {mcp.netMode !== "loopback" && mcp.lanUrl && (
+                      <>
+                        <Row
+                          label={tr("局域网地址")}
+                          desc={tr("同一网络内的其它设备用这个地址访问服务；分享链接与二维码也基于它生成")}
+                          control={
+                            <div className="flex items-center gap-2">
+                              <code className="max-w-[200px] truncate font-mono text-[12px] text-[var(--text-2)]">
+                                {mcp.lanUrl}
+                              </code>
+                              <button
+                                className="btn !py-1 text-[11.5px]"
+                                onClick={() => copyText(mcp.lanUrl ?? "", tr("已复制局域网地址"))}
+                              >
+                                {tr("复制地址")}
+                              </button>
+                              <button
+                                className="btn !py-1 text-[11.5px]"
+                                onClick={() => setMcpShowLanQr(true)}
+                              >
+                                {tr("二维码")}
+                              </button>
+                            </div>
+                          }
+                        />
+                        {mcpShowLanQr && mcp.lanUrl && (
+                          <QrModal
+                            title={tr("局域网地址")}
+                            text={mcp.lanUrl}
+                            hint={tr("手机扫码直达服务（分享页与 API 文档上线后可直接扫码打开）")}
+                            copyOkText={tr("已复制局域网地址")}
+                            onClose={() => setMcpShowLanQr(false)}
+                          />
+                        )}
+                      </>
+                    )}
+                    <Row
+                      label={tr("端口")}
+                      desc={tr("服务监听端口（默认 7411，改完自动热重启）。被占用时上方会显示失败原因")}
+                      control={
+                        <input
+                          value={mcpPort}
+                          disabled={mcpBusy}
+                          inputMode="numeric"
+                          onChange={(e) => setMcpPort(e.target.value.replace(/[^0-9]/g, ""))}
+                          onBlur={commitMcpPort}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") commitMcpPort();
+                          }}
+                          className="w-24 rounded-lg border border-[var(--separator)] bg-[var(--content)] px-3 py-1.5 text-[13px] tabular-nums outline-none focus:border-[var(--accent-strong)]"
+                        />
+                      }
+                    />
+                    <Row
+                      label={tr("访问令牌")}
+                      desc={tr("客户端通过 ?token= 或 Authorization: Bearer 携带。轮换后已连接的客户端需重新配置")}
+                      control={
+                        <div className="flex items-center gap-2">
+                          <code className="max-w-[180px] truncate font-mono text-[12px] text-[var(--text-2)]">
+                            {mcpShowToken ? mcp.token : "•".repeat(Math.min(mcp.token.length, 24))}
+                          </code>
+                          <button
+                            className="btn !py-1 text-[11.5px]"
+                            onClick={() => setMcpShowToken((v) => !v)}
+                          >
+                            {mcpShowToken ? tr("隐藏") : tr("显示")}
+                          </button>
+                          <button
+                            className="btn !py-1 text-[11.5px]"
+                            onClick={() => copyText(mcp.urlWithToken, tr("已复制带令牌的连接地址"))}
+                          >
+                            {tr("复制地址")}
+                          </button>
+                          <button
+                            className="btn !py-1 text-[11.5px]"
+                            disabled={mcpBusy}
+                            onClick={rotateMcpToken}
+                          >
+                            {tr("轮换")}
+                          </button>
+                        </div>
+                      }
+                    />
+                    <Row
+                      label={tr("客户端配置")}
+                      desc={tr(
+                        "直接发给 AI 客户端，或用命令行一键添加（Codex / Claude Code 等支持 MCP 的工具）",
+                      )}
+                      control={
+                        <button
+                          className="btn !py-1 text-[11.5px]"
+                          onClick={() => setMcpShowSnippet((v) => !v)}
+                        >
+                          {mcpShowSnippet ? tr("收起") : tr("查看配置")}
+                        </button>
+                      }
+                    />
+                    {mcpShowSnippet && mcpSnippet && (
+                      <div className="space-y-2 pb-3">
+                        <SnippetBlock label="mcpServers JSON" text={mcpSnippet.json} onCopy={copyText} />
+                        <SnippetBlock label="Codex CLI" text={mcpSnippet.codexCli} onCopy={copyText} />
+                        <SnippetBlock label="Claude CLI" text={mcpSnippet.claudeCli} onCopy={copyText} />
+                      </div>
+                    )}
+                    <div className="pt-3">
+                      <div className="mb-1.5 text-[12px] text-[var(--text-2)]">
+                        {tr("最近调用")}
+                        {mcp.calls.length > 0 ? `（${mcp.calls.length}）` : ""}
+                      </div>
+                      {mcp.calls.length === 0 ? (
+                        <div className="text-[12px] text-[var(--text-2)]">
+                          {tr("AI 客户端连上后，这里会显示每次工具调用的耗时与结果")}
+                        </div>
+                      ) : (
+                        <div className="space-y-1">
+                          {mcp.calls.slice(0, 8).map((c, i) => (
+                            <div key={`${c.at}-${i}`} className="flex items-baseline gap-2 text-[12px]">
+                              <span className="shrink-0 tabular-nums text-[var(--text-2)]">
+                                {clockOf(c.at)}
+                              </span>
+                              <span className={`shrink-0 font-mono ${c.ok ? "" : "text-[#ff453a]"}`}>
+                                {c.tool}
+                              </span>
+                              <span className="shrink-0 tabular-nums text-[var(--text-2)]">{c.ms}ms</span>
+                              <span className="truncate text-[var(--text-2)]">{c.summary}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </>
+                )}
+              </Group>
+
               <Group title={tr("代理")}>
                 <Row
                   label={tr("跟随系统代理")}
@@ -1309,7 +1676,7 @@ export function SettingsPage() {
               )}
               <Row
                 label={tr("自动暂停")}
-                desc={tr("切到非桌面应用时自动暂停壁纸，切回桌面时自动播放（手动暂停不受影响）")}
+                desc={tr("看得见就播：壁纸几乎被完全遮挡（全屏应用、最大化窗口、屏保）时自动暂停，重新露出就自动恢复播放；每块屏幕独立判断，与前台应用无关（手动暂停不受影响）")}
                 control={<Switch checked={autoPause} onChange={toggleAutoPause} />}
               />
               <Row
@@ -1330,29 +1697,6 @@ export function SettingsPage() {
                 }
                 control={<Switch checked={interactive} onChange={toggleInteractive} />}
               />
-              {/* 侧边栏透明度：入口暂时隐藏（默认固定 78%，见 lib/sidebar.ts）。
-                  代码保留，需要恢复时去掉这层注释即可（changeSidebarAlpha 也在）。
-              <Row
-                label="侧边栏透明度"
-                desc={`调节左侧菜单栏的半透明/磨砂质感（${Math.round(sidebarAlpha * 100)}%）。默认 78%`}
-                control={
-                  <div className="flex items-center gap-2 w-48">
-                    <input
-                      type="range"
-                      min={0.2}
-                      max={1}
-                      step={0.05}
-                      value={sidebarAlpha}
-                      onChange={(e) => changeSidebarAlpha(Number(e.target.value))}
-                      className="flex-1"
-                    />
-                    <span className="w-10 text-right text-[12px] text-[var(--text-2)]">
-                      {Math.round(sidebarAlpha * 100)}%
-                    </span>
-                  </div>
-                }
-              />
-              */}
             </Group>
           )}
 
@@ -1390,7 +1734,41 @@ export function SettingsPage() {
           )}
 
           {tab === "performance" && (
-            <Group title={tr("性能")}>
+            <Group title={tr("画质")}>
+              <Row
+                label={tr("画质档位")}
+                desc={
+                  preset === "low"
+                    ? tr("低：省电优先 — 清晰度 0.75 · 15 FPS · 粒子/后处理低 · 贴图 60% · 法线 75%")
+                    : preset === "medium"
+                      ? tr("中：均衡 — 清晰度 0.85 · 30 FPS · 粒子/后处理中 · 贴图 80%")
+                      : preset === "high"
+                        ? tr("高：画质优先 — 清晰度 1.0 · 30 FPS · 粒子/后处理高 · 贴图/法线原生")
+                        : tr("自定义：手动调整下方任意参数即进入自定义。点档位一键套用预设，整体覆盖下方画质参数（显示模式/滤镜等观感设置不动）")
+                }
+                control={
+                  <div className="flex items-center gap-2">
+                    <div className="flex overflow-hidden rounded-lg border border-[var(--separator)]">
+                      {(["low", "medium", "high", "custom"] as const).map((id) => (
+                        <button
+                          key={id}
+                          type="button"
+                          disabled={id === "custom" && preset !== "custom"}
+                          onClick={() => void applyQualityPreset(id)}
+                          className={`px-3 py-1 text-[12.5px] transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+                            preset === id
+                              ? "bg-[var(--accent-fill)] text-white"
+                              : "bg-[var(--content)] text-[var(--text-2)] hover:text-[var(--text)]"
+                          }`}
+                        >
+                          {tr(PRESET_LABELS[id])}
+                        </button>
+                      ))}
+                    </div>
+                    {presetMsg && <span className="text-[12px] text-red-500">{presetMsg}</span>}
+                  </div>
+                }
+              />
               <Row
                 label={tr("显示模式")}
                 desc={
@@ -1417,81 +1795,124 @@ export function SettingsPage() {
               />
               <Row
                 label={tr("清晰度")}
-                desc={tr("自动=跟随屏幕像素比（Retina 原生清晰，默认）；高清=100% 像素比；标准/省电逐级降低分辨率以省显存。宿主窗口像素比异常时自动档也能识别")}
+                desc={tr("渲染分辨率相对屏幕像素比的倍率（0.50–1.00，1=原生），越低越省显存")}
                 control={
                   <div className="flex items-center gap-2">
-                    <select
+                    <input
+                      type="range"
+                      min={0.5}
+                      max={1}
+                      step={0.05}
                       value={renderDpr}
                       onChange={(e) => changeRenderDpr(Number(e.target.value))}
-                      className="rounded-lg border border-[var(--separator)] bg-[var(--content)] px-2 py-1 text-[12.5px] outline-none focus:border-[var(--accent-strong)]"
-                    >
-                      <option value={0}>{tr("自动")}</option>
-                      <option value={0.75}>{tr("省电")}</option>
-                      <option value={0.85}>{tr("标准")}</option>
-                      <option value={1}>{tr("高清")}</option>
-                    </select>
+                      className={SLIDER_CLS}
+                    />
+                    <span className="w-12 text-right text-[12px] tabular-nums text-[var(--text-2)]">
+                      {renderDpr >= 1 ? tr("原生") : `×${renderDpr.toFixed(2)}`}
+                    </span>
                     {renderDprMsg && <span className="text-[12px] text-red-500">{renderDprMsg}</span>}
                   </div>
                 }
               />
               <Row
-                label={tr("帧率上限")}
-                desc={
-                  sceneFps <= 15
-                    ? tr("15 FPS：最省电")
-                    : sceneFps <= 24
-                      ? tr("24 FPS：默认，GPU 占用最低，最省电")
-                      : sceneFps <= 30
-                        ? tr("30 FPS：流畅，GPU 占用低")
-                        : sceneFps <= 45
-                          ? tr("45 FPS：流畅度与功耗折中")
-                          : sceneFps >= 120
-                            ? tr("120 FPS：最流畅，GPU 占用最高（需高刷屏才看得出）")
-                            : tr("60 FPS：画质与 GPU 占用均衡")
-                }
+                label={tr("视频纹理清晰度")}
+                desc={tr(
+                  "场景里的视频纹理每帧上传的清晰度。自动 = 按实测帧率往下压（推荐：WKWebView 下逐帧上传要同步取像素，全屏视频层是掉帧主因）；固定档在视频清晰度与流畅度之间手动取舍，改动即时生效",
+                )}
                 control={
                   <div className="flex items-center gap-2">
                     <select
-                      value={sceneFps}
-                      onChange={(e) => changeSceneFps(Number(e.target.value))}
+                      value={String(videoTexScale)}
+                      onChange={(e) => changeVideoTexScale(Number(e.target.value))}
                       className="rounded-lg border border-[var(--separator)] bg-[var(--content)] px-2 py-1 text-[12.5px] outline-none focus:border-[var(--accent-strong)]"
                     >
-                      <option value={15}>15 FPS</option>
-                      <option value={24}>24 FPS</option>
-                      <option value={30}>30 FPS</option>
-                      <option value={45}>45 FPS</option>
-                      <option value={60}>60 FPS</option>
-                      <option value={120}>120 FPS</option>
+                      <option value="0">{tr("自动（按帧率）")}</option>
+                      <option value="1">{tr("高清 ×1.00")}</option>
+                      <option value="0.7">{tr("标准 ×0.70")}</option>
+                      <option value="0.5">{tr("省电 ×0.50")}</option>
                     </select>
+                    {videoTexScaleMsg && (
+                      <span className="text-[12px] text-red-500">{videoTexScaleMsg}</span>
+                    )}
+                  </div>
+                }
+              />
+              <Row
+                label={tr("贴图倍率")}
+                desc={tr("贴图解码/上传的分辨率倍率（0.50–1.00，1=原生）：去掉看不出来的过采样，画面逐像素不变但省显存。改动后壁纸重载一次")}
+                control={
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="range"
+                      min={0.5}
+                      max={1}
+                      step={0.05}
+                      value={resources}
+                      onChange={(e) => changeResources(Number(e.target.value))}
+                      className={SLIDER_CLS}
+                    />
+                    <span className="w-12 text-right text-[12px] tabular-nums text-[var(--text-2)]">
+                      {resources >= 1 ? tr("原生") : `×${resources.toFixed(2)}`}
+                    </span>
+                    {resourcesMsg && <span className="text-[12px] text-red-500">{resourcesMsg}</span>}
+                  </div>
+                }
+              />
+              <Row
+                label={tr("法线倍率")}
+                desc={tr("法线/蒙版贴图的分辨率倍率（0.35–1.00，默认 1 不缩）：折射与光照对模糊敏感，非必要不动。改动后壁纸重载一次")}
+                control={
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="range"
+                      min={0.35}
+                      max={1}
+                      step={0.05}
+                      value={resourcesNormal}
+                      onChange={(e) => changeResourcesNormal(Number(e.target.value))}
+                      className={SLIDER_CLS}
+                    />
+                    <span className="w-12 text-right text-[12px] tabular-nums text-[var(--text-2)]">
+                      {resourcesNormal >= 1 ? tr("原生") : `×${resourcesNormal.toFixed(2)}`}
+                    </span>
+                    {resourcesNormalMsg && (
+                      <span className="text-[12px] text-red-500">{resourcesNormalMsg}</span>
+                    )}
+                  </div>
+                }
+              />
+              <Row
+                label={tr("帧率上限")}
+                desc={tr("场景动画的帧率上限（15–60 FPS 任意值）：越低 GPU 占用越低")}
+                control={
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="range"
+                      min={15}
+                      max={60}
+                      step={1}
+                      value={sceneFps}
+                      onChange={(e) => changeSceneFps(Number(e.target.value))}
+                      className={SLIDER_CLS}
+                    />
+                    <span className="w-14 text-right text-[12px] tabular-nums text-[var(--text-2)]">
+                      {sceneFps} FPS
+                    </span>
                     {sceneFpsMsg && <span className="text-[12px] text-red-500">{sceneFpsMsg}</span>}
                   </div>
                 }
               />
               <Row
                 label={tr("抗锯齿")}
-                desc={
-                  aa === "off"
-                    ? tr("关闭（默认，最省性能）")
-                    : aa === "fxaa"
-                      ? tr("FXAA：帧末一次后处理，平滑所有边缘（含贴图边缘），成本低")
-                      : aa === "msaa2"
-                        ? tr("MSAA 2x：多重采样，只平滑几何边缘（图层/粒子边缘），画质最正")
-                        : tr("MSAA 4x：多重采样 4 倍，几何边缘最平滑，GPU 占用最高")
-                }
+                desc={tr("抗锯齿方案优化中：当前所有档位一律关闭且禁止更改（FXAA/MSAA 在部分壁纸上有瑕疵），后续版本开放")}
                 control={
-                  <div className="flex items-center gap-2">
-                    <select
-                      value={aa}
-                      onChange={(e) => void changeAa(e.target.value)}
-                      className="rounded-lg border border-[var(--separator)] bg-[var(--content)] px-2 py-1 text-[12.5px] outline-none focus:border-[var(--accent-strong)]"
-                    >
-                      <option value="off">{tr("关")}</option>
-                      <option value="fxaa">FXAA</option>
-                      <option value="msaa2">MSAA 2x</option>
-                      <option value="msaa4">MSAA 4x</option>
-                    </select>
-                    {aaMsg && <span className="text-[12px] text-red-500">{aaMsg}</span>}
-                  </div>
+                  <select
+                    disabled
+                    value="off"
+                    className="rounded-lg border border-[var(--separator)] bg-[var(--content)] px-2 py-1 text-[12.5px] opacity-60 outline-none"
+                  >
+                    <option value="off">{tr("关（已锁定）")}</option>
+                  </select>
                 }
               />
               <Row
@@ -1507,16 +1928,29 @@ export function SettingsPage() {
                 }
                 control={
                   <div className="flex items-center gap-2">
-                    <select
-                      value={particles}
-                      onChange={(e) => void changeParticles(e.target.value)}
-                      className="rounded-lg border border-[var(--separator)] bg-[var(--content)] px-2 py-1 text-[12.5px] outline-none focus:border-[var(--accent-strong)]"
-                    >
-                      <option value="high">{tr("高")}</option>
-                      <option value="medium">{tr("中")}</option>
-                      <option value="low">{tr("低")}</option>
-                      <option value="off">{tr("关")}</option>
-                    </select>
+                    <input
+                      type="range"
+                      min={0}
+                      max={3}
+                      step={1}
+                      value={Math.max(
+                        0,
+                        PARTICLE_STOPS.indexOf(particles as (typeof PARTICLE_STOPS)[number]),
+                      )}
+                      onChange={(e) => changeParticles(PARTICLE_STOPS[Number(e.target.value)])}
+                      className={SLIDER_CLS}
+                    />
+                    <span className="w-8 text-right text-[12px] text-[var(--text-2)]">
+                      {tr(
+                        particles === "high"
+                          ? "高"
+                          : particles === "medium"
+                            ? "中"
+                            : particles === "low"
+                              ? "低"
+                              : "关",
+                      )}
+                    </span>
                     {particlesMsg && <span className="text-[12px] text-red-500">{particlesMsg}</span>}
                   </div>
                 }
@@ -1528,25 +1962,88 @@ export function SettingsPage() {
                     ? tr("高（默认）：效果链全分辨率（辉光/模糊/水波等画面效果）")
                     : post === "medium"
                       ? tr("中：效果链分辨率压到屏幕尺寸以内，显存占用降低")
-                      : tr("低：效果链分辨率减半，显存占用约 1/4")
+                      : post === "off"
+                        ? tr("关：效果链直通（辉光/水波等画面效果全无，最省性能）")
+                        : tr("低：效果链分辨率减半，显存占用约 1/4")
                 }
                 control={
                   <div className="flex items-center gap-2">
-                    <select
-                      value={post}
-                      onChange={(e) => void changePost(e.target.value)}
-                      className="rounded-lg border border-[var(--separator)] bg-[var(--content)] px-2 py-1 text-[12.5px] outline-none focus:border-[var(--accent-strong)]"
-                    >
-                      <option value="high">{tr("高")}</option>
-                      <option value="medium">{tr("中")}</option>
-                      <option value="low">{tr("低")}</option>
-                    </select>
+                    <input
+                      type="range"
+                      min={0}
+                      max={3}
+                      step={1}
+                      value={Math.max(0, POST_STOPS.indexOf(post as (typeof POST_STOPS)[number]))}
+                      onChange={(e) => changePost(POST_STOPS[Number(e.target.value)])}
+                      className={SLIDER_CLS}
+                    />
+                    <span className="w-8 text-right text-[12px] text-[var(--text-2)]">
+                      {tr(
+                        post === "high" ? "高" : post === "medium" ? "中" : post === "off" ? "关" : "低",
+                      )}
+                    </span>
                     {postMsg && <span className="text-[12px] text-red-500">{postMsg}</span>}
                   </div>
                 }
               />
               <Row
-                label={tr("官方素材（Wallpaper Engine）")}
+                label={tr("滤镜")}
+                desc={tr("整个画面的色彩效果，实时热切、不重载壁纸；与托盘菜单「滤镜效果」是同一设置")}
+                control={
+                  <div className="flex items-center gap-2">
+                    <select
+                      value={filter}
+                      onChange={(e) => void changeFilter(e.target.value)}
+                      className="rounded-lg border border-[var(--separator)] bg-[var(--content)] px-2 py-1 text-[12.5px] outline-none focus:border-[var(--accent-strong)]"
+                    >
+                      {FILTER_OPTIONS.map((o) => (
+                        <option key={o.id} value={o.id}>
+                          {tr(o.label)}
+                        </option>
+                      ))}
+                    </select>
+                    {filterMsg && <span className="text-[12px] text-red-500">{filterMsg}</span>}
+                  </div>
+                }
+              />
+            <Row
+              label={tr("切换效果")}
+              desc={
+                reveal === "fade"
+                  ? tr("叠化（默认）：新壁纸淡入盖过旧壁纸。换到另一张壁纸时生效")
+                  : reveal === "zoom"
+                    ? tr("推近：新壁纸从 130% 缩回原位淡入。换到另一张壁纸时生效")
+                    : reveal === "blur"
+                      ? tr("模糊：新壁纸由重失焦变清晰淡入。换到另一张壁纸时生效")
+                      : reveal === "depth"
+                        ? tr("景深：推近与失焦同时收拢，观感更立体。换到另一张壁纸时生效")
+                        : reveal === "circle"
+                          ? tr("圆形揭示：新壁纸光圈从屏幕中心展开。换到另一张壁纸时生效")
+                          : reveal === "wipe"
+                            ? tr("横向擦除：新壁纸从左向右擦出，覆盖旧壁纸。换到另一张壁纸时生效")
+                            : tr("滑入：新壁纸整幅从右侧滑入，覆盖旧壁纸。换到另一张壁纸时生效")
+              }
+              control={
+                <div className="flex items-center gap-2">
+                  <select
+                    value={reveal}
+                    onChange={(e) => void changeReveal(e.target.value)}
+                    className="rounded-lg border border-[var(--separator)] bg-[var(--content)] px-2 py-1 text-[12.5px] outline-none focus:border-[var(--accent-strong)]"
+                  >
+                    <option value="fade">{tr("叠化")}</option>
+                    <option value="zoom">{tr("推近")}</option>
+                    <option value="blur">{tr("模糊")}</option>
+                    <option value="depth">{tr("景深")}</option>
+                    <option value="circle">{tr("圆形揭示")}</option>
+                    <option value="wipe">{tr("横向擦除")}</option>
+                    <option value="slide">{tr("滑入")}</option>
+                  </select>
+                  {revealMsg && <span className="text-[12px] text-red-500">{revealMsg}</span>}
+                </div>
+              }
+            />
+            <Row
+              label={tr("官方素材（Wallpaper Engine）")}
                 desc={
                   localAssets?.available
                     ? tr(
@@ -1569,7 +2066,7 @@ export function SettingsPage() {
                 <>
                   <div className="flex items-center gap-2 px-3 pb-1 text-[12px]">
                     {localAssets?.available ? (
-                      <span className="break-all text-green-600 dark:text-green-400">
+                      <span className="break-all text-green-400">
                         {tr("素材根")}: {localAssets.root}
                       </span>
                     ) : (
@@ -1614,124 +2111,6 @@ export function SettingsPage() {
               )}
               {localAssetsMsg && (
                 <div className="px-3 pb-1 text-[12px] text-red-500">{trMsg(localAssetsMsg)}</div>
-              )}
-            </Group>
-          )}
-
-          {tab === "mcp" && (
-            <Group title={tr("AI / MCP")}>
-              <Row
-                label={tr("MCP 服务")}
-                desc={
-                  mcpState === "未启动"
-                    ? tr(
-                        "已关闭：AI 客户端（Codex / Claude 等）无法连接。开启后仅监听本机回环，连接需带访问令牌",
-                      )
-                    : mcpState === "运行中"
-                      ? `${tr("运行中")} · ${mcp?.url}${tr("（仅本机，需令牌）")}`
-                      : mcpState === "启动失败"
-                        ? `${tr("启动失败")}: ${trMsg(mcp?.lastError ?? "")}`
-                        : tr("正在启动…")
-                }
-                control={<Switch checked={mcp?.enabled === true} onChange={toggleMcp} />}
-              />
-              {mcp?.enabled && (
-                <>
-                  <Row
-                    label={tr("端口")}
-                    desc={tr("MCP 服务监听端口（默认 7411，改完自动热重启）。被占用时上方会显示失败原因")}
-                    control={
-                      <input
-                        value={mcpPort}
-                        disabled={mcpBusy}
-                        inputMode="numeric"
-                        onChange={(e) => setMcpPort(e.target.value.replace(/[^0-9]/g, ""))}
-                        onBlur={commitMcpPort}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") commitMcpPort();
-                        }}
-                        className="w-24 rounded-lg border border-[var(--separator)] bg-[var(--content)] px-3 py-1.5 text-[13px] tabular-nums outline-none focus:border-[var(--accent-strong)]"
-                      />
-                    }
-                  />
-                  <Row
-                    label={tr("访问令牌")}
-                    desc={tr("客户端通过 ?token= 或 Authorization: Bearer 携带。轮换后已连接的客户端需重新配置")}
-                    control={
-                      <div className="flex items-center gap-2">
-                        <code className="max-w-[180px] truncate font-mono text-[12px] text-[var(--text-2)]">
-                          {mcpShowToken ? mcp.token : "•".repeat(Math.min(mcp.token.length, 24))}
-                        </code>
-                        <button
-                          className="btn !py-1 text-[11.5px]"
-                          onClick={() => setMcpShowToken((v) => !v)}
-                        >
-                          {mcpShowToken ? tr("隐藏") : tr("显示")}
-                        </button>
-                        <button
-                          className="btn !py-1 text-[11.5px]"
-                          onClick={() => copyText(mcp.urlWithToken, tr("已复制带令牌的连接地址"))}
-                        >
-                          {tr("复制地址")}
-                        </button>
-                        <button
-                          className="btn !py-1 text-[11.5px]"
-                          disabled={mcpBusy}
-                          onClick={rotateMcpToken}
-                        >
-                          {tr("轮换")}
-                        </button>
-                      </div>
-                    }
-                  />
-                  <Row
-                    label={tr("客户端配置")}
-                    desc={tr(
-                      "直接发给 AI 客户端，或用命令行一键添加（Codex / Claude Code 等支持 MCP 的工具）",
-                    )}
-                    control={
-                      <button
-                        className="btn !py-1 text-[11.5px]"
-                        onClick={() => setMcpShowSnippet((v) => !v)}
-                      >
-                        {mcpShowSnippet ? tr("收起") : tr("查看配置")}
-                      </button>
-                    }
-                  />
-                  {mcpShowSnippet && mcpSnippet && (
-                    <div className="space-y-2 pb-3">
-                      <SnippetBlock label="mcpServers JSON" text={mcpSnippet.json} onCopy={copyText} />
-                      <SnippetBlock label="Codex CLI" text={mcpSnippet.codexCli} onCopy={copyText} />
-                      <SnippetBlock label="Claude CLI" text={mcpSnippet.claudeCli} onCopy={copyText} />
-                    </div>
-                  )}
-                  <div className="pt-3">
-                    <div className="mb-1.5 text-[12px] text-[var(--text-2)]">
-                      {tr("最近调用")}
-                      {mcp.calls.length > 0 ? `（${mcp.calls.length}）` : ""}
-                    </div>
-                    {mcp.calls.length === 0 ? (
-                      <div className="text-[12px] text-[var(--text-2)]">
-                        {tr("AI 客户端连上后，这里会显示每次工具调用的耗时与结果")}
-                      </div>
-                    ) : (
-                      <div className="space-y-1">
-                        {mcp.calls.slice(0, 8).map((c, i) => (
-                          <div key={`${c.at}-${i}`} className="flex items-baseline gap-2 text-[12px]">
-                            <span className="shrink-0 tabular-nums text-[var(--text-2)]">
-                              {clockOf(c.at)}
-                            </span>
-                            <span className={`shrink-0 font-mono ${c.ok ? "" : "text-[#ff453a]"}`}>
-                              {c.tool}
-                            </span>
-                            <span className="shrink-0 tabular-nums text-[var(--text-2)]">{c.ms}ms</span>
-                            <span className="truncate text-[var(--text-2)]">{c.summary}</span>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                </>
               )}
             </Group>
           )}
@@ -1814,14 +2193,15 @@ const ISSUES_URL = `${REPO_URL}/issues`;
 const LICENSE_URL = `${REPO_URL}/blob/main/LICENSE`;
 const MEDIA_BRIDGE_URL = "https://github.com/oneincase/media-bridge";
 
-/** 「关于」面板上次的检查结果：切标签会重挂组件，缓存一下避免每次进页面都打 GitHub API */
+/** 「关于」面板上次的检查结果：切标签会重挂组件，缓存一下避免每次进页面都打更新清单端点 */
 let aboutCheckCache: UpdateInfo | null = null;
 
 /**
- * 「关于」面板：应用信息 + 更新检查 / 下载 / 安装 + 相关链接。
+ * 「关于」面板：应用信息 + 更新检查 / 下载安装 / 重启生效 + 相关链接。
  *
- * 更新走「GitHub Releases 最新版 → 比对版本 → 下载当前平台安装包 → 打开安装器」，
- * 不依赖官方 updater 需要的签名密钥与 latest.json（见 src-tauri/src/update.rs）。
+ * 更新走官方 updater 插件：「读 Release 里的 latest-{target}-{arch}.json 清单 →
+ * 下载并校验签名（进度 update:progress）→ 平台原地安装 → 重启生效」，
+ * Windows 装完由安装器自动重启本体（见 src-tauri/src/update.rs）。
  */
 function AboutPanel() {
   const [info, setInfo] = useState<{
@@ -1836,16 +2216,18 @@ function AboutPanel() {
   );
   const [errMsg, setErrMsg] = useState("");
   const [prog, setProg] = useState<{ received: number; total: number } | null>(null);
-  const [file, setFile] = useState("");
   const [busy, setBusy] = useState(false);
-  const [hint, setHint] = useState("");
+  /** 下载完成进入安装阶段（update:phase 事件推进；Windows 上装完进程直接退出） */
+  const [installing, setInstalling] = useState(false);
+  /** 安装已完成（macOS/Linux 待用户点重启；Windows 到不了这个状态） */
+  const [installed, setInstalled] = useState(false);
 
   const check = useCallback(async () => {
     setPhase("checking");
     setErrMsg("");
-    setHint("");
-    // 重新检查后旧安装包可能已不对应（换版本），清掉避免误开
-    setFile("");
+    setInstalling(false);
+    setInstalled(false);
+    setProg(null);
     try {
       const r = await api.appUpdateCheck();
       aboutCheckCache = r;
@@ -1859,7 +2241,7 @@ function AboutPanel() {
 
   useEffect(() => {
     api.appInfo().then(setInfo).catch(console.warn);
-    // 有缓存就不再自动打一次 API（切标签回来时）
+    // 有缓存就不再自动打一次端点（切标签回来时）
     if (!aboutCheckCache) void check();
   }, [check]);
 
@@ -1873,33 +2255,42 @@ function AboutPanel() {
     };
   }, []);
 
-  const download = useCallback(async () => {
-    if (!upd?.asset) return;
+  // 下载结束进入安装阶段时，Rust 侧发 `update:phase`
+  useEffect(() => {
+    const un = listen<{ phase: string }>("update:phase", (e) => {
+      if (e.payload.phase === "installing") setInstalling(true);
+    });
+    return () => {
+      void un.then((f) => f());
+    };
+  }, []);
+
+  const downloadInstall = useCallback(async () => {
     setBusy(true);
     setErrMsg("");
-    setHint("");
-    setFile("");
-    setProg({ received: 0, total: upd.asset.size });
+    setInstalling(false);
+    setInstalled(false);
+    setProg({ received: 0, total: 0 });
     try {
-      const path = await api.appUpdateDownload(upd.asset.url, upd.asset.name);
-      setFile(path);
-      setHint(tr("下载完成，点「打开安装包」继续"));
+      await api.appUpdateDownloadInstall();
+      setInstalled(true);
     } catch (e) {
       setErrMsg(String(e));
     } finally {
       setBusy(false);
+      setInstalling(false);
       setProg(null);
     }
-  }, [upd]);
+  }, []);
 
-  const openInstaller = useCallback(async () => {
+  const restart = useCallback(async () => {
     setErrMsg("");
     try {
-      setHint(await api.appUpdateOpen(file));
+      await api.appUpdateRestart();
     } catch (e) {
       setErrMsg(String(e));
     }
-  }, [file]);
+  }, []);
 
   const pct = prog && prog.total > 0 ? Math.min(100, Math.round((prog.received / prog.total) * 100)) : null;
   const osLabel =
@@ -1911,9 +2302,9 @@ function AboutPanel() {
   })();
 
   const linkBtn =
-    "rounded-lg border border-[var(--separator)] px-2.5 py-1 text-[12.5px] text-[var(--text-2)] transition-colors hover:bg-black/5 hover:text-[var(--text-1)] dark:hover:bg-white/8";
+    "rounded-lg border border-[var(--separator)] px-2.5 py-1 text-[12.5px] text-[var(--text-2)] transition-colors hover:bg-white/8 hover:text-[var(--text-1)]";
   const primaryBtn =
-    "rounded-lg bg-[var(--accent-strong)] px-3 py-1.5 text-[12.5px] font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-40";
+    "rounded-lg bg-[var(--accent-fill)] px-3 py-1.5 text-[12.5px] font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-40";
 
   return (
     <div className="space-y-3">
@@ -1937,8 +2328,8 @@ function AboutPanel() {
             </div>
             <div className="mt-1 text-[12px] text-[var(--text-2)]">
               {info?.os === "macos"
-                ? tr("macOS 动态壁纸引擎 · 浏览/下载并应用 Steam 创意工坊壁纸")
-                : tr("跨平台动态壁纸引擎 · 浏览/下载并应用 Steam 创意工坊壁纸")}
+                ? tr("macOS 动态壁纸引擎 · 极致优雅的开源壁纸软件，绝非单纯的WE复刻")
+                : tr("跨平台动态壁纸引擎 · 极致优雅的开源壁纸软件，绝非单纯的WE复刻")}
             </div>
             <div className="mt-1 text-[11.5px] text-[var(--text-2)] opacity-80">
               {tr("平台")} {osLabel} · {info?.arch ?? ""}
@@ -1953,7 +2344,7 @@ function AboutPanel() {
           <div className="text-[14px] font-medium">{tr("软件更新")}</div>
           <button
             className={primaryBtn}
-            disabled={phase === "checking" || busy}
+            disabled={phase === "checking" || busy || installing || installed}
             onClick={() => void check()}
           >
             {phase === "checking" ? tr("正在检查…") : tr("检查更新")}
@@ -1965,7 +2356,12 @@ function AboutPanel() {
           {phase === "checking" && tr("正在检查…")}
           {phase === "latest" && tr("已是最新版本")}
           {phase === "error" && `${tr("检查更新失败")}${errMsg ? `：${trMsg(errMsg)}` : ""}`}
-          {phase === "available" && upd && tr("发现新版本 {v}", { v: `v${upd.latest}` })}
+          {phase === "available" &&
+            (installing
+              ? tr("正在安装更新…")
+              : installed
+                ? tr("更新已安装，重启软件后生效")
+                : upd && tr("发现新版本 {v}", { v: `v${upd.latest}` }))}
         </div>
 
         {phase === "available" && upd && (
@@ -1977,7 +2373,7 @@ function AboutPanel() {
               </div>
             )}
             {upd.notes.trim() !== "" && (
-              <div className="rounded-lg border border-[var(--separator)] bg-black/5 dark:bg-white/5">
+              <div className="rounded-lg border border-[var(--separator)] bg-white/5">
                 <div className="border-b border-[var(--separator)] px-2.5 py-1.5 text-[11.5px] text-[var(--text-2)]">
                   {tr("更新内容")}
                 </div>
@@ -1991,32 +2387,35 @@ function AboutPanel() {
               <div className="space-y-1">
                 <div className="h-1.5 w-full overflow-hidden rounded-full bg-[var(--separator)]">
                   <div
-                    className="h-full rounded-full bg-[var(--accent-strong)] transition-[width] duration-200"
+                    className="h-full rounded-full bg-[var(--accent-fill)] transition-[width] duration-200"
                     style={{ width: pct === null ? "30%" : `${pct}%` }}
                   />
                 </div>
                 <div className="text-[11.5px] text-[var(--text-2)]">
-                  {tr("下载中…")}
-                  {prog.total > 0
-                    ? ` ${formatBytes(prog.received)} / ${formatBytes(prog.total)}${pct !== null ? ` · ${pct}%` : ""}`
-                    : ` ${formatBytes(prog.received)}`}
+                  {installing
+                    ? tr("下载完成，正在校验签名并安装…")
+                    : `${tr("下载中…")}${
+                        prog.total > 0
+                          ? ` ${formatBytes(prog.received)} / ${formatBytes(prog.total)}${pct !== null ? ` · ${pct}%` : ""}`
+                          : ` ${formatBytes(prog.received)}`
+                      }`}
                 </div>
               </div>
             )}
 
             <div className="flex flex-wrap items-center gap-2">
-              {upd.asset ? (
-                <button className={primaryBtn} disabled={busy} onClick={() => void download()}>
-                  {busy ? tr("下载中…") : tr("下载更新")}
+              {!installed && (
+                <button
+                  className={primaryBtn}
+                  disabled={busy || installing}
+                  onClick={() => void downloadInstall()}
+                >
+                  {busy ? (installing ? tr("正在安装更新…") : tr("下载中…")) : tr("下载更新并安装")}
                 </button>
-              ) : (
-                <span className="text-[12px] text-[var(--text-2)]">
-                  {tr("当前平台没有可直接下载的安装包")}
-                </span>
               )}
-              {file && (
-                <button className={primaryBtn} onClick={() => void openInstaller()}>
-                  {tr("打开安装包")}
+              {installed && (
+                <button className={primaryBtn} onClick={() => void restart()}>
+                  {tr("重启并完成更新")}
                 </button>
               )}
               <button className={linkBtn} onClick={() => void openUrl(upd.htmlUrl || RELEASES_URL)}>
@@ -2024,7 +2423,6 @@ function AboutPanel() {
               </button>
             </div>
 
-            {hint && <div className="text-[12px] text-[var(--text-2)]">{trMsg(hint)}</div>}
             {errMsg && phase === "available" && (
               <div className="text-[12px] text-red-500">{trMsg(errMsg)}</div>
             )}
@@ -2140,32 +2538,5 @@ function Row({
       </div>
       {control}
     </div>
-  );
-}
-
-function Switch({
-  checked,
-  onChange,
-  disabled,
-}: {
-  checked: boolean;
-  onChange: (v: boolean) => void;
-  disabled?: boolean;
-}) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      disabled={disabled}
-      onClick={() => onChange(!checked)}
-      className={`relative inline-flex h-[22px] w-[38px] shrink-0 items-center rounded-full transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${checked ? "bg-[var(--accent-strong)]" : "bg-[var(--separator)]"
-        }`}
-    >
-      <span
-        className={`inline-block h-[18px] w-[18px] transform rounded-full bg-[var(--content)] shadow transition-transform ${checked ? "translate-x-[18px]" : "translate-x-[2px]"
-          }`}
-      />
-    </button>
   );
 }

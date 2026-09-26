@@ -26,10 +26,20 @@ import {
   type WebPropValues,
 } from "../api/steam";
 import { evalCondition } from "../lib/weCondition";
+import {
+  PARTICLE_STOPS,
+  POST_STOPS,
+  PRESET_LABELS,
+  QUALITY_PRESETS,
+  deriveQualityPreset,
+  stopLabel,
+} from "../lib/qualityPresets";
 import { refreshItemPropsCache } from "../hooks/useItemProps";
 import { ConfirmModal } from "./ConfirmModal";
 import { tr, trMsg } from "../lib/i18n";
 import { EmptyState } from "./EmptyState";
+import { WindowControls } from "./WindowControls";
+import { useOs } from "../lib/platform";
 import { IconSliders } from "./icons";
 
 /// WE 线格式 "r g b"（0..1 浮点）→ #rrggbb
@@ -126,6 +136,8 @@ export function WallpaperPropsPanel({
   const [play, setPlay] = useState<ItemPlayConfig>({});
   const [globals, setGlobals] = useState<PlayConfigGlobals | null>(null);
   const [playMsg, setPlayMsg] = useState("");
+  /** 独立窗口（embedded）的窗口壳按平台分叉：macOS 背景拖动 + ×，Win/Linux 拖拽区 + 自绘控制 */
+  const isMac = useOs() === "macos";
 
   const draftRef = useRef(draft);
   draftRef.current = draft;
@@ -133,9 +145,10 @@ export function WallpaperPropsPanel({
   defsRef.current = defs;
   const saveTimer = useRef<number | null>(null);
 
-  // ---- 独立窗口拖动：交给系统背景拖动（movableByWindowBackground，见
-  // props_window.rs）。JS 侧不要再插手——WKWebView 在非交互区域会吃掉鼠标
-  // 事件走原生手势，两套并存就是"时灵时不灵"。双击最大化保留。 ----
+  // ---- 独立窗口拖动：macOS 走系统背景拖动（movableByWindowBackground，见
+  // props_window.rs）——JS 侧不要再插手手动 setPosition，WKWebView 在非交互
+  // 区域会吃掉鼠标事件走原生手势，两套并存就是"时灵时不灵"。Windows/Linux
+  // 没有背景拖动，头部挂 data-tauri-drag-region 交给系统拖窗（下方标题栏）。----
 
   // ---- 载入属性定义（每次打开都重新拉，值必须是最新的；成功后刷新可用性缓存） ----
   useEffect(() => {
@@ -208,11 +221,25 @@ export function WallpaperPropsPanel({
   }, [itemId]);
 
   /**
-   * 改一项播放设置：立即落盘（这几项没有"输入中"的中间态，不需要防抖）。
+   * 改一项播放设置。本地状态立即跟上（滑条拖动要实时），落盘去抖 350ms 只发
+   * 最后一次 —— 滑条是连续 onChange，逐次落盘会连着重载壁纸窗口（贴图/法线
+   * 倍率是挂载期参数，改动即重载）。
    * 传 undefined 表示恢复「跟随全局」。
    */
+  const playCommitTimer = useRef<number | null>(null);
+  const playPending = useRef<ItemPlayConfig | null>(null);
+  const commitPlay = useCallback(
+    async (cfg: ItemPlayConfig) => {
+      try {
+        await api.wallpaperItemPlayConfigSet(itemId, cfg);
+      } catch (e) {
+        setPlayMsg(String(e));
+      }
+    },
+    [itemId],
+  );
   const changePlay = useCallback(
-    async (patch: ItemPlayConfig) => {
+    (patch: ItemPlayConfig) => {
       const next: ItemPlayConfig = { ...play, ...patch };
       // undefined 要真的从对象里删掉：留着 key 会被序列化成 null，
       // 后端 Option<T> 反序列化成 Some(null) 而不是 None，"跟随全局"就失效了
@@ -221,14 +248,62 @@ export function WallpaperPropsPanel({
       }
       setPlay(next);
       setPlayMsg("");
-      try {
-        await api.wallpaperItemPlayConfigSet(itemId, next);
-      } catch (e) {
-        setPlayMsg(String(e));
-      }
+      playPending.current = next;
+      if (playCommitTimer.current) window.clearTimeout(playCommitTimer.current);
+      playCommitTimer.current = window.setTimeout(() => {
+        playCommitTimer.current = null;
+        const cfg = playPending.current;
+        playPending.current = null;
+        if (cfg) void commitPlay(cfg);
+      }, 350);
     },
-    [itemId, play],
+    // commitPlay 身份稳定（只依赖 itemId）；play 走 playPending 不进依赖，
+    // 否则每次 setState 换闭包，去抖永远等不到触发
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [itemId],
   );
+
+  /** 立即落盘去抖中的播放设置（关闭/卸载时冲刷，防止拖完就关丢改动） */
+  const flushPlay = useCallback(async () => {
+    if (playCommitTimer.current) {
+      window.clearTimeout(playCommitTimer.current);
+      playCommitTimer.current = null;
+    }
+    if (playPending.current) {
+      const cfg = playPending.current;
+      playPending.current = null;
+      await commitPlay(cfg);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [itemId]);
+
+  /** 画质档位一键套用：六个画质参数整体写成本壁纸专属值（抗锯齿恒 off 不动） */
+  const applyPlayPreset = useCallback(
+    (id: "low" | "medium" | "high") => {
+      const p = QUALITY_PRESETS[id];
+      changePlay({
+        renderDpr: p.renderDpr,
+        sceneFps: p.sceneFps,
+        particles: p.particles,
+        postProcessing: p.post,
+        resources: p.resources,
+        resourcesNormal: p.resourcesNormal,
+      });
+    },
+    [changePlay],
+  );
+
+  /** 画质档位行「专属 ×」：六个画质参数全部回到跟随全局 */
+  const followPlayQuality = useCallback(() => {
+    changePlay({
+      renderDpr: undefined,
+      sceneFps: undefined,
+      particles: undefined,
+      postProcessing: undefined,
+      resources: undefined,
+      resourcesNormal: undefined,
+    });
+  }, [changePlay]);
 
   const playOverrideCount = useMemo(
     () => (Object.keys(play) as (keyof ItemPlayConfig)[]).filter((k) => play[k] !== undefined).length,
@@ -284,8 +359,9 @@ export function WallpaperPropsPanel({
         saveTimer.current = null;
         void doSave();
       }
+      void flushPlay();
     };
-  }, [doSave]);
+  }, [doSave, flushPlay]);
 
   const change = useCallback(
     (name: string, v: WebPropValues[string]) => {
@@ -352,8 +428,9 @@ export function WallpaperPropsPanel({
       saveTimer.current = null;
       void doSave();
     }
+    void flushPlay();
     onClose();
-  }, [doSave, onClose]);
+  }, [doSave, flushPlay, onClose]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -439,24 +516,29 @@ export function WallpaperPropsPanel({
       <div
         className={`props-embedded flex w-full flex-col overflow-hidden ${
           embedded
-            ? "h-screen props-tint"
-            : "card animate-modal-pop h-[78vh] max-w-2xl"
+            ? "h-full"
+            : "card glass-panel animate-modal-pop h-[78vh] max-w-2xl"
         }`}
         onClick={(e) => e.stopPropagation()}
       >
         {/* 标题栏（单行：图标 + 「壁纸配置」+ 壁纸名，超长截断）。
-            独立窗口（embedded）：红绿灯在左上（Overlay 标题栏），标题行用 pt-9
-            整行放在红绿灯正下方，不再 pl-20 让位（旧的双行+缩进太丑）；
-            拖动走系统背景拖动（movableByWindowBackground，见 props_window.rs），
-            红绿灯已是关闭入口。主窗口弹窗：保留 ×，配合遮罩点击与底栏完成。 */}
+            独立窗口（embedded）全平台无边框（decorations:false，见 props_window.rs）：
+            macOS 拖动走系统背景拖动（movableByWindowBackground），双击头部最大化、
+            右侧 × 关闭；Windows/Linux 没有背景拖动，头部挂 data-tauri-drag-region
+            交给系统拖窗（连带双击最大化由 Tauri 内建处理 —— 这里绝不能再挂
+            onDoubleClick，两次 toggle 会相互抵消），右侧换成自绘 WindowControls
+            （min/max/close）。主窗口弹窗：保留 ×，配合遮罩点击与底栏完成。 */}
         <div
-          {...(embedded
+          {...(embedded && isMac
             ? {
                 onDoubleClick: () => void getCurrentWindow().toggleMaximize(),
               }
             : {})}
-          className={`flex shrink-0 items-center justify-between gap-3 border-b border-[var(--separator)] ${
-            embedded ? "px-5 pb-3 pt-9" : "px-5 py-3"
+          data-tauri-drag-region={embedded && !isMac ? "deep" : undefined}
+          className={`flex shrink-0 items-center justify-between gap-3 border-b border-[var(--separator)] px-5 ${
+            // 独立窗口头部定高：WindowControls 是 h-full 的通栏按钮（同原生标题条
+            // 的整条 hover），高度得有确定值可依；弹窗保持自适应行高
+            embedded ? "h-12" : "py-3"
           }`}
         >
           <div className="flex min-w-0 items-baseline gap-2">
@@ -468,9 +550,11 @@ export function WallpaperPropsPanel({
               {title}
             </span>
           </div>
-          {!embedded && (
+          {embedded && !isMac ? (
+            <WindowControls />
+          ) : (
             <button
-              className="shrink-0 rounded-lg px-2 py-0.5 text-[18px] leading-none text-[var(--text-2)] hover:bg-black/5 dark:hover:bg-white/10"
+              className="shrink-0 rounded-lg px-2 py-0.5 text-[18px] leading-none text-[var(--text-2)] hover:bg-white/10"
               onClick={close}
               aria-label={tr("关闭")}
             >
@@ -497,7 +581,7 @@ export function WallpaperPropsPanel({
               className={`rounded-lg px-2.5 py-1 text-[12.5px] ${
                 tab === key
                   ? "border border-[var(--accent-strong)] bg-[var(--accent)] text-[var(--accent-fg)]"
-                  : "text-[var(--text-2)] hover:bg-black/5 dark:hover:bg-white/10"
+                  : "text-[var(--text-2)] hover:bg-white/10"
               }`}
               onClick={() => setTab(key)}
             >
@@ -515,7 +599,21 @@ export function WallpaperPropsPanel({
             globals={globals}
             errMsg={playMsg}
             onChange={changePlay}
-            onResetAll={() => void changePlay({ fit: undefined, renderDpr: undefined, sceneFps: undefined, volume: undefined })}
+            onResetAll={() =>
+              changePlay({
+                fit: undefined,
+                renderDpr: undefined,
+                sceneFps: undefined,
+                volume: undefined,
+                aa: undefined,
+                particles: undefined,
+                postProcessing: undefined,
+                resources: undefined,
+                resourcesNormal: undefined,
+              })
+            }
+            onApplyPreset={applyPlayPreset}
+            onFollowQuality={followPlayQuality}
             overrideCount={playOverrideCount}
           />
         ) : loadError ? (
@@ -669,7 +767,7 @@ export function WallpaperPropsModal(props: {
 }) {
   return createPortal(
     <div
-      className="animate-overlay fixed inset-0 z-[80] flex items-center justify-center bg-black/50 p-8"
+      className="animate-overlay fixed inset-0 z-[80] flex items-center justify-center bg-black/25 p-8"
       onClick={props.onClose}
     >
       <WallpaperPropsPanel {...props} />
@@ -939,7 +1037,7 @@ function PropRow({
             aria-checked={!!cur}
             className={`flex h-4 w-4 shrink-0 items-center justify-center rounded-[3px] border transition-colors ${
               cur
-                ? "border-[var(--accent-strong)] bg-[var(--accent-strong)] text-[var(--accent-fg)]"
+                ? "border-[var(--accent-strong)] bg-[var(--accent-fill)] text-[var(--accent-fg)]"
                 : "border-[var(--separator)] bg-[var(--card)] hover:border-[var(--accent-strong)]"
             }`}
             onClick={() => onChange(p.name, !cur)}
@@ -1311,14 +1409,11 @@ function ComboControl({
 }
 
 // ---------- 播放设置分区（每壁纸覆盖，未设置则跟随全局） ----------
+//
+// 控件与主窗口「设置 → 画质」同一套设计（档位按钮 + 滑条），只是每一行
+// 多一层「跟随全局 / 专属」语义：滑条显示生效值（覆盖 ?? 全局），拖动即写
+// 本壁纸专属值，点「专属 ×」回到跟随全局。
 
-/** 清晰度档位：与设置页、Rust 的 RENDER_DPR 常量保持一致（相对设备像素比倍率，0=自动） */
-const DPR_TIERS: Array<{ v: number; label: string }> = [
-  { v: 0, label: "自动" },
-  { v: 0.75, label: "省电" },
-  { v: 0.85, label: "标准" },
-  { v: 1, label: "高清" },
-];
 const FIT_LABELS: Record<string, string> = {
   // 与设置页、托盘菜单同一套说法（cover/contain/stretch → 裁剪/缩放/拉伸），
   // 同一个值在三处叫法必须一致，否则用户以为是不同的东西
@@ -1326,21 +1421,17 @@ const FIT_LABELS: Record<string, string> = {
   contain: "缩放",
   stretch: "拉伸",
 };
-const FPS_TIERS = [15, 24, 30, 45, 60, 120];
-/** 抗锯齿档位（与设置页、Rust 的 AA_CHOICES 一致，库 1.3.23+） */
-const AA_LABELS: Record<string, string> = {
-  off: "关",
-  fxaa: "FXAA",
-  msaa2: "MSAA 2x",
-  msaa4: "MSAA 4x",
-};
-/** 粒子/后处理质量档（与设置页、Rust 的 PARTICLE/POST_QUALITY_CHOICES 一致） */
-const QUALITY_LABELS: Record<string, string> = {
-  high: "高",
-  medium: "中",
-  low: "低",
-  off: "关",
-};
+/** 抗锯齿已锁定为关（方案优化中）：不提供档位选择，见下方锁定行。
+ *  优化完成后恢复 off/fxaa/msaa2/msaa4 四档（与设置页、Rust 的 AA_CHOICES 一致） */
+
+/** 滑条行统一取值：覆盖值优先，缺失跟随全局（清晰度历史 0=自动按原生显示） */
+function effDpr(play: ItemPlayConfig, globals: PlayConfigGlobals): number {
+  const v = play.renderDpr;
+  return v !== undefined && v > 0 ? v : globals.renderDpr || 1;
+}
+function effResources(play: ItemPlayConfig, globals: PlayConfigGlobals): number {
+  return play.resources ?? globals.resources ?? 1;
+}
 
 function PlayConfigPanel({
   play,
@@ -1348,6 +1439,8 @@ function PlayConfigPanel({
   errMsg,
   onChange,
   onResetAll,
+  onApplyPreset,
+  onFollowQuality,
   overrideCount,
 }: {
   play: ItemPlayConfig;
@@ -1355,6 +1448,10 @@ function PlayConfigPanel({
   errMsg: string;
   onChange: (patch: ItemPlayConfig) => void;
   onResetAll: () => void;
+  /** 画质档位一键套用：把六个画质参数写成本壁纸专属值（抗锯齿不动） */
+  onApplyPreset: (id: "low" | "medium" | "high") => void;
+  /** 画质档位行「专属 ×」：六个画质参数全部回到跟随全局 */
+  onFollowQuality: () => void;
   overrideCount: number;
 }) {
   if (!globals) {
@@ -1370,15 +1467,61 @@ function PlayConfigPanel({
       </div>
     );
   }
+  // 档位反推按**生效值**（覆盖 ?? 全局）：与设置页同规则，任一参数不是预设值
+  // 即「自定义」。六个画质参数任一为专属值时档位行亮「专属」标记
+  const preset = deriveQualityPreset({
+    renderDpr: effDpr(play, globals),
+    sceneFps: play.sceneFps ?? globals.sceneFps,
+    particles: play.particles ?? globals.particles,
+    post: play.postProcessing ?? globals.postProcessing,
+    resources: effResources(play, globals),
+    resourcesNormal: play.resourcesNormal ?? globals.resourcesNormal,
+  });
+  const qualityOverridden = (
+    ["renderDpr", "sceneFps", "particles", "postProcessing", "resources", "resourcesNormal"] as const
+  ).some((k) => play[k] !== undefined);
   return (
     <>
       <div className="flex-1 overflow-y-auto px-5 py-3">
         <div className="mb-3 text-[11.5px] leading-relaxed text-[var(--text-2)]">
           {tr(
-            "这些设置只作用于本张壁纸，切换壁纸后各自保留。选「跟随全局」则使用设置 → 性能里的值。",
+            "这些设置只作用于本张壁纸，切换壁纸后各自保留。选「跟随全局」则使用设置 → 画质里的值。",
           )}
         </div>
         <div className="flex flex-col gap-3">
+          <PlayRow
+            label={tr("画质档位")}
+            desc={
+              preset === "low"
+                ? tr("低：省电优先 — 清晰度 0.75 · 15 FPS · 粒子/后处理低 · 贴图 60% · 法线 75%")
+                : preset === "medium"
+                  ? tr("中：均衡 — 清晰度 0.85 · 30 FPS · 粒子/后处理中 · 贴图 80%")
+                  : preset === "high"
+                    ? tr("高：画质优先 — 清晰度 1.0 · 30 FPS · 粒子/后处理高 · 贴图/法线原生")
+                    : tr("自定义：手动调整下方任意参数即进入自定义。点档位一键套用预设，整体覆盖下方画质参数（显示模式/音量不动）")
+            }
+            isOverride={qualityOverridden}
+            onFollow={onFollowQuality}
+          >
+            <div className="flex overflow-hidden rounded-lg border border-[var(--separator)]">
+              {(["low", "medium", "high", "custom"] as const).map((id) => (
+                <button
+                  key={id}
+                  type="button"
+                  disabled={id === "custom" && preset !== "custom"}
+                  onClick={() => id !== "custom" && onApplyPreset(id)}
+                  className={`px-3 py-1 text-[12.5px] transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+                    preset === id
+                      ? "bg-[var(--accent-fill)] text-white"
+                      : "bg-[var(--card)] text-[var(--text-2)] hover:text-[var(--text)]"
+                  }`}
+                >
+                  {tr(PRESET_LABELS[id])}
+                </button>
+              ))}
+            </div>
+          </PlayRow>
+
           <PlayRow
             label={tr("显示模式")}
             desc={tr("画面与屏幕比例不一致时如何填充")}
@@ -1405,78 +1548,104 @@ function PlayConfigPanel({
 
           <PlayRow
             label={tr("清晰度")}
-            desc={tr("越高越清晰，显存占用也越高；实际生效值不超过屏幕像素比")}
+            desc={tr("渲染分辨率相对屏幕像素比的倍率（0.50–1.00，1=原生），越低越省显存")}
             isOverride={play.renderDpr !== undefined}
             onFollow={() => onChange({ renderDpr: undefined })}
           >
-            <select
-              className={playSelectCls}
-              value={play.renderDpr ?? ""}
-              onChange={(e) =>
-                onChange({ renderDpr: e.target.value ? Number(e.target.value) : undefined })
-              }
-            >
-              <option value="">
-                {tr("跟随全局（{v}）", {
-                  v: tr(
-                    DPR_TIERS.find((t) => t.v === globals.renderDpr)?.label ??
-                      String(globals.renderDpr),
-                  ),
-                })}
-              </option>
-              {DPR_TIERS.map((t) => (
-                <option key={t.v} value={t.v}>
-                  {tr(t.label)}
-                </option>
-              ))}
-            </select>
+            <div className="flex items-center gap-2">
+              <input
+                type="range"
+                min={0.5}
+                max={1}
+                step={0.05}
+                value={effDpr(play, globals)}
+                onChange={(e) => onChange({ renderDpr: Number(e.target.value) })}
+                className={playSliderCls}
+              />
+              <span className="w-12 text-right text-[12px] tabular-nums text-[var(--text-2)]">
+                {effDpr(play, globals) >= 1 ? tr("原生") : `×${effDpr(play, globals).toFixed(2)}`}
+              </span>
+            </div>
+          </PlayRow>
+
+          <PlayRow
+            label={tr("贴图倍率")}
+            desc={tr("贴图解码/上传的分辨率倍率（0.50–1.00，1=原生）：省显存，画面逐像素不变。改动后本壁纸重载一次")}
+            isOverride={play.resources !== undefined}
+            onFollow={() => onChange({ resources: undefined })}
+          >
+            <div className="flex items-center gap-2">
+              <input
+                type="range"
+                min={0.5}
+                max={1}
+                step={0.05}
+                value={effResources(play, globals)}
+                onChange={(e) => onChange({ resources: Number(e.target.value) })}
+                className={playSliderCls}
+              />
+              <span className="w-12 text-right text-[12px] tabular-nums text-[var(--text-2)]">
+                {effResources(play, globals) >= 1
+                  ? tr("原生")
+                  : `×${effResources(play, globals).toFixed(2)}`}
+              </span>
+            </div>
+          </PlayRow>
+
+          <PlayRow
+            label={tr("法线倍率")}
+            desc={tr("法线/蒙版贴图的分辨率倍率（0.35–1.00，默认 1 不缩）：折射与光照对模糊敏感，非必要不动。改动后本壁纸重载一次")}
+            isOverride={play.resourcesNormal !== undefined}
+            onFollow={() => onChange({ resourcesNormal: undefined })}
+          >
+            <div className="flex items-center gap-2">
+              <input
+                type="range"
+                min={0.35}
+                max={1}
+                step={0.05}
+                value={play.resourcesNormal ?? globals.resourcesNormal}
+                onChange={(e) => onChange({ resourcesNormal: Number(e.target.value) })}
+                className={playSliderCls}
+              />
+              <span className="w-12 text-right text-[12px] tabular-nums text-[var(--text-2)]">
+                {(play.resourcesNormal ?? globals.resourcesNormal) >= 1
+                  ? tr("原生")
+                  : `×${(play.resourcesNormal ?? globals.resourcesNormal).toFixed(2)}`}
+              </span>
+            </div>
           </PlayRow>
 
           <PlayRow
             label={tr("帧率上限")}
-            desc={tr("越低 GPU 占用越低")}
+            desc={tr("场景动画的帧率上限（15–60 FPS 任意值）：越低 GPU 占用越低")}
             isOverride={play.sceneFps !== undefined}
             onFollow={() => onChange({ sceneFps: undefined })}
           >
-            <select
-              className={playSelectCls}
-              value={play.sceneFps ?? ""}
-              onChange={(e) =>
-                onChange({ sceneFps: e.target.value ? Number(e.target.value) : undefined })
-              }
-            >
-              <option value="">
-                {tr("跟随全局（{v}）", { v: `${globals.sceneFps} FPS` })}
-              </option>
-              {FPS_TIERS.map((f) => (
-                <option key={f} value={f}>
-                  {f} FPS
-                </option>
-              ))}
-            </select>
+            <div className="flex items-center gap-2">
+              <input
+                type="range"
+                min={15}
+                max={60}
+                step={1}
+                value={play.sceneFps ?? globals.sceneFps}
+                onChange={(e) => onChange({ sceneFps: Number(e.target.value) })}
+                className={playSliderCls}
+              />
+              <span className="w-14 text-right text-[12px] tabular-nums text-[var(--text-2)]">
+                {play.sceneFps ?? globals.sceneFps} FPS
+              </span>
+            </div>
           </PlayRow>
 
           <PlayRow
             label={tr("抗锯齿")}
-            desc={tr("FXAA 平滑所有边缘（帧末后处理）；MSAA 只平滑几何边缘（图层/粒子）")}
+            desc={tr("抗锯齿方案优化中：当前所有档位一律关闭且禁止更改，后续版本开放")}
             isOverride={play.aa !== undefined}
             onFollow={() => onChange({ aa: undefined })}
           >
-            <select
-              className={playSelectCls}
-              value={play.aa ?? ""}
-              onChange={(e) =>
-                onChange({ aa: (e.target.value || undefined) as ItemPlayConfig["aa"] })
-              }
-            >
-              <option value="">
-                {tr("跟随全局（{v}）", { v: tr(AA_LABELS[globals.aa] ?? globals.aa) })}
-              </option>
-              {Object.entries(AA_LABELS).map(([v, label]) => (
-                <option key={v} value={v}>
-                  {tr(label)}
-                </option>
-              ))}
+            <select disabled value="off" className={`${playSelectCls} opacity-60`}>
+              <option value="off">{tr("关（已锁定）")}</option>
             </select>
           </PlayRow>
 
@@ -1486,22 +1655,29 @@ function PlayConfigPanel({
             isOverride={play.particles !== undefined}
             onFollow={() => onChange({ particles: undefined })}
           >
-            <select
-              className={playSelectCls}
-              value={play.particles ?? ""}
-              onChange={(e) =>
-                onChange({ particles: (e.target.value || undefined) as ItemPlayConfig["particles"] })
-              }
-            >
-              <option value="">
-                {tr("跟随全局（{v}）", { v: tr(QUALITY_LABELS[globals.particles] ?? globals.particles) })}
-              </option>
-              {Object.entries(QUALITY_LABELS).map(([v, label]) => (
-                <option key={v} value={v}>
-                  {tr(label)}
-                </option>
-              ))}
-            </select>
+            <div className="flex items-center gap-2">
+              <input
+                type="range"
+                min={0}
+                max={3}
+                step={1}
+                value={Math.max(
+                  0,
+                  PARTICLE_STOPS.indexOf(
+                    (play.particles ?? globals.particles) as (typeof PARTICLE_STOPS)[number],
+                  ),
+                )}
+                onChange={(e) =>
+                  onChange({
+                    particles: PARTICLE_STOPS[Number(e.target.value)] as ItemPlayConfig["particles"],
+                  })
+                }
+                className={playSliderCls}
+              />
+              <span className="w-8 text-right text-[12px] text-[var(--text-2)]">
+                {tr(stopLabel(play.particles ?? globals.particles))}
+              </span>
+            </div>
           </PlayRow>
 
           <PlayRow
@@ -1510,22 +1686,31 @@ function PlayConfigPanel({
             isOverride={play.postProcessing !== undefined}
             onFollow={() => onChange({ postProcessing: undefined })}
           >
-            <select
-              className={playSelectCls}
-              value={play.postProcessing ?? ""}
-              onChange={(e) =>
-                onChange({ postProcessing: (e.target.value || undefined) as ItemPlayConfig["postProcessing"] })
-              }
-            >
-              <option value="">
-                {tr("跟随全局（{v}）", { v: tr(QUALITY_LABELS[globals.postProcessing] ?? globals.postProcessing) })}
-              </option>
-              {Object.entries(QUALITY_LABELS).map(([v, label]) => (
-                <option key={v} value={v}>
-                  {tr(label)}
-                </option>
-              ))}
-            </select>
+            <div className="flex items-center gap-2">
+              <input
+                type="range"
+                min={0}
+                max={3}
+                step={1}
+                value={Math.max(
+                  0,
+                  POST_STOPS.indexOf(
+                    (play.postProcessing ?? globals.postProcessing) as (typeof POST_STOPS)[number],
+                  ),
+                )}
+                onChange={(e) =>
+                  onChange({
+                    postProcessing: POST_STOPS[
+                      Number(e.target.value)
+                    ] as ItemPlayConfig["postProcessing"],
+                  })
+                }
+                className={playSliderCls}
+              />
+              <span className="w-8 text-right text-[12px] text-[var(--text-2)]">
+                {tr(stopLabel(play.postProcessing ?? globals.postProcessing))}
+              </span>
+            </div>
           </PlayRow>
 
           <PlayRow
@@ -1574,6 +1759,8 @@ function PlayConfigPanel({
 
 const playSelectCls =
   "rounded-lg border border-[var(--separator)] bg-[var(--card)] px-2.5 py-1.5 text-[12.5px] focus:outline-none focus:ring-1 focus:ring-[var(--accent-strong)]";
+// 播放设置滑条：与设置页画质滑条同观感（窄一点，行内右对齐）
+const playSliderCls = "w-32 accent-[var(--accent-strong)]";
 
 function PlayRow({
   label,

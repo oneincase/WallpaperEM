@@ -31,9 +31,11 @@ jobs:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             label: x64
+            updater_arch: x86_64
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             label: arm64
+            updater_arch: aarch64
 
     runs-on: ${{ matrix.os }}
     name: Linux-${{ matrix.label }}
@@ -122,6 +124,10 @@ jobs:
           # linuxdeploy 依赖解析（不认 $ORIGIN/../ 风格的 rpath）要能找到
           # libsteam_api.so 才肯把它部署进 AppImage：把 vendored sdk 目录给它
           LD_LIBRARY_PATH: ${{ github.workspace }}/src-tauri/sdk/linux64:${{ github.workspace }}/src-tauri/sdk/linuxarm64
+          # updater 签名密钥（createUpdaterArtifacts 生成 .AppImage.sig 用）。
+          # 私钥内容存 Secrets：TAURI_SIGNING_PRIVATE_KEY（无密码，PASSWORD 留空串）
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm tauri build --target ${{ matrix.target }}
 
       - name: 上传构建产物（artifact）
@@ -143,3 +149,23 @@ jobs:
             src-tauri/target/${{ matrix.target }}/release/bundle/appimage/*.AppImage
           draft: false
           prerelease: false
+
+      # updater 清单（应用内更新的端点）：AppImage 本身就是下载体（v2
+      # createUpdaterArtifacts 不再打 tar.gz），两个架构各写各的文件名，无竞态。
+      # 注意：deb 安装的用户 updater 用不了（只覆盖 AppImage），应用内会引导去下载页。
+      - name: 生成并上传 updater 更新清单
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release view "$GITHUB_REF_NAME" --repo "${{ github.repository }}" --json body -q .body > "$RUNNER_TEMP/release-notes.md" || : > "$RUNNER_TEMP/release-notes.md"
+          node scripts/gen-update-manifest.mjs \
+            --repo "${{ github.repository }}" \
+            --tag "$GITHUB_REF_NAME" \
+            --file "latest-linux-${{ matrix.updater_arch }}.json" \
+            --target "linux-${{ matrix.updater_arch }}" \
+            --asset src-tauri/target/${{ matrix.target }}/release/bundle/appimage/*.AppImage \
+            --notes-file "$RUNNER_TEMP/release-notes.md"
+          gh release upload "$GITHUB_REF_NAME" "latest-linux-${{ matrix.updater_arch }}.json" \
+            --repo "${{ github.repository }}" --clobber

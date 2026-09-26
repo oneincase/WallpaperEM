@@ -47,7 +47,7 @@ export function AnchoredMenu({
   return (
     <div
       ref={ref}
-      className="animate-modal-pop fixed z-[70] overflow-y-auto rounded-xl border border-[var(--separator)] bg-[var(--card)] py-1 shadow-xl"
+      className="glass-panel animate-modal-pop fixed z-[70] overflow-y-auto rounded-xl border border-[var(--card-border)] py-1 shadow-xl"
       style={{
         left,
         right,
@@ -78,7 +78,7 @@ export function MenuItem({
     <button
       disabled={disabled}
       onClick={onClick}
-      className={`flex w-full items-center justify-between gap-3 px-3 py-1.5 text-left text-[13px] transition-colors hover:bg-black/5 disabled:opacity-40 dark:hover:bg-white/10 ${
+      className={`flex w-full items-center justify-between gap-3 px-3 py-1.5 text-left text-[13px] transition-colors hover:bg-white/10 disabled:opacity-40 ${
         selected ? "text-[var(--accent-strong)]" : ""
       }`}
     >

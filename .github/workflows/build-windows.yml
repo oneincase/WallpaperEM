@@ -30,9 +30,11 @@ jobs:
         include:
           - target: x86_64-pc-windows-msvc
             label: x64
+            updater_arch: x86_64
           - target: aarch64-pc-windows-msvc
             label: arm64
             msvc_arch: arm64
+            updater_arch: aarch64
 
     runs-on: windows-latest
     name: Windows-${{ matrix.label }}
@@ -131,6 +133,11 @@ jobs:
         # beforeBuildCommand 会先跑 pnpm --filter @we/desktop build 生成前端 dist/，
         # 再编译 Rust release 并打包 nsis/msi（targets 见 tauri.windows.conf.json）。
         # 显式 --target：产物落在 target/<triple>/release/bundle/ 下，两个架构互不覆盖。
+        env:
+          # updater 签名密钥（createUpdaterArtifacts 生成 setup.exe.sig 用）。
+          # 私钥内容存 Secrets：TAURI_SIGNING_PRIVATE_KEY（无密码，PASSWORD 留空串）
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm tauri build --target ${{ matrix.target }}
 
       - name: 上传构建产物（artifact）
@@ -152,3 +159,23 @@ jobs:
             src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi
           draft: false
           prerelease: false
+
+      # updater 清单（应用内更新的端点）：NSIS setup.exe 本身就是下载体（v2
+      # createUpdaterArtifacts 不再压 zip），两个架构各写各的文件名，无竞态。
+      - name: 生成并上传 updater 更新清单
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release view "$GITHUB_REF_NAME" --repo "${{ github.repository }}" --json body -q .body > "$RUNNER_TEMP/release-notes.md" || : > "$RUNNER_TEMP/release-notes.md"
+          node scripts/gen-update-manifest.mjs \
+            --repo "${{ github.repository }}" \
+            --tag "$GITHUB_REF_NAME" \
+            --file "latest-windows-${{ matrix.updater_arch }}.json" \
+            --target "windows-${{ matrix.updater_arch }}" \
+            --asset src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.exe \
+            --notes-file "$RUNNER_TEMP/release-notes.md"
+          gh release upload "$GITHUB_REF_NAME" "latest-windows-${{ matrix.updater_arch }}.json" \
+            --repo "${{ github.repository }}" --clobber

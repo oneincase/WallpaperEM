@@ -71,11 +71,11 @@ export function WorkshopUploadModal({
 
   return (
     <div
-      className="animate-overlay fixed inset-0 z-[60] flex items-center justify-center bg-black/30"
+      className="animate-overlay fixed inset-0 z-[60] flex items-center justify-center bg-black/25"
       onClick={busy ? undefined : onClose}
     >
       <div
-        className="card animate-modal-pop w-96 p-5"
+        className="card glass-panel animate-modal-pop w-96 p-5"
         onClick={(e) => e.stopPropagation()}
       >
         <h3 className="text-[14.5px] font-semibold">
@@ -119,7 +119,7 @@ export function WorkshopUploadModal({
               </select>
             </label>
             {/* 版权/授权提示：上传他人作品需自行确认有授权 */}
-            <p className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11.5px] leading-relaxed text-amber-700 dark:text-amber-400">
+            <p className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11.5px] leading-relaxed text-amber-400">
               {tr(
                 "上传他人制作的壁纸前请注意版权/授权：转载他人作品需要获得对方许可，并遵守 Steam 订阅者协议与工坊规则。"
               )}
@@ -149,7 +149,7 @@ export function WorkshopUploadModal({
           <div className="mt-4">
             <div className="h-2 w-full overflow-hidden rounded-full bg-[var(--separator)]">
               <div
-                className="h-full rounded-full bg-[var(--accent-strong)] transition-all"
+                className="h-full rounded-full bg-[var(--accent-fill)] transition-all"
                 style={{ width: `${Math.min(100, Math.max(2, progress))}%` }}
               />
             </div>

@@ -670,6 +670,55 @@ export const EN_US: Record<string, string> = {
     "⚠️ Not authorized yet: System Settings → Privacy & Security → Screen & System Audio Recording → “System Audio only” → enable WallpaperEM, then re-toggle this switch (or restart the app)",
   "⚠️ 权限尚未生效：请在系统设置中允许本应用捕获系统音频，然后完全退出应用再重新打开":
     "⚠️ Permission not effective yet: allow this app to capture system audio in your system settings, then fully quit and reopen the app",
+
+  // ---------------- 快捷键页 ----------------
+  "快捷键": "Hotkeys",
+  "全局生效：游戏/其它应用在前台也能用。⌘M、⌘H 这类 macOS 系统惯例键只在 WallpaperEM 内生效（避免劫持其它应用）；主窗口隐藏后用 ⌘⇧M 全局唤回。点「录制」后按下新组合键，Esc 取消。":
+    "Global: they work even when a game or another app is in front. macOS conventions like ⌘M/⌘H only work inside WallpaperEM (so they never hijack other apps) — use ⌘⇧M to bring the main window back from anywhere. Click Record and press a new combo; Esc cancels.",
+  "按下快捷键…（Esc 取消）": "Press a shortcut… (Esc to cancel)",
+  "未绑定": "Not bound",
+  "录制": "Record",
+  "默认": "Default",
+  "快捷键冲突": "Shortcut conflict",
+  "「{combo}」是系统/菜单保留组合，占用后可能不生效或引发异常。仍然覆盖？":
+    "“{combo}” is reserved by the system/menu — taking it may not work or cause weird behavior. Override anyway?",
+  "「{combo}」已被「{who}」占用。覆盖后将从对方移除。":
+    "“{combo}” is already used by “{who}”. Overriding removes it from there.",
+  "覆盖": "Override",
+  "快捷键已更新": "Shortcut updated",
+  "快捷键读取失败：{err}": "Failed to read shortcuts: {err}",
+  "录制准备失败：{err}": "Failed to start recording: {err}",
+  "快捷键设置失败：{err}": "Failed to set shortcut: {err}",
+  "已恢复默认快捷键": "Default shortcut restored",
+  "恢复默认失败：{err}": "Failed to restore default: {err}",
+  "请配合修饰键（⌘/Ctrl/Alt/Shift）或使用 F 键":
+    "Add a modifier (⌘/Ctrl/Alt/Shift) or use an F-key",
+  "最小化主窗口": "Minimize Main Window",
+  "隐藏主窗口": "Hide Main Window",
+
+  // ---------------- 画质（去自动档后的文案微调） ----------------
+  "高：画质优先 — 清晰度 1.0 · 30 FPS · 粒子/后处理高 · 贴图/法线原生":
+    "High: quality first — clarity 1.0 · 30 FPS · particles/post high · textures/normals native",
+  "自定义：手动调整下方任意参数即进入自定义。点档位一键套用预设，整体覆盖下方画质参数（显示模式/音量不动）":
+    "Custom: adjusting any parameter below switches to Custom. Click a preset to apply it — it overwrites the quality parameters below (display mode / volume untouched).",
+  "渲染分辨率相对屏幕像素比的倍率（0.50–1.00，1=原生），越低越省显存":
+    "Render resolution as a multiple of the screen pixel ratio (0.50–1.00, 1 = native). Lower saves VRAM.",
+  "场景动画的帧率上限（15–60 FPS 任意值）：越低 GPU 占用越低":
+    "Scene animation frame-rate cap (any value 15–60 FPS). Lower uses less GPU.",
+  "贴图解码/上传的分辨率倍率（0.50–1.00，1=原生）：省显存，画面逐像素不变。改动后本壁纸重载一次":
+    "Texture decode/upload resolution (0.50–1.00, 1 = native): saves VRAM with zero visual change. This wallpaper reloads once after changes.",
+  "法线/蒙版贴图的分辨率倍率（0.35–1.00，默认 1 不缩）：折射与光照对模糊敏感，非必要不动。改动后本壁纸重载一次":
+    "Normal/mask texture resolution (0.35–1.00, 1 = native): refraction and lighting are blur-sensitive — leave it unless needed. This wallpaper reloads once after changes.",
+
+  // ---------------- 快捷键动作（与 Rust hotkeys::ACTIONS 同名） ----------------
+  "主窗口显示/隐藏": "Toggle Main Window",
+  "壁纸设置窗口显示/隐藏": "Toggle Wallpaper Settings",
+  "手动暂停/播放": "Pause / Resume",
+  "自动暂停开启/关闭": "Toggle Auto Pause",
+  "定时切换开启/关闭": "Toggle Slideshow",
+  "下一个壁纸": "Next Wallpaper",
+  "上一个壁纸": "Previous Wallpaper",
+
 };
 
 export const EN_US_BACKEND: Record<string, string> = {

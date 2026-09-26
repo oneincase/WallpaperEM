@@ -278,7 +278,7 @@ function ModeToggle({
   return (
     <div className="relative flex rounded-full border border-[var(--separator)] bg-[var(--card)] p-0.5 text-[12px] shadow-sm">
       <span
-        className="absolute bottom-0.5 top-0.5 rounded-full bg-[var(--accent-strong)] transition-all duration-200 ease-out"
+        className="absolute bottom-0.5 top-0.5 rounded-full bg-[var(--accent-fill)] transition-all duration-200 ease-out"
         style={{ width: "calc(50% - 2px)", left: independent ? "calc(50% + 1px)" : "2px" }}
       />
       <button
@@ -354,7 +354,7 @@ function LayoutStage({ displays, nowMs }: { displays: DisplayInfo[]; nowMs: numb
                   className="absolute inset-0 h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.06]"
                 />
               ) : (
-                <div className="absolute inset-0 flex items-center justify-center bg-black/5 text-[var(--text-2)] opacity-40 dark:bg-white/5">
+                <div className="absolute inset-0 flex items-center justify-center bg-white/5 text-[var(--text-2)] opacity-40">
                   <IconMonitor />
                 </div>
               )}
@@ -382,7 +382,7 @@ function LayoutStage({ displays, nowMs }: { displays: DisplayInfo[]; nowMs: numb
                   {!b.nextAtMs ? null : (
                     <span className="absolute inset-x-0 bottom-0 h-[3px] bg-black/25">
                       <span
-                        className="block h-full bg-[var(--accent-strong)]/90"
+                        className="block h-full bg-[var(--accent-fill)]"
                         style={{ width: `${pct * 100}%` }}
                       />
                     </span>
@@ -440,7 +440,7 @@ function DisplayCard({
       className="card group flex items-center gap-4 p-3.5 transition-shadow hover:shadow-lg"
     >
       {/* 封面 */}
-      <div className="relative h-[76px] w-[124px] shrink-0 overflow-hidden rounded-xl bg-black/5 shadow-inner dark:bg-white/5">
+      <div className="relative h-[76px] w-[124px] shrink-0 overflow-hidden rounded-xl bg-white/5 shadow-inner">
         {d.previewUrl ? (
           <img
             src={d.previewUrl}
@@ -499,7 +499,7 @@ function DisplayCard({
             {b.nextAtMs ? (
               <span className="h-[3px] w-14 overflow-hidden rounded bg-[var(--separator)]">
                 <span
-                  className="block h-full bg-[var(--accent-strong)]"
+                  className="block h-full bg-[var(--accent-fill)]"
                   style={{ width: `${pct * 100}%` }}
                 />
               </span>

@@ -20,6 +20,12 @@
  */
 (function (w) {
   "use strict";
+  // 幂等：同一文档只装一套。宿主（如 dsh-wallpaper-engine 的 /scene-files）会把 shim
+  // 直接注进 HTML，渲染页跨源改写时若判重失手再注一次，就会有两套 rAF 节流 / 指针桥 /
+  // 音频泵叠加 —— 实测帧率上限被限两次（15fps → 7.5fps），观感「卡得不行」。
+  // 宿主侧判重 + 这里守卫 = 双保险。
+  if (w.__weShimInstalled) return;
+  w.__weShimInstalled = true;
   try {
     if (w.document && w.document.documentElement) {
       w.document.documentElement.setAttribute("data-we-shim", "1");
@@ -27,6 +33,198 @@
   } catch (_) {
     
   }
+
+  /**
+   * 不透明源下的存储 / Cookie 兜底。
+   *
+   * 严格沙箱（`sandbox="allow-scripts"`）里文档是不透明源，下面这些属性**读取即抛**
+   * SecurityError —— 不是「返回一个不可用的对象」，而是属性访问本身抛（Chromium
+   * 实测，2026-09-25）：
+   *   window.localStorage / window.sessionStorage / document.cookie（读写都抛）
+   *   window.caches / navigator.serviceWorker（**故意不兜底**：假装成功比抛错更危险，
+   *   等缓存命中的应用会永远挂住；且全语料 0 命中）
+   *   window.indexedDB 不抛（返回对象），无需处理。
+   *
+   * 语料（本机 15 张 web 壁纸）：localStorage 6 张、document.cookie 2 张，且都写在
+   * **作者代码的第一行逻辑里** —— 2905017768 Bocchi 把读取放进 React 的 useState
+   * 初始化，首屏渲染就抛 → #root 空 → 整屏白，宿主侧看到的是作者一帧都没跑
+   * （web fps 恒 -1）。1396475780 AudiOrbits、3110581014 / 3406740580 两张 pano2vr
+   * 全景同型。官方 CEF 里壁纸跑在真实源上、两类 API 都可用，所以工坊不会做防御。
+   *
+   * 可替换性（实测，决定这条修法成立）：两者在 Chromium 里都是**可配置**属性 ——
+   * localStorage / sessionStorage 是 window 上的自有访问器，cookie 在
+   * Document.prototype 上，defineProperty 均成功。
+   *
+   * 语义边界：不透明源拿不到真存储，这里退化为**文档内内存存储**（同一次会话内读写
+   * 一致，换壁纸 / 刷新即失）。目标是「别崩」，不是持久化对等；要真持久化得把写入经
+   * 父页 postMessage 转给宿主落盘（未做）。
+   */
+  function storageGetterThrows() {
+    try {
+      void w.localStorage;
+      return false;
+    } catch (_) {
+      return true;
+    }
+  }
+
+  function makeMemoryStorage() {
+    var data = Object.create(null);
+    var api = {};
+    function has(k) {
+      return Object.prototype.hasOwnProperty.call(data, k);
+    }
+    function def(name, fn) {
+      // 方法必须**不可枚举**：真实 Storage 上 Object.keys / for…in 只列存储的键
+      Object.defineProperty(api, name, {
+        configurable: true,
+        enumerable: false,
+        writable: true,
+        value: fn,
+      });
+    }
+    def("getItem", function (k) {
+      var s = String(k);
+      return has(s) ? data[s] : null;
+    });
+    def("setItem", function (k, v) {
+      data[String(k)] = String(v);
+    });
+    def("removeItem", function (k) {
+      delete data[String(k)];
+    });
+    def("clear", function () {
+      data = Object.create(null);
+    });
+    def("key", function (i) {
+      var keys = Object.keys(data);
+      var n = Number(i) || 0;
+      return n >= 0 && n < keys.length ? keys[n] : null;
+    });
+    Object.defineProperty(api, "length", {
+      configurable: true,
+      enumerable: false,
+      get: function () {
+        return Object.keys(data).length;
+      },
+    });
+    // 属性式读写（`localStorage.foo = 1` / `localStorage["foo"]` / delete / for…in）
+    // 映射到同一份数据：不映射就会分裂成两份状态（属性写的值 getItem 读不到，且没有
+    // 任何报错，比抛错更难查）。方法名优先于同名数据键 —— 真实 Storage 的顺序相反
+    // （命名属性是自有属性、会盖住原型方法），这里不模仿那个角落语义。
+    if (typeof w.Proxy !== "function") return api;
+    return new w.Proxy(api, {
+      get: function (t, p) {
+        if (typeof p !== "string") return t[p];
+        if (p in t) return t[p];
+        return has(p) ? data[p] : undefined;
+      },
+      set: function (t, p, v) {
+        if (typeof p !== "string" || p in t) {
+          t[p] = v;
+          return true;
+        }
+        data[p] = String(v);
+        return true;
+      },
+      has: function (t, p) {
+        return (typeof p === "string" && has(p)) || p in t;
+      },
+      deleteProperty: function (t, p) {
+        if (typeof p === "string" && has(p)) {
+          delete data[p];
+          return true;
+        }
+        delete t[p];
+        return true;
+      },
+      // 只报存储的键：真实 Storage 上 Object.keys 拿不到方法名
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, p) {
+        if (typeof p === "string" && has(p)) {
+          return { configurable: true, enumerable: true, writable: true, value: data[p] };
+        }
+        return Object.getOwnPropertyDescriptor(t, p);
+      },
+    });
+  }
+
+  function installOpaqueOriginFallbacks() {
+    try {
+      if (storageGetterThrows()) {
+        // getter 必须返回**同一个实例**：new 一个每次访问（真实 Storage 是同一对象），
+        // 否则 setItem 写完下一次读取就换了个空对象，比不兜底还怪。
+        var ls = null;
+        Object.defineProperty(w, "localStorage", {
+          configurable: true,
+          get: function () {
+            if (!ls) ls = makeMemoryStorage();
+            return ls;
+          },
+        });
+        var ss = null;
+        Object.defineProperty(w, "sessionStorage", {
+          configurable: true,
+          get: function () {
+            if (!ss) ss = makeMemoryStorage();
+            return ss;
+          },
+        });
+      }
+    } catch (_) {
+      /* 将来引擎把属性改成不可配置时保持原样：作者脚本照样抛，但至少不是我们抛的 */
+    }
+    // Cookie：pano2vr 一族（3110581014 / 3406740580）直接读 document.cookie.length
+    try {
+      void w.document.cookie;
+    } catch (_) {
+      try {
+        installMemoryCookie();
+      } catch (__) {
+        /* 忽略 */
+      }
+    }
+  }
+
+  /** 内存 cookie jar：同会话内可读回自己写的键，跨会话不保留（见上）。 */
+  function installMemoryCookie() {
+    var jar = Object.create(null);
+    Object.defineProperty(w.Document.prototype, "cookie", {
+      configurable: true,
+      enumerable: true,
+      get: function () {
+        var parts = [];
+        for (var k in jar) {
+          if (Object.prototype.hasOwnProperty.call(jar, k)) parts.push(k + "=" + jar[k]);
+        }
+        return parts.join("; ");
+      },
+      set: function (v) {
+        var s = String(v);
+        var pair = s.split(";")[0];
+        var eq = pair.indexOf("=");
+        if (eq <= 0) return;
+        var name = pair.slice(0, eq).trim();
+        if (!name) return;
+        // 删除语义：max-age=0 或 expires 在过去（作者清 cookie 的两种写法）
+        var expires = /expires=([^;]+)/i.exec(s);
+        var dead = /max-age=0/i.test(s);
+        if (expires) {
+          var at = Date.parse(expires[1]);
+          if (!isNaN(at) && at <= Date.now()) dead = true;
+        }
+        if (dead) {
+          delete jar[name];
+          return;
+        }
+        jar[name] = pair.slice(eq + 1).trim();
+      },
+    });
+  }
+
+  installOpaqueOriginFallbacks();
 
   var audioListener = null;
   var propertyListener = null;
@@ -1396,23 +1594,41 @@
         rafMap[idNative] = { kind: "native", id: idNative };
         return idNative;
       }
+      // 跳帧节流：每帧都挂原生 rAF（与显示器 vsync 同相位），只把第 n 帧交给作者
+      // 回调。旧实现是 `setTimeout(1000/fps)` 之后再 rAF —— 定时器回调落在刷新的
+      // 任意相位上，30fps 上限会产出 17/33/50ms 的抖动间隔，观感就是「限了 30 反而
+      // 更卡」。n 按实测的原生 rAF 间隔自适应（60Hz→2，120Hz→4，90Hz→3）。
       var id = ++rafCounter;
-      var to = w.setTimeout(function () {
+      var slot = 0;
+      var lastNow = 0;
+      var nativeMs = 0;
+      var step = function (now) {
+        if (lastNow > 0) {
+          var dt = now - lastNow;
+          if (dt > 1 && dt < 40) nativeMs = nativeMs > 0 ? nativeMs * 0.8 + dt * 0.2 : dt;
+        }
+        lastNow = now;
+        slot++;
+        // 目标间隔 / 实测间隔向上取整 = 落在 fps 上限**以下**的均匀帧；留 0.05 容差，
+        // 否则 16.4ms 这类测量噪声会把 30fps 算成 20fps。
+        var n = nativeMs > 0 ? Math.max(1, Math.ceil(1000 / fps / nativeMs - 0.05)) : 2;
+        if (slot % n !== 0) {
+          rafMap[id] = { kind: "native", id: origRaf(step) };
+          return;
+        }
         delete rafMap[id];
-        origRaf(function (now) {
-          try {
-            cb(now);
-          } catch (_) {
-            /* 忽略 */
-          }
-          try {
-            w.parent.postMessage({ op: "we-frame", t: now }, "*");
-          } catch (_) {
-            /* 忽略 */
-          }
-        });
-      }, limit);
-      rafMap[id] = { kind: "timeout", to: to };
+        try {
+          cb(now);
+        } catch (_) {
+          /* 忽略 */
+        }
+        try {
+          w.parent.postMessage({ op: "we-frame", t: now }, "*");
+        } catch (_) {
+          /* 忽略 */
+        }
+      };
+      rafMap[id] = { kind: "native", id: origRaf(step) };
       return id;
     };
     throttled.__weThrottled = true;
@@ -1434,5 +1650,70 @@
   }
 
   installRafThrottle();
+
+  // ── 宿主控制通道（postMessage）──────────────────────────────────────────
+  // 常规宿主与本 iframe 同源，直接读 contentWindow.__weXxx 调用（上面那批全局）。
+  // 但宿主把工坊 HTML 嵌进**共享自身 origin** 的页面时必须收紧 sandbox（只给
+  // allow-scripts，防作者脚本冒用宿主身份）—— 那时父页跨源读不到本 window，
+  // 控制改经 postMessage 落到同一批实现上：op 名与 web.ts 的 weShimSend 一一对应，
+  // 语义与直访完全一致。载荷用 structured clone，NaN（滚轮"无位置"）原样保留。
+  try {
+    w.addEventListener("message", function (ev) {
+      var d = ev && ev.data;
+      if (!d || typeof d !== "object" || d.__we !== 1) return;
+      try {
+        switch (d.op) {
+          case "setPaused":
+            w.__weSetPaused(!!d.v);
+            break;
+          case "setVolume":
+            w.__weSetVolume(Number(d.v) || 0);
+            break;
+          case "setFps":
+            w.__weSetFps(Number(d.n) || 0);
+            break;
+          case "applyProps":
+            if (w.__weApplyProps) w.__weApplyProps(d.props);
+            break;
+          case "pointer":
+            if (w.__wePushPointer) {
+              w.__wePushPointer(Number(d.x), Number(d.y), Number(d.b) || 0, Number(d.m) || 0);
+            }
+            break;
+          case "pointerLeave":
+            if (w.__wePointerLeave) w.__wePointerLeave();
+            break;
+          case "audio":
+            // 宿主下发的量化音频快照（0-255 整数，~20fps）：还原成 0..1 浮点后
+            // 喂给既有的 __wePushAudio（与同源直调路径落到同一实现）。
+            if (w.__wePushAudio && d.a) {
+              var arr = new Array(d.a.length);
+              for (var ai = 0; ai < d.a.length; ai++) arr[ai] = (Number(d.a[ai]) || 0) / 255;
+              w.__wePushAudio(arr);
+            }
+            break;
+          case "media":
+            if (w.__wePushMedia && d.ev) w.__wePushMedia(d.ev);
+            break;
+          case "wheel":
+            if (w.__wePushWheel) {
+              w.__wePushWheel(
+                Number(d.x),
+                Number(d.y),
+                Number(d.dx) || 0,
+                Number(d.dy) || 0,
+                Number(d.mode) || 0,
+                Number(d.mods) || 0,
+              );
+            }
+            break;
+        }
+      } catch (_) {
+        /* 作者脚本异常不该打断控制通道 */
+      }
+    });
+  } catch (_) {
+    /* 无 addEventListener 的环境忽略 */
+  }
 })(window);
 

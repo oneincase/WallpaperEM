@@ -69,7 +69,7 @@ export function WallpaperCard({
           <span
             className={`absolute right-2 top-2 z-20 flex h-6 w-6 items-center justify-center rounded-full border-2 text-[12px] font-bold transition-colors ${
               selected
-                ? "border-[var(--accent-strong)] bg-[var(--accent-strong)] text-[var(--content)]"
+                ? "border-[var(--accent-strong)] bg-[var(--accent-fill)] text-[var(--text-1)]"
                 : "border-white/80 bg-black/25 text-transparent"
             }`}
           >

@@ -294,7 +294,7 @@ export function HomePage({ onOpenDetail }: { onOpenDetail: (id: string) => void 
                 没有才显示「下载」。已应用的条目保留只读态，避免重复下发同一张壁纸 */}
             {currentApplied ? (
               <button
-                className="btn !bg-green-500/15 !text-green-600 dark:!text-green-400 !border-green-500/30 cursor-default disabled:opacity-75"
+                className="btn !bg-green-500/15 !text-green-400 !border-green-500/30 cursor-default disabled:opacity-75"
                 disabled
                 title={tr("已应用到桌面")}
               >

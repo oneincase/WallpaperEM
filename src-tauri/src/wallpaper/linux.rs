@@ -17,8 +17,9 @@
 //! - **「隐藏图标」开关**：macOS 上是窗口层级的两档切换；Linux 无法统一压在
 //!   图标之上，这里只切换鼠标事件穿透。
 //! - **前台应用观察者 / 自动暂停**：Linux 各 DE 没有统一的前台应用通知机制
-//!   （X11 可读 _NET_ACTIVE_WINDOW，Wayland 各家私有协议），当前为空实现，
-//!   托盘里的「自动暂停」开关在 Linux 上暂不生效。
+//!   （X11 可读 _NET_ACTIVE_WINDOW，Wayland 各家私有协议），前台观察为空实现；
+//!   但自动暂停的判据已改为**遮挡快照**（[`occlusion_snapshot`]，X11 会话有效），
+//!   Wayland 会话无法枚举全局窗口清单，开关不生效（详见该函数说明）。
 //! - **显示器睡眠**：无统一查询接口（logind/DPMS 各管一段），恒返回 false，
 //!   即不做「合盖暂停/释放壁纸」的自动处理。
 
@@ -289,15 +290,132 @@ fn set_ignore_cursor_events_safe<R: Runtime>(window: &WebviewWindow<R>, ignore: 
 /// 直接拖标题栏即可。空实现保持平台层签名一致。
 pub fn set_movable_by_background<R: Runtime>(_window: &WebviewWindow<R>, _movable: bool) {}
 
-/// 前台应用切换观察者（自动暂停/指针注入门控数据源）。
-/// Linux 暂无统一实现（见模块头注释），空实现：自动暂停不生效，
+/// 前台应用切换观察者：Linux 各 DE 无统一通知机制，空实现。
+/// 自动暂停不依赖它 —— 判据是 [`occlusion_snapshot`] 的逐屏遮挡（X11 有效）；
 /// 指针注入保持「桌面恒活动」的旧行为。
 pub fn start_auto_pause_observer(_app: &tauri::AppHandle) {
-    tracing::info!("linux: 前台应用观察者不可用，自动暂停与桌面活动检测不生效");
+    tracing::info!("linux: 前台应用观察者不可用（自动暂停走遮挡快照，X11 会话生效）");
 }
 
 /// Linux 无此机制：恢复信号只走前台观察（见 start_auto_pause_observer 的说明）
 pub fn start_desktop_click_monitor(_app: &tauri::AppHandle) {}
+
+/// 遮挡快照（Linux/X11）：逐屏遮挡比例，自动暂停「看得见就播」的可见性判据
+/// （与 macOS 的 CGWindowList / Windows 的 EnumWindows 实现同构）。
+///
+/// 数据源 `_NET_CLIENT_LIST_STACKING`（窗口管理器维护的顶层窗口清单，缺失时
+/// 退回无序的 `_NET_CLIENT_LIST`）+ `get_geometry`（相对根窗口 = 虚拟桌面坐标）。
+/// 过滤规则与另两平台一致：本应用窗口（`_NET_WM_PID`）不算、
+/// `_NET_WM_WINDOW_TYPE_DESKTOP/DOCK`（桌面/面板，铺屏或常驻）不算、
+/// 不可见的（map_state != VIEWABLE，含最小化）不算。
+///
+/// **Wayland 会话直接返回 None**：Wayland 协议没有全局窗口清单，Xwayland 只能看到
+/// X11 客户端、看不到原生 Wayland 窗口 —— 拿残缺清单算遮挡会把「原生应用全屏」
+/// 误判成桌面干净（壁纸在全屏后面白烧），宁可保持不生效（判定表恒 Keep）。
+/// 显式 `GDK_BACKEND=x11` 的会话不受此限（X11 就是真实视图）。
+pub fn occlusion_snapshot() -> Option<super::auto_pause::OcclusionSnapshot> {
+    use super::auto_pause::{covered_ratio, OcclusionSnapshot};
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, MapState, Window};
+
+    let force_x11 = std::env::var("GDK_BACKEND").is_ok_and(|b| b == "x11");
+    if !force_x11 && std::env::var("WAYLAND_DISPLAY").is_ok() {
+        return None;
+    }
+
+    let (conn, screen_num) = x11rb::connect(None).ok()?;
+    let root = conn.setup().roots[screen_num].root;
+    let intern = |name: &[u8]| -> Option<u32> {
+        Some(conn.intern_atom(false, name).ok()?.reply().ok()?.atom)
+    };
+
+    // 顶层窗口清单（没有 EWMH 的 WM 罕见；两代属性都没有就不判定）
+    let list_atom = intern(b"_NET_CLIENT_LIST_STACKING")?;
+    let windows: Vec<Window> = {
+        let prop = |atom| -> Option<Vec<u32>> {
+            Some(
+                conn.get_property(false, root, atom, AtomEnum::WINDOW, 0, 4096)
+                    .ok()?
+                    .reply()
+                    .ok()?
+                    .value32()?
+                    .collect(),
+            )
+        };
+        match prop(list_atom).filter(|v| !v.is_empty()) {
+            Some(v) => v,
+            None => prop(intern(b"_NET_CLIENT_LIST")?)?,
+        }
+    };
+
+    let pid_atom = intern(b"_NET_WM_PID")?;
+    let type_atom = intern(b"_NET_WM_WINDOW_TYPE")?;
+    let type_desktop = intern(b"_NET_WM_WINDOW_TYPE_DESKTOP")?;
+    let type_dock = intern(b"_NET_WM_WINDOW_TYPE_DOCK")?;
+    let mut rects: Vec<(f64, f64, f64, f64)> = Vec::new();
+    for w in windows {
+        // 本应用窗口（设置窗/壁纸窗）不算遮挡
+        let pid = conn
+            .get_property(false, w, pid_atom, AtomEnum::CARDINAL, 0, 1)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| r.value32().and_then(|mut it| it.next()));
+        if pid == Some(std::process::id()) {
+            continue;
+        }
+        // 桌面/面板不算（桌面元素铺满整屏，会让「桌面干净」恒不成立）
+        let wtype: Vec<u32> = conn
+            .get_property(false, w, type_atom, AtomEnum::ATOM, 0, 8)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| r.value32().map(|it| it.collect()))
+            .unwrap_or_default();
+        if wtype.contains(&type_desktop) || wtype.contains(&type_dock) {
+            continue;
+        }
+        // 只算映射可见的（最小化/收起 = UNMAPPED/UNVIEWABLE）
+        let viewable = conn
+            .get_window_attributes(w)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .map(|a| a.map_state == MapState::VIEWABLE)
+            .unwrap_or(false);
+        if !viewable {
+            continue;
+        }
+        // 顶层窗口的 x/y 相对根窗口 = 虚拟桌面坐标（与显示器同一空间）
+        if let Some(g) = conn.get_geometry(w).ok().and_then(|c| c.reply().ok()) {
+            if g.width > 0 && g.height > 0 {
+                rects.push((
+                    g.x as f64,
+                    g.y as f64,
+                    g.x as f64 + g.width as f64,
+                    g.y as f64 + g.height as f64,
+                ));
+            }
+        }
+    }
+
+    // 显示器（active_screens 是逻辑坐标，× scale 还原 X11 像素空间；id 同一套推导）
+    let coverages = active_screens()
+        .into_iter()
+        .map(|s| {
+            let rect = (
+                s.x * s.scale,
+                s.y * s.scale,
+                (s.x + s.w) * s.scale,
+                (s.y + s.h) * s.scale,
+            );
+            (s.id, covered_ratio(&rects, rect))
+        })
+        .collect();
+    Some(OcclusionSnapshot { coverages })
+}
+
+/// 前台应用类型（Linux）：无统一实现，恒 Unknown。
+pub fn frontmost_kind(_app: &tauri::AppHandle) -> super::auto_pause::FrontKind {
+    super::auto_pause::FrontKind::Unknown
+}
 
 /// 读系统光标位置（逻辑坐标，左上原点）与左键状态。
 ///

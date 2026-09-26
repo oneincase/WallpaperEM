@@ -98,8 +98,8 @@ export function GuardDialogs() {
     <>
       {/* Steam Guard 验证码弹窗 */}
       {guardTaskId != null && (
-        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/30">
-          <div className="card w-80 p-5">
+        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/25">
+          <div className="card glass-panel w-80 p-5">
             <h3 className="text-[14.5px] font-semibold">{tr("Steam Guard 验证码")}</h3>
             <p className="mt-1.5 text-[12.5px] text-[var(--text-2)]">
               {tr("「{title}」需要验证码（已发送到邮箱/手机令牌）", { title: guardTitle })}
@@ -130,8 +130,8 @@ export function GuardDialogs() {
 
       {/* 手机 App 确认弹窗：手动关闭或登录推进才消失 */}
       {mobileEntry && guardTaskId == null && (
-        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/30">
-          <div className="card w-96 p-5">
+        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/25">
+          <div className="card glass-panel w-96 p-5">
             <h3 className="text-[14.5px] font-semibold">{tr("等待手机确认")}</h3>
             <p className="mt-1.5 text-[12.5px] leading-relaxed text-[var(--text-2)]">
               {tr(

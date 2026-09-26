@@ -24,11 +24,15 @@ tauri-plugin-global-shortcut = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-desktop-underlay = "0.2"
+# 应用内更新：签名校验 + 平台静默安装 + 重启（见 src/update.rs）
+tauri-plugin-updater = "2"
 # window-vibrancy 仅在 macOS/Windows 有实际实现，Linux 下为空 crate（编译安全）
 window-vibrancy = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
+# 分享页属性实时推送的 SSE body：mpsc Receiver → Stream（axum Body::from_stream）
+tokio-stream = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 tracing-appender = "0.2"
@@ -47,12 +51,16 @@ tower-http = { version = "0.6", features = ["fs"] }
 libc = "0.2"
 # MCP 回环监听绑定：SO_REUSEADDR（TIME_WAIT 残留导致改端口必报占用的解法）
 socket2 = "0.6"
+# 网络服务的本机局域网地址探测（设置页展示/分享链接 host/Origin 校验共用）：
+# 枚举网卡挑物理网卡的私网 IPv4 —— 默认路由可能走 VPN 隧道（utun fake-ip），
+# UDP 默认路由探测在挂代理的机器上会拿到无用地址，故只作兜底
+if-addrs = "0.13"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 base64 = "0.22"
 # 封面转码（远端封面 png / 静态 webp → preview.jpg，见 cover_cache）：
 # 纯 Rust 无 C 依赖。tauri 本身就带了这个 crate（只开 png），这里只是多开
 # jpeg/webp 两个解码器，不额外引入第二套图像栈
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 
 # 全平台媒体桥接（正在播放元数据/封面/歌词 + 系统音频采集 + 反向控制）。
 # 与 webwallgl 一样走同级自有仓库 file: 依赖；default-features 关掉 http
@@ -103,6 +111,7 @@ keyring = { version = "3", features = ["windows-native"] }
 # 版本与 tauri 2.11 / tauri-plugin-desktop-underlay 保持一致（同一份 HWND 类型）。
 windows = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Dwm",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
     "Win32_UI_Input_KeyboardAndMouse",

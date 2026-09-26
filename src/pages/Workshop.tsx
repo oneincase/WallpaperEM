@@ -423,7 +423,7 @@ export function WorkshopPage({ onOpenDetail }: { onOpenDetail: (id: string) => v
             乘积；超上限时后端会截断，结果不完整就得说出来，不然用户会以为
             多选没生效 */}
         {truncated && (
-          <div className="mb-3 shrink-0 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-2.5 text-[12.5px] text-amber-700 dark:text-amber-300">
+          <div className="mb-3 shrink-0 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-2.5 text-[12.5px] text-amber-300">
             {tr("选中的标签组合太多，只查询了其中一部分，结果可能不全 —— 建议每组少选几个标签。")}
           </div>
         )}
@@ -512,7 +512,7 @@ export function WorkshopPage({ onOpenDetail }: { onOpenDetail: (id: string) => v
                     {/* 快捷操作：未下载 → 下载；已下载 → 应用到桌面 */}
                     {downloadedItems.has(item.id) ? (
                       <button
-                        className="rounded-md p-0.5 text-[var(--accent-strong)] transition-colors hover:bg-black/5 dark:hover:bg-white/10"
+                        className="rounded-md p-0.5 text-[var(--accent-strong)] transition-colors hover:bg-white/10"
                         title={tr("应用到桌面")}
                         aria-label={tr("应用到桌面")}
                         onClick={(e) => void quickApply(item.id, e.currentTarget)}
@@ -521,7 +521,7 @@ export function WorkshopPage({ onOpenDetail }: { onOpenDetail: (id: string) => v
                       </button>
                     ) : (
                       <button
-                        className="rounded-md p-0.5 text-[var(--text-2)] transition-colors hover:bg-black/5 hover:text-[var(--accent-strong)] dark:hover:bg-white/10 disabled:opacity-40"
+                        className="rounded-md p-0.5 text-[var(--text-2)] transition-colors hover:bg-white/10 hover:text-[var(--accent-strong)] disabled:opacity-40"
                         title={tr("下载")}
                         aria-label={tr("下载")}
                         disabled={pendingIds.has(item.id)}

@@ -1,28 +1,32 @@
-//! 软件更新：检查 GitHub Releases、下载安装包并交给系统安装。
+//! 软件更新：官方 `tauri-plugin-updater`（校验签名 → 下载进度 → 平台静默安装 → 重启生效）。
 //!
-//! 为什么不用 `tauri-plugin-updater`：官方 updater 要求发布方维护签名密钥、
-//! 并在 release 里附带 `latest.json` 与签名文件；本项目直接在 GitHub 上以
-//! `.dmg` / `.exe|.msi` / `.AppImage|.deb` 分发（见 `.github/workflows/`），
-//! 所以走「查 latest release → 比对版本 → 下载对应平台安装包 → 打开安装器」
-//! 这条不依赖签名基础设施的路径。
+//! 演进：早期版本刻意不用官方 updater（要求维护签名密钥 + Release 挂 latest.json 与
+//! `.sig`），走「查 GitHub API → 下载安装包 → 打开安装器」的自定义流程；但它做不到
+//! 「下载完重启即新版」（macOS 还得手动拖 DMG）。现改为官方插件，代价是接管签名
+//! 基础设施：密钥由 `pnpm tauri signer generate` 生成（私钥只存 `~/.tauri/` 与
+//! GitHub Secrets，绝不入库），CI 构建时用 `TAURI_SIGNING_PRIVATE_KEY` 签名，
+//! 各平台 workflow 往 Release 追加 `latest-{target}-{arch}.json` 清单（见
+//! `scripts/gen-update-manifest.mjs`），端点模板在 tauri.conf.json 的 plugins.updater。
 //!
-//! 网络请求沿用应用自己的代理设置（`download_proxy` → `steam_proxy` 回退，
-//! 与下载链路同一套），系统代理跟随 `follow_system_proxy`。
+//! 流程：`check()` 读清单（比对 semver，无 api.github.com 速率限制）→ `download()`
+//! 校验 minisign 签名、节流发 `update:progress` → `install()` 平台原生安装
+//! （Windows 装完由 NSIS passive 窗口接管并自动重启本体；macOS/Linux 需调
+//! `app_update_restart`）。代理沿用应用自己的设置（`download_proxy` → `steam_proxy`
+//! 回退、`follow_system_proxy`），透传给插件的 `UpdaterBuilder::proxy/no_proxy`。
+//!
+//! 已知限制（失败时前端引导「前往下载页」兜底）：deb/rpm 安装的应用不支持应用内
+//! 升级（updater 只覆盖 AppImage）；Release 清单里的 notes 是发布时快照。
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use rusqlite::Connection;
 use serde::Serialize;
 use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::io::AsyncWriteExt;
+use tauri_plugin_updater::UpdaterExt;
 
 /// GitHub 仓库（owner/repo）
 const REPO: &str = "oneincase/WallpaperEM";
-/// 单次请求超时：检查很轻，下载用同一 client 但超时只约束「连接与首字节」
-const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 当前版本。以 **Tauri 包信息**为准（来自 tauri.conf.json，与发版 tag / 安装包一致）；
 /// Cargo.toml 的 version 只用于 crate 元数据，两者不一致时以用户看到的安装包版本为准。
@@ -32,29 +36,19 @@ pub fn current_version(app: &AppHandle) -> String {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UpdateAsset {
-    pub name: String,
-    pub url: String,
-    pub size: u64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct UpdateInfo {
     /// 当前版本
     pub current: String,
-    /// 最新版本（去掉 tag 前缀 v）
+    /// 最新版本（清单里的 semver，无 v 前缀）
     pub latest: String,
     pub has_update: bool,
-    /// Release 标题
+    /// 版本标题（如 "v1.2.0"，原 Release 标题位）
     pub name: String,
-    /// Release 说明（Markdown 原文，前端按纯文本展示）
+    /// 更新说明（Release 正文快照，前端按纯文本展示）
     pub notes: String,
     pub published_at: String,
-    /// Release 页面地址（拿不到平台安装包时的兜底入口）
+    /// Release 页面地址（检查失败 / 无法应用内更新时的兜底入口）
     pub html_url: String,
-    /// 当前平台匹配到的安装包；没有则为 None（仍可去 html_url 下载）
-    pub asset: Option<UpdateAsset>,
 }
 
 /// 读代理设置（与下载链路同一套键）
@@ -74,259 +68,113 @@ fn proxy_settings(app: &AppHandle) -> (Option<String>, bool) {
     (proxy, follow)
 }
 
-fn build_client(app: &AppHandle) -> Result<reqwest::Client, String> {
+/// 用 tauri.conf.json 里的 updater 配置（pubkey/endpoints）构建 Updater，
+/// 并透传应用内代理设置。
+fn build_updater(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, String> {
     let (proxy, follow) = proxy_settings(app);
-    let mut builder = reqwest::Client::builder()
-        .user_agent(format!("WallpaperEM/{}", current_version(app)))
-        .timeout(HTTP_TIMEOUT);    if let Some(p) = proxy {
-        builder = builder
-            .proxy(reqwest::Proxy::all(&p).map_err(|e| format!("代理配置无效: {e}"))?);
+    let mut builder = app.updater_builder();
+    if let Some(p) = proxy {
+        let url = url::Url::parse(&p).map_err(|e| format!("代理配置无效: {e}"))?;
+        builder = builder.proxy(url);
     } else if !follow {
         builder = builder.no_proxy();
     }
+    // 不设 timeout：插件的 timeout 覆盖整个请求（含响应体），大安装包会被误杀
     builder.build().map_err(|e| e.to_string())
 }
 
-/// 版本号 → (major, minor, patch)；非数字段按 0，预发布后缀（-rc.1）不参与比较
-fn ver_tuple(s: &str) -> (u64, u64, u64) {
-    let core = s
-        .trim()
-        .trim_start_matches(|c| c == 'v' || c == 'V')
-        .split(|c: char| c == '-' || c == '+')
-        .next()
-        .unwrap_or("");
-    let mut it = core.split('.').map(|p| p.trim().parse::<u64>().unwrap_or(0));
-    (
-        it.next().unwrap_or(0),
-        it.next().unwrap_or(0),
-        it.next().unwrap_or(0),
-    )
+/// `check()` 失败 → 给用户看的中文说明（前端会再冠「检查更新失败：」前缀）
+fn check_err(e: tauri_plugin_updater::Error) -> String {
+    use tauri_plugin_updater::Error;
+    match e {
+        // 端点 404：清单还没挂上（发版中）或 Release 尚未创建
+        Error::ReleaseNotFound => "更新清单不存在（新版本可能正在发布中）".into(),
+        // 清单里没有 {os}-{arch} 平台键
+        Error::TargetsNotFound(_) => "当前平台没有对应的更新清单".into(),
+        other => other.to_string(),
+    }
 }
 
-fn is_newer(latest: &str, current: &str) -> bool {
-    ver_tuple(latest) > ver_tuple(current)
-}
-
-/// 按平台优先级挑安装包
-fn pick_asset<'a>(assets: &'a [UpdateAsset]) -> Option<&'a UpdateAsset> {
-    // 顺序即优先级：Windows 的 NSIS(.exe) 比 MSI 更好装；Linux 的 AppImage 免安装
-    let prefs: &[&str] = if cfg!(target_os = "macos") {
-        &[".dmg"]
-    } else if cfg!(target_os = "windows") {
-        &[".exe", ".msi"]
-    } else {
-        &[".appimage", ".deb", ".rpm"]
-    };
-    prefs.iter().find_map(|p| {
-        assets
-            .iter()
-            .find(|a| a.name.to_ascii_lowercase().ends_with(p))
-    })
-}
-
-/// 检查是否有新版本（GET /releases/latest）
+/// 检查是否有新版本（读 Release 里的 latest-{target}-{arch}.json 清单）
 #[tauri::command(rename = "app_update_check")]
 pub async fn app_update_check(app: AppHandle) -> Result<UpdateInfo, String> {
-    let client = build_client(&app)?;
-    let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let resp = client
-        .get(&url)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|e| format!("检查更新失败: {e}"))?;
-    let status = resp.status();
-    if status == reqwest::StatusCode::NOT_FOUND {
-        return Err("仓库还没有发布任何 Release".into());
-    }
-    if !status.is_success() {
-        return Err(format!("检查更新失败: HTTP {}", status.as_u16()));
-    }
-    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-
-    let tag = v
-        .get("tag_name")
-        .and_then(|s| s.as_str())
-        .unwrap_or_default();
-    let latest = tag
-        .trim_start_matches(|c| c == 'v' || c == 'V')
-        .to_string();
     let current = current_version(&app);
-    let assets: Vec<UpdateAsset> = v
-        .get("assets")
-        .and_then(|a| a.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|a| {
-                    Some(UpdateAsset {
-                        name: a.get("name")?.as_str()?.to_string(),
-                        url: a.get("browser_download_url")?.as_str()?.to_string(),
-                        size: a.get("size").and_then(|s| s.as_u64()).unwrap_or(0),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let html_url = format!("https://github.com/{REPO}/releases");
+    let updater = build_updater(&app)?;
+    let found = updater.check().await.map_err(check_err)?;
 
-    Ok(UpdateInfo {
-        has_update: !latest.is_empty() && is_newer(&latest, &current),
-        current,
-        latest,
-        name: v
-            .get("name")
-            .and_then(|s| s.as_str())
-            .unwrap_or_default()
-            .to_string(),
-        notes: v
-            .get("body")
-            .and_then(|s| s.as_str())
-            .unwrap_or_default()
-            .to_string(),
-        published_at: v
-            .get("published_at")
-            .and_then(|s| s.as_str())
-            .unwrap_or_default()
-            .to_string(),
-        html_url: v
-            .get("html_url")
-            .and_then(|s| s.as_str())
-            .unwrap_or_default()
-            .to_string(),
-        asset: pick_asset(&assets).cloned(),
+    Ok(match found {
+        Some(u) => UpdateInfo {
+            current,
+            latest: u.version.clone(),
+            has_update: true,
+            name: format!("v{}", u.version),
+            notes: u.body.unwrap_or_default(),
+            // time::OffsetDateTime → RFC3339（JS Date 可直接 parse）
+            published_at: u
+                .date
+                .and_then(|d| chrono::DateTime::from_timestamp(d.unix_timestamp(), d.nanosecond()))
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_default(),
+            html_url,
+        },
+        None => UpdateInfo {
+            latest: current.clone(),
+            current,
+            has_update: false,
+            name: String::new(),
+            notes: String::new(),
+            published_at: String::new(),
+            html_url,
+        },
     })
 }
 
-/// 只保留文件名部分，避免 URL/用户输入里的路径穿越
-fn safe_file_name(name: &str) -> String {
-    let base = name
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(name)
-        .trim()
-        .to_string();
-    let cleaned: String = base
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+' | ' '))
-        .collect();
-    if cleaned.is_empty() {
-        "wallpaperem-update".into()
-    } else {
-        cleaned
-    }
-}
-
-/// 下载安装包到缓存目录 `updates/`，边下边发 `update:progress` 事件，返回落地路径
-#[tauri::command(rename = "app_update_download")]
-pub async fn app_update_download(
-    app: AppHandle,
-    url: String,
-    name: String,
-) -> Result<String, String> {
-    let dir = app
-        .path()
-        .app_cache_dir()
-        .map_err(|e| e.to_string())?
-        .join("updates");
-    tokio::fs::create_dir_all(&dir)
+/// 下载新版本（边下边发 `update:progress`，校验签名）并原地安装。
+/// 返回后：macOS/Linux 调 `app_update_restart` 生效；Windows 上 install 会直接
+/// 退出本进程（NSIS 装完自动重启），此命令在 Windows 上不会返回。
+#[tauri::command(rename = "app_update_download_install")]
+pub async fn app_update_download_install(app: AppHandle) -> Result<(), String> {
+    let updater = build_updater(&app)?;
+    let update = updater
+        .check()
         .await
-        .map_err(|e| format!("创建下载目录失败: {e}"))?;
-    let dest: PathBuf = dir.join(safe_file_name(&name));
-
-    let client = build_client(&app)?;
-    let mut resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("下载失败: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("下载失败: HTTP {}", resp.status().as_u16()));
-    }
-    let total = resp.content_length().unwrap_or(0);
-
-    // 覆盖旧文件：重新下载应拿到完整的新包，而不是续写
-    let _ = tokio::fs::remove_file(&dest).await;
-    let mut file = tokio::fs::File::create(&dest)
-        .await
-        .map_err(|e| format!("写入失败: {e}"))?;
+        .map_err(check_err)?
+        .ok_or_else(|| "没有可用的更新（可能已是最新版本）".to_string())?;
 
     let mut received: u64 = 0;
+    let mut total: u64 = 0;
     let mut last_emit: u64 = 0;
-    while let Some(chunk) = resp.chunk().await.map_err(|e| format!("下载中断: {e}"))? {
-        file.write_all(&chunk)
-            .await
-            .map_err(|e| format!("写入失败: {e}"))?;
-        received += chunk.len() as u64;
-        // 每 ~256KB 或最后一包推一次，避免小水管下事件风暴
-        if received - last_emit >= 256 * 1024 || (total > 0 && received >= total) {
-            last_emit = received;
-            let _ = app.emit(
-                "update:progress",
-                json!({ "received": received, "total": total }),
-            );
-        }
-    }
-    file.flush().await.map_err(|e| e.to_string())?;
-    drop(file);
-
-    if total > 0 && received != total {
-        return Err(format!("下载不完整：{received}/{total} 字节"));
-    }
+    let bytes = update
+        .download(
+            |chunk, content_length| {
+                received += chunk as u64;
+                total = content_length.unwrap_or(0);
+                // 每 ~256KB 或最后一包推一次，避免小水管下事件风暴
+                if received - last_emit >= 256 * 1024 || (total > 0 && received >= total) {
+                    last_emit = received;
+                    let _ = app.emit(
+                        "update:progress",
+                        json!({ "received": received, "total": total }),
+                    );
+                }
+            },
+            || {},
+        )
+        .await
+        .map_err(|e| format!("下载更新失败: {e}"))?;
     let _ = app.emit(
         "update:progress",
         json!({ "received": received, "total": total.max(received) }),
     );
-    Ok(dest.to_string_lossy().to_string())
+
+    let _ = app.emit("update:phase", json!({ "phase": "installing" }));
+    update.install(&bytes).map_err(|e| format!("安装更新失败: {e}"))?;
+    Ok(())
 }
 
-/// 打开已下载的安装包，返回一句给用户看的操作提示
-#[tauri::command(rename = "app_update_open")]
-pub fn app_update_open(path: String) -> Result<String, String> {
-    let p = PathBuf::from(&path);
-    if !p.is_file() {
-        return Err("安装包不存在（可能已被清理），请重新下载".into());
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg(&p)
-            .spawn()
-            .map_err(|e| format!("打开安装镜像失败: {e}"))?;
-        return Ok("已打开安装镜像：把 WallpaperEM 拖入「应用程序」覆盖旧版即可".into());
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        // cmd /C start "" <path>：第一个空引号是窗口标题占位，否则带空格路径会被当成标题。
-        // 加 CREATE_NO_WINDOW 避免 cmd 自己先闪一个控制台（安装器窗口照常弹出）。
-        let mut cmd = std::process::Command::new("cmd");
-        cmd.args(["/C", "start", ""]).arg(&p);
-        crate::util::hide_console(&mut cmd);
-        cmd.spawn().map_err(|e| format!("启动安装程序失败: {e}"))?;
-        return Ok("已启动安装程序，按提示完成更新".into());
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        // AppImage 免安装：补可执行位后打开所在目录，让用户替换旧文件
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(&p) {
-                let mut perm = meta.permissions();
-                perm.set_mode(perm.mode() | 0o111);
-                let _ = std::fs::set_permissions(&p, perm);
-            }
-        }
-        let dir = p.parent().unwrap_or(std::path::Path::new("."));
-        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
-        // 必须显式 return：本块是语句块，尾表达式的值会被丢弃（macOS 上该块被
-        // cfg 掉所以不报错，Linux 编译才会撞 E0308）
-        if p.to_string_lossy().to_ascii_lowercase().ends_with(".appimage") {
-            return Ok("AppImage 已下载并设为可执行，请用它替换旧文件".into());
-        }
-        return Ok("已打开安装包所在目录，请按发行版方式安装".into());
-    }
-
-    #[allow(unreachable_code)]
-    Err("当前平台不支持自动打开安装包，请手动安装".into())
+/// 安装完成后重启应用（Windows 上装完即退出，走不到这里）
+#[tauri::command(rename = "app_update_restart")]
+pub fn app_update_restart(app: AppHandle) {
+    app.restart();
 }

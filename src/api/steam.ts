@@ -237,13 +237,27 @@ export const api = {
     ),
   /** 原生文件夹选择框（单选）：返回选中的绝对路径，用户取消返回 null */
   appPickFolder: () => invoke<string | null>("app_pick_folder"),
-  /** 检查更新（读 GitHub Releases 最新版并与当前版本比对） */
+  /** 检查更新（读 Release 里的 latest-{target}-{arch}.json 清单，semver 比对） */
   appUpdateCheck: () => invoke<UpdateInfo>("app_update_check"),
-  /** 下载匹配当前平台的安装包到缓存目录，返回落地路径（进度走 update:progress 事件） */
-  appUpdateDownload: (url: string, name: string) =>
-    invoke<string>("app_update_download", { url, name }),
-  /** 打开已下载的安装包，返回给用户看的操作提示 */
-  appUpdateOpen: (path: string) => invoke<string>("app_update_open", { path }),
+  /** 下载新版本（进度走 update:progress 事件）并原地安装；Windows 上装完进程直接退出 */
+  appUpdateDownloadInstall: () => invoke<void>("app_update_download_install"),
+  /** 安装完成后重启应用（Windows 走安装器自动重启，调不到这个） */
+  appUpdateRestart: () => invoke<void>("app_update_restart"),
+  // 快捷键
+  /** 当前绑定 + 默认值 + 系统保留组合（「快捷键」页一次性拉齐） */
+  hotkeysList: () => invoke<HotkeysInfo>("hotkeys_list"),
+  /**
+   * 设置某动作的绑定（整组替换；空数组 = 清空）。
+   * force = 覆盖模式：注册失败（可能被其它应用占用）也照存不误。
+   */
+  hotkeysSet: (action: string, bindings: string[], force?: boolean) =>
+    invoke<void>("hotkeys_set", { action, bindings, force }),
+  /** 恢复某动作（或全部）的默认绑定 */
+  hotkeysReset: (action?: string) => invoke<void>("hotkeys_reset", { action }),
+  /** 录制挂起：摘菜单 + 注销全局热键，让 ⌘+任意键能到达录制框 */
+  hotkeysRecordBegin: () => invoke<void>("hotkeys_record_begin"),
+  /** 录制结束（成功/取消都要调）：恢复菜单与全部热键 */
+  hotkeysRecordEnd: () => invoke<void>("hotkeys_record_end"),
   // 工坊
   workshopSearch: (params: WorkshopSearchParams) =>
     invoke<WorkshopSearchResult>("workshop_search", { params }),
@@ -398,6 +412,19 @@ export const api = {
   wallpaperSetParticles: (quality: string) => invoke<void>("wallpaper_set_particles", { quality }),
   /** 全局后处理质量档（off/low/medium/high，库 1.3.23+） */
   wallpaperSetPost: (quality: string) => invoke<void>("wallpaper_set_post", { quality }),
+  /** 全局无缝切换效果（叠化/推近/模糊/景深/圆形揭示/横向擦除/滑入），下一次换壁纸生效 */
+  wallpaperSetReveal: (reveal: string) => invoke<void>("wallpaper_set_reveal", { reveal }),
+  /** 全局滤镜 id（白名单见 Rust WALLPAPER_FILTERS），热切所有壁纸窗口 */
+  wallpaperSetFilter: (filter: string) => invoke<void>("wallpaper_set_filter", { filter }),
+  /** 全局贴图资源倍率（0.5–1；null = 跟随清晰度档）。挂载期生效，改后壁纸整页重载 */
+  wallpaperSetResources: (scale: number | null) =>
+    invoke<void>("wallpaper_set_resources", { scale }),
+  /** 全局法线/蒙版资源倍率（0.35–1，默认 1 不缩）。挂载期生效，改后壁纸整页重载 */
+  wallpaperSetResourcesNormal: (scale: number) =>
+    invoke<void>("wallpaper_set_resources_normal", { scale }),
+  /** 一键套用画质档位（low/medium/high）：整体覆盖清晰度/帧率/粒子/后处理/资源倍率/法线倍率 */
+  wallpaperSetQualityPreset: (preset: string) =>
+    invoke<void>("wallpaper_set_quality_preset", { preset }),
   /** 读某壁纸的播放设置覆盖 + 当前全局默认（用于把未覆盖项显示成「跟随全局」） */
   wallpaperItemPlayConfig: (itemId: string) =>
     invoke<{ override: ItemPlayConfig; globals: PlayConfigGlobals }>(
@@ -471,6 +498,20 @@ export const api = {
   // MCP（AI agent 接入，见 README「MCP 服务」）
   mcpStatus: () => invoke<McpStatus>("mcp_status"),
   mcpSetEnabled: (enabled: boolean) => invoke<McpStatus>("mcp_set_enabled", { enabled }),
+  /** 网络模式（loopback/lan/any），切换后服务热重启 */
+  mcpSetNetMode: (mode: string) => invoke<McpStatus>("mcp_set_net_mode", { mode }),
+  /** 我的分享（设置页管理区） */
+  shareList: () => invoke<ShareRecord[]>("share_list"),
+  /** 创建分享（expiresInSec 缺省/ null = 永久） */
+  shareCreate: (itemId: string, expiresInSec?: number | null, note?: string) =>
+    invoke<ShareRecord>("share_create", { itemId, expiresInSec: expiresInSec ?? null, note: note ?? null }),
+  shareRemove: (shareId: string) => invoke<boolean>("share_remove", { shareId }),
+  shareSetEnabled: (shareId: string, enabled: boolean) =>
+    invoke<boolean>("share_set_enabled", { shareId, enabled }),
+  /** 分享子开关（默认关：分享暴露的是内容） */
+  shareServiceEnabled: () => invoke<boolean>("share_enabled_status"),
+  shareSetServiceEnabled: (enabled: boolean) =>
+    invoke<void>("share_set_service_enabled", { enabled }),
   mcpSetPort: (port: number) => invoke<McpStatus>("mcp_set_port", { port }),
   mcpRotateToken: () => invoke<McpStatus>("mcp_rotate_token"),
   mcpConfigSnippet: () => invoke<McpConfigSnippet>("mcp_config_snippet"),
@@ -622,6 +663,24 @@ export type WebPropType =
   | (string & {});
 
 /** project.json 属性定义 + 当前值（wire 格式：color="r g b" 浮点串，bool=布尔，slider=数值…） */
+
+/** 快捷键动作（7 项，见 hotkeys 模块 ACTIONS 表） */
+export interface HotkeyItem {
+  id: string;
+  /** 中文动作名（Rust i18n 键） */
+  label: string;
+  /** 当前绑定（规范小写写法，如 "cmd+shift+p"）；空数组 = 未绑定 */
+  bindings: string[];
+  /** 默认绑定（「恢复默认」用） */
+  defaults: string[];
+}
+
+export interface HotkeysInfo {
+  items: HotkeyItem[];
+  /** 系统/菜单已占用、不建议覆盖的组合 */
+  reserved: string[];
+}
+
 /**
  * 单张壁纸的播放设置覆盖。字段缺失 = 跟随全局默认。
  *
@@ -641,6 +700,10 @@ export interface ItemPlayConfig {
   particles?: "off" | "low" | "medium" | "high";
   /** 后处理质量（库 1.3.23+） */
   postProcessing?: "off" | "low" | "medium" | "high";
+  /** 贴图资源倍率（0.5–1，挂载期生效，改后重载） */
+  resources?: number;
+  /** 法线/蒙版资源倍率（0.35–1，挂载期生效，改后重载） */
+  resourcesNormal?: number;
 }
 
 /** 当前全局默认（供 UI 在「跟随全局」时显示实际会用的值） */
@@ -652,6 +715,9 @@ export interface PlayConfigGlobals {
   aa: string;
   particles: string;
   postProcessing: string;
+  /** 贴图/法线倍率的全局值（供滑条在「跟随全局」时显示） */
+  resources: number | null;
+  resourcesNormal: number;
 }
 
 /** 文案 HTML 里抽出的图（WE 属性面板会渲染 <img>），由后端 we_props 解析 */
@@ -784,10 +850,14 @@ export interface McpStatus {
   enabled: boolean;
   /** HTTP 监听是否真的起来了（端口被占用时为 false，原因见 lastError） */
   running: boolean;
+  /** 网络模式：loopback=本机 / lan=局域网 / any=任意 */
+  netMode: "loopback" | "lan" | "any";
   port: number;
   token: string;
   url: string;
   urlWithToken: string;
+  /** 局域网/任意模式下的本机局域网地址（如 http://192.168.1.10:7411）；本机模式或探测失败为 null */
+  lanUrl: string | null;
   /** 启动失败原因（端口占用等），成功时为 null */
   lastError: string | null;
   calls: McpCallLog[];
@@ -802,25 +872,31 @@ export interface McpConfigSnippet {
   claudeCli: string;
 }
 
-/** 更新包（当前平台匹配到的那个） */
-export interface UpdateAsset {
-  name: string;
-  url: string;
-  /** 字节数；GitHub 未给时为 0 */
-  size: number;
+/** 一条壁纸分享（shareId 即访客凭据，不可枚举） */
+export interface ShareRecord {
+  shareId: string;
+  itemId: string;
+  title: string;
+  /** epoch 秒 */
+  createdAt: number;
+  /** epoch 秒；null = 永久 */
+  expiresAt: number | null;
+  enabled: boolean;
+  note: string | null;
+  views: number;
 }
 
-/** 更新检查结果（对齐 Rust `UpdateInfo`） */
+/** 更新检查结果（对齐 Rust `UpdateInfo`，来自 updater 清单） */
 export interface UpdateInfo {
   current: string;
   latest: string;
   hasUpdate: boolean;
-  /** Release 标题 */
+  /** 版本标题（如 "v1.2.0"） */
   name: string;
-  /** Release 说明（Markdown 原文，界面按纯文本展示） */
+  /** 更新说明（Release 正文快照，界面按纯文本展示） */
   notes: string;
+  /** RFC3339；清单没给时为空串 */
   publishedAt: string;
+  /** Release 页面地址（检查失败 / 无法应用内更新时的手动下载入口） */
   htmlUrl: string;
-  /** 没有匹配当前平台的安装包时为 null（仍可走 htmlUrl 手动下载） */
-  asset: UpdateAsset | null;
 }

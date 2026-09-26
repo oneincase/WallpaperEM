@@ -113,7 +113,7 @@ export function useApplyWallpaper(opts: { onApplied?: (itemId: string) => void }
             {tr("应用到哪块屏？")}
           </div>
           <button
-            className="flex w-full items-center justify-between gap-3 px-3 py-1.5 text-left text-[13px] hover:bg-black/5 dark:hover:bg-white/10"
+            className="flex w-full items-center justify-between gap-3 px-3 py-1.5 text-left text-[13px] hover:bg-white/10"
             onClick={() => choose(null)}
           >
             <span>{tr("全部显示器")}</span>
@@ -122,7 +122,7 @@ export function useApplyWallpaper(opts: { onApplied?: (itemId: string) => void }
           {menu.displays.map((d) => (
             <button
               key={d.id}
-              className="flex w-full items-center justify-between gap-3 px-3 py-1.5 text-left text-[13px] hover:bg-black/5 dark:hover:bg-white/10"
+              className="flex w-full items-center justify-between gap-3 px-3 py-1.5 text-left text-[13px] hover:bg-white/10"
               onClick={() => choose(d.id)}
             >
               <span className="truncate">

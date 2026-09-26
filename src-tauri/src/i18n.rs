@@ -83,7 +83,14 @@ fn en(zh: &str) -> Option<&'static str> {
         "高清" => "High",
         "帧率上限" => "FPS Limit",
         "滤镜效果" => "Filter",
+        "切换效果" => "Transition",
         "退出" => "Quit",
+        // ---- 托盘 · 画质档位子菜单 ----
+        "画质档位" => "Quality Preset",
+        "低" => "Low",
+        "中" => "Medium",
+        "高" => "High",
+        "自定义" => "Custom",
         // ---- 托盘 · 轮播子菜单 ----
         "轮播" => "Slideshow",
         "上一张" => "Previous",
@@ -91,8 +98,16 @@ fn en(zh: &str) -> Option<&'static str> {
         "暂停轮播" => "Pause Slideshow",
         "恢复轮播" => "Resume Slideshow",
         "轮播：未启用" => "Slideshow: off",
-        // ---- macOS 应用菜单 ----
+        // ---- macOS 应用菜单 / 快捷键动作（见 hotkeys.rs）----
         "最小化主窗口" => "Minimize Main Window",
+        "隐藏主窗口" => "Hide Main Window",
+        "主窗口显示/隐藏" => "Toggle Main Window",
+        "壁纸设置窗口显示/隐藏" => "Toggle Wallpaper Settings",
+        "手动暂停/播放" => "Pause / Resume",
+        "自动暂停开启/关闭" => "Toggle Auto Pause",
+        "定时切换开启/关闭" => "Toggle Slideshow",
+        "下一个壁纸" => "Next Wallpaper",
+        "上一个壁纸" => "Previous Wallpaper",
         // ---- 原生文件选择框 ----
         "壁纸" => "Wallpapers",
         "文件" => "Files",
@@ -114,6 +129,18 @@ fn en(zh: &str) -> Option<&'static str> {
         "提亮" => "Brighten",
         "压暗" => "Darken",
         "高对比" => "High Contrast",
+        // ---- 切换效果（与 wallpaper::REVEAL_FX 的标签一一对应）----
+        "叠化" => "Cross-fade",
+        "推近" => "Zoom In",
+        "模糊" => "Blur In",
+        "景深" => "Depth of Field",
+        "圆形揭示" => "Circle Reveal",
+        "横向擦除" => "Wipe",
+        "滑入" => "Slide In",
+        // ---- 画质（设置页「画质」；抗锯齿锁定期的拒绝提示）----
+        "抗锯齿已锁定为关闭（方案优化中，暂不支持更改）" => {
+            "Anti-aliasing is locked to Off (being reworked; changes are disabled for now)"
+        }
         _ => return None,
     })
 }

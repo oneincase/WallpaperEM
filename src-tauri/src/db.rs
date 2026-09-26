@@ -252,6 +252,24 @@ fn migrate(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
         conn.pragma_update(None, "user_version", 11)?;
         tracing::info!("db migrated to version 11（downloads 加 attempts）");
     }
+    if v < 12 {
+        // v12：壁纸分享（mcp::shares）。shareId 即访客凭据（128bit 随机 hex），
+        // 行本身无敏感信息；expires_at NULL = 永久，过期行由懒校验 + 定时清扫回收
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS shares (
+                id          TEXT PRIMARY KEY,
+                item_id     TEXT NOT NULL,
+                created_at  INTEGER NOT NULL,
+                expires_at  INTEGER,
+                enabled     INTEGER NOT NULL DEFAULT 1,
+                note        TEXT,
+                views       INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_shares_item ON shares(item_id);",
+        )?;
+        conn.pragma_update(None, "user_version", 12)?;
+        tracing::info!("db migrated to version 12（shares 表）");
+    }
     Ok(())
 }
 
@@ -482,11 +500,36 @@ mod tests {
     }
 
     #[test]
-    fn v5_maps_old_dpr_tiers_to_three_levels() {
+    /// v12：shares 表随迁移创建（幂等 CREATE IF NOT EXISTS；索引就位）
+    #[test]
+    fn v12_creates_shares_table() {
         let c = v4_db();
         migrate(&c).unwrap();
+        let v: i64 = c
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 12);
+        // 插入 + 唯一键约束生效
+        c.execute(
+            "INSERT INTO shares (id, item_id, created_at) VALUES ('a1', 'i1', 1)",
+            [],
+        )
+        .unwrap();
+        assert!(c
+            .execute(
+                "INSERT INTO shares (id, item_id, created_at) VALUES ('a1', 'i1', 1)",
+                [],
+            )
+            .is_err());
+        let n: i64 = c
+            .query_row("SELECT COUNT(*) FROM shares", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+    }
 
-        // v8 把绝对 DPR 三档再映射成相对倍率四档：旧 2（高清）→ 1（新高清）
+    fn v5_maps_old_dpr_tiers_to_three_levels() {
+        let c = v4_db();
+        migrate(&c).unwrap();        // v8 把绝对 DPR 三档再映射成相对倍率四档：旧 2（高清）→ 1（新高清）
         let v: String = c
             .query_row(
                 "SELECT value FROM settings WHERE key='wallpaper_render_dpr'",
@@ -509,8 +552,9 @@ mod tests {
         let ver: i64 = c
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        // 版本号是链式的：v4 的库跑一次 migrate() 会一路升到当前最新（v9）
-        assert_eq!(ver, 9);
+        // 版本号是链式的：v4 的库跑一次 migrate() 会一路升到当前最新。
+        // 断言下限而不是具体数字 —— 迁移只会追加，钉死「当前最新」每加一版都要来改一次
+        assert!(ver >= 9, "migrate 未把 v4 一路升上来: {ver}");
     }
 
     #[test]

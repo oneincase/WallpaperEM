@@ -90,11 +90,11 @@ export function PreviewModal({
 
   return (
     <div
-      className="animate-overlay fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-8"
+      className="animate-overlay fixed inset-0 z-50 flex items-center justify-center bg-black/25 p-8"
       onClick={onClose}
     >
       <div
-        className="card animate-modal-pop flex h-[70vh] w-full max-w-4xl flex-col overflow-hidden"
+        className="card glass-panel animate-modal-pop flex h-[70vh] w-full max-w-4xl flex-col overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between border-b border-[var(--separator)] px-4 py-2.5">

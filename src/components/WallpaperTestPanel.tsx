@@ -67,7 +67,7 @@ export function WallpaperTestPanel() {
         <span
           className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium ${
             active
-              ? "bg-green-500/15 text-green-600 dark:text-green-400"
+              ? "bg-green-500/15 text-green-400"
               : "bg-gray-500/15 text-[var(--text-2)]"
           }`}
         >

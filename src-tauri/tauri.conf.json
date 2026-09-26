@@ -20,9 +20,10 @@
         "minWidth": 940,
         "minHeight": 600,
         "center": true,
-        "titleBarStyle": "Overlay",
-        "hiddenTitle": true,
-        "transparent": true
+        "decorations": false,
+        "shadow": true,
+        "transparent": true,
+        "devtools": false
       }
     ],
     "security": {
@@ -68,6 +69,18 @@
         ]
       }
     },
-    "category": "Utility"
+    "category": "Utility",
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEY1NUJEOUVFMTQ0MTJGQTcKUldTbkwwRVU3dGxiOWVWc2dob2lDZ2EwckI4b2tyYzh2ZGpaUC92QURyTExVSnRKMUpiTVNCVEcK",
+      "endpoints": [
+        "https://github.com/oneincase/WallpaperEM/releases/latest/download/latest-{{target}}-{{arch}}.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

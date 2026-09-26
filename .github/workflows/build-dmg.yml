@@ -129,6 +129,11 @@ jobs:
           # 默认自签名证书名 → ad-hoc（无任何证书，授权无法跨版本保留）
           APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY || secrets.MACOS_CERTIFICATE_NAME || (secrets.MACOS_CERTIFICATE_P12 != '' && 'WallpaperEM Dev Signer' || '-') }}
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          # updater 签名密钥（createUpdaterArtifacts 生成 .app.tar.gz.sig 用）。
+          # 私钥内容存 Secrets：TAURI_SIGNING_PRIVATE_KEY（~/.tauri/wallpaperem.key 文件内容）、
+          # 该密钥无密码，故 PASSWORD 留空串
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm tauri build --target universal-apple-darwin
 
       - name: 上传构建产物（artifact）
@@ -149,5 +154,27 @@ jobs:
           name: ${{ github.ref_name }}
           files: |
             src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz
           draft: false
           prerelease: false
+
+      # updater 清单（应用内更新的端点）：内容含下载地址 + minisign 签名。
+      # universal 包对两种架构是同一个 .app.tar.gz → darwin-aarch64 / darwin-x86_64
+      # 两个清单文件内容相同，仅文件名不同（端点按 {{target}}-{{arch}} 拼 URL）。
+      - name: 生成并上传 updater 更新清单
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release view "$GITHUB_REF_NAME" --repo "${{ github.repository }}" --json body -q .body > "$RUNNER_TEMP/release-notes.md" || : > "$RUNNER_TEMP/release-notes.md"
+          node scripts/gen-update-manifest.mjs \
+            --repo "${{ github.repository }}" \
+            --tag "$GITHUB_REF_NAME" \
+            --file latest-darwin-aarch64.json \
+            --target darwin-aarch64 --target darwin-x86_64 \
+            --asset src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz \
+            --notes-file "$RUNNER_TEMP/release-notes.md"
+          cp latest-darwin-aarch64.json latest-darwin-x86_64.json
+          gh release upload "$GITHUB_REF_NAME" latest-darwin-aarch64.json latest-darwin-x86_64.json \
+            --repo "${{ github.repository }}" --clobber

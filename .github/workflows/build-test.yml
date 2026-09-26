@@ -216,6 +216,10 @@ jobs:
           # linuxdeploy 依赖解析（不认 $ORIGIN/../ 风格的 rpath）要能找到
           # libsteam_api.so 才肯把它部署进 AppImage：把 vendored sdk 目录给它
           LD_LIBRARY_PATH: ${{ github.workspace }}/src-tauri/sdk/linux64:${{ github.workspace }}/src-tauri/sdk/linuxarm64
+          # updater 签名密钥：createUpdaterArtifacts: true 出 .sig 需要它
+          # （minisign 更新签名，与上面的应用代码签名是两回事）
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm tauri build ${{ matrix.build_args }}
 
       - name: 上传构建产物

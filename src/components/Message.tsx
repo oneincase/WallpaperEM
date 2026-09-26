@@ -89,7 +89,7 @@ export function MessageProvider({ children }: { children: ReactNode }) {
 const TONE: Record<MessageKind, { bar: string; icon: string }> = {
   success: { bar: "bg-green-500", icon: "text-green-500" },
   error: { bar: "bg-red-500", icon: "text-red-500" },
-  info: { bar: "bg-[var(--accent-strong)]", icon: "text-[var(--accent-strong)]" },
+  info: { bar: "bg-[var(--accent-fill)]", icon: "text-[var(--accent-strong)]" },
 };
 
 function Toast({ item, onDismiss }: { item: MessageItem; onDismiss: () => void }) {
@@ -118,7 +118,7 @@ function Toast({ item, onDismiss }: { item: MessageItem; onDismiss: () => void }
   return (
     <div
       role="status"
-      className={`pointer-events-auto flex max-w-[380px] items-start gap-2.5 overflow-hidden rounded-xl border border-[var(--separator)] bg-[var(--card)] pr-3 shadow-[var(--shadow)] backdrop-blur-xl transition-all duration-200 ${
+      className={`pointer-events-auto flex max-w-[380px] items-start gap-2.5 overflow-hidden rounded-xl border border-[var(--card-border)] bg-[var(--card)] pr-3 shadow-[var(--shadow)] backdrop-blur-xl transition-all duration-200 ${
         entered && !leaving
           ? "translate-x-0 opacity-100"
           : "translate-x-3 opacity-0"

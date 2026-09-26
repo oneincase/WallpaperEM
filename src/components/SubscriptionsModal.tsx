@@ -335,11 +335,11 @@ export function SubscriptionsModal({
 
   return createPortal(
     <div
-      className="animate-overlay fixed inset-0 z-[80] flex items-center justify-center bg-black/50 p-8"
+      className="animate-overlay fixed inset-0 z-[80] flex items-center justify-center bg-black/25 p-8"
       onClick={() => !downloading && onClose()}
     >
       <div
-        className="card animate-modal-pop flex h-[78vh] w-full max-w-3xl flex-col overflow-hidden"
+        className="card glass-panel animate-modal-pop flex h-[78vh] w-full max-w-3xl flex-col overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
         {/* 标题栏 */}
@@ -352,7 +352,7 @@ export function SubscriptionsModal({
             {tr("拉取登录账号在 Wallpaper Engine 工坊的全部订阅，批量下载缺失项")}
           </span>
           <button
-            className="shrink-0 rounded-lg px-2 py-0.5 text-[18px] leading-none text-[var(--text-2)] hover:bg-black/5 dark:hover:bg-white/10"
+            className="shrink-0 rounded-lg px-2 py-0.5 text-[18px] leading-none text-[var(--text-2)] hover:bg-white/10"
             onClick={() => !downloading && onClose()}
             aria-label={tr("关闭")}
           >

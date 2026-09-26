@@ -14,8 +14,9 @@
 //!   普通窗口之下（盖住桌面图标并直接接收鼠标）。
 //! - **前台应用观察者 / 自动暂停**：用 `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)`
 //!   实现（Win32 有稳定的全局前台切换通知），语义与 macOS 的
-//!   NSWorkspaceDidActivateApplicationNotification 对齐：切到非桌面自动暂停、
-//!   回桌面（Progman/WorkerW 前台，或点在自己的壁纸窗口上）自动恢复。
+//!   NSWorkspaceDidActivateApplicationNotification 对齐，只作判定表的即时提示；
+//!   暂停/恢复判据见 [`super::auto_pause`]（EnumWindows 遮挡快照，与 macOS
+//!   同享「看得见就播」可见性判据）。
 //! - **显示器睡眠**：独占线程注册 `GUID_CONSOLE_DISPLAY_STATE` 电源通知
 //!   （`WM_POWERBROADCAST` → `PBT_POWERSETTINGCHANGE`），关屏时暂停、亮屏恢复，
 //!   与 macOS 的 `CGDisplayIsAsleep` 轮询等价但事件驱动、零轮询开销。
@@ -41,12 +42,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, EnumWindows, FindWindowA, FindWindowExA,
     GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW, GetParent, GetWindow,
-    GetWindowLongPtrW, GetWindowThreadProcessId, RegisterClassW, SendMessageTimeoutA, SetParent,
-    SetWindowLongPtrW, SetWindowPos, TranslateMessage, EVENT_SYSTEM_FOREGROUND, GWL_EXSTYLE,
-    GWL_STYLE, GW_CHILD, GW_HWNDNEXT, HWND_BOTTOM, HWND_MESSAGE, MSG, PBT_POWERSETTINGCHANGE,
-    SMTO_NORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WINEVENT_OUTOFCONTEXT, WNDCLASSW, WM_POWERBROADCAST, WS_CHILD,
-    WS_EX_LAYERED, WS_EX_NOREDIRECTIONBITMAP, WS_POPUP, WS_VISIBLE,
+    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+    RegisterClassW, SendMessageTimeoutA, SetParent, SetWindowLongPtrW, SetWindowPos, TranslateMessage,
+    EVENT_SYSTEM_FOREGROUND, GWL_EXSTYLE, GWL_STYLE, GW_CHILD, GW_HWNDNEXT, HWND_BOTTOM,
+    HWND_MESSAGE, MSG, PBT_POWERSETTINGCHANGE, SMTO_NORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SWP_SHOWWINDOW, WINDOW_EX_STYLE, WINDOW_STYLE, WINEVENT_OUTOFCONTEXT, WNDCLASSW,
+    WM_POWERBROADCAST, WS_CHILD, WS_EX_LAYERED, WS_EX_NOREDIRECTIONBITMAP, WS_POPUP, WS_VISIBLE,
 };
 
 #[derive(Debug, Clone)]
@@ -746,44 +747,146 @@ unsafe extern "system" fn foreground_hook_proc(
     on_foreground_changed(app, hwnd);
 }
 
-/// 前台窗口变化：非桌面 → 自动暂停；桌面（Progman/WorkerW）或点在自己的壁纸
-/// 窗口上 → 恢复本功能挂的暂停。语义与 macOS 的 on_frontmost_changed 一一对应。
+/// 前台窗口变化：指针注入门控 + 把前台类型当即时提示（Hint）交给共享判定表
+/// （[`super::auto_pause`]）。判定的**判据**是逐屏可见性（[`occlusion_snapshot`]），
+/// 前台类型只作 Hint 加速与快照缺失时的兜底语义。
 fn on_foreground_changed(app: &tauri::AppHandle, hwnd: HWND) {
+    use super::auto_pause::{recheck_with, settings_window_visible, FrontKind, Mode};
+    let kind = kind_of_hwnd(hwnd);
+    // 指针注入门控：桌面活动（Progman/WorkerW 前台 / 壁纸窗口被点）才注入。
+    // 「本应用前台且设置窗不可见」= 交互态点了壁纸窗口，按桌面语义
+    let is_desktop = match kind {
+        FrontKind::Desktop => true,
+        FrontKind::SelfApp => !settings_window_visible(app),
+        _ => false,
+    };
+    super::pointer::set_desktop_active(is_desktop);
+    recheck_with(app, Mode::Hint, kind);
+}
+
+/// 窗口 → 前台类型：本进程窗口 = SelfApp（判定表再分「点壁纸」/「设置窗」），
+/// 桌面类名（Progman/WorkerW/图标视图）= Desktop，其余 = Other。
+fn kind_of_hwnd(hwnd: HWND) -> super::auto_pause::FrontKind {
+    use super::auto_pause::FrontKind;
     let own_process = std::process::id();
     let mut pid: u32 = 0;
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
-
-    // 点桌面在交互态下点的是自己的壁纸窗口（不是 Explorer）——「在桌面上点壁纸」
-    // 按桌面语义处理；任一设置窗可见才是真的在操作本应用（保持中性语义）
-    let self_click_desktop = pid == own_process && !settings_window_visible(app);
-    let is_desktop = self_click_desktop || class_name_is_desktop(hwnd);
-
-    super::pointer::set_desktop_active(is_desktop);
-    if pid == own_process && !self_click_desktop {
-        return;
+    if pid == own_process {
+        FrontKind::SelfApp
+    } else if class_name_is_desktop(hwnd) {
+        FrontKind::Desktop
+    } else {
+        FrontKind::Other
     }
-    let Some(st) = app.try_state::<super::WallpaperEngineState>() else {
-        return;
-    };
-    if is_desktop {
-        let was_auto = {
-            let mut g = st.auto_paused.lock().unwrap();
-            std::mem::replace(&mut *g, false)
-        };
-        if was_auto {
-            let _ = super::resume_all(app.clone());
-            tracing::info!("auto-pause: 回到桌面，壁纸已恢复播放");
+}
+
+/// 当前前台窗口类型（判定表轮询路径用）。查询失败返回 Unknown。
+pub fn frontmost_kind(_app: &tauri::AppHandle) -> super::auto_pause::FrontKind {
+    use super::auto_pause::FrontKind;
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.is_invalid() {
+        return FrontKind::Unknown;
+    }
+    kind_of_hwnd(hwnd)
+}
+
+/// 遮挡快照（Windows）：逐屏遮挡比例（物理虚拟桌面坐标），自动暂停
+/// 「看得见就播」的可见性判据（与 macOS 的 CGWindowList 实现同构）。
+///
+/// 数据源 `EnumWindows` 顶层窗口 + Tauri `available_monitors`（物理坐标）。
+/// 过滤规则：
+/// - 本进程窗口（设置窗/交互态壁纸窗）不算遮挡 —— 我们是壁纸系统自身；
+///   非交互态壁纸窗是 WorkerW 的**子**窗口，EnumWindows 本来就不枚举；
+/// - 桌面类名（Progman/WorkerW/图标视图）铺满整屏，必须排除；
+/// - 不可见/最小化的跳过；**DWM cloak 的跳过** —— 别的虚拟桌面上的窗口与
+///   挂起的 UWP 窗口 `IsWindowVisible` 仍为真但并不显示，不过滤会让
+///   「切到空虚拟桌面」永远判成有遮挡（这正是要修的 bug 形态）；
+/// - 其余可见顶层窗口都算（含任务栏：它确实盖着壁纸一条，单靠它过不了阈值）。
+///
+/// 坐标：枚举前后把线程钉在 `DPI_AWARENESS_CONTEXT_SYSTEM_AWARE` 并还原 ——
+/// GetWindowRect 与显示器物理坐标同处一个坐标系（遮挡比例与单位无关，
+/// 只要两边一致）。
+pub fn occlusion_snapshot() -> Option<super::auto_pause::OcclusionSnapshot> {
+    use super::auto_pause::{covered_ratio, OcclusionSnapshot};
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+
+    struct EnumCtx {
+        own_pid: u32,
+        rects: Vec<(f64, f64, f64, f64)>,
+    }
+    unsafe extern "system" fn collect(window: HWND, out: LPARAM) -> BOOL {
+        unsafe {
+            let ctx = &mut *(out.0 as *mut EnumCtx);
+            let mut pid: u32 = 0;
+            GetWindowThreadProcessId(window, Some(&mut pid));
+            if pid == ctx.own_pid {
+                return true.into();
+            }
+            if !IsWindowVisible(window).as_bool() || IsIconic(window).as_bool() {
+                return true.into();
+            }
+            let mut cloaked: u32 = 0;
+            let _ = DwmGetWindowAttribute(
+                window,
+                DWMWA_CLOAKED,
+                &mut cloaked as *mut u32 as *mut _,
+                std::mem::size_of::<u32>() as u32,
+            );
+            if cloaked != 0 {
+                return true.into();
+            }
+            if class_name_is_desktop(window) {
+                return true.into();
+            }
+            let mut r = RECT::default();
+            if GetWindowRect(window, &mut r).is_ok() && r.right > r.left && r.bottom > r.top {
+                ctx.rects
+                    .push((r.left as f64, r.top as f64, r.right as f64, r.bottom as f64));
+            }
+            true.into()
         }
-        return;
     }
 
-    if !auto_pause_enabled(app) || *st.paused.lock().unwrap() {
-        return;
+    let app = APP.get()?;
+    // 显示器（物理虚拟桌面坐标 + 稳定 id，与 active_screens 同一套 id 推导）
+    let monitors: Vec<(u32, (f64, f64, f64, f64))> = app
+        .available_monitors()
+        .ok()?
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let p = m.position();
+            let s = m.size();
+            let x = p.x as f64;
+            let y = p.y as f64;
+            (
+                monitor_id(m.name().map(|n| n.as_str()), i),
+                (x, y, x + s.width as f64, y + s.height as f64),
+            )
+        })
+        .collect();
+    if monitors.is_empty() {
+        return None;
     }
-    if super::auto_pause_enter(app).is_ok() {
-        *st.auto_paused.lock().unwrap() = true;
-        tracing::info!("auto-pause: 前台切换，壁纸已自动暂停");
+
+    let prev = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE) };
+    let mut ctx = EnumCtx {
+        own_pid: std::process::id(),
+        rects: Vec::new(),
+    };
+    unsafe {
+        let _ = EnumWindows(Some(collect), LPARAM(&mut ctx as *mut EnumCtx as _));
     }
+    unsafe {
+        SetThreadDpiAwarenessContext(prev);
+    }
+
+    let coverages = monitors
+        .iter()
+        .map(|(id, rect)| (*id, covered_ratio(&ctx.rects, *rect)))
+        .collect();
+    Some(OcclusionSnapshot { coverages })
 }
 
 /// 前台窗口是否为「桌面」（Explorer 的 Progman / WorkerW / 图标视图）
@@ -798,33 +901,6 @@ fn class_name_is_desktop(hwnd: HWND) -> bool {
         name.as_str(),
         "Progman" | "WorkerW" | "SHELLDLL_DefView" | "SysListView32"
     )
-}
-
-/// 主设置窗/壁纸属性窗是否可见（任一可见即认为用户正在操作本应用设置）
-fn settings_window_visible(app: &tauri::AppHandle) -> bool {
-    let visible = |label: &str| {
-        app.get_webview_window(label)
-            .and_then(|w| w.is_visible().ok())
-            .unwrap_or(false)
-    };
-    if visible("main") {
-        return true;
-    }
-    app.webview_windows()
-        .keys()
-        .any(|label| label.starts_with("props-") && visible(label))
-}
-
-/// 设置开关：wallpaper_auto_pause，默认关（与 macOS 同一份持久化）
-fn auto_pause_enabled(app: &tauri::AppHandle) -> bool {
-    app.try_state::<std::sync::Arc<Mutex<rusqlite::Connection>>>()
-        .and_then(|db| {
-            db.lock()
-                .ok()
-                .and_then(|c| crate::db::get_setting(&c, "wallpaper_auto_pause"))
-        })
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false)
 }
 
 /// 交互态下点桌面走的是壁纸窗口自己的鼠标事件（已直收），无需 macOS 那条

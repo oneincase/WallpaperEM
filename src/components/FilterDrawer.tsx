@@ -64,7 +64,7 @@ export function FilterDrawer({
         }`}
       />
       <div
-        className={`absolute inset-y-0 left-0 z-30 flex w-64 max-w-[85%] flex-col border-r border-[var(--separator)] bg-[var(--card)]/92 shadow-2xl backdrop-blur-2xl backdrop-saturate-150 transition-transform duration-300 ease-out ${
+        className={`glass-panel absolute inset-y-0 left-0 z-30 flex w-64 max-w-[85%] flex-col border-r border-[var(--separator)] shadow-2xl transition-transform duration-300 ease-out ${
           shown ? "translate-x-0" : "-translate-x-full"
         }`}
       >
@@ -120,7 +120,7 @@ export function FilterButton({
       className={`relative flex shrink-0 items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-[12.5px] font-medium transition-colors ${
         activeCount > 0
           ? "border-[var(--accent-strong)] bg-[var(--accent)] text-[var(--accent-strong)]"
-          : "border-[var(--separator)] text-[var(--text-2)] hover:bg-black/5 dark:hover:bg-white/10"
+          : "border-[var(--separator)] text-[var(--text-2)] hover:bg-white/10"
       }`}
       onClick={onClick}
     >
@@ -141,7 +141,7 @@ export function FilterButton({
       </svg>
       {tr("筛选")}
       {activeCount > 0 && (
-        <span className="rounded-full bg-[var(--accent-strong)] px-1.5 text-[10px] font-bold text-[var(--content)]">
+        <span className="rounded-full bg-[var(--accent-fill)] px-1.5 text-[10px] font-bold text-[var(--text-1)]">
           {activeCount}
         </span>
       )}
@@ -205,7 +205,7 @@ export function TagChip({
   const cls =
     state === "on"
       ? "border-[var(--accent-strong)] bg-[var(--accent)] text-[var(--accent-fg)]"
-      : "border-[var(--separator)] text-[var(--text-2)] hover:bg-black/5 dark:hover:bg-white/10";
+      : "border-[var(--separator)] text-[var(--text-2)] hover:bg-white/10";
   return (
     <button
       className={`rounded-lg border px-2 py-[3px] text-[11.5px] transition-colors ${cls}`}

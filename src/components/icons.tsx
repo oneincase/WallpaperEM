@@ -152,6 +152,16 @@ export const IconUpload = () => (
   </Svg>
 );
 
+/** 分享：经典三节点连线（分享语义通用图形） */
+export const IconShare = ({ size }: { size?: number }) => (
+  <Svg size={size}>
+    <circle cx="6" cy="12" r="2.4" />
+    <circle cx="17.4" cy="5.8" r="2.4" />
+    <circle cx="17.4" cy="18.2" r="2.4" />
+    <path d="M8.2 10.9l7-4M8.2 13.1l7 4" strokeWidth={1.6} />
+  </Svg>
+);
+
 /** 删除：圆角垃圾桶，桶身两道短竖 */
 export const IconTrash = () => (
   <Svg>
@@ -182,6 +192,14 @@ export const IconSliders = ({ size }: { size?: number }) => (
   </Svg>
 );
 
+/** 快捷键：键盘（键帽用短横线示意） */
+export const IconKeyboard = ({ size }: { size?: number }) => (
+  <Svg size={size}>
+    <rect x="2.6" y="6" width="18.8" height="12" rx="2.4" />
+    <path d="M6 9.4h.01M9.2 9.4h.01M12.4 9.4h.01M15.6 9.4h.01M6 12.4h.01M9.2 12.4h.01M12.4 12.4h.01M15.6 12.4h.01M8 15.4h8" />
+  </Svg>
+);
+
 // ---------- 播放控制 ----------
 
 /** 播放：圆角三角 */
@@ -208,44 +226,5 @@ export const IconPause = ({ size }: { size?: number }) => (
 export const IconStop = ({ size }: { size?: number }) => (
   <Svg size={size}>
     <rect x="5.4" y="5.4" width="13.2" height="13.2" rx="3.6" fill="currentColor" stroke="none" />
-  </Svg>
-);
-
-// ---------- 侧边栏收缩 / 展开 ----------
-
-export const IconSidebarCollapse = () => (
-  <Svg>
-    <rect x="2.8" y="3.6" width="18.4" height="16.8" rx="4" />
-    <path d="M9.4 3.8v16.4" />
-  </Svg>
-);
-
-export const IconSidebarExpand = IconSidebarCollapse;
-
-// ---------- 主题切换 ----------
-
-/** 浅色：胖太阳 + 短光芒 */
-export const IconSun = () => (
-  <Svg>
-    <circle cx="12" cy="12" r="4.4" />
-    <path d="M12 2.9v1.9M12 19.2v1.9M4.6 4.6l1.35 1.35M18.05 18.05l1.35 1.35M2.9 12h1.9M19.2 12h1.9M4.6 19.4l1.35-1.35M18.05 5.95 19.4 4.6" />
-  </Svg>
-);
-
-/** 深色：月牙 + 两颗星 */
-export const IconMoon = () => (
-  <Svg>
-    <path d="M20.2 14.6A8.4 8.4 0 0 1 9.4 3.8a8.4 8.4 0 1 0 10.8 10.8Z" />
-    <Sparkle x={17.4} y={5.6} r={1.7} />
-    <Sparkle x={20.4} y={9.4} r={1.1} />
-  </Svg>
-);
-
-/** 跟随系统：左半太阳右半月 */
-export const IconAuto = () => (
-  <Svg>
-    <circle cx="12" cy="12" r="4.4" />
-    <path d="M12 7.6a4.4 4.4 0 0 1 0 8.8Z" fill="currentColor" stroke="none" />
-    <path d="M12 2.9v1.9M12 19.2v1.9M4.6 4.6l1.35 1.35M2.9 12h1.9M4.6 19.4l1.35-1.35" />
   </Svg>
 );

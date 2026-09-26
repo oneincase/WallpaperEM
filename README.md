@@ -12,9 +12,13 @@
   <img src="public/icon/icon_512x512.png" width="120" alt="WallpaperEM logo"/>
 </p>
 
-**WallpaperEM** 是一款开源的动态壁纸引擎：浏览并下载 Steam 创意工坊（Wallpaper Engine）壁纸，一键应用到桌面。支持 **视频 / GIF / 网页 / 场景（WebGL）/ 图片** 五类壁纸、多显示器、托盘与全局快捷键；内置 MCP 服务，可以用 AI 直接创作壁纸工程。
+**WallpaperEM** 是一款极致优雅的全平台桌面壁纸引擎软件，绝非 WE 的简单复刻！**场景、网页、视频、图片全支持！** 浏览并下载 Steam 创意工坊（Wallpaper Engine）壁纸，一键应用到桌面，支持多显示器、托盘与全局快捷键。
 
-**WallpaperEM** is an open-source dynamic wallpaper engine: browse and download Wallpaper Engine workshop wallpapers, then apply them to your desktop. It supports **video / GIF / web / scene (WebGL) / image** wallpapers across multiple displays, with a tray icon and global shortcuts — plus a built-in MCP server so AI agents can author wallpaper projects directly.
+它的优点：**极小的安装包大小 · 第三方依赖解耦 · 极好的性能优化 · 多档位画质预设 · AI 壁纸创作 · 壁纸分享（链接支持手机打开实时渲染）** —— 后续版本还有更多优秀的功能等待大家体验！！！
+
+**WallpaperEM** is a supremely elegant, cross-platform desktop wallpaper engine — definitely **not a simple clone of Wallpaper Engine**! **Scenes, web pages, videos and images — all supported!** Browse and download Wallpaper Engine Workshop wallpapers and apply them to your desktop in one click, with multi-display, a tray icon and global shortcuts.
+
+Its highlights: **tiny installer size · decoupled third-party dependencies · excellent performance optimisation · multi-level quality presets · AI wallpaper creation · wallpaper sharing (open the link on your phone for live real-time rendering)** — and many more great features waiting for you in future versions!!!
 
 ---
 
@@ -187,6 +191,7 @@ see [Build from Source](#从源码构建--build-from-source).
 - 🖼️ **系统静态壁纸同步**：把当前壁纸的代表帧设为系统静态壁纸，锁屏 / 引擎未运行时观感一致。
 - 🔔 **托盘 + 全局快捷键**：`Cmd/Ctrl+Shift+P` 暂停/恢复、`Cmd/Ctrl+Shift+N` 下一张；托盘内可切显示模式、清晰度、帧率、滤镜。
 - 🌍 **界面语言**：中文 / English 一键切换（界面、托盘菜单、原生文案、后端提示一起变）。
+- 📡 **壁纸分享**：生成分享链接（永久 / 限时，直链 / iframe 代码），手机等设备用浏览器打开即**实时渲染**该壁纸（支持竖屏 / 横屏切换、局域网二维码）；网络模式可选本机 / 局域网 / 任意。
 - 🤖 **AI / MCP 创作**：内置 MCP 服务（默认 `127.0.0.1:7411`），30+ 工具覆盖「建工程 → 写素材 → 校验 → 安装 → 应用 → 截图 → 上传工坊」全流程（详见 [MCP 服务](#mcp-服务--mcp-server)）。
 - 🧹 **首次安装不打扰**：从未应用过壁纸时不创建任何壁纸窗口，桌面保持系统壁纸；壁纸缺失/加载失败时只显示简洁的 SVG 提示。
 - 🧱 **原生集成**：macOS 桌面层窗口、Linux X11 桌面层、Windows `Progman` / `WorkerW` 桌面层（含 Win11 raised-desktop 适配），全部无边框透明、系统级置底。
@@ -207,6 +212,7 @@ see [Build from Source](#从源码构建--build-from-source).
 - 🖼️ **System static wallpaper sync**: use a representative frame of the current wallpaper as the system wallpaper, so the lock screen and the engine-off state look consistent.
 - 🔔 **Tray + global shortcuts**: `Cmd/Ctrl+Shift+P` pause/resume, `Cmd/Ctrl+Shift+N` next; display mode, quality, frame rate and filter are switchable from the tray.
 - 🌍 **UI language**: one-click switch between 中文 and English (UI, tray menu, native strings and backend messages all follow).
+- 📡 **Wallpaper sharing**: generate a share link (permanent or time-limited, direct link / iframe code); open it in any browser — e.g. on your phone — and the wallpaper **renders live** there (portrait / landscape toggle, LAN QR code included). Network modes: local-only / LAN / any.
 - 🤖 **AI / MCP authoring**: a built-in MCP server (default `127.0.0.1:7411`) exposes 30+ tools covering "create project → write assets → validate → install → apply → screenshot → workshop upload" (see [MCP Server](#mcp-服务--mcp-server)).
 - 🧹 **Non-intrusive first run**: no wallpaper window is created until you apply one, so the desktop keeps your system wallpaper; when a wallpaper is missing or fails to load, only a minimal SVG notice is shown.
 - 🧱 **Native integration**: macOS desktop-level windows, the Linux X11 desktop layer, and the Windows `Progman` / `WorkerW` desktop layer (including the Windows 11 raised-desktop layout) — all borderless, transparent and system-level.
@@ -304,6 +310,17 @@ pnpm tauri dev
 ```bash
 pnpm tauri build
 ```
+
+> ⚠️ 应用内更新签名校验（`bundle.createUpdaterArtifacts`）要求提供更新签名私钥，
+> 本地打包前先设置（CI 里由仓库 Secret `TAURI_SIGNING_PRIVATE_KEY` 自动注入；
+> 忘记设置会在打包阶段明确报错）：
+>
+> ```bash
+> export TAURI_SIGNING_PRIVATE_KEY="$HOME/.tauri/wallpaperem.key"   # 密钥文件路径（或直接粘贴文件内容）
+> export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""                      # 该密钥无密码
+> ```
+>
+> 只跑 `pnpm tauri dev` 不需要该密钥。
 
 > 产物 / Bundles：
 > - macOS：`bundle/dmg/*.dmg`、`bundle/macos/WallpaperEM.app`

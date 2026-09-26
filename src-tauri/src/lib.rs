@@ -10,6 +10,7 @@ mod cover_cache;
 mod db;
 mod download;
 mod ffmpeg;
+mod hotkeys;
 mod i18n;
 mod keychain;
 mod library;
@@ -38,8 +39,6 @@ mod workshop;
 
 use rusqlite::Connection;
 use std::sync::{Arc, Mutex};
-#[cfg(target_os = "macos")]
-use tauri::menu::MenuItemKind;
 use tauri::{
     menu::{CheckMenuItem, CheckMenuItemBuilder, Menu, MenuItem, PredefinedMenuItem, Submenu},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -59,63 +58,24 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_desktop_underlay::init())
+        // 应用内更新（配置在 tauri.conf.json 的 plugins.updater；JS 侧未授权，仅走自定义命令）
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
                     use tauri_plugin_global_shortcut::ShortcutState;
                     if event.state() == ShortcutState::Pressed {
-                        // Shortcut 实现 Display（如 "CommandOrControl+Shift+P"），按末字符区分
-                        let s = shortcut.to_string();
-                        let last = s.chars().last().unwrap_or('?').to_ascii_lowercase();
-                        tracing::info!("global shortcut pressed: {s}");
-                        match last {
-                            'p' => {
-                                // ⌘⇧P：切换暂停/恢复
-                                let paused = app
-                                    .try_state::<wallpaper::WallpaperEngineState>()
-                                    .map(|s| *s.paused.lock().unwrap())
-                                    .unwrap_or(false);
-                                if paused {
-                                    let _ = wallpaper::resume_all(app.clone());
-                                } else {
-                                    let _ = wallpaper::pause_all(app.clone());
-                                }
-                            }
-                            'n' => {
-                                // ⌘⇧N：下一张（轮播）
-                                if let Err(e) = wallpaper::next(app.clone(), None) {
-                                    tracing::warn!("next failed: {e}");
-                                }
-                            }
-                            'r' => {
-                                // ⌘⇧R：暂停/恢复轮播（定时自动切换；⌘⇧P 是暂停壁纸渲染，两回事）
-                                let paused = app
-                                    .try_state::<Arc<Mutex<Connection>>>()
-                                    .and_then(|db| {
-                                        db.lock().ok().and_then(|c| {
-                                            db::get_setting(&c, "playlist_rotation_paused")
-                                        })
-                                    })
-                                    .map(|v| v == "true" || v == "1")
-                                    .unwrap_or(false);
-                                if let Err(e) = wallpaper::rotation_set(app.clone(), !paused) {
-                                    tracing::warn!("rotation_set failed: {e}");
-                                }
-                            }
-                            _ => {}
-                        }
+                        tracing::info!("global shortcut pressed: {shortcut}");
+                        hotkeys::dispatch_by_shortcut(app, shortcut);
                     }
                 })
                 .build(),
         )
-        // ⌘H 自定义为「最小化主窗口」：macOS 默认的 Hide 走 NSApplication hide，
-        // 会把桌面级壁纸窗口一起藏掉；对壁纸引擎来说「隐藏」的合理语义是
-        // 主窗口最小化（setup 里已把应用菜单的 Hide 项替换成本项）
+        // 菜单快捷键（⌘M/⌘H 等 macOS 系统惯例键走这里，见 hotkeys 模块注释）
         .on_menu_event(|app, event| {
-            if event.id.as_ref() == "minimize_main" {
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.minimize();
-                }
+            let id = event.id.as_ref();
+            if !hotkeys::handle_menu_event(app, id) {
+                tracing::debug!("unhandled menu event: {id}");
             }
         })
         .setup(|app| {
@@ -143,33 +103,10 @@ pub fn run() {
             // launchd 立即复活，表现为"退出软件后一直自己重新启动"）
             #[cfg(target_os = "macos")]
             commands::ensure_keepalive_startup(app.handle());
-            // 应用菜单改造：⌘H 从「隐藏应用」换成「最小化主窗口」
-            // （壁纸窗口另有 canHide=false 兜底，双保险）
-            // 句柄留着：语言切换时要重写这项文案（见 retranslate_native_ui）
-            #[cfg(target_os = "macos")]
-            let mut minimize_main: Option<MenuItem<tauri::Wry>> = None;
-            #[cfg(target_os = "macos")]
-            {
-                let menu = Menu::default(app.handle())?;
-                if let Some(MenuItemKind::Submenu(app_menu)) = menu.items()?.into_iter().next() {
-                    let items = app_menu.items()?;
-                    // Menu::default 的 app 子菜单布局固定：
-                    // [About, sep, Services, sep, Hide, HideOthers, sep, Quit]
-                    if let Some(hide) = items.get(4) {
-                        let _ = app_menu.remove(hide);
-                    }
-                    let minimize = MenuItem::with_id(
-                        app.handle(),
-                        "minimize_main",
-                        i18n::tr("最小化主窗口"),
-                        true,
-                        Some("Cmd+H"),
-                    )?;
-                    app_menu.insert(&minimize, 4usize)?;
-                    minimize_main = Some(minimize);
-                }
-                app.set_menu(menu)?;
-            }
+            // 应用菜单（macOS）与快捷键注册都归 hotkeys 模块：⌘M/⌘H 这类系统
+            // 惯例键落菜单键位、其余组合落全局热键，绑定可由「快捷键」页录制改写。
+            // 菜单裁剪策略（只留 app 子菜单 + Edit）也内含在 build_app_menu 里。
+            hotkeys::init(app.handle())?;
             // 托盘失败不致命：Linux 无托盘协议的环境（GNOME 未装 AppIndicator 扩展、
             // 容器/无头会话）里 TrayIconBuilder::build 会报错，不能让整个 setup 崩掉 ——
             // 退化为「无托盘常驻」，主窗口与壁纸功能照常（研究文档 §3.2 的降级策略）
@@ -181,14 +118,9 @@ pub fn run() {
                     None
                 }
             };
-            app.manage(NativeMenuState {
-                tray,
-                #[cfg(target_os = "macos")]
-                minimize_main,
-            });
+            app.manage(NativeMenuState { tray });
             // 轮播状态文案（当前项 / 暂停·恢复）按启动时状态刷新一次
             update_tray_rotation(app.handle());
-            register_shortcuts(app.handle())?;
             // 抽帧组件（ffmpeg）的托管路径：抽帧入口拿不到 AppHandle，启动时缓存一份
             ffmpeg::init(app.handle());
             // 音频捕获状态须先于内容服务器（SSE 端点读取其共享频谱帧）
@@ -217,6 +149,11 @@ pub fn run() {
             // 工具全都依赖它们，早启动只会让首个请求撞上未就绪状态
             mcp::init(app.handle()).map_err(|e| e.to_string())?;
             download::init(app.handle()).map_err(|e| e.to_string())?;
+            // 深色玻璃设计：先把 AppKit 外观钉成 dark 再上材质 —— vibrancy 材质
+            // 亮度跟随系统外观，系统浅色模式下材质发白，深色 tint 盖不住、白字
+            // 对比度掉档。只影响本应用（材质 + 原生控件），不改系统设置
+            #[cfg(target_os = "macos")]
+            force_dark_appearance();
             apply_vibrancy(app.handle())?;
             // T1 验证钩子：WE_AUTO_WORKSHOP=1 时启动即搜索第一页并打日志
             if std::env::var("WE_AUTO_WORKSHOP").as_deref() == Ok("1") {
@@ -275,6 +212,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::ping,
+            hotkeys::hotkeys_list,
+            hotkeys::hotkeys_set,
+            hotkeys::hotkeys_reset,
+            hotkeys::hotkeys_record_begin,
+            hotkeys::hotkeys_record_end,
             #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
             workshop_upload::workshop_upload_start,
             #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
@@ -297,6 +239,7 @@ pub fn run() {
             wallpaper::displays_list,
             wallpaper::display_binding_set,
             wallpaper::active_items,
+            wallpaper::ui_backdrop,
             wallpaper::pause_all,
             wallpaper::resume_all,
             wallpaper::set_volume,
@@ -304,10 +247,15 @@ pub fn run() {
             wallpaper::set_render_dpr,
             wallpaper::set_language,
             wallpaper::set_scene_fps,
+            wallpaper::set_video_tex_scale,
             wallpaper::set_filter,
+            wallpaper::set_reveal,
             wallpaper::set_aa,
             wallpaper::set_particles,
             wallpaper::set_post,
+            wallpaper::set_resources,
+            wallpaper::set_resources_normal,
+            wallpaper::set_quality_preset,
             wallpaper::item_play_config_get,
             wallpaper::item_play_config_set,
             wallpaper::interactive_set,
@@ -382,13 +330,20 @@ pub fn run() {
             misc::cache_stats,
             misc::cache_clear,
             update::app_update_check,
-            update::app_update_download,
-            update::app_update_open,
+            update::app_update_download_install,
+            update::app_update_restart,
             mcp::mcp_status,
             mcp::mcp_set_enabled,
+            mcp::mcp_set_net_mode,
             mcp::mcp_set_port,
             mcp::mcp_rotate_token,
             mcp::mcp_config_snippet,
+            mcp::shares::share_list_cmd,
+            mcp::shares::share_create_cmd,
+            mcp::shares::share_remove_cmd,
+            mcp::shares::share_set_enabled_cmd,
+            mcp::shares::share_enabled_status_cmd,
+            mcp::shares::share_set_service_enabled_cmd,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -491,27 +446,14 @@ fn init_logging(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// 显示模式 / 清晰度 / 帧率上限的档位表：(id 后缀, 中文标签)。
-/// 档位值必须与设置页、wallpaper 侧的校验范围一致（Settings.tsx 同名三项）。
-const FIT_ITEMS: &[(&str, &str)] = &[
-    ("cover", "裁剪"),
-    ("contain", "缩放"),
-    ("stretch", "拉伸"),
-];
-// 相对设备像素比倍率：0 自动（=设备 DPR）/ 0.75 省电 / 0.85 标准 / 1 高清（=原生）
-const DPR_ITEMS: &[(&str, &str)] = &[
-    ("0", "自动"),
-    ("0.75", "省电"),
-    ("0.85", "标准"),
-    ("1", "高清"),
-];
-const FPS_ITEMS: &[(&str, &str)] = &[
-    ("15", "15 FPS"),
-    ("24", "24 FPS"),
-    ("30", "30 FPS"),
-    ("45", "45 FPS"),
-    ("60", "60 FPS"),
-    ("120", "120 FPS"),
+/// 画质档位表：(id 后缀, 中文标签)。低/中/高与设置页 QUALITY_PRESETS、
+/// wallpaper::PRESET_* 同一套预设；「自定义」只是反推出来的状态（同设置页），
+/// 点它不做事。档位判定按六个画质参数的当前值逐字段比对。
+const QUALITY_ITEMS: &[(&str, &str)] = &[
+    ("low", "低"),
+    ("medium", "中"),
+    ("high", "高"),
+    ("custom", "自定义"),
 ];
 
 /// 托盘菜单项的句柄集合。留着只为一件事：**切换语言时原地改文字**。
@@ -526,14 +468,12 @@ pub struct TrayMenu {
     rot_prev: MenuItem<tauri::Wry>,
     rot_next: MenuItem<tauri::Wry>,
     rot_pause: MenuItem<tauri::Wry>,
-    fit_menu: Submenu<tauri::Wry>,
-    fit_items: Vec<CheckMenuItem<tauri::Wry>>,
-    dpr_menu: Submenu<tauri::Wry>,
-    dpr_items: Vec<CheckMenuItem<tauri::Wry>>,
-    fps_menu: Submenu<tauri::Wry>,
-    fps_items: Vec<CheckMenuItem<tauri::Wry>>,
+    quality_menu: Submenu<tauri::Wry>,
+    quality_items: Vec<CheckMenuItem<tauri::Wry>>,
     filter_menu: Submenu<tauri::Wry>,
     filter_items: Vec<CheckMenuItem<tauri::Wry>>,
+    reveal_menu: Submenu<tauri::Wry>,
+    reveal_items: Vec<CheckMenuItem<tauri::Wry>>,
     quit: MenuItem<tauri::Wry>,
 }
 
@@ -546,20 +486,16 @@ impl TrayMenu {
         self.rot_menu.set_text(i18n::tr("轮播"))?;
         self.rot_prev.set_text(i18n::tr("上一张"))?;
         self.rot_next.set_text(i18n::tr("下一张"))?;
-        self.fit_menu.set_text(i18n::tr("显示模式"))?;
-        self.dpr_menu.set_text(i18n::tr("清晰度"))?;
-        self.fps_menu.set_text(i18n::tr("帧率上限"))?;
+        self.quality_menu.set_text(i18n::tr("画质档位"))?;
         self.filter_menu.set_text(i18n::tr("滤镜效果"))?;
-        for (item, (_, label)) in self.fit_items.iter().zip(FIT_ITEMS) {
-            item.set_text(i18n::tr(label))?;
-        }
-        for (item, (_, label)) in self.dpr_items.iter().zip(DPR_ITEMS) {
-            item.set_text(i18n::tr(label))?;
-        }
-        for (item, (_, label)) in self.fps_items.iter().zip(FPS_ITEMS) {
+        self.reveal_menu.set_text(i18n::tr("切换效果"))?;
+        for (item, (_, label)) in self.quality_items.iter().zip(QUALITY_ITEMS) {
             item.set_text(i18n::tr(label))?;
         }
         for (item, (_, label)) in self.filter_items.iter().zip(wallpaper::WALLPAPER_FILTERS) {
+            item.set_text(i18n::tr(label))?;
+        }
+        for (item, (_, label)) in self.reveal_items.iter().zip(wallpaper::REVEAL_FX) {
             item.set_text(i18n::tr(label))?;
         }
         // 轮播状态文案是动态的（当前项 / 暂停·恢复），按当前状态重写
@@ -598,22 +534,46 @@ impl TrayMenu {
             "wallpaper_auto_pause" => {
                 let _ = self.auto_pause.set_checked(value == "true" || value == "1");
             }
-            "wallpaper_fit" => sync(&self.fit_items, FIT_ITEMS, value),
-            "wallpaper_render_dpr" => sync(&self.dpr_items, DPR_ITEMS, value),
-            "wallpaper_scene_fps" => sync(&self.fps_items, FPS_ITEMS, value),
             "wallpaper_filter" => sync(&self.filter_items, wallpaper::WALLPAPER_FILTERS, value),
+            "wallpaper_reveal" => sync(&self.reveal_items, wallpaper::REVEAL_FX, value),
+            // 画质六参数的勾选不在这里跟：档位是按整组值反推的，
+            // 见 notify_setting_changed 的 apply_quality_preset 调用
             _ => {}
+        }
+    }
+
+    /// 画质档位勾选（低/中/高/自定义单选）。`preset` 为 QUALITY_ITEMS 的 id。
+    fn apply_quality_preset(&self, preset: &str) {
+        for (item, (id, _)) in self.quality_items.iter().zip(QUALITY_ITEMS) {
+            let _ = item.set_checked(*id == preset);
         }
     }
 }
 
 /// 共享设置（托盘快速设置 ↔ 设置页 ↔ MCP）写入后的统一通知：托盘勾选就地同步 +
 /// 广播 `settings-changed`，让各窗口的控件（设置页下拉/开关、轮播条暂停钮）跟上。
-/// 值以持久化后的字符串为准，调用方须在 DB 锁外调用（内部不拿锁）。
+/// 值以持久化后的字符串为准。**调用方须在 DB 锁外调用**（内部会拿锁反查画质参数
+/// 反推档位勾选，Mutex 不可重入）。
 pub(crate) fn notify_setting_changed(app: &AppHandle, key: &str, value: &str) {
+    const QUALITY_KEYS: [&str; 6] = [
+        "wallpaper_render_dpr",
+        "wallpaper_scene_fps",
+        "wallpaper_particles",
+        "wallpaper_post",
+        "wallpaper_resources",
+        "wallpaper_resources_normal",
+    ];
     if let Some(state) = app.try_state::<NativeMenuState>() {
         if let Some(tray) = &state.tray {
             tray.apply_setting(key, value);
+            // 画质档位是按六个参数整组反推的：任一参数变了都重算一次勾选
+            if QUALITY_KEYS.contains(&key) {
+                if let Some(db) = app.try_state::<Arc<Mutex<Connection>>>() {
+                    if let Ok(conn) = db.lock() {
+                        tray.apply_quality_preset(wallpaper::derive_quality_preset_id(&conn));
+                    }
+                }
+            }
         }
     }
     let _ = app.emit(
@@ -637,8 +597,6 @@ pub(crate) fn update_tray_rotation(app: &AppHandle) {
 pub struct NativeMenuState {
     /// 托盘不可用的环境（Linux 无 AppIndicator 等）为 None，见 build_tray 的降级说明
     tray: Option<TrayMenu>,
-    #[cfg(target_os = "macos")]
-    minimize_main: Option<MenuItem<tauri::Wry>>,
 }
 
 /// 语言变了：把**原生绘制**的文案重写一遍（托盘菜单、macOS 应用菜单、独立窗口标题）。
@@ -650,13 +608,9 @@ pub(crate) fn retranslate_native_ui(app: &AppHandle) {
                 tracing::warn!("retranslate tray failed: {e}");
             }
         }
-        #[cfg(target_os = "macos")]
-        {
-            if let Some(item) = &state.minimize_main {
-                let _ = item.set_text(i18n::tr("最小化主窗口"));
-            }
-        }
     }
+    // macOS 应用菜单里的快捷键项（⌘M/⌘H 等）跟着语言重写
+    hotkeys::retranslate(app);
     // 独立「壁纸设置」窗口的原生标题由 Rust 侧绘制（label 形如 props-<itemId>）
     for (label, win) in app.webview_windows() {
         if label.starts_with("props-") {
@@ -680,9 +634,6 @@ fn build_tray(app: &AppHandle) -> tauri::Result<TrayMenu> {
     let item_props = MenuItem::with_id(app, "item_props", i18n::tr("壁纸设置"), true, None::<&str>)?;
 
     // 全局快速设置：与设置页同一份持久化（settings 表），初始勾选读当前值
-    let cur_fit = tray_read_setting(app, "wallpaper_fit", "cover");
-    let cur_dpr = tray_read_setting(app, "wallpaper_render_dpr", "0");
-    let cur_fps = tray_read_setting(app, "wallpaper_scene_fps", "24");
     let cur_filter = tray_read_setting(app, "wallpaper_filter", wallpaper::DEFAULT_FILTER);
     let cur_auto_pause = tray_read_setting(app, "wallpaper_auto_pause", "false");
     // 自动暂停：切到非桌面应用自动暂停、回桌面自动播放（默认关，见 macos.rs 观察者）
@@ -715,22 +666,18 @@ fn build_tray(app: &AppHandle) -> tauri::Result<TrayMenu> {
             .build(app)
     };
     // 单选语义：CheckMenuItem 自身不做互斥，点击后在事件里手动同步整组勾选
-    // 档位表是常量（FIT_ITEMS 等），构建与语言切换重写共用一份，避免两边走偏
-    let fit_items: Vec<CheckMenuItem<tauri::Wry>> = FIT_ITEMS
+    // 档位表是常量（QUALITY_ITEMS 等），构建与语言切换重写共用一份，避免两边走偏。
+    // 勾选态按六参数反推（与设置页同规则），点低/中/高一键套用整个预设
+    let cur_quality = {
+        let db = app.try_state::<Arc<Mutex<Connection>>>();
+        db.and_then(|db| db.lock().ok().map(|c| wallpaper::derive_quality_preset_id(&c)))
+            .unwrap_or("custom")
+    };
+    let quality_items: Vec<CheckMenuItem<tauri::Wry>> = QUALITY_ITEMS
         .iter()
-        .map(|(id, label)| mk_check(&format!("fit_{id}"), i18n::tr(label), cur_fit == *id))
+        .map(|(id, label)| mk_check(&format!("quality_{id}"), i18n::tr(label), cur_quality == *id))
         .collect::<tauri::Result<Vec<_>>>()?;
-    let dpr_items: Vec<CheckMenuItem<tauri::Wry>> = DPR_ITEMS
-        .iter()
-        .map(|(id, label)| mk_check(&format!("dpr_{id}"), i18n::tr(label), cur_dpr == *id))
-        .collect::<tauri::Result<Vec<_>>>()?;
-    let fps_items: Vec<CheckMenuItem<tauri::Wry>> = FPS_ITEMS
-        .iter()
-        .map(|(id, label)| mk_check(&format!("fps_{id}"), i18n::tr(label), cur_fps == *id))
-        .collect::<tauri::Result<Vec<_>>>()?;
-    let fit_menu = Submenu::with_items(app, i18n::tr("显示模式"), true, &as_refs(&fit_items))?;
-    let dpr_menu = Submenu::with_items(app, i18n::tr("清晰度"), true, &as_refs(&dpr_items))?;
-    let fps_menu = Submenu::with_items(app, i18n::tr("帧率上限"), true, &as_refs(&fps_items))?;
+    let quality_menu = Submenu::with_items(app, i18n::tr("画质档位"), true, &as_refs(&quality_items))?;
     // 全局滤镜：id 白名单与渲染器的 CSS filter 表一一对应（见
     // wallpaper::WALLPAPER_FILTERS），这里只摆开关，表达式不经过原生侧。
     // 作用范围是桌面壁纸窗口，壁纸预览（主窗口里的 iframe）不受影响。
@@ -739,6 +686,14 @@ fn build_tray(app: &AppHandle) -> tauri::Result<TrayMenu> {
         .map(|(id, label)| mk_check(&format!("filter_{id}"), i18n::tr(label), cur_filter == *id))
         .collect::<tauri::Result<Vec<_>>>()?;
     let filter_menu = Submenu::with_items(app, i18n::tr("滤镜效果"), true, &as_refs(&filter_items))?;
+    // 无缝切换的过渡效果：同 filter 一套模式（白名单 id 只在渲染器里落成动画）。
+    // 改动不热更活窗口 —— 下一次换壁纸时新窗按新效果显形
+    let cur_reveal = tray_read_setting(app, "wallpaper_reveal", wallpaper::DEFAULT_REVEAL);
+    let reveal_items: Vec<tauri::menu::CheckMenuItem<tauri::Wry>> = wallpaper::REVEAL_FX
+        .iter()
+        .map(|(id, label)| mk_check(&format!("reveal_{id}"), i18n::tr(label), cur_reveal == *id))
+        .collect::<tauri::Result<Vec<_>>>()?;
+    let reveal_menu = Submenu::with_items(app, i18n::tr("切换效果"), true, &as_refs(&reveal_items))?;
 
     let sep1 = PredefinedMenuItem::separator(app)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
@@ -751,10 +706,9 @@ fn build_tray(app: &AppHandle) -> tauri::Result<TrayMenu> {
             &auto_pause_item,
             &rot_menu,
             &sep1,
-            &fit_menu,
-            &dpr_menu,
-            &fps_menu,
+            &quality_menu,
             &filter_menu,
+            &reveal_menu,
             &sep2,
             &quit,
         ],
@@ -770,14 +724,12 @@ fn build_tray(app: &AppHandle) -> tauri::Result<TrayMenu> {
         rot_prev: rot_prev.clone(),
         rot_next: rot_next.clone(),
         rot_pause: rot_pause.clone(),
-        fit_menu: fit_menu.clone(),
-        fit_items: fit_items.clone(),
-        dpr_menu: dpr_menu.clone(),
-        dpr_items: dpr_items.clone(),
-        fps_menu: fps_menu.clone(),
-        fps_items: fps_items.clone(),
+        quality_menu: quality_menu.clone(),
+        quality_items: quality_items.clone(),
         filter_menu: filter_menu.clone(),
+        reveal_menu: reveal_menu.clone(),
         filter_items: filter_items.clone(),
+        reveal_items: reveal_items.clone(),
         quit: quit.clone(),
     };
 
@@ -847,15 +799,12 @@ fn build_tray(app: &AppHandle) -> tauri::Result<TrayMenu> {
                         "wallpaper_auto_pause",
                         if next { "true" } else { "false" },
                     );
-                    // 关闭时若正挂在自动暂停上，立即恢复播放（标志一清，
-                    // 回桌面也不会再代劳恢复了）
+                    // 关闭时若正挂在自动暂停上，立即恢复播放（集合一清，
+                    // 露出/回桌面也不会再代劳恢复了）
                     if !next {
                         if let Some(st) = app.try_state::<wallpaper::WallpaperEngineState>() {
-                            let was_auto = {
-                                let mut g = st.auto_paused.lock().unwrap();
-                                std::mem::replace(&mut *g, false)
-                            };
-                            if was_auto {
+                            let any_auto = !st.auto_paused.lock().unwrap().is_empty();
+                            if any_auto {
                                 let _ = wallpaper::resume_all(app.clone());
                             }
                         }
@@ -865,20 +814,23 @@ fn build_tray(app: &AppHandle) -> tauri::Result<TrayMenu> {
                 _ => {
                     // 全局快速设置：复用设置页的 command 实现（持久化 + 实时下发 +
                     // notify_setting_changed 统一同步勾选/设置页控件，这里不再手动勾选）
-                    if let Some(fit) = id.strip_prefix("fit_") {
-                        let _ = wallpaper::set_fit(app.clone(), fit.to_string());
-                    } else if let Some(dpr) = id.strip_prefix("dpr_") {
-                        if let Ok(v) = dpr.parse::<f32>() {
-                            let _ = wallpaper::set_render_dpr(app.clone(), v);
-                        }
-                    } else if let Some(fps) = id.strip_prefix("fps_") {
-                        if let Ok(v) = fps.parse::<u32>() {
-                            let _ = wallpaper::set_scene_fps(app.clone(), v);
+                    if let Some(quality) = id.strip_prefix("quality_") {
+                        // 「自定义」是反推状态不是预设：点了不套用任何东西
+                        if quality != "custom" {
+                            if let Err(e) =
+                                wallpaper::set_quality_preset(app.clone(), quality.to_string())
+                            {
+                                tracing::warn!("tray set quality preset failed: {e}");
+                            }
                         }
                     } else if let Some(filter) = id.strip_prefix("filter_") {
                         // 白名单校验在 command 里；这里只负责调用，失败记日志
                         if let Err(e) = wallpaper::set_filter(app.clone(), filter.to_string()) {
                             tracing::warn!("tray set filter failed: {e}");
+                        }
+                    } else if let Some(reveal) = id.strip_prefix("reveal_") {
+                        if let Err(e) = wallpaper::set_reveal(app.clone(), reveal.to_string()) {
+                            tracing::warn!("tray set reveal fx failed: {e}");
                         }
                     }
                 }
@@ -930,23 +882,22 @@ fn tray_read_setting(app: &AppHandle, key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
-/// 全局快捷键：暂停/恢复渲染、下一张（轮播）、暂停/恢复轮播。
-///
-/// macOS 用 ⌘⇧P / ⌘⇧N / ⌘⇧R；Windows / Linux 用 Ctrl+Shift+ 同字母
-/// （"cmd" 修饰键在非 macOS 平台上解析失败，会静默不注册）。
-fn register_shortcuts(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
-    use tauri_plugin_global_shortcut::GlobalShortcutExt;
-    #[cfg(target_os = "macos")]
-    const SHORTCUTS: [&str; 3] = ["cmd+shift+p", "cmd+shift+n", "cmd+shift+r"];
-    #[cfg(not(target_os = "macos"))]
-    const SHORTCUTS: [&str; 3] = ["ctrl+shift+p", "ctrl+shift+n", "ctrl+shift+r"];
-    for s in SHORTCUTS {
-        match app.global_shortcut().register(s) {
-            Ok(_) => tracing::info!("shortcut registered: {s}"),
-            Err(e) => tracing::warn!("shortcut register failed {s}: {e}"),
-        }
+/// 把应用外观钉成深色（macOS）：NSVisualEffectView 的材质亮度跟随外观，系统
+/// 浅色模式下材质发白，深色玻璃 tint 盖不住、白字对比度掉档。setup 主线程调用；
+/// 失败只丢观感（材质退回跟随系统），不影响功能。
+#[cfg(target_os = "macos")]
+fn force_dark_appearance() {
+    use objc2_app_kit::{NSAppearance, NSApplication};
+    unsafe {
+        let Some(dark) = NSAppearance::appearanceNamed(objc2_app_kit::NSAppearanceNameDarkAqua)
+        else {
+            tracing::warn!("NSAppearance darkAqua unavailable; vibrancy follows system");
+            return;
+        };
+        NSApplication::sharedApplication(objc2::MainThreadMarker::new_unchecked())
+            .setAppearance(Some(&dark));
+        tracing::info!("app appearance pinned to darkAqua");
     }
-    Ok(())
 }
 
 /// 主窗口背景材质：macOS 侧栏 vibrancy（window-vibrancy，NSVisualEffectView）；
@@ -978,7 +929,9 @@ pub(crate) fn apply_backdrop(window: &tauri::WebviewWindow) {
         window,
         window_vibrancy::NSVisualEffectMaterial::Sidebar,
         None,
-        Some(16.0),
+        // 与渲染器 CSS 圆角对齐（App.tsx 根容器 rounded-[12px]）：borderless
+        // 窗口没有系统圆角了，材质自己圆 12px，CSS 圆角外的四角才是透明桌面
+        Some(12.0),
     ) {
         Ok(_) => tracing::info!("vibrancy applied to {}", window.label()),
         Err(e) => tracing::warn!("vibrancy apply failed for {}: {e}", window.label()),

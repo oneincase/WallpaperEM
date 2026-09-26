@@ -5,7 +5,9 @@
 //! - `legacy_display_ids` / `refresh_display_meta`：显示器稳定 id 迁移映射与名称缓存刷新
 //! - `set_frame` / `apply_desktop_window`：窗口几何与桌面层级
 //! - `set_movable_by_background`：背景拖动（仅 macOS 有效，其余平台空实现）
-//! - `start_auto_pause_observer`：前台应用切换观察（自动暂停数据源）
+//! - `start_auto_pause_observer`：前台应用切换观察（自动暂停即时提示）
+//! - `occlusion_snapshot` / `frontmost_kind`：桌面可见性快照 + 前台类型
+//!   （自动暂停判定数据源，见 auto_pause.rs）
 //! - `cursor_state`：系统光标位置查询（指针注入数据源）
 //!
 //! 未支持的平台走 fallback：壁纸窗口是普通置底窗口，引擎主体功能仍可用。
@@ -80,6 +82,14 @@ mod fallback {
     pub fn start_auto_pause_observer(_app: &tauri::AppHandle) {}
 
     pub fn start_desktop_click_monitor(_app: &tauri::AppHandle) {}
+
+    pub fn occlusion_snapshot() -> Option<crate::wallpaper::auto_pause::OcclusionSnapshot> {
+        None
+    }
+
+    pub fn frontmost_kind(_app: &tauri::AppHandle) -> crate::wallpaper::auto_pause::FrontKind {
+        crate::wallpaper::auto_pause::FrontKind::Unknown
+    }
 
     pub fn cursor_state() -> Option<(f64, f64, u32)> {
         None

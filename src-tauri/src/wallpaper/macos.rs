@@ -10,7 +10,7 @@
 //!   WKWebView 动态内容不合成到屏幕。
 
 use std::ffi::c_void;
-use tauri::{Manager, Runtime, WebviewWindow};
+use tauri::{Runtime, WebviewWindow};
 
 // 层级说明（WindowServer 实际值）：
 //   WindowServer 桌面画 = -2147483626
@@ -54,6 +54,8 @@ extern "C" {
     fn CGWindowLevelForKey(key: i32) -> i32;
     fn CGDisplayCreateUUIDFromDisplayID(display: u32) -> *mut c_void;
     fn CGDisplayPixelsWide(display: u32) -> usize;
+    fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32) -> *mut c_void;
+    fn CGRectMakeWithDictionaryRepresentation(dict: *mut c_void, rect: *mut CRect) -> bool;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -739,19 +741,18 @@ pub fn set_movable_by_background<R: Runtime>(window: &WebviewWindow<R>, movable:
     }
 }
 
-// ---------- 自动暂停（前台应用切换监听） ----------
+// ---------- 自动暂停（前台应用切换监听 + 桌面可见性快照） ----------
 
 /// 前台应用切换观察者，驱动两件事：
-/// 1. 自动暂停（设置 → 通用 / 托盘菜单，默认关）：切到非桌面应用自动暂停
-///    壁纸，切回桌面（Finder 成为前台）自动恢复。只恢复本功能自己挂的暂停
-///    （auto_paused 标志），用户手动暂停不受前台切换影响；
-///    本应用自身前台化算中性（设置窗口/托盘操作常见，不动播放状态）。
+/// 1. 自动暂停的**即时提示**（设置 → 通用 / 托盘菜单，默认关）：判定表在
+///    [`super::auto_pause`]（判据是桌面可见性，前台只是加速信号），这里把
+///    通知自带的前台类型按 Hint 传过去 —— 切应用立刻暂停/恢复，不等轮询。
 /// 2. 指针注入门控（无开关，纯优化）：只有桌面活动（Finder 前台）时才注入
 ///    光标，前台是别的应用（含本应用自己）时停注入 —— 光标不在桌面层上，
 ///    注入的坐标对壁纸无意义，还每 33ms 白过一次 JS 桥。
 ///
-/// 用 NSWorkspaceDidActivateApplicationNotification 观察者（即时响应），
-/// 不走 2s 轮询 —— 切应用的停顿感对「自动暂停」是可感知的。
+/// 用 NSWorkspaceDidActivateApplicationNotification 观察者（即时响应）；
+/// 最小化/关窗这类**不换前台**的回桌面路径由 auto_pause 的 250ms 对账兜底。
 pub fn start_auto_pause_observer(app: &tauri::AppHandle) {
     use objc2::msg_send;
     use objc2::runtime::{AnyClass, AnyObject};
@@ -837,28 +838,123 @@ fn frontmost_bundle_id() -> Option<String> {
     }
 }
 
-/// 主设置窗/壁纸属性窗是否可见（任一可见即认为用户正在操作本应用设置，
-/// 此时自身前台化保持中性；都不可见说明自身前台化是「点击桌面壁纸」所致）
-fn settings_window_visible(app: &tauri::AppHandle) -> bool {
-    let visible = |label: &str| {
-        app.get_webview_window(label)
-            .and_then(|w| w.is_visible().ok())
-            .unwrap_or(false)
-    };
-    if visible("main") {
-        return true;
+/// 前台应用类型（自动暂停判定表的前台一元）。查询失败返回 Unknown。
+pub fn frontmost_kind(app: &tauri::AppHandle) -> super::auto_pause::FrontKind {
+    use super::auto_pause::FrontKind;
+    let own = app.config().identifier.clone();
+    match frontmost_bundle_id() {
+        Some(b) if b == "com.apple.finder" => FrontKind::Desktop,
+        Some(b) if b == own => FrontKind::SelfApp,
+        Some(_) => FrontKind::Other,
+        None => FrontKind::Unknown,
     }
-    app.webview_windows()
-        .keys()
-        .any(|label| label.starts_with("props-") && visible(label))
 }
 
-/// 「隐藏图标」开启后的桌面点击监视（自动暂停的第二条恢复信号）。
+/// 「盖住壁纸」的窗口快照：自动暂停的可见性判据（消费方见 [`super::auto_pause`]）。
 ///
-/// 为什么需要：自动暂停的恢复挂在「前台应用切换」上（Finder / 本应用被点活），
-/// 但交互态下点桌面点的是本应用的壁纸窗口 —— 无边框窗不能成为 key window，
-/// 点击不一定触发应用激活，前台可能一直停在别的应用上，恢复信号就永远不来
-/// （实测：暂停后点桌面不恢复）。所以补一条不依赖前台切换的直接信号：
+/// 数据源 `CGWindowListCopyWindowInfo(OnScreenOnly | ExcludeDesktopElements)`：
+/// 只含当前 Space 上的可见窗口，桌面元素（壁纸/图标窗）已排除。再过滤：
+/// - 层 0（普通应用窗口）与屏保层（kCGScreenSaverWindowLevelKey≈1000 附近）
+///   才算「盖壁纸」；其余非 0 层是程序坞/菜单栏/光标层等系统 UI —— 不计入，
+///   否则「桌面干净」永远不成立（光标层 28x28 常驻窗实测会把判据判死）；
+/// - 本应用自己的窗口（设置窗等）不算：我们是壁纸系统自身；
+/// - alpha≈0、零面积、不与任何屏幕相交的忽略（F11 把窗口移出屏幕边缘后
+///   窗口还在、但不算遮挡，判据要回落到「桌面干净」）。
+///
+/// `coverages` 用网格采样估算每块屏被盖住的比例（[`super::auto_pause::covered_ratio`]）。
+/// 坐标系：CGWindowList 的 bounds 与 CGDisplayBounds 同为 CG 全局（左上原点），可直接比较。
+pub fn occlusion_snapshot() -> Option<super::auto_pause::OcclusionSnapshot> {
+    use super::auto_pause::{covered_ratio, OcclusionSnapshot};
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::NSString;
+
+    // kCGWindowListOptionOnScreenOnly(1) | kCGWindowListExcludeDesktopElements(16)
+    const LIST_FLAGS: u32 = 1 | 16;
+    let own_pid = std::process::id() as i32;
+    let mut rects: Vec<(f64, f64, f64, f64)> = Vec::new();
+    unsafe {
+        let info = CGWindowListCopyWindowInfo(LIST_FLAGS, 0);
+        if info.is_null() {
+            return None;
+        }
+        let arr = info.cast::<AnyObject>();
+        let key_pid = NSString::from_str("kCGWindowOwnerPID");
+        let key_layer = NSString::from_str("kCGWindowLayer");
+        let key_alpha = NSString::from_str("kCGWindowAlpha");
+        let key_bounds = NSString::from_str("kCGWindowBounds");
+        let n: usize = msg_send![arr, count];
+        for i in 0..n {
+            let w: *mut AnyObject = msg_send![arr, objectAtIndex: i];
+            if w.is_null() {
+                continue;
+            }
+            // objc 消息发给 nil 返回 0：缺字段按「层 0 / 不透明」处理前先显式取值
+            let pid_v: *mut AnyObject = msg_send![w, objectForKey: &*key_pid];
+            let pid: i32 = msg_send![pid_v, intValue];
+            if pid == own_pid {
+                continue;
+            }
+            let layer_v: *mut AnyObject = msg_send![w, objectForKey: &*key_layer];
+            let layer: i32 = msg_send![layer_v, intValue];
+            // 只认两种层：0（普通应用窗口）与屏保层（kCGScreenSaverWindowLevelKey=13
+            // 附近，全屏盖住壁纸时该停）。其余非 0 层都是系统 UI —— 程序坞(20)/
+            // 菜单栏(24)/光标层(2147483630)等一律不算：实测光标层的 28x28 常驻窗
+            // 会把「桌面干净」判死（恢复永不触发），是本过滤的重点。
+            let saver_level: i32 = CGWindowLevelForKey(13);
+            let covering_layer = layer == 0 || (saver_level..=saver_level + 32).contains(&layer);
+            if !covering_layer {
+                continue;
+            }
+            let alpha_v: *mut AnyObject = msg_send![w, objectForKey: &*key_alpha];
+            let alpha: f64 = msg_send![alpha_v, doubleValue];
+            if alpha <= 0.05 {
+                continue;
+            }
+            let bounds_v: *mut AnyObject = msg_send![w, objectForKey: &*key_bounds];
+            if bounds_v.is_null() {
+                continue;
+            }
+            let mut r = CRect {
+                origin: CPoint { x: 0.0, y: 0.0 },
+                size: CSize {
+                    width: 0.0,
+                    height: 0.0,
+                },
+            };
+            let ok: bool =
+                CGRectMakeWithDictionaryRepresentation(bounds_v.cast::<c_void>(), &mut r);
+            if !ok || r.size.width <= 0.0 || r.size.height <= 0.0 {
+                continue;
+            }
+            rects.push((
+                r.origin.x,
+                r.origin.y,
+                r.origin.x + r.size.width,
+                r.origin.y + r.size.height,
+            ));
+        }
+        CFRelease(info);
+    }
+    let screens = active_screens();
+    rects.retain(|(x1, y1, x2, y2)| {
+        screens
+            .iter()
+            .any(|s| *x1 < s.x + s.w && *x2 > s.x && *y1 < s.y + s.h && *y2 > s.y)
+    });
+    let coverages = screens
+        .iter()
+        .map(|s| (s.id, covered_ratio(&rects, (s.x, s.y, s.w, s.h))))
+        .collect();
+    Some(OcclusionSnapshot { coverages })
+}
+
+/// 「隐藏图标」开启后的桌面点击监视（自动暂停的即时恢复信号之一）。
+///
+/// 交互态下点桌面点的是本应用的壁纸窗口 —— 无边框窗不能成为 key window，
+/// 点击不一定触发应用激活，前台可能一直停在别的应用上（通知不发、恢复不走
+/// Hint 路径）。虽然可见性对账 250ms 内也会兜住，但「用户刚点了桌面」是最
+/// 强的恢复意图，这里直接恢复不等对账：
 /// 本应用收到的、落在桌面级窗口（level < 0，即壁纸窗口）上的鼠标按下 =
 /// 用户在操作桌面 → 恢复「自动暂停」挂起的播放（用户手动暂停不动）。
 ///
@@ -880,17 +976,10 @@ pub fn start_desktop_click_monitor(app: &tauri::AppHandle) {
             }
             let level: isize = msg_send![&*win, level];
             if level < 0 {
-                // 桌面级（壁纸）窗口上的点击 = 用户在操作桌面：恢复自动暂停
-                if let Some(st) = app2.try_state::<super::WallpaperEngineState>() {
-                    let was_auto = {
-                        let mut g = st.auto_paused.lock().unwrap();
-                        std::mem::replace(&mut *g, false)
-                    };
-                    if was_auto {
-                        let _ = super::resume_all(app2.clone());
-                        tracing::info!("auto-pause: 桌面壁纸被点击，壁纸已恢复播放");
-                    }
-                }
+                // 桌面级（壁纸）窗口上的点击 = 用户在操作桌面：恢复自动暂停。
+                // 只恢复「当前看得见」的屏 —— 被全屏盖住的屏保持暂停（按屏独立）。
+                // 用户手动暂停不动（resume_visible 只动 auto_paused 集合内的）
+                super::auto_pause::resume_visible(&app2);
             }
             event
         }
@@ -916,58 +1005,30 @@ pub fn start_desktop_click_monitor(app: &tauri::AppHandle) {
     tracing::info!("desktop click monitor registered（交互态点桌面恢复自动暂停）");
 }
 
-/// 前台应用变化：非桌面 → 自动暂停；桌面（Finder）→ 恢复本功能挂的暂停
+/// 前台应用变化：只做两件事 —— 指针注入门控 + 把前台类型当即时提示（Hint）
+/// 交给共享判定表（[`super::auto_pause`]）。
+///
+/// 暂停/恢复的**判据**是桌面可见性（窗口清单），前台只是加速信号：
+/// 最小化/关闭窗口后前台仍停在原应用上，恢复由判定表的轮询兜底接管
+/// （旧实现只认前台切换，回桌面必须点一下才恢复 —— 已废除该耦合）。
 fn on_frontmost_changed(app: &tauri::AppHandle, bundle_id: &str, own_bundle: &str) {
+    use super::auto_pause::{recheck_with, settings_window_visible, FrontKind, Mode};
     tracing::debug!("frontmost changed: {bundle_id}");
-    // 「隐藏图标」开启后，点桌面实际点在本应用的壁纸窗口上（它在图标之上且
-    // 接收鼠标）→ 前台应用变成我们自己，而不是 Finder。这并非「离开桌面」，
-    // 恰恰是「在桌面上点壁纸」：主设置窗/属性窗不可见时按桌面语义处理
-    // （恢复自动暂停 + 桌面活动）；任一设置窗可见才是真的在操作本应用
-    // （保持旧的中性语义，不动播放状态）。
-    let self_click_desktop = bundle_id == own_bundle && !settings_window_visible(app);
-    let is_desktop = bundle_id == "com.apple.finder" || self_click_desktop;
-    // 指针注入门控：桌面活动（Finder 前台 / 壁纸窗口被点）才注入。这句要放在
-    // own_bundle 早退之前 —— 与自动暂停的「自身前台化中性」语义不同。
-    super::pointer::set_desktop_active(is_desktop);
-    // 自己前台化且在操作设置窗：中性，不动播放状态
-    if bundle_id == own_bundle && !self_click_desktop {
-        return;
-    }
-    let Some(st) = app.try_state::<super::WallpaperEngineState>() else {
-        return;
+    let kind = if bundle_id == own_bundle {
+        FrontKind::SelfApp
+    } else if bundle_id == "com.apple.finder" {
+        FrontKind::Desktop
+    } else {
+        FrontKind::Other
     };
-    if is_desktop {
-        // 回到桌面：只恢复「自动暂停」挂的，用户手动暂停不动
-        let was_auto = {
-            let mut g = st.auto_paused.lock().unwrap();
-            std::mem::replace(&mut *g, false)
-        };
-        if was_auto {
-            let _ = super::resume_all(app.clone());
-            tracing::info!("auto-pause: 回到桌面（前台={bundle_id}），壁纸已恢复播放");
-        }
-        return;
-    }
-    // 切到非桌面：开关开且当前未暂停才自动暂停（已暂停的不覆盖标志，
-    // 避免把用户的手动暂停误标成自动的、回桌面时被代劳恢复）
-    if !auto_pause_enabled(app) || *st.paused.lock().unwrap() {
-        return;
-    }
-    if super::auto_pause_enter(app).is_ok() {
-        *st.auto_paused.lock().unwrap() = true;
-        tracing::info!("auto-pause: 切到 {bundle_id}，壁纸已自动暂停");
-    }
-}
-
-/// 设置开关：wallpaper_auto_pause，默认关。每次前台切换时直读 DB（切换是
-/// 低频事件，SQLite 读取亚毫秒；直读免去与设置页/托盘两侧的缓存同步）
-fn auto_pause_enabled(app: &tauri::AppHandle) -> bool {
-    app.try_state::<std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>>()
-        .and_then(|db| {
-            db.lock()
-                .ok()
-                .and_then(|c| crate::db::get_setting(&c, "wallpaper_auto_pause"))
-        })
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false)
+    // 指针注入门控：桌面活动（Finder 前台 / 壁纸窗口被点）才注入 —— 光标不在
+    // 桌面层上时注入的坐标对壁纸无意义。「本应用前台且设置窗不可见」= 交互态
+    // 点了壁纸窗口，按桌面语义；设置窗在场 = 在操作本应用，不注入。
+    let is_desktop = match kind {
+        FrontKind::Desktop => true,
+        FrontKind::SelfApp => !settings_window_visible(app),
+        _ => false,
+    };
+    super::pointer::set_desktop_active(is_desktop);
+    recheck_with(app, Mode::Hint, kind);
 }

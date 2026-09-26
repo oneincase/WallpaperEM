@@ -209,13 +209,13 @@ export function DownloadsPage() {
                   )}
                 </div>
                 <div className="w-40">
-                  <div className="h-1.5 rounded-full bg-black/10 dark:bg-white/10 overflow-hidden">
+                  <div className="h-1.5 rounded-full bg-white/10 overflow-hidden">
                     {/* progress < 0：后端（steamcmd）不输出进度且拿不到总大小，显示不确定态 */}
                     {t.status !== "done" && t.progress < 0 ? (
-                      <div className="h-full w-1/3 rounded-full bg-[var(--accent-strong)] animate-indeterminate" />
+                      <div className="h-full w-1/3 rounded-full bg-[var(--accent-fill)] animate-indeterminate" />
                     ) : (
                       <div
-                        className="h-full bg-[var(--accent-strong)] transition-all"
+                        className="h-full bg-[var(--accent-fill)] transition-all"
                         style={{ width: `${t.status === "done" ? 100 : Math.max(0, t.progress)}%` }}
                       />
                     )}

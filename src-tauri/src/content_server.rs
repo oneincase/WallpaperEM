@@ -900,7 +900,19 @@ async fn now_playing_sse(
 /// 与库 buildSeedScript 产出的形式一致。位置选 <head> 开标签之后，
 /// 保证先于壁纸自身脚本执行。
 fn inject_we_shim(state: &ContentServerState, item_id: &str, html: Vec<u8>) -> Vec<u8> {
-    let boot = crate::we_props::boot_json(&state.db, &state.wallpapers_dir, item_id);
+    inject_we_shim_core(&state.db, &state.wallpapers_dir, item_id, html)
+}
+
+/// shim 注入核心：给条目 HTML 注入 shim 源 + 属性/fps/目录文件清单种子数据。
+/// 内容服务器的 /web/ 路由与分享的 media 路由（mcp::shares）共用 —— 同源入口下
+/// 库期望宿主已在 HTML 里注入 shim，谁服务 HTML 谁负责注入。
+pub(crate) fn inject_we_shim_core(
+    db: &Arc<Mutex<Connection>>,
+    wallpapers_dir: &Path,
+    item_id: &str,
+    html: Vec<u8>,
+) -> Vec<u8> {
+    let boot = crate::we_props::boot_json(db, wallpapers_dir, item_id);
     let fps = boot.get("fps").and_then(|v| v.as_i64()).unwrap_or(60);
     let props = boot
         .get("props")
@@ -920,8 +932,8 @@ fn inject_we_shim(state: &ContentServerState, item_id: &str, html: Vec<u8>) -> V
     // 目录属性的文件清单：库的 shim 从父页预推的清单里挑随机文件
     // （官方 CEF 直接读文件系统，浏览器里做不到）。不推的话
     // wallpaperRequestRandomFileForProperty 恒回空串，幻灯片壁纸的图片永远不换。
-    let dir_files = match state.db.lock() {
-        Ok(conn) => crate::we_props::directory_files(&conn, &state.wallpapers_dir, item_id),
+    let dir_files = match db.lock() {
+        Ok(conn) => crate::we_props::directory_files(&conn, wallpapers_dir, item_id),
         Err(_) => Default::default(),
     };
     for (prop, files) in &dir_files {

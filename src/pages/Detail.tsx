@@ -6,7 +6,8 @@ import { useWallpaperMeta } from "../hooks/useWallpaperMeta";
 import { useApplyWallpaper } from "../hooks/useApplyWallpaper";
 import { useItemProps } from "../hooks/useItemProps";
 import { WallpaperPropsModal } from "../components/WallpaperPropsModal";
-import { IconSliders } from "../components/icons";
+import { ShareModal } from "../components/ShareModal";
+import { IconSliders, IconShare } from "../components/icons";
 import { useMessage } from "../components/Message";
 import { tr, trMsg } from "../lib/i18n";
 import { tagLabel } from "../lib/tags";
@@ -21,6 +22,7 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
   const [faved, setFaved] = useState(false);
   const [applying, setApplying] = useState(false);
   const [showProps, setShowProps] = useState(false);
+  const [showShare, setShowShare] = useState(false);
   const { appliedItems, downloadedItems, refreshApplied } = useWallpaperMeta();
   const { apply: applyWithTarget, menuNode: applyMenu } = useApplyWallpaper();
   // 作者名片（Steam 资料页解析）；解析失败回退显示裸 SteamID64
@@ -66,7 +68,7 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
           onClick={onBack}
           title={tr("关闭")}
           aria-label={tr("关闭详情")}
-          className="ml-auto flex h-6 w-6 items-center justify-center rounded-[6px] text-[var(--text-2)] transition-colors hover:bg-black/5 hover:text-[var(--text-1)] dark:hover:bg-white/8"
+          className="ml-auto flex h-6 w-6 items-center justify-center rounded-[6px] text-[var(--text-2)] transition-colors hover:bg-white/8 hover:text-[var(--text-1)]"
         >
           <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
             <path d="M2 2l8 8M10 2l-8 8" />
@@ -139,7 +141,7 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
             <div className="mt-4 flex gap-2 items-center flex-wrap">
               {downloaded ? (
                 <button
-                  className="btn !bg-sky-500/15 !text-sky-600 dark:!text-sky-400 !border-sky-500/30 cursor-default disabled:opacity-75"
+                  className="btn !bg-sky-500/15 !text-sky-400 !border-sky-500/30 cursor-default disabled:opacity-75"
                   disabled
                   title={tr("已下载到本地库")}
                 >
@@ -166,7 +168,7 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
               )}
               {applied ? (
                 <button
-                  className="btn !bg-green-500/15 !text-green-600 dark:!text-green-400 !border-green-500/30 hover:opacity-80"
+                  className="btn !bg-green-500/15 !text-green-400 !border-green-500/30 hover:opacity-80"
                   title={tr("已应用到桌面（可点击重新应用或指定屏）")}
                   onClick={async (e) => {
                     setApplying(true);
@@ -211,6 +213,16 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
                   )}
                 </button>
               )}
+              {downloaded && item && (
+                <button
+                  className="btn"
+                  onClick={() => setShowShare(true)}
+                  title={tr("生成浏览器可打开的分享链接")}
+                >
+                  <IconShare size={14} />
+                  {tr("分享")}
+                </button>
+              )}
               <button
                 className={`btn ${faved ? "btn-danger" : ""}`}
                 onClick={async () => {
@@ -246,6 +258,16 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
           itemId={item.id}
           title={item.title}
           onClose={() => setShowProps(false)}
+        />
+      )}
+
+      {/* 分享弹窗（落地页/直链/iframe + 二维码） */}
+      {showShare && item && (
+        <ShareModal
+          itemId={item.id}
+          title={item.title}
+          wtype={item.type}
+          onClose={() => setShowShare(false)}
         />
       )}
 

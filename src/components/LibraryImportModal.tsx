@@ -101,15 +101,15 @@ export function LibraryImportModal({
   };
 
   const btnCls =
-    "flex-1 rounded-lg border border-[var(--separator)] px-3 py-2 text-left text-[12.5px] font-medium hover:bg-black/5 disabled:opacity-60 dark:hover:bg-white/10";
+    "flex-1 rounded-lg border border-[var(--separator)] px-3 py-2 text-left text-[12.5px] font-medium hover:bg-white/10 disabled:opacity-60";
 
   return (
     <div
-      className="animate-overlay fixed inset-0 z-[60] flex items-center justify-center bg-black/30"
+      className="animate-overlay fixed inset-0 z-[60] flex items-center justify-center bg-black/25"
       onClick={importing ? undefined : onClose}
     >
       <div
-        className="card animate-modal-pop flex max-h-[80vh] w-[560px] flex-col p-5"
+        className="card glass-panel animate-modal-pop flex max-h-[80vh] w-[560px] flex-col p-5"
         onClick={(e) => e.stopPropagation()}
       >
         <h3 className="text-[14.5px] font-semibold">{tr("导入壁纸")}</h3>

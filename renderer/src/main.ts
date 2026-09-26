@@ -45,6 +45,12 @@ type WallpaperConfig = {
   /** 全局滤镜 id（见 WALLPAPER_FILTERS 白名单），未知 id 按无滤镜处理 */
   filter?: string;
   /**
+   * 无缝切换的过渡效果 id（见 REVEAL_FX 白名单）：新窗在旧窗上方**显形**的方式。
+   * 动画时长见 REVEAL_MS 表；宿主按同一份时长 + 裕量等收尾才收旧窗
+   * （wallpaper::reveal_fx_wait_ms，两边同步改）。未知 id / 缺省回落叠化（旧行为）。
+   */
+  reveal?: string;
+  /**
    * 渲染质量档位（库 1.3.23+）：抗锯齿 aa（off/fxaa/msaa2/msaa4）、
    * 粒子 particles（off/low/medium/high）、后处理 postProcessing（同档）。
    * query 键是 aa/pq/pp（与上游 bench 约定）；setWallpaper 下发的 JSON 键与
@@ -158,17 +164,840 @@ const wrap: HTMLDivElement = (() => {
 })();
 
 /**
- * 首帧就绪后显形（0.7s 渐入）。整页生命周期只渐入一次：同一窗口内的热更新
- * （setWallpaper 重挂）不该反复淡入淡出。无缝切换的宿主侧在 ready 后等渐入走完
- * 才收旧窗，视觉上是叠化而不是跳变。
+ * 首帧就绪后显形（0.7s）。整页生命周期只显形一次：同一窗口内的热更新
+ * （setWallpaper 重挂）不该反复淡入淡出。无缝切换的宿主侧在 ready 后等显形
+ * 走完才收旧窗，视觉上是「切换效果」而不是跳变。
  */
 let revealed = false;
 function reveal() {
   if (revealed) return;
   revealed = true;
-  requestAnimationFrame(() => {
-    wrap.style.opacity = "1";
+  shareLoaderHide(); // 分享页：壁纸显形即收加载层（桌面页无此层，空操作）
+  runRevealFx(shareRevealFx()); // 竖屏旋转下强制叠化（transform 冲突，见 shareApplyOrient）
+}
+
+// ---- 无缝切换的过渡效果（新窗在旧窗上方「显形」的方式）----
+//
+// 新窗口透明起步，wrap 的显形动画就是用户看到的切换效果：默认叠化沿用 wrap
+// 自带的 opacity transition；其余效果用 Web Animations API 在 wrap 上跑一次性
+// 关键帧（transform / filter / clip-path），结束后**写回内联终态再 cancel** ——
+// fill 若留在元素上会永久盖住 style.filter（全局滤镜）等内联改动，cancel 让
+// 关键帧彻底放手、由内联样式接管。
+// 时长按效果单独定：叠化是旧有行为保持 0.7s；位移/裁剪/模糊类必须 1s+ 才能
+// 「看清」——动作与淡入同时发生，时长太短就只剩隐约一顿（实测反馈）。宿主
+// 收旧窗的等待见 wallpaper::reveal_fx_wait_ms，与这份表**必须同步改**。
+const REVEAL_MS: Record<string, number> = {
+  fade: 700,
+  zoom: 1300,
+  blur: 1300,
+  depth: 1400,
+  circle: 1200,
+  wipe: 1000,
+  slide: 1200,
+};
+/** 动画缓动：起步平缓、收尾减速 —— 动作铺满全程，而不是挤在前 1/3 就结束 */
+const REVEAL_EASING = "cubic-bezier(0.35, 0.1, 0.25, 1)";
+
+function runRevealFx(fx: string) {
+  const plainFade = () => {
+    requestAnimationFrame(() => {
+      wrap.style.opacity = "1";
+    });
+  };
+  if (fx === "fade") {
+    plainFade(); // 默认叠化：CSS transition 负责，不引入关键帧
+    return;
+  }
+  // blur/景深的 filter 关键帧要带上当前全局滤镜的表达式：WAAPI 对函数列表
+  // 不匹配的 filter（如 blur(44px) → sepia(0.75)）只能离散跳变，两端都凑成
+  // 「blur(N) + 同一段滤镜」才能连续插值；收尾 style.filter 接管也不跳帧
+  const base = WALLPAPER_FILTERS[state.cfg.filter ?? "none"] ?? "";
+  const blurPair = (px: number): [string, string] =>
+    base ? [`blur(${px}px) ${base}`, `blur(0px) ${base}`] : [`blur(${px}px)`, "blur(0px)"];
+  const keyframes: Keyframe[] | null = (() => {
+    switch (fx) {
+      case "zoom": // 推近：从 1.3 倍缩回原位
+        return [
+          { opacity: 0, transform: "scale(1.3)" },
+          { opacity: 1, transform: "scale(1)" },
+        ];
+      case "blur": {
+        // 模糊：重失焦到聚焦（44px 在低透明度下也读得出）
+        const [from, to] = blurPair(44);
+        return [
+          { opacity: 0, filter: from },
+          { opacity: 1, filter: to },
+        ];
+      }
+      case "depth": {
+        // 景深：推近与失焦同时收拢
+        const [from, to] = blurPair(30);
+        return [
+          { opacity: 0, transform: "scale(1.35)", filter: from },
+          { opacity: 1, transform: "scale(1)", filter: to },
+        ];
+      }
+      // 以下两端都写 opacity:1 —— 只动裁剪/位移，被裁掉的区域透出旧壁纸
+      case "circle": // 圆形揭示：光圈从中心展开（85% 保证盖到四角）
+        return [
+          { opacity: 1, clipPath: "circle(0% at 50% 50%)" },
+          { opacity: 1, clipPath: "circle(85% at 50% 50%)" },
+        ];
+      case "wipe": // 横向擦除：左 → 右
+        return [
+          { opacity: 1, clipPath: "inset(0 100% 0 0)" },
+          { opacity: 1, clipPath: "inset(0 0% 0 0)" },
+        ];
+      case "slide": // 滑入：整幅从右滑进，未覆盖处透出旧壁纸
+        return [
+          { opacity: 1, transform: "translateX(100%)" },
+          { opacity: 1, transform: "translateX(0%)" },
+        ];
+      default: // 未知 id：回落叠化
+        return null;
+    }
+  })();
+  if (!keyframes) {
+    plainFade();
+    return;
+  }
+  const anim = wrap.animate(keyframes, {
+    duration: REVEAL_MS[fx] ?? REVEAL_MS.fade,
+    easing: REVEAL_EASING,
+    fill: "both",
   });
+  // 先写回内联终态再 cancel：放手瞬间画面不变。finished 因 cancel reject 时
+  // 同样要走收尾，两路都指向 done
+  const done = () => {
+    wrap.style.opacity = "1";
+    // 恢复的是常驻旋转（竖屏分享模式）而非清空 —— 清空会丢失方向
+    wrap.style.transform = shareWrapTransform();
+    wrap.style.clipPath = "";
+    try {
+      anim.cancel();
+    } catch {
+      /* 已收尾的动画不可再 cancel，防御一层 */
+    }
+  };
+  anim.finished.then(done, done);
+}
+
+// ---- 分享页加载指示（仅 share 域挂载显示；桌面壁纸窗口不受影响）----
+//
+// 分享渲染页要拉的是几十 MB 级资源（scene.pkg / 视频），裸等就是一块黑屏。
+// 加载层提供：中央彩色音符条（SVG 均衡器动画）+ 实时进度条。进度是**真**的：
+// - video / gif / image：渲染器自己流式预取主文件（逐块计字节）后转 blob URL
+//   直接喂库 —— 进度全程真实，不双倍下载；
+// - scene：同样流式预取 scene.pkg，但产物交给浏览器 HTTP 缓存（分享路由带
+//   Cache-Control），库随后的同 URL 请求秒回缓存；
+// - web：多小文件没有单一总量，进度按「已见资源字节」爬行、封顶 90%，如实不造假。
+//
+// 注意这段代码跑在**所有**壁纸页里，必须保持零副作用：非 share 域不会创建任何
+// 节点、不发起任何预取。
+
+function isShareMount(cfg: WallpaperConfig): boolean {
+  return (cfg.mediaBase ?? "").startsWith("/share/");
+}
+
+type ShareLoaderState = {
+  root: HTMLDivElement;
+  fill: HTMLDivElement;
+  pct: HTMLSpanElement;
+  stage: HTMLDivElement;
+  /** 爬行进度（无总量时的乐观推进），封顶 0.9 */
+  crawl: number;
+  /** 预取实测进度（0..1） */
+  real: number;
+  timer: number;
+  hidden: boolean;
+};
+
+let shareLoader: ShareLoaderState | null = null;
+
+function shareLoaderShow(): void {
+  if (shareLoader) return;
+  const root = document.createElement("div");
+  root.id = "share-loader";
+  root.style.cssText =
+    "position:fixed;inset:0;z-index:9;display:grid;place-items:center;" +
+    "background:radial-gradient(120% 120% at 50% 38%, #10141f 0%, #06080d 72%);" +
+    "transition:opacity .45s ease;";
+  root.innerHTML = `
+  <style>
+    #share-loader .eqb { transform-box: fill-box; transform-origin: center bottom;
+      animation: eqwave .9s ease-in-out infinite alternate; }
+    #share-loader .e2 { animation-delay: .12s } #share-loader .e3 { animation-delay: .24s }
+    #share-loader .e4 { animation-delay: .36s } #share-loader .e5 { animation-delay: .48s }
+    @keyframes eqwave { from { transform: scaleY(.2) } to { transform: scaleY(1) } }
+    #share-loader .eqn { animation: eqfloat 1.8s ease-in-out infinite; }
+    #share-loader .n2 { animation-delay: .55s }
+    @keyframes eqfloat { 0%, 100% { transform: translateY(0); opacity: .45 }
+      50% { transform: translateY(-7px); opacity: 1 } }
+  </style>
+  <div style="display:flex;flex-direction:column;align-items:center;gap:18px;user-select:none">
+    <svg width="132" height="72" viewBox="0 0 132 72" fill="none" aria-hidden="true">
+      <defs>
+        <linearGradient id="eqg1" x1="0" y1="1" x2="0" y2="0"><stop offset="0" stop-color="#22d3ee"/><stop offset="1" stop-color="#38bdf8"/></linearGradient>
+        <linearGradient id="eqg2" x1="0" y1="1" x2="0" y2="0"><stop offset="0" stop-color="#34d399"/><stop offset="1" stop-color="#a3e635"/></linearGradient>
+        <linearGradient id="eqg3" x1="0" y1="1" x2="0" y2="0"><stop offset="0" stop-color="#818cf8"/><stop offset="1" stop-color="#a78bfa"/></linearGradient>
+        <linearGradient id="eqg4" x1="0" y1="1" x2="0" y2="0"><stop offset="0" stop-color="#fb7185"/><stop offset="1" stop-color="#f472b6"/></linearGradient>
+        <linearGradient id="eqg5" x1="0" y1="1" x2="0" y2="0"><stop offset="0" stop-color="#fbbf24"/><stop offset="1" stop-color="#fb923c"/></linearGradient>
+      </defs>
+      <rect class="eqb"    x="14" y="8" width="12" height="56" rx="6" fill="url(#eqg1)"/>
+      <rect class="eqb e2" x="33" y="8" width="12" height="56" rx="6" fill="url(#eqg2)"/>
+      <rect class="eqb e3" x="52" y="8" width="12" height="56" rx="6" fill="url(#eqg3)"/>
+      <rect class="eqb e4" x="71" y="8" width="12" height="56" rx="6" fill="url(#eqg4)"/>
+      <rect class="eqb e5" x="90" y="8" width="12" height="56" rx="6" fill="url(#eqg5)"/>
+      <text class="eqn n1" x="16" y="16" fill="#7dd3fc" font-size="14">♪</text>
+      <text class="eqn n2" x="100" y="20" fill="#f9a8d4" font-size="16">♫</text>
+    </svg>
+    <div style="display:flex;align-items:center;gap:10px">
+      <div style="width:220px;height:6px;border-radius:999px;background:rgba(255,255,255,.12);overflow:hidden">
+        <div id="share-load-fill" style="height:100%;width:3%;border-radius:999px;background:linear-gradient(90deg,#22d3ee,#a78bfa,#f472b6);transition:width .18s ease"></div>
+      </div>
+      <span id="share-load-pct" style="font:600 12px ui-monospace,SFMono-Regular,Menlo,monospace;color:#cbd5e1;min-width:36px">3%</span>
+    </div>
+    <div id="share-load-stage" style="font:12.5px ui-sans-serif,system-ui,sans-serif;color:#8b949e">加载资源 · Downloading</div>
+  </div>`;
+  document.body.appendChild(root);
+  shareLoader = {
+    root,
+    fill: root.querySelector("#share-load-fill") as HTMLDivElement,
+    pct: root.querySelector("#share-load-pct") as HTMLSpanElement,
+    stage: root.querySelector("#share-load-stage") as HTMLDivElement,
+    crawl: 0.03,
+    real: 0,
+    timer: 0,
+    hidden: false,
+  };
+  // 爬行器：无总量（web 类型 / 总长未知）时按渐近曲线推进，封顶 90%
+  shareLoader.timer = window.setInterval(() => {
+    if (!shareLoader || shareLoader.hidden) return;
+    shareLoader.crawl = Math.min(0.9, shareLoader.crawl + (0.9 - shareLoader.crawl) * 0.035);
+    shareLoaderRender();
+  }, 130);
+}
+
+/** 更新进度。frac=null 表示该阶段无总量（交给爬行器）；stage 换文案。 */
+function shareLoaderSet(frac: number | null, stage?: string): void {
+  if (!shareLoader || shareLoader.hidden) return;
+  if (frac != null && Number.isFinite(frac)) {
+    shareLoader.real = Math.max(shareLoader.real, Math.min(1, frac));
+  }
+  if (stage) shareLoader.stage.textContent = stage;
+  shareLoaderRender();
+}
+
+function shareLoaderRender(): void {
+  if (!shareLoader || shareLoader.hidden) return;
+  const display = Math.max(shareLoader.crawl, shareLoader.real);
+  const pct = Math.round(display * 100);
+  shareLoader.fill.style.width = `${Math.max(3, pct)}%`;
+  shareLoader.pct.textContent = `${pct}%`;
+}
+
+function shareLoaderHide(): void {
+  if (!shareLoader || shareLoader.hidden) return;
+  shareLoader.hidden = true;
+  window.clearInterval(shareLoader.timer);
+  shareLoader.fill.style.width = "100%";
+  shareLoader.pct.textContent = "100%";
+  shareLoader.stage.textContent = "完成 · Ready";
+  const root = shareLoader.root;
+  window.setTimeout(() => root.remove(), 480);
+}
+
+/** 主资源流式预取：逐块回调进度；keep=true 时聚成 Blob（媒体类喂库用）。 */
+async function streamShareResource(
+  url: string,
+  keep: boolean,
+  onProgress: (loaded: number, total: number) => void,
+): Promise<Blob | null> {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const total = Number(res.headers.get("content-length")) || 0;
+  const reader = res.body?.getReader();
+  if (!reader) return null; // 无流环境：放弃预取，库自己拉
+  const type = res.headers.get("content-type") ?? "application/octet-stream";
+  const chunks: Uint8Array[] = [];
+  let loaded = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    loaded += value.byteLength;
+    if (keep) chunks.push(value);
+    onProgress(loaded, total);
+  }
+  if (!keep) return null;
+  return new Blob(chunks as BlobPart[], { type });
+}
+
+/** share 域 URL 拼接：除首段（已是路径）外逐段编码（文件名空格/中文）。 */
+function shareUrl(base: string, ...segs: string[]): string {
+  const path = [base.replace(/\/+$/, ""), ...segs.map((s) => s.split("/").map(encodeURIComponent).join("/"))].join("/");
+  return new URL(path, location.href).href;
+}
+
+/**
+ * 分享挂载的前置准备：把主资源先拉下来（带真实进度），媒体类转 blob 直喂，
+ * scene 落 HTTP 缓存供库秒取。失败不阻断挂载（退化为无进度黑屏 → 库自己报错）。
+ */
+async function prepareSharePrimary(cfg: WallpaperConfig): Promise<void> {
+  const base = (cfg.mediaBase ?? "").replace(/\/+$/, "");
+  if (cfg.type === "scene" && cfg.src) {
+    // 与库同一份候选链：声明优先，缺省 scene.pkg / scenes/scene.pkg
+    const candidates = cfg.scenePkg ? [cfg.scenePkg] : [];
+    for (const p of ["scene.pkg", "scenes/scene.pkg"]) {
+      if (!candidates.includes(p)) candidates.push(p);
+    }
+    for (const pkg of candidates) {
+      const url = shareUrl(base, cfg.src, ...pkg.split("/"));
+      try {
+        await streamShareResource(url, false, (loaded, total) => {
+          shareLoaderSet(total ? loaded / total : null, "加载资源 · Downloading");
+        });
+        shareLoaderSet(1, "解析挂载 · Preparing");
+        return;
+      } catch {
+        continue; // 试下一个候选名
+      }
+    }
+    shareLoaderSet(null); // 全部候选失败：交给库自己报错，进度走爬行
+  } else if ((cfg.type === "video" || cfg.type === "gif" || cfg.type === "image") && cfg.src) {
+    const url = new URL(cfg.src, location.href).href;
+    const blob = await streamShareResource(url, true, (loaded, total) => {
+      shareLoaderSet(total ? loaded / total : null, "加载资源 · Downloading");
+    });
+    if (blob) cfg.src = URL.createObjectURL(blob);
+    shareLoaderSet(1, "解析挂载 · Preparing");
+  } else {
+    shareLoaderSet(null); // web 等多文件类型：爬行模式
+  }
+}
+
+/** 分享挂载入口：先显示加载层、预取主资源，再走常规 mount。 */
+async function bootstrapShareMount(cfg: WallpaperConfig): Promise<void> {
+  // 访客页黑底：竖屏/横屏模式的留边（桌面页必须保持透明，见 wrap 注释）
+  document.body.style.background = "#000";
+  shareLoaderShow();
+  try {
+    await prepareSharePrimary(cfg);
+  } catch (e) {
+    reportDiag(cfg, `share preload failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  const orient = shareOrientEffective();
+  shareApplyOrient(orient);
+  window.addEventListener("resize", () => {
+    shareApplyOrient(shareOrientEffective());
+  });
+  sharePetShow(cfg, orient);
+  mount(cfg);
+  shareSubscribeProps(audioToken);
+}
+
+// ---- 分享访客 HUD：横竖屏切换 / 全屏 / 静音（仅 share 域显示）----
+//
+// 横竖屏：三态循环（跟随窗口 → 竖屏 9:16 → 横屏 16:9），实现 = 把 wrap 从
+// 「铺满视口」改成「按画幅 contain 居中」，壁纸内容自身 cover 填框 —— 预览
+// 手机/桌面两种画幅，不裁剪不变形。偏好记 localStorage（访客本地，不回传）；
+// URL ?orient= 优先于记忆（分享者可强制）。
+
+type ShareOrient = "auto" | "portrait" | "landscape";
+const SHARE_ORIENT_KEY = "wpem.share.orient";
+
+function shareOrientEffective(): ShareOrient {
+  const q = new URLSearchParams(location.search).get("orient");
+  if (q === "portrait" || q === "landscape" || q === "auto") return q;
+  const ls = localStorage.getItem(SHARE_ORIENT_KEY);
+  if (ls === "portrait" || ls === "landscape" || ls === "auto") return ls;
+  return "auto";
+}
+
+function shareApplyOrient(o: ShareOrient): void {
+  // 竖屏：内容按「横屏视口」尺寸渲染（壁纸以为自己在横屏），整体 rotate 90°
+  // 落进竖屏 —— 构图完整无裁切，方向跟着画幅切（移动端核心诉求）。
+  // wrap 的 transform 同时被 reveal 动画使用：竖屏下 reveal 强制 fade
+  //（见 shareRevealFx），动画收尾恢复的是这个常驻旋转而不是清空。
+  if (o === "portrait") {
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    wrap.style.left = `${Math.round((vw - vh) / 2)}px`;
+    wrap.style.top = `${Math.round((vh - vw) / 2)}px`;
+    wrap.style.right = "auto";
+    wrap.style.bottom = "auto";
+    wrap.style.width = `${vh}px`;
+    wrap.style.height = `${vw}px`;
+    wrap.style.transform = "rotate(90deg)";
+  } else {
+    wrap.style.left = "0";
+    wrap.style.top = "0";
+    wrap.style.right = "0";
+    wrap.style.bottom = "0";
+    wrap.style.width = "";
+    wrap.style.height = "";
+    wrap.style.transform = "";
+  }
+  // wrap 尺寸/朝向变了要库自己重排画布：借窗口 resize 事件触发它的 re-fit
+  window.dispatchEvent(new Event("resize"));
+}
+
+/** 竖屏模式下 wrap 的常驻旋转量（reveal 动画收尾时恢复用） */
+function shareWrapTransform(): string {
+  return shareOrientEffective() === "portrait" ? "rotate(90deg)" : "";
+}
+
+/** 竖屏下 reveal 不能用 transform 类效果（会跟常驻旋转打架），强制叠化 */
+function shareRevealFx(): string {
+  const fx = state.cfg.reveal ?? "fade";
+  return shareOrientEffective() === "portrait" ? "fade" : fx;
+}
+
+const SHARE_PET_KEY = "wpem.share.pet";
+/** 手机上宠物与按钮都要更大（用户实测：小屏差点看不到） */
+const PET_SIZE = window.innerWidth < 560 ? 78 : 60;
+const HUD_BTN = window.innerWidth < 560 ? 48 : 40;
+
+function petMascotSvg(): string {
+  // 兔子音符伙伴：长耳 + 腮红 + ω 嘴，配色跟加载层一致
+  return `<svg viewBox="0 0 64 64" width="${PET_SIZE}" height="${PET_SIZE}" aria-hidden="true">
+    <defs>
+      <radialGradient id="petg" cx="35%" cy="26%" r="85%">
+        <stop offset="0" stop-color="#8ff0fb"/><stop offset=".55" stop-color="#8b9cf9"/><stop offset="1" stop-color="#5b5bd6"/>
+      </radialGradient>
+    </defs>
+    <g class="pet-bob">
+      <ellipse cx="32" cy="57" rx="14" ry="3.2" fill="rgba(0,0,0,.35)"/>
+      <g class="pet-ear ear-l">
+        <rect x="20" y="2" width="9" height="22" rx="4.5" fill="url(#petg)"/>
+        <rect x="22.4" y="6" width="4.2" height="14" rx="2.1" fill="#f9a8d4" opacity=".85"/>
+      </g>
+      <g class="pet-ear ear-r">
+        <rect x="35" y="2" width="9" height="22" rx="4.5" fill="url(#petg)"/>
+        <rect x="37.4" y="6" width="4.2" height="14" rx="2.1" fill="#f9a8d4" opacity=".85"/>
+      </g>
+      <circle cx="32" cy="42" r="20" fill="url(#petg)"/>
+      <g class="pet-eye">
+        <ellipse cx="24.6" cy="40" rx="3.8" ry="4.8" fill="#0b1020"/>
+        <circle cx="25.9" cy="38.4" r="1.4" fill="#fff"/>
+      </g>
+      <g class="pet-eye">
+        <ellipse cx="39.4" cy="40" rx="3.8" ry="4.8" fill="#0b1020"/>
+        <circle cx="40.7" cy="38.4" r="1.4" fill="#fff"/>
+      </g>
+      <ellipse cx="19.4" cy="46.5" rx="3.6" ry="2.1" fill="#f9a8d4" opacity=".6"/>
+      <ellipse cx="44.6" cy="46.5" rx="3.6" ry="2.1" fill="#f9a8d4" opacity=".6"/>
+      <path d="M29.5 48c1 1.5 2 1.5 3 0M32.5 48c1 1.5 2 1.5 3 0" stroke="#0b1020" stroke-width="1.6" fill="none" stroke-linecap="round"/>
+    </g>
+    <g class="pet-note"><text x="47" y="13" font-size="13" fill="#f9a8d4">♪</text></g>
+  </svg>`;
+}
+
+function hudIcon(paths: string): string {
+  return `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">${paths}</svg>`;
+}
+
+const SHARE_ICONS = {
+  portrait:
+    '<rect x="7" y="3" width="10" height="18" rx="2"/><path d="M11 18.2h2"/>',
+  landscape:
+    '<rect x="3" y="7" width="18" height="10" rx="2"/><path d="M18.2 14v-4"/>',
+  auto: '<path d="M14 4h6v6M10 20H4v-6M20 4l-6.5 6.5M4 20l6.5-6.5"/>',
+  fullscreen:
+    '<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>',
+  fsExit: '<path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/>',
+  soundOn:
+    '<path d="M4 9.5v5h3.5L12 19V5L7.5 9.5H4Z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M18 6a8.5 8.5 0 0 1 0 12"/>',
+  soundOff: '<path d="M4 9.5v5h3.5L12 19V5L7.5 9.5H4Z"/><path d="M16 9.5l5 5M21 9.5l-5 5"/>',
+  props: '<path d="M4 6h10M4 12h16M4 18h7"/><circle cx="17" cy="6" r="2.4"/><circle cx="14" cy="18" r="2.4"/>',
+  reload: '<path d="M20 12a8 8 0 1 1-2.3-5.6"/><path d="M20 3v4h-4"/>',
+};
+
+let shareHud: {
+  pet: HTMLDivElement;
+  menu: HTMLDivElement;
+  orientBtn: HTMLButtonElement;
+  muteBtn: HTMLButtonElement;
+  orient: ShareOrient;
+  muted: boolean;
+  expanded: boolean;
+} | null = null;
+
+/**
+ * 分享访客 HUD：可拖动的边缘吸附小宠物，点击呼出操作列（画幅/全屏/静音/作者属性/重载）。
+ * - 拖动：window 级 pointer 监听（触屏可靠）+ 6px 阈值区分点击；松手吸附较近左右边缘
+ *   并记忆位置；默认右上角。
+ * - 尺寸自适应：小屏（手机）宠物与按钮都放大。
+ * - 「作者属性」打开属性表单（访客本地热更，不回写宿主）。
+ */
+function sharePetShow(cfg: WallpaperConfig, orient: ShareOrient): void {
+  if (shareHud) return;
+  const pet = document.createElement("div");
+  pet.id = "share-pet";
+  const menu = document.createElement("div");
+  menu.id = "share-pet-menu";
+  menu.innerHTML = `
+  <style>
+    #share-pet { position:fixed; z-index:11; width:${PET_SIZE}px; height:${PET_SIZE}px;
+      cursor:grab; touch-action:none; user-select:none; -webkit-user-select:none;
+      filter:drop-shadow(0 5px 12px rgba(0,0,0,.5));
+      transition:left .28s cubic-bezier(.2,.9,.25,1.25), top .28s cubic-bezier(.2,.9,.25,1.25), transform .2s ease; }
+    #share-pet.dragging { transition:none; cursor:grabbing; transform:scale(1.12) rotate(-4deg); }
+    #share-pet.dragging .pet-eye { transform:scaleY(.55); }
+    #share-pet.open { transform:scale(1.06); }
+    #share-pet .pet-eye { transform-box:fill-box; transform-origin:center;
+      animation:petblink 4.2s ease-in-out infinite; }
+    @keyframes petblink { 0%,93%,100% { transform:scaleY(1) } 96% { transform:scaleY(.08) } }
+    #share-pet .pet-bob { animation:petbob 3s ease-in-out infinite; transform-box:fill-box; }
+    @keyframes petbob { 50% { transform:translateY(-3px) } }
+    #share-pet .pet-note { transform-box:fill-box; animation:petnote 2.4s ease-in-out infinite; }
+    @keyframes petnote { 0%,100% { transform:translate(0,0); opacity:.5 } 50% { transform:translate(-3px,-6px); opacity:1 } }
+    #share-pet.open .ear-l { transform-box:fill-box; transform-origin:bottom center; animation:earwig 1s ease-in-out infinite; }
+    #share-pet.open .ear-r { transform-box:fill-box; transform-origin:bottom center; animation:earwig 1s ease-in-out .15s infinite reverse; }
+    @keyframes earwig { 0%,100% { transform:rotate(0) } 50% { transform:rotate(7deg) } }
+    #share-pet-menu { position:fixed; z-index:11; display:flex; flex-direction:column; gap:10px; }
+    #share-pet-menu button { width:${HUD_BTN}px; height:${HUD_BTN}px; border-radius:999px; display:grid; place-items:center;
+      background:rgba(16,20,31,.78); border:1px solid rgba(255,255,255,.14); color:#e6edf3;
+      cursor:pointer; backdrop-filter:blur(6px); transition:background .15s ease, opacity .18s ease, transform .18s ease; }
+    #share-pet-menu button:hover { background:rgba(40,48,66,.9); }
+    #share-pet-menu.collapsed button { opacity:0; pointer-events:none; transform:scale(.6) translateY(6px); }
+  </style>
+  ${petMascotSvg()}
+  <button id="hud-orient" title=""></button>
+  <button id="hud-fs" title="全屏 Fullscreen"></button>
+  <button id="hud-mute" title="声音 Sound"></button>
+  <button id="hud-props" title="作者属性 Properties">${hudIcon(SHARE_ICONS.props)}</button>
+  <button id="hud-reload" title="重载 Reload">${hudIcon(SHARE_ICONS.reload)}</button>`;
+  document.body.append(menu, pet);
+  const orientBtn = menu.querySelector("#hud-orient") as HTMLButtonElement;
+  const fsBtn = menu.querySelector("#hud-fs") as HTMLButtonElement;
+  const muteBtn = menu.querySelector("#hud-mute") as HTMLButtonElement;
+  shareHud = { pet, menu, orientBtn, muteBtn, orient, muted: cfg.muted !== false, expanded: false };
+
+  // ---- 摆位：默认右上角；记忆位置 → 钳回视口 → 吸附较近边缘 ----
+  const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+  const place = (x: number, y: number) => {
+    pet.style.left = `${clamp(Math.round(x), 10, window.innerWidth - PET_SIZE - 10)}px`;
+    pet.style.top = `${clamp(Math.round(y), 10, window.innerHeight - PET_SIZE - 10)}px`;
+  };
+  const saved = (() => {
+    try {
+      const p = JSON.parse(localStorage.getItem(SHARE_PET_KEY) || "null") as { x: number; y: number } | null;
+      if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) return p;
+    } catch { /* 忽略坏数据 */ }
+    return null;
+  })();
+  if (saved) place(saved.x, saved.y);
+  else place(window.innerWidth - PET_SIZE - 14, 16);
+  const snapToEdge = () => {
+    const x = parseFloat(pet.style.left) || 0;
+    const y = parseFloat(pet.style.top) || 0;
+    const edgeX = x + PET_SIZE / 2 < window.innerWidth / 2 ? 10 : window.innerWidth - PET_SIZE - 10;
+    place(edgeX, y);
+  };
+  const layoutMenu = () => {
+    const px = parseFloat(pet.style.left) || 0;
+    const py = parseFloat(pet.style.top) || 0;
+    const onRight = px + PET_SIZE / 2 >= window.innerWidth / 2;
+    const mx = onRight ? px - HUD_BTN - 12 : px + PET_SIZE + 12;
+    const mh = menu.querySelectorAll("button").length * (HUD_BTN + 10);
+    const my = clamp(py, 10, window.innerHeight - mh - 10);
+    menu.style.left = `${Math.round(mx)}px`;
+    menu.style.top = `${Math.round(my)}px`;
+  };
+
+  // ---- 展开/收起 ----
+  const setExpanded = (open: boolean) => {
+    if (!shareHud) return;
+    shareHud.expanded = open;
+    menu.classList.toggle("collapsed", !open);
+    pet.classList.toggle("open", open);
+    if (open) layoutMenu();
+  };
+  document.addEventListener("pointerdown", (ev) => {
+    const target = ev.target as Node;
+    if (shareHud?.expanded && !pet.contains(target) && !menu.contains(target)) setExpanded(false);
+  });
+
+  // ---- 拖动：window 级监听（触屏可靠），6px 阈值区分点击 ----
+  let drag: { sx: number; sy: number; ox: number; oy: number; moved: boolean } | null = null;
+  const onMove = (ev: PointerEvent) => {
+    if (!drag || !shareHud) return;
+    const dx = ev.clientX - drag.sx;
+    const dy = ev.clientY - drag.sy;
+    if (!drag.moved && Math.hypot(dx, dy) > 6) {
+      drag.moved = true;
+      setExpanded(false);
+      pet.classList.add("dragging");
+    }
+    if (drag.moved) {
+      ev.preventDefault();
+      pet.style.left = `${clamp(drag.ox + dx, 10, window.innerWidth - PET_SIZE - 10)}px`;
+      pet.style.top = `${clamp(drag.oy + dy, 10, window.innerHeight - PET_SIZE - 10)}px`;
+    }
+  };
+  const onUp = () => {
+    if (!drag) return;
+    const wasDrag = drag.moved;
+    drag = null;
+    pet.classList.remove("dragging");
+    if (wasDrag) {
+      snapToEdge();
+      try {
+        localStorage.setItem(SHARE_PET_KEY, JSON.stringify({ x: parseFloat(pet.style.left), y: parseFloat(pet.style.top) }));
+      } catch { /* 存不了就本次会话有效 */ }
+      if (shareHud?.expanded) layoutMenu();
+    } else {
+      setExpanded(!shareHud?.expanded);
+    }
+  };
+  pet.addEventListener("pointerdown", (ev) => {
+    if (ev.button !== 0 && ev.pointerType === "mouse") return;
+    ev.preventDefault();
+    drag = { sx: ev.clientX, sy: ev.clientY, ox: parseFloat(pet.style.left) || 0, oy: parseFloat(pet.style.top) || 0, moved: false };
+  });
+  window.addEventListener("pointermove", onMove, { passive: false });
+  window.addEventListener("pointerup", onUp);
+  window.addEventListener("pointercancel", onUp);
+
+  window.addEventListener("resize", () => {
+    snapToEdge();
+    if (shareHud?.expanded) layoutMenu();
+  });
+
+  // ---- 按钮行为 ----
+  const ORIENT_TITLE: Record<ShareOrient, string> = {
+    auto: "跟随窗口 · Auto",
+    portrait: "竖屏（方向跟随）",
+    landscape: "横屏 16:9",
+  };
+  const orientIcon = (o: ShareOrient) =>
+    hudIcon(o === "portrait" ? SHARE_ICONS.portrait : o === "landscape" ? SHARE_ICONS.landscape : SHARE_ICONS.auto);
+  orientBtn.innerHTML = orientIcon(orient);
+  orientBtn.title = `画幅：${ORIENT_TITLE[orient]}`;
+  orientBtn.addEventListener("click", () => {
+    if (!shareHud) return;
+    const order: ShareOrient[] = ["auto", "portrait", "landscape"];
+    shareHud.orient = order[(order.indexOf(shareHud.orient) + 1) % 3];
+    try {
+      localStorage.setItem(SHARE_ORIENT_KEY, shareHud.orient);
+    } catch {
+      /* 隐私模式等存不了就本次会话有效 */
+    }
+    orientBtn.innerHTML = orientIcon(shareHud.orient);
+    orientBtn.title = `画幅：${ORIENT_TITLE[shareHud.orient]}`;
+    shareApplyOrient(shareHud.orient);
+  });
+
+  const fsIcon = () =>
+    hudIcon(document.fullscreenElement ? SHARE_ICONS.fsExit : SHARE_ICONS.fullscreen);
+  fsBtn.innerHTML = fsIcon();
+  fsBtn.addEventListener("click", () => {
+    if (document.fullscreenElement) void document.exitFullscreen().catch(() => {});
+    else void document.documentElement.requestFullscreen().catch(() => {});
+  });
+  document.addEventListener("fullscreenchange", () => {
+    fsBtn.innerHTML = fsIcon();
+  });
+
+  const muteIcon = () => hudIcon(shareHud?.muted ? SHARE_ICONS.soundOff : SHARE_ICONS.soundOn);
+  muteBtn.innerHTML = muteIcon();
+  muteBtn.addEventListener("click", () => {
+    if (!shareHud) return;
+    shareHud.muted = !shareHud.muted;
+    muteBtn.innerHTML = muteIcon();
+    window.__wp && window.__wp.setVolume(shareHud.muted ? 0 : 1);
+  });
+
+  menu.querySelector("#hud-reload")?.addEventListener("click", () => location.reload());
+  menu.querySelector("#hud-props")?.addEventListener("click", () => {
+    void sharePropsPanelToggle();
+  });
+
+  // 初始收起
+  menu.classList.add("collapsed");
+  setExpanded(false);
+}
+
+// ---- 作者属性表单（访客本地热更；不回写宿主 —— 分享面是只读的）----
+
+let sharePropsPanel: HTMLDivElement | null = null;
+
+/** wire value 里的可编辑标量（{type,value} 包裹或裸值两种形态） */
+function wireScalar(v: unknown): unknown {
+  return v && typeof v === "object" ? (v as { value?: unknown }).value : v;
+}
+/** 改值后按原形态包回去（保持 type 等元信息） */
+function wireWrap(orig: unknown, newVal: unknown): unknown {
+  return orig && typeof orig === "object"
+    ? { ...(orig as Record<string, unknown>), value: newVal }
+    : newVal;
+}
+/** WE 颜色 "R G B"（0..1 浮点）→ #rrggbb */
+function colorToHex(rgb: string): string {
+  const parts = rgb.trim().split(/\s+/).map(Number);
+  if (parts.length < 3 || parts.some((n) => !Number.isFinite(n))) return "#7c8cf8";
+  const hex = (n: number) => Math.max(0, Math.min(255, Math.round(n * 255))).toString(16).padStart(2, "0");
+  return `#${hex(parts[0])}${hex(parts[1])}${hex(parts[2])}`;
+}
+function hexToColor(hex: string): string {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
+  if (!m) return "0.5 0.5 0.5";
+  const n = parseInt(m[1], 16);
+  const f = (v: number) => (v / 255).toFixed(5);
+  return `${f((n >> 16) & 255)} ${f((n >> 8) & 255)} ${f(n & 255)}`;
+}
+
+/** 打开/关闭作者属性面板；首次打开拉取定义并渲染表单 */
+async function sharePropsPanelToggle(): Promise<void> {
+  if (sharePropsPanel) {
+    sharePropsPanel.remove();
+    sharePropsPanel = null;
+    return;
+  }
+  const token = audioToken;
+  if (!token) return;
+  const panel = document.createElement("div");
+  panel.id = "share-props";
+  panel.style.cssText =
+    "position:fixed;z-index:12;top:12px;right:12px;width:min(340px,calc(100vw - 24px));" +
+    "max-height:min(76vh,640px);overflow:auto;border-radius:14px;padding:14px 16px;" +
+    "background:rgba(13,17,23,.95);border:1px solid rgba(255,255,255,.14);color:#e6edf3;" +
+    "font:13px/1.6 ui-sans-serif,system-ui,sans-serif;box-shadow:0 10px 30px rgba(0,0,0,.5);";
+  panel.innerHTML = `<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+    <div style="font-weight:600">壁纸属性 · Properties</div>
+    <button id="share-props-close" style="background:none;border:0;color:#8b949e;font-size:16px;cursor:pointer">✕</button>
+  </div><div id="share-props-body" style="color:#8b949e;font-size:12.5px">加载中…</div>`;
+  document.body.appendChild(panel);
+  sharePropsPanel = panel;
+  panel.querySelector("#share-props-close")?.addEventListener("click", () => {
+    panel.remove();
+    sharePropsPanel = null;
+  });
+  let defs: Array<Record<string, unknown>> = [];
+  try {
+    const res = await fetch(`/props-defs/${encodeURIComponent(token)}`);
+    defs = res.ok ? ((await res.json()) as Array<Record<string, unknown>>) : [];
+  } catch {
+    /* 保持空态 */
+  }
+  const body = panel.querySelector("#share-props-body") as HTMLDivElement;
+  const sortable = (v: unknown) => (typeof v === "number" ? v : 0);
+  defs.sort((a, b) => sortable(a.order) - sortable(b.order));
+  if (!defs.length) {
+    body.textContent = "这张壁纸没有可调的作者属性 · No adjustable properties";
+    return;
+  }
+  body.textContent = "";
+  body.style.color = "#e6edf3";
+  const apply = (name: string, wire: unknown) => {
+    window.__wp && window.__wp.updateWebProps({ [name]: { value: wire } });
+  };
+  for (const d of defs) {
+    const name = String(d.name ?? "");
+    const ptype = String(d.ptype ?? "other");
+    const label = String(d.text ?? "") || name;
+    if (ptype === "file" || ptype === "other" || ptype === "text") continue; // 访客侧无法给文件/无控件
+    const row = document.createElement("div");
+    row.style.cssText = "padding:9px 0;border-bottom:1px solid rgba(255,255,255,.08)";
+    const labelEl = document.createElement("div");
+    labelEl.textContent = label;
+    labelEl.style.cssText = "font-size:12.5px;color:#cbd5e1;margin-bottom:6px;white-space:pre-line";
+    row.appendChild(labelEl);
+    const orig = d.value;
+    const scalar = wireScalar(orig);
+    const inputStyle =
+      "width:100%;box-sizing:border-box;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.14);" +
+      "border-radius:8px;color:#e6edf3;padding:5px 8px;font-size:12.5px;outline:none;accent-color:#8b9cf9";
+    if (ptype === "bool") {
+      const on = scalar === true;
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = on;
+      cb.style.cssText = "width:16px;height:16px;accent-color:#8b9cf9;cursor:pointer";
+      cb.addEventListener("change", () => apply(name, wireWrap(orig, cb.checked)));
+      row.appendChild(cb);
+    } else if (ptype === "color") {
+      const str = typeof scalar === "string" ? scalar : "0.5 0.5 0.5";
+      const picker = document.createElement("input");
+      picker.type = "color";
+      picker.value = colorToHex(str);
+      picker.style.cssText = "width:100%;height:32px;background:none;border:1px solid rgba(255,255,255,.14);border-radius:8px;cursor:pointer;padding:2px";
+      picker.addEventListener("input", () => apply(name, wireWrap(orig, hexToColor(picker.value))));
+      row.appendChild(picker);
+    } else if (ptype === "slider") {
+      const val = typeof scalar === "number" ? scalar : Number(scalar) || 0;
+      const min = typeof d.min === "number" ? d.min : 0;
+      const max = typeof d.max === "number" ? d.max : 1;
+      const step = typeof d.step === "number" && d.step > 0 ? d.step : 0.01;
+      const wrap = document.createElement("div");
+      wrap.style.cssText = "display:flex;align-items:center;gap:8px";
+      const range = document.createElement("input");
+      range.type = "range";
+      range.min = String(min);
+      range.max = String(max);
+      range.step = String(step);
+      range.value = String(val);
+      range.style.cssText = "flex:1;accent-color:#8b9cf9;cursor:pointer";
+      const num = document.createElement("span");
+      num.textContent = String(val);
+      num.style.cssText = "font:11.5px ui-monospace,monospace;color:#8b949e;min-width:34px;text-align:right";
+      range.addEventListener("input", () => {
+        const v = Number(range.value);
+        num.textContent = String(v);
+        apply(name, wireWrap(orig, v));
+      });
+      wrap.append(range, num);
+      row.appendChild(wrap);
+    } else if (ptype === "combo" && Array.isArray(d.options) && d.options.length) {
+      const sel = document.createElement("select");
+      sel.style.cssText = inputStyle;
+      for (const opt of d.options as Array<Record<string, unknown>>) {
+        const ov = opt.value;
+        const ovScalar = wireScalar(ov);
+        const optEl = document.createElement("option");
+        optEl.value = JSON.stringify({ raw: ovScalar });
+        optEl.textContent = String(opt.label ?? String(ovScalar));
+        if (JSON.stringify(ovScalar) === JSON.stringify(scalar)) optEl.selected = true;
+        sel.appendChild(optEl);
+      }
+      sel.addEventListener("change", () => {
+        try {
+          const { raw } = JSON.parse(sel.value) as { raw: unknown };
+          apply(name, wireWrap(orig, raw));
+        } catch { /* 忽略 */ }
+      });
+      row.appendChild(sel);
+    } else if (ptype === "textinput") {
+      const inp = document.createElement("input");
+      inp.type = "text";
+      inp.value = String(scalar ?? "");
+      inp.style.cssText = inputStyle;
+      inp.addEventListener("change", () => apply(name, wireWrap(orig, inp.value)));
+      row.appendChild(inp);
+    } else {
+      continue;
+    }
+    body.appendChild(row);
+  }
+}
+
+// ---- 分享访客的属性实时订阅（宿主改 props → SSE → updateWebProps 热更）----
+
+function shareSubscribeProps(token: string | null): void {
+  if (!token) return;
+  const es = new EventSource(`/props-events/${encodeURIComponent(token)}`);
+  es.addEventListener("props", (ev) => {
+    try {
+      const wire = JSON.parse((ev as MessageEvent).data) as Record<
+        string,
+        { value: unknown }
+      >;
+      window.__wp && window.__wp.updateWebProps(wire);
+    } catch {
+      /* 坏帧忽略 */
+    }
+  });
+  // 断线重连由 EventSource 自管；不再消费的连接随页面关闭释放
 }
 
 // 屏蔽默认右键菜单（壁纸窗口应只响应用户自定义交互，不弹浏览器/调试菜单）。
@@ -1241,7 +2070,10 @@ if (audioToken) {
   systemMedia.connect(audioToken, (m) => reportDiag(initialCfg, m));
 }
 
-mount(initialCfg);
+// 分享域挂载走 bootstrap（加载层 + 主资源预取）；桌面壁纸窗口直接挂载，
+// 零额外开销
+if (isShareMount(initialCfg)) void bootstrapShareMount(initialCfg);
+else mount(initialCfg);
 
 // 页面卸载兜底：预览 iframe 关闭 / 壁纸窗口销毁时释放 WebGL 上下文与 SSE 连接
 const teardown = () => {
@@ -1251,5 +2083,6 @@ const teardown = () => {
 };
 window.addEventListener("pagehide", teardown);
 window.addEventListener("beforeunload", teardown);
+
 
 export {};
