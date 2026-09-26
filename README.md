@@ -58,29 +58,52 @@ Its highlights: **tiny installer size · decoupled third-party dependencies · e
 ## 🖼️ 界面截图 / Screenshots
 
 <p align="center">
-  <img src="docs/img/shot-workshop.jpg" width="860" alt="Steam Workshop browse"/>
+  <img src="docs/img/shot-home.jpg" width="860" alt="Discover — random Workshop picks"/>
 </p>
-<p align="center"><sub>工坊 · 搜索 / 排序 / 筛选，一键下载 — Browse the Steam Workshop</sub></p>
+<p align="center"><sub>发现 · 随机推荐，点缩略图或箭头换一批 — Discover: random Workshop picks</sub></p>
 
 <p align="center">
-  <img src="docs/img/shot-wallpaper.jpg" width="860" alt="Wallpaper preview"/>
+  <img src="docs/img/shot-workshop.jpg" width="860" alt="Steam Workshop browse"/>
 </p>
-<p align="center"><sub>发现 · 随机推荐，点缩略图或箭头切换 — Discover: random wallpaper picks</sub></p>
+<p align="center"><sub>工坊 · 搜索 / 排序 / 筛选，一键下载（已入库的条目带「已下载」标记）— Browse the Steam Workshop</sub></p>
+
+<p align="center">
+  <img src="docs/img/shot-library.jpg" width="860" alt="Local library"/>
+</p>
+<p align="center"><sub>本地库 · 筛选 / 搜索 / 切换列表（轮播进度与控制在右上角）— Local library: filter, search, playlists</sub></p>
 
 <p align="center">
   <img src="docs/img/shot-displays.jpg" width="860" alt="Displays management"/>
 </p>
-<p align="center"><sub>显示器 · 多屏管理（统一 / 独立模式 · 轮播列表）— Displays: multi-monitor management</sub></p>
+<p align="center"><sub>显示器 · 每屏独立管理（统一 / 独立模式 · 每屏轮播）— Displays: per-screen control &amp; rotation</sub></p>
+
+<p align="center">
+  <img src="docs/img/shot-shares.jpg" width="860" alt="Wallpaper sharing"/>
+</p>
+<p align="center"><sub>分享 · 一条链接手机实时渲染（二维码 / 启停 / 浏览数）— Shares: live rendering on your phone</sub></p>
+
+<p align="center">
+  <img src="docs/img/shot-hotkeys.jpg" width="860" alt="Global hotkeys"/>
+</p>
+<p align="center"><sub>快捷键 · 全局热键逐项自定义录制 — Global hotkeys, individually rebindable</sub></p>
+
+<p align="center">
+  <img src="docs/img/shot-performance.jpg" width="860" alt="Settings — Quality"/>
+</p>
+<p align="center"><sub>设置 · 画质（档位预设 + 清晰度 / 帧率上限等细项）— Quality presets &amp; fine tuning</sub></p>
 
 <p align="center">
   <img src="docs/img/shot-settings.jpg" width="860" alt="Settings — General"/>
 </p>
-<p align="center"><sub>设置 · 通用（自启 / 语言 / 音频可视化）— General</sub></p>
+<p align="center"><sub>设置 · 通用（自启 / 语言 / 音频可视化 / 自动暂停）— General</sub></p>
 
 <p align="center">
   <img src="docs/img/shot-about.jpg" width="860" alt="Settings — About & updates"/>
 </p>
-<p align="center"><sub>设置 · 关于（软件更新）— About (updates)</sub></p>
+<p align="center"><sub>设置 · 关于（应用内更新）— About (in-app updates)</sub></p>
+
+<p align="center"><sub>界面为深色玻璃，底色与描边跟随当前壁纸自适应着色；截图为 macOS 真机实拍。</sub></p>
+<p align="center"><sub>Dark-glass UI whose tint follows the wallpaper currently applied; captured live on macOS.</sub></p>
 
 ---
 
@@ -187,11 +210,12 @@ see [Build from Source](#从源码构建--build-from-source).
 - 🎛️ **滤镜效果**：高斯模糊 / 黑白 / 怀旧 / 鲜艳 / 暖色 / 冷色 / 反色 / 提亮 / 压暗 / 高对比。
 - 🔊 **系统音频可视化**：捕获系统输出做实时 FFT，壁纸跟着音乐律动（macOS 需屏幕录制权限，Windows 免权限）。
 - 🎵 **系统「正在播放」**：歌名 / 歌手 / 专辑 / 进度 / 封面推送给壁纸（macOS MediaRemote、Windows GSMTC、Linux MPRIS）。
-- ⏸️ **自动暂停**：切到别的应用时暂停渲染、回到桌面自动恢复（省电，可开关）。
+- ⏸️ **自动暂停（看得见就播）**：壁纸几乎被完全遮挡（全屏应用 / 最大化窗口 / 屏保）时自动暂停，重新露出即恢复；每块屏幕独立判断，与前台应用无关（省电，可开关）。
 - 🖼️ **系统静态壁纸同步**：把当前壁纸的代表帧设为系统静态壁纸，锁屏 / 引擎未运行时观感一致。
-- 🔔 **托盘 + 全局快捷键**：`Cmd/Ctrl+Shift+P` 暂停/恢复、`Cmd/Ctrl+Shift+N` 下一张；托盘内可切显示模式、清晰度、帧率、滤镜。
+- 🔔 **托盘 + 自定义全局快捷键**：主界面 / 壁纸设置 / 暂停播放 / 自动暂停 / 定时切换 / 上一张 / 下一张共 7 组全局热键，逐项可录制改键、可恢复默认；托盘内可切显示模式、清晰度、帧率、滤镜。
 - 🌍 **界面语言**：中文 / English 一键切换（界面、托盘菜单、原生文案、后端提示一起变）。
 - 📡 **壁纸分享**：生成分享链接（永久 / 限时，直链 / iframe 代码），手机等设备用浏览器打开即**实时渲染**该壁纸（支持竖屏 / 横屏切换、局域网二维码）；网络模式可选本机 / 局域网 / 任意。
+- 🔄 **应用内更新**：设置 → 关于 里「检查 → 下载 → 安装 → 重启生效」，更新产物带签名校验。
 - 🤖 **AI / MCP 创作**：内置 MCP 服务（默认 `127.0.0.1:7411`），30+ 工具覆盖「建工程 → 写素材 → 校验 → 安装 → 应用 → 截图 → 上传工坊」全流程（详见 [MCP 服务](#mcp-服务--mcp-server)）。
 - 🧹 **首次安装不打扰**：从未应用过壁纸时不创建任何壁纸窗口，桌面保持系统壁纸；壁纸缺失/加载失败时只显示简洁的 SVG 提示。
 - 🧱 **原生集成**：macOS 桌面层窗口、Linux X11 桌面层、Windows `Progman` / `WorkerW` 桌面层（含 Win11 raised-desktop 适配），全部无边框透明、系统级置底。
@@ -208,11 +232,12 @@ see [Build from Source](#从源码构建--build-from-source).
 - 🎛️ **Filters**: Gaussian blur / monochrome / sepia / vivid / warm / cool / invert / brighten / darken / high contrast.
 - 🔊 **System audio visualisation**: real-time FFT of the system output, so wallpapers react to your music (Screen Recording permission on macOS; none needed on Windows).
 - 🎵 **System Now Playing**: title / artist / album / progress / cover art delivered to wallpapers (MediaRemote on macOS, GSMTC on Windows, MPRIS on Linux).
-- ⏸️ **Auto-pause**: pause rendering when you switch to another app, resume when you return to the desktop (toggleable).
+- ⏸️ **Auto-pause (visible = playing)**: pauses when the wallpaper is almost fully occluded (full-screen app / maximised window / screen saver) and resumes the moment it reappears; judged per screen and independent of the foreground app (toggleable).
 - 🖼️ **System static wallpaper sync**: use a representative frame of the current wallpaper as the system wallpaper, so the lock screen and the engine-off state look consistent.
-- 🔔 **Tray + global shortcuts**: `Cmd/Ctrl+Shift+P` pause/resume, `Cmd/Ctrl+Shift+N` next; display mode, quality, frame rate and filter are switchable from the tray.
+- 🔔 **Tray + rebindable global shortcuts**: seven global hotkeys (main window / wallpaper settings / pause / auto-pause / rotation / next / previous), each one rebindable and resettable from the app; display mode, quality, frame rate and filter are switchable from the tray.
 - 🌍 **UI language**: one-click switch between 中文 and English (UI, tray menu, native strings and backend messages all follow).
 - 📡 **Wallpaper sharing**: generate a share link (permanent or time-limited, direct link / iframe code); open it in any browser — e.g. on your phone — and the wallpaper **renders live** there (portrait / landscape toggle, LAN QR code included). Network modes: local-only / LAN / any.
+- 🔄 **In-app updates**: check → download → install → restart from Settings → About, with signature-verified update artifacts.
 - 🤖 **AI / MCP authoring**: a built-in MCP server (default `127.0.0.1:7411`) exposes 30+ tools covering "create project → write assets → validate → install → apply → screenshot → workshop upload" (see [MCP Server](#mcp-服务--mcp-server)).
 - 🧹 **Non-intrusive first run**: no wallpaper window is created until you apply one, so the desktop keeps your system wallpaper; when a wallpaper is missing or fails to load, only a minimal SVG notice is shown.
 - 🧱 **Native integration**: macOS desktop-level windows, the Linux X11 desktop layer, and the Windows `Progman` / `WorkerW` desktop layer (including the Windows 11 raised-desktop layout) — all borderless, transparent and system-level.
@@ -398,8 +423,8 @@ pnpm tauri build
    *(Apply from the Library or the item detail page; all displays follow.)*
 5. **调优**：设置 → 通用 可调 **帧率上限** 与 **清晰度**（省电优先就选 24 FPS + 省电）；单张壁纸可在「壁纸设置」里单独覆盖。
    *(Tune frame rate cap and quality under Settings → General; each wallpaper can override them in Wallpaper Settings.)*
-6. **托盘与快捷键**：托盘可切显示模式 / 清晰度 / 帧率 / 滤镜；`Cmd/Ctrl+Shift+P` 暂停/恢复，`Cmd/Ctrl+Shift+N` 下一张。
-   *(Switch display mode / quality / frame rate / filter from the tray; Cmd/Ctrl+Shift+P pauses, Cmd/Ctrl+Shift+N skips.)*
+6. **托盘与快捷键**：托盘可切显示模式 / 清晰度 / 帧率 / 滤镜；`Cmd/Ctrl+Shift+P` 暂停/恢复，`Cmd/Ctrl+Shift+N` 下一张 —— 这 7 组全局热键都能在「快捷键」页里改键。
+   *(Switch display mode / quality / frame rate / filter from the tray; Cmd/Ctrl+Shift+P pauses, Cmd/Ctrl+Shift+N skips — all seven global hotkeys are rebindable on the Shortcuts page.)*
 7. **壁纸交互（可选）**：设置 → 通用 → 开启「壁纸交互」后，场景视差与网页壁纸可接收鼠标（会盖住桌面图标）。
    *(Enable "Wallpaper interaction" for scene parallax and web wallpaper mouse input — it covers the desktop icons.)*
 
@@ -411,7 +436,12 @@ pnpm tauri build
 
 The app ships an MCP (Model Context Protocol) server so AI clients (Claude Code, Cursor, Codex CLI, …) can create and debug wallpaper projects directly.
 
-- **开启**：设置 → **AI / MCP** → 打开开关；页面会给出端口（默认 `7411`）、令牌与「复制带令牌地址」。
+<p align="center">
+  <img src="docs/img/shot-network.jpg" width="860" alt="Settings — Network & services"/>
+</p>
+<p align="center"><sub>设置 · 网络与服务：MCP、REST API 与壁纸分享共用一个网络服务（端口 / 令牌 / 局域网地址与二维码）— MCP, REST API and sharing share one local service</sub></p>
+
+- **开启**：设置 → **网络与服务** → 打开开关；页面会给出端口（默认 `7411`）、令牌与「复制带令牌地址」。
 - **接入**：把 `http://127.0.0.1:<port>/mcp?token=<token>` 作为 MCP 服务器地址加入客户端：
 
 ```jsonc
@@ -438,14 +468,14 @@ The app ships an MCP (Model Context Protocol) server so AI clients (Claude Code,
 WallpaperEM/
 ├─ public/icon/                 # 应用图标（含多倍图）
 ├─ renderer/                    # 壁纸渲染器页（视频 / GIF / 网页 / 场景 / 图片）
-├─ src/                         # Tauri 前端主界面（发现 / 工坊 / 下载 / 本地库 / 收藏 / 设置）
+├─ src/                         # Tauri 前端主界面（发现 / 工坊 / 下载 / 本地库 / 收藏 / 显示器 / 分享 / 快捷键 / 设置）
 │  ├─ locales/                  # 中→英文案表（中文原文当键）
 │  └─ lib/i18n.ts               # 运行时取词（tr / trMsg / useLocale）
 ├─ docs/
 │  ├─ mcp-authoring-web.md      # 网页壁纸工程规范（面向 AI agent）
 │  ├─ mcp-authoring-scene.md    # 场景壁纸工程规范（面向 AI agent）
 │  ├─ cross-platform-research.md
-│  └─ img/                      # 赞助码（支付宝 / 微信）
+│  └─ img/                      # 界面截图（shot-*.jpg）与赞助码
 ├─ src-tauri/
 │  ├─ src/
 │  │  ├─ wallpaper/             # 壁纸引擎：多屏桌面窗口 / 会话持久化 / 轮播 / 指针注入
@@ -465,7 +495,8 @@ WallpaperEM/
 │  │  ├─ db.rs · secure_store.rs# SQLite / 本地加密凭据
 │  │  └─ i18n.rs                # 原生文案（托盘 / 窗口标题）
 │  └─ tauri.conf.json
-├─ scripts/                     # 构建 / 同步 / 校验脚本
+├─ scripts/                     # 构建 / 同步 / 校验 / 抓图脚本
+│  └─ ui-shots/                 # README 界面截图：按窗口 2x 抓拍（用法见该目录 README）
 ├─ CHANGELOG.md · LICENSE
 └─ package.json
 ```
