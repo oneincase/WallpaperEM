@@ -36,6 +36,12 @@ type WallpaperConfig = {
   renderDpr?: number;
   /** 场景壁纸帧率上限（24/30/45/60/120），越低 GPU 占用越低；默认 24 */
   sceneFps?: number;
+  /**
+   * 视频纹理上传倍率（库 2.0.0+）：0 = 自动（库内帧率守门按实测帧率压），
+   * 正数 = 固定（1 = 不压最清晰 / 0.5 = 半幅）。见画质页「视频纹理清晰度」。
+   * WKWebView 下逐帧 texImage2D(视频帧) 要同步跨进程取像素，代价随像素数线性。
+   */
+  videoTexScale?: number;
   /** 全局滤镜 id（见 WALLPAPER_FILTERS 白名单），未知 id 按无滤镜处理 */
   filter?: string;
   /**
@@ -871,6 +877,8 @@ function mountViaLib(cfg: WallpaperConfig) {
           particles: cfg.particles as QualityOptions["particles"],
           postProcessing: cfg.postProcessing as QualityOptions["postProcessing"],
         },
+        // 视频纹理上传倍率（0 = 自动，交给库内帧率守门）
+        videoTexScale: cfg.videoTexScale ?? 0,
         // 场景壁纸的初始属性（project.json 值，含全局语言）
         properties,
         onDiagnostic: (msg: string, level: string) => reportDiag(cfg, `[${level}] ${msg}`),
@@ -1035,6 +1043,8 @@ declare global {
       restore(): void;
       setRenderDpr(dpr: number): void;
       setSceneFps(fps: number): void;
+      /** 视频纹理上传倍率热更（0 = 自动交给守门，>0 固定；就地生效不重挂载） */
+      setVideoTexScale(scale: number): void;
       /** 渲染质量档位热更（库 1.3.23+）：部分更新、就地生效不重挂载 */
       setQuality(patch: QualityOptions): void;
       /** 当前生效的质量档位（三项齐全；未挂载库实例时为 null） */
@@ -1131,6 +1141,10 @@ window.__wp = {
     mount(state.cfg);
   },
   // 调整帧率上限
+  setVideoTexScale(scale: number) {
+    state.cfg.videoTexScale = scale;
+    state.inst?.setVideoTexScale?.(scale);
+  },
   setSceneFps(fps: number) {
     state.cfg.sceneFps = fps;
     state.inst?.setFps(fps);
@@ -1201,6 +1215,8 @@ const initialCfg: WallpaperConfig = {
   // query 未带 renderDpr 时为 0（自动跟随设备 DPR）；query 值是相对倍率
   renderDpr: Number(params.get("renderDpr")) || 0,
   sceneFps: Number(params.get("sceneFps")) || 24,
+  // 0/缺省 = 自动（守门接管）；正数 = 固定倍率
+  videoTexScale: Number(params.get("vidscale")) || 0,
   filter: params.get("filter") ?? undefined,
   // 渲染质量档位（query 键 aa/pq/pp → cfg 字段 aa/particles/postProcessing）
   aa: params.get("aa") ?? undefined,

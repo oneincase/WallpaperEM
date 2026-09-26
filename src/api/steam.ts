@@ -387,6 +387,8 @@ export const api = {
   wallpaperInteractiveSet: (enabled: boolean) => invoke<void>("wallpaper_interactive_set", { enabled }),
   wallpaperSetFit: (fit: string) => invoke<void>("wallpaper_set_fit", { fit }),
   wallpaperSetRenderDpr: (dpr: number) => invoke<void>("wallpaper_set_render_dpr", { dpr }),
+  // 视频纹理上传倍率：0 = 自动（库内帧率守门按实测帧率压），>0 固定（1 = 不压）
+  wallpaperSetVideoTexScale: (scale: number) => invoke<void>("wallpaper_set_video_tex_scale", { scale }),
   wallpaperSetLanguage: (language: string) =>
     invoke<void>("wallpaper_set_language", { language }),
   wallpaperSetSceneFps: (fps: number) => invoke<void>("wallpaper_set_scene_fps", { fps }),
