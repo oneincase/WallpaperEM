@@ -45,3 +45,7 @@ dist-linux/
 
 # Linux 打包资源暂存（build.rs 按目标架构从 sdk/ 生成）
 src-tauri/bundled/
+
+# --- 界面截图工具的工作目录 / 编译产物（scripts/ui-shots）---
+.ui-shots/
+scripts/ui-shots/.bin/
