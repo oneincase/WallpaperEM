@@ -42,3 +42,13 @@
 - ~~`backup/stash-wip-mcp-library`~~：已于 2026-09-29 落进 `main`（`aac457f`：`wallpaper_diff` +
   `reference/capabilities` + 去掉 `angles` warning），stash 与备份分支都已清理。
 - `wip/standby-warm-window-abandoned`：被放弃的「热备窗」方向，仅作参考。
+
+## 下次从这里接（2026-09-29 停点）
+
+- **`main` 是绿的、已推送**：`pnpm typecheck` / `i18n:audit` 通过，`cargo check` 只剩 `db.rs` 两条基线
+  warning，`cargo test --lib` 255 passed / 0 failed。没有半成品挂在树上。
+- **#10 的两条路**（选一条即可，不用两件都做）：
+  1. 你这边 `git fetch origin && git rebase origin/main`，按上面「已占位的结构」一节调 `pages/*`；
+  2. 或由后端线先机械 rebase 推到 `origin/fix/apply-menu-stop-rebased`，你 reset 过去微调 UI。
+- **`wip/mcp-knowledge-library-filter` 已冗余**（内容全在 `main`），可随时删；`wip/standby-warm-window-abandoned`
+  建议留着（被放弃方向的唯一副本）。
