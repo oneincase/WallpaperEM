@@ -12,6 +12,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { pushLocaleToBackend, tr, useLocale } from "./lib/i18n";
 import { useWindowRounded } from "./lib/platform";
 import { useWallpaperBackdrop } from "./hooks/useWallpaperBackdrop";
+import { useBackdropMaterial, needsReadabilityFloor } from "./hooks/useBackdropMaterial";
 import "./index.css";
 
 // 同主窗口入口：全屏蔽浏览器默认右键菜单（详见 main.tsx 注释）
@@ -22,6 +23,8 @@ function PropsWindow() {
   useLocale();
   // 与主窗口同一套玻璃：当前壁纸模糊背景 + 按封面亮度自适应 tint
   const backdrop = useWallpaperBackdrop();
+  // 同主窗口：材质没落实到窗口时，无壁纸态要自己垫底（见 useBackdropMaterial）
+  const material = useBackdropMaterial();
   // 最大化/全屏时去圆角与描边（同主窗口壳）
   const rounded = useWindowRounded();
   const [itemId] = useState(() => new URLSearchParams(location.search).get("item") ?? "");
@@ -61,7 +64,9 @@ function PropsWindow() {
     <div
       className={`props-slide relative h-screen overflow-hidden ${
         rounded ? "rounded-[12px] ring-1 ring-[var(--card-border)]" : ""
-      } ${backdrop ? "" : "bg-[rgba(18,18,22,0.92)]"}`}
+      } ${
+        needsReadabilityFloor(backdrop, material) ? "bg-[var(--no-backdrop-fallback)]" : ""
+      }`}
     >
       {/* 无边框窗口的边缘缩放把手（Win/Linux；macOS 靠系统） */}
       <ResizeHandles enabled={rounded} />

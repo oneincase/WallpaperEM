@@ -34,6 +34,15 @@
   /* 交互态玻璃（胶囊导航/悬浮面）：底 tint 极轻，交互态靠白alpha 立起来 */
   --glass-hover: rgba(255, 255, 255, 0.12);
   --glass-active: rgba(255, 255, 255, 0.2);
+  /* 无壁纸封面 + 平台材质没落到窗口时的兜底不透明底（挂载见 App.tsx /
+     props-main.tsx 的 needsReadabilityFloor，状态来自 lib.rs BackdropMaterial）。
+     没有壁纸时 .app-backdrop::before 无图即透明，只剩 ::after 的 --content
+     （--glass-lift 此时为 0 ⇒ 仅 0.22），压不住桌面，白字会糊在用户壁纸上。
+     alpha 0.62 叠上 ::after 的 0.22 后等效约 70% 不透明
+     （1 - (1-0.62) × (1-0.22) ≈ 0.70），与 Windows acrylic tint
+     （28,28,32,180 ≈ 70%）同一档 —— 让「材质不可用」与「材质可用」的观感对齐。
+     材质可用时**不挂**这一层，保持真玻璃。 */
+  --no-backdrop-fallback: rgba(16, 16, 20, 0.62);
 }
 
 html,

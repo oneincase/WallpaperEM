@@ -13,6 +13,7 @@ import { TopBar, type PageId } from "./components/TopBar";
 import { GuardDialogs } from "./components/GuardDialogs";
 import { ResizeHandles } from "./components/ResizeHandles";
 import { useWallpaperBackdrop } from "./hooks/useWallpaperBackdrop";
+import { useBackdropMaterial, needsReadabilityFloor } from "./hooks/useBackdropMaterial";
 import { useWindowRounded } from "./lib/platform";
 import { readState, writeState } from "./lib/cache-snapshots";
 import { pushLocaleToBackend, useLocale } from "./lib/i18n";
@@ -57,6 +58,9 @@ function Shell() {
   const rounded = useWindowRounded();
   // 页内玻璃背景 + 自适应 tint（见 hooks/useWallpaperBackdrop.ts）
   const backdrop = useWallpaperBackdrop();
+  // 平台材质是否真的落到窗口上：没有壁纸封面时它是唯一压住桌面、保住白字可读性
+  // 的东西。没落实（Windows acrylic+blur 均失败 / Linux 不可探测）就得自己垫底
+  const material = useBackdropMaterial();
 
   // 冻结自检：系统睡眠/合盖后 WebKit 可能恢复出一个「卡死」的页面（定时器全部
   // 停摆）。定时器恢复触发时若发现实际流逝时间远超定时周期，说明页面曾被长时间
@@ -130,7 +134,11 @@ function Shell() {
     : "overflow-hidden";
 
   return (
-    <div className={`relative flex h-full flex-col ${chrome} ${backdrop ? "" : "bg-[rgba(18,18,22,0.92)]"}`}>
+    <div
+      className={`relative flex h-full flex-col ${chrome} ${
+        needsReadabilityFloor(backdrop, material) ? "bg-[var(--no-backdrop-fallback)]" : ""
+      }`}
+    >
       {/* 无边框窗口的边缘缩放把手（Win/Linux；macOS 靠系统） */}
       <ResizeHandles enabled={rounded} />
       {/* 页内玻璃背景：当前壁纸高斯模糊 + 深色 tint（样式见 index.css .app-backdrop）。
