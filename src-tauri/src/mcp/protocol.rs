@@ -73,26 +73,21 @@ fn initialize_result(params: &Value) -> Value {
             "version": env!("CARGO_PKG_VERSION"),
         },
         "instructions": "WallpaperEM 壁纸引擎。推荐流程：projects_list 看现有工程 → project_create 建工程（web 或 scene）\
-→ 用 project_write_file 写文件（或直接用你自己的文件工具改 ~/Documents/WallpaperEM/Projects/<工程>/ 下的文件）\
-→ project_validate 校验（scene 可再 scene_inspect 体检）→ scene_pack（install=true 直接覆盖安装）→ wallpaper_apply 应用到桌面\
-→ wallpaper_screenshot 截图看效果（framesMs 可多帧验收动画），不满意就改文件重来（改完重新 scene_pack + install，截图会自动重挂到新版）。\
-画面不对先读 renderer_diag（效果被跳过/贴图没找到这类问题只在那里可见）。\
-动手前先读 resources：wallpaperem://docs/scene-project（工程规范）、wallpaperem://reference/scene-support（支持范围）、\
-wallpaperem://reference/pitfalls（症状→原因→改法，**踩过的坑全在这**）、wallpaperem://reference/particles、wallpaperem://reference/effects。\
-**写粒子/自写 shader 前先要配方**：particle_recipe（星尘/余烬/星云絮/流星，贴图走渲染库内置）与 effect_scaffold\
-（水面波纹/指针光晕/音频条/七段时钟，一次给全 effects+材质+.frag+.vert 四件套）。\
-这三份 reference 资源就是渲染库能力边界的真源 —— **不需要去翻渲染库源码**。"
+    → 用 project_write_file 写文件（或直接用你自己的文件工具改 ~/Documents/WallpaperEM/Projects/<工程>/ 下的文件）\
+    → project_validate 校验（scene 可再 scene_inspect 体检）→ scene_pack（install=true 直接覆盖安装）→ wallpaper_apply 应用到桌面\
+    → wallpaper_screenshot 截图看效果（framesMs 可多帧验收动画），不满意就改文件重来（改完重新 scene_pack + install，截图会自动重挂到新版）。\
+    画面不对先读 renderer_diag（效果被跳过/贴图没找到这类问题只在那里可见）。\
+    动手前先读 resources：wallpaperem://docs/scene-project（工程规范）、wallpaperem://reference/scene-support（支持范围）、\
+    wallpaperem://reference/pitfalls（症状→原因→改法，**踩过的坑全在这**）、wallpaperem://reference/particles、wallpaperem://reference/effects。\
+    **写粒子/自写 shader 前先要配方**：particle_recipe（星尘/余烬/星云絮/流星，贴图走渲染库内置）与 effect_scaffold\
+    （水面波纹/指针光晕/音频条/七段时钟，一次给全 effects+材质+.frag+.vert 四件套）。\
+    这三份 reference 资源就是渲染库能力边界的真源 —— **不需要去翻渲染库源码**。"
     })
 }
 
 // ---------------------------------------------------------------- tools/call
 
-async fn call_tool_message(
-    app: &AppHandle,
-    st: &McpState,
-    id: Value,
-    params: &Value,
-) -> Value {
+async fn call_tool_message(app: &AppHandle, st: &McpState, id: Value, params: &Value) -> Value {
     let Some(name) = params.get("name").and_then(|n| n.as_str()) else {
         return error(id, -32602, "tools/call 缺少 name");
     };
@@ -154,6 +149,12 @@ fn resources_list() -> Vec<Value> {
             "mimeType": "application/json",
         }),
         json!({
+            "uri": "wallpaperem://reference/capabilities",
+            "name": "场景能力矩阵（机器可读）",
+            "description": "渲染库已支持能力的**实测清单**：文字对象 / 内置泛光 general.bloom / composelayer 分组 / parent / 变换关键帧动画 / 属性绑定 vector 字段 / combos 变体 / camera.zoom / 全屏后期 / 内置粒子贴图 —— 每条给出 JSON 形状、生效判据、已知坑与实测数值；另附库自带 CASEBOOK 与 verify:* 的位置",
+            "mimeType": "application/json",
+        }),
+        json!({
             "uri": "wallpaperem://reference/effects",
             "name": "自写效果着色器契约（机器可读）",
             "description": "效果链三段式文件布局、可用 g_* uniform（时间/指针/音频频谱/颜色）、顶点与片段模板、四类现成配方（水面波纹/指针光晕/音频条/时钟）与坑 —— 不用再翻渲染库源码",
@@ -211,27 +212,30 @@ fn read_resource(app: &AppHandle, params: &Value) -> Result<Value, (i64, String)
         "wallpaperem://docs/scene-project" => {
             include_str!("../../../docs/mcp-authoring-scene.md").to_string()
         }
-        "wallpaperem://reference/effects" => serde_json::to_string_pretty(
-            &crate::mcp::references::effects_json(),
-        )
-        .map_err(|e| (-32603, e.to_string()))?,
-        "wallpaperem://reference/particles" => serde_json::to_string_pretty(
-            &crate::mcp::references::particles_json(),
-        )
-        .map_err(|e| (-32603, e.to_string()))?,
-        "wallpaperem://reference/pitfalls" => serde_json::to_string_pretty(
-            &crate::mcp::references::pitfalls_json(),
-        )
-        .map_err(|e| (-32603, e.to_string()))?,
+        "wallpaperem://reference/capabilities" => {
+            serde_json::to_string_pretty(&crate::mcp::references::capabilities_json())
+                .map_err(|e| (-32603, e.to_string()))?
+        }
+        "wallpaperem://reference/effects" => {
+            serde_json::to_string_pretty(&crate::mcp::references::effects_json())
+                .map_err(|e| (-32603, e.to_string()))?
+        }
+        "wallpaperem://reference/particles" => {
+            serde_json::to_string_pretty(&crate::mcp::references::particles_json())
+                .map_err(|e| (-32603, e.to_string()))?
+        }
+        "wallpaperem://reference/pitfalls" => {
+            serde_json::to_string_pretty(&crate::mcp::references::pitfalls_json())
+                .map_err(|e| (-32603, e.to_string()))?
+        }
         "wallpaperem://templates/web-basic" => template_bundle("web"),
         "wallpaperem://templates/scene-basic" => template_bundle("scene"),
         other => {
             if let Some(item_id) = other.strip_prefix("wallpaperem://library/") {
                 let item_id = percent_decode(item_id);
-                let detail = tools::library_item_json(app, &item_id)
-                    .map_err(|e| (-32602, e))?;
-                let props = crate::library::item_props(app.clone(), item_id.clone())
-                    .unwrap_or_default();
+                let detail = tools::library_item_json(app, &item_id).map_err(|e| (-32602, e))?;
+                let props =
+                    crate::library::item_props(app.clone(), item_id.clone()).unwrap_or_default();
                 serde_json::to_string_pretty(&json!({
                     "item": detail,
                     "properties": serde_json::to_value(props).unwrap_or(json!([])),
@@ -265,7 +269,11 @@ fn template_bundle(kind: &str) -> String {
         out.push_str(&format!("## {rel}\n\n"));
         match std::str::from_utf8(bytes) {
             Ok(text) => {
-                let lang = if rel.ends_with(".json") { "json" } else { "html" };
+                let lang = if rel.ends_with(".json") {
+                    "json"
+                } else {
+                    "html"
+                };
                 out.push_str(&format!("```{lang}\n{text}\n```\n\n"));
             }
             Err(_) => out.push_str(&format!(
@@ -411,7 +419,9 @@ mod tests {
     #[test]
     fn resources_are_addressable() {
         let list = resources_list();
-        assert!(list.iter().any(|r| r["uri"] == json!("wallpaperem://docs/scene-project")));
+        assert!(list
+            .iter()
+            .any(|r| r["uri"] == json!("wallpaperem://docs/scene-project")));
         assert!(template_bundle("web").contains("index.html"));
         assert!(template_bundle("scene").contains("scene.json"));
     }

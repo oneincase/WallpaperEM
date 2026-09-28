@@ -104,6 +104,10 @@ fn output_schema_for(name: &str) -> Option<Value> {
             "failReason": { "type": "string" },
             "readyItem": { "type": "string" },
         })),
+        "wallpaper_diff" => obj(json!({
+            "verdict": { "type": "string" },
+            "diff": { "type": "object" },
+        })),
         "particle_recipe" => obj(json!({
             "kind": { "type": "string" },
             "texture": { "type": "string" },
@@ -394,6 +398,20 @@ pub fn definitions() -> Vec<Value> {
             "name": "wallpaper_rotation_set",
             "description": "暂停/恢复轮播的定时自动切换（不影响壁纸渲染本身）。",
             "inputSchema": obj(json!({ "paused": { "type": "boolean" } }), json!(["paused"])),
+        }),
+        json!({
+            "name": "wallpaper_diff",
+            "description": "**判定某个字段/效果/属性到底有没有改变画面**：给同一壁纸两组用户属性值，各渲染一帧，返回逐像素差（差均值、最大差、变化像素占比）与两帧落盘路径。判别能力是否生效请用这个 —— 全图均值/灰阶数/峰值行这类间接指标在 alpha<1 混合与薄带图层上会看不出变化（实测踩过两次）。",
+            "inputSchema": obj(json!({
+                "itemId": { "type": "string", "description": "壁纸条目 id（或工程名）" },
+                "propsA": { "type": "object", "description": "第一组用户属性值（例如 posterize 设 0）；省略则用当前值" },
+                "propsB": { "type": "object", "description": "第二组用户属性值（例如 posterize 设 1）；两组都省略 = 只渲染一帧" },
+                "settleMs": { "type": "integer", "description": "每次抓帧前稳定等待，默认 1000" },
+                "timeoutMs": { "type": "integer", "description": "等渲染就绪上限，默认 60000" },
+                "maxWidth": { "type": "integer", "description": "抓帧宽度，默认 900" },
+                "threshold": { "type": "integer", "description": "单个像素算「有变化」的阈值，默认 6" },
+                "restore": { "type": "boolean", "description": "结束后把属性恢复成调用前的值，默认 true" },
+            }), json!(["itemId"])),
         }),
         json!({
             "name": "layer_selfcheck",
@@ -820,6 +838,7 @@ async fn call_inner(app: &AppHandle, name: &str, args: &Value) -> Result<Value, 
             blocking(move || crate::wallpaper::resume_all(app)).await?;
             Ok(json!({ "paused": false }))
         }
+        "wallpaper_diff" => wallpaper_diff(app, args).await,
         "layer_selfcheck" => layer_selfcheck(app, args).await,
         "pitfall_search" => pitfall_search(args),
         "particle_recipe" => particle_recipe(args),
@@ -1575,6 +1594,231 @@ fn pitfall_search(args: &Value) -> Result<Value, String> {
     }))
 }
 
+/// 逐像素差：返回差均值、最大差、变化像素数与包围盒（供 wallpaper_diff / 之后的验证工具复用）
+fn frame_diff(a: &image::RgbImage, b: &image::RgbImage, threshold: i32) -> Value {
+    let mut b2 = b.clone();
+    if a.dimensions() != b2.dimensions() {
+        b2 = image::imageops::resize(
+            &b2,
+            a.width(),
+            a.height(),
+            image::imageops::FilterType::Triangle,
+        );
+    }
+    let (w, h) = a.dimensions();
+    let (mut changed, mut sum, mut worst) = (0u64, 0u64, 0i32);
+    let (mut min_x, mut max_x, mut min_y, mut max_y) = (u32::MAX, 0u32, u32::MAX, 0u32);
+    for y in 0..h {
+        for x in 0..w {
+            let pa = a.get_pixel(x, y);
+            let pb = b2.get_pixel(x, y);
+            let d = (0..3)
+                .map(|c| (pa[c] as i32 - pb[c] as i32).abs())
+                .max()
+                .unwrap_or(0);
+            worst = worst.max(d);
+            sum += d as u64;
+            if d >= threshold {
+                changed += 1;
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+    let total = ((w as u64) * (h as u64)).max(1);
+    // 带符号的分块均值差：动画噪声（粒子忽隐忽现）在每块里近似零均值，
+    // 而系统性变化（暗角/泛光/色阶化/整体位移）会让很多块**同号**偏；
+    // 所以"同号且超过阈值的块数"比整帧均值更能区分信号与噪声。
+    let (bx, by) = (16u32, 9u32);
+    let mut signed: Vec<f64> = Vec::with_capacity((bx * by) as usize);
+    for gy in 0..by {
+        for gx in 0..bx {
+            let x0 = gx * w / bx;
+            let x1 = ((gx + 1) * w / bx).max(x0 + 1);
+            let y0 = gy * h / by;
+            let y1 = ((gy + 1) * h / by).max(y0 + 1);
+            let (mut acc, mut cnt) = (0i64, 0i64);
+            for y in y0..y1.min(h) {
+                for x in x0..x1.min(w) {
+                    let pa = a.get_pixel(x, y);
+                    let pb = b2.get_pixel(x, y);
+                    for c in 0..3 {
+                        acc += pa[c] as i64 - pb[c] as i64;
+                        cnt += 1;
+                    }
+                }
+            }
+            signed.push(if cnt > 0 {
+                acc as f64 / cnt as f64
+            } else {
+                0.0
+            });
+        }
+    }
+    let systematic = signed.iter().filter(|v| v.abs() > 2.0).count();
+    let signed_mean = signed.iter().sum::<f64>() / signed.len().max(1) as f64;
+    json!({
+        "mean": ((sum as f64 / total as f64) * 1000.0).round() / 1000.0,
+        "max": worst,
+        "systematicBlocks": systematic,
+        "blocks": (bx * by) as usize,
+        "signedMean": (signed_mean * 1000.0).round() / 1000.0,
+        "changedPixels": changed,
+        "changedRatio": ((changed as f64 / total as f64) * 10000.0).round() / 10000.0,
+        "region": if changed > 0 {
+            json!({ "x": [min_x, max_x], "y": [min_y, max_y], "image": [w, h] })
+        } else { Value::Null },
+    })
+}
+
+/// A/B 逐像素差：判定「某个开关/属性到底有没有改变画面」。
+///
+/// 为什么单独做一个工具：判定"生效没有"最容易被间接指标骗 —— 全图均值在局部动效上
+/// 只动零点几、灰阶数在 alpha<1 混合下仍可能满值、峰值行对"薄带移动"不敏感。
+/// 我在这上面连错两次（combo、矢量绑定都误判成"没生效"），所以把它固化成工具。
+async fn wallpaper_diff(app: &AppHandle, args: &Value) -> Result<Value, String> {
+    let item = req_str(args, "itemId")?;
+    let settle = args
+        .get("settleMs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1000);
+    let timeout = args
+        .get("timeoutMs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(60_000);
+    let max_width = args.get("maxWidth").and_then(|v| v.as_u64()).unwrap_or(900) as u32;
+    let threshold = args.get("threshold").and_then(|v| v.as_u64()).unwrap_or(6) as i32;
+    let restore = args
+        .get("restore")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    // itemId 允许直接给工程名（能自动取到已安装条目 id），也允许给真正的条目 id
+    let item_id = workspace::installed_item_id_of(app, &item).unwrap_or_else(|| item.clone());
+    let before = crate::library::item_props(app.clone(), item_id.clone()).unwrap_or_default();
+    // before: Vec<PropEntry>，恢复到调用前的值（restore=true 时）
+    let props_a = args.get("propsA").and_then(|v| v.as_object()).cloned();
+    let props_b = args.get("propsB").and_then(|v| v.as_object()).cloned();
+    if props_a.is_none() && props_b.is_none() {
+        return Err("propsA / propsB 至少给一组（两组都不给就没有可比的差异）".into());
+    }
+
+    // 一帧：设置属性（可选）→ 应用 → 抓帧
+    let shoot = |props: Option<serde_json::Map<String, Value>>, tag: &'static str| {
+        let app = app.clone();
+        let item_id = item_id.clone();
+        async move {
+            if let Some(values) = props {
+                let app_s = app.clone();
+                let id_s = item_id.clone();
+                blocking(move || crate::library::set_item_props(app_s, id_s, values)).await?;
+            }
+            let t0 = crate::system_wallpaper::ready_stamp(&app);
+            let app_a = app.clone();
+            let id_a = item_id.clone();
+            blocking(move || crate::wallpaper::apply_item(app_a, id_a, None)).await?;
+            let (bytes, _m) =
+                capture_once(&app, t0, settle, timeout, Some(max_width), None).await?;
+            tracing::info!("wallpaper_diff[{tag}]: 抓帧 {} 字节", bytes.len());
+            let path = app
+                .path()
+                .app_cache_dir()
+                .ok()
+                .map(|d| d.join("mcp-diff"))
+                .unwrap_or_else(std::env::temp_dir);
+            let _ = std::fs::create_dir_all(&path);
+            let safe: String = item_id
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            let file = path.join(format!("{safe}-{tag}.jpg"));
+            let _ = std::fs::write(&file, &bytes);
+            Ok::<(Vec<u8>, std::path::PathBuf), String>((bytes, file))
+        }
+    };
+
+    // 三帧：A 与 A' 用**同一组属性**渲染两次 —— 它们的差就是"场景自己在动"的噪声底；
+    // 有了它才能判断 B 与 A 的差到底算不算"生效"（动画壁纸里同值两次也会有明显差异）。
+    let (bytes_a, path_a) = shoot(props_a.clone(), "A").await?;
+    let (bytes_a2, path_a2) = shoot(props_a, "A2").await?;
+    let (bytes_b, path_b) = shoot(props_b, "B").await?;
+    if restore {
+        let values: serde_json::Map<String, Value> = before
+            .iter()
+            .map(|p| (p.name.clone(), json!(p.value)))
+            .collect();
+        let app_r = app.clone();
+        let id_r = item_id.clone();
+        let _ = blocking(move || crate::library::set_item_props(app_r, id_r, values)).await;
+    }
+
+    let img_a = image::load_from_memory(&bytes_a)
+        .map_err(|e| format!("A 帧解码失败: {e}"))?
+        .to_rgb8();
+    let img_a2 = image::load_from_memory(&bytes_a2)
+        .map_err(|e| format!("A2 帧解码失败: {e}"))?
+        .to_rgb8();
+    let img_b = image::load_from_memory(&bytes_b)
+        .map_err(|e| format!("B 帧解码失败: {e}"))?
+        .to_rgb8();
+
+    let noise = frame_diff(&img_a, &img_a2, threshold as i32);
+    let signal = frame_diff(&img_a, &img_b, threshold as i32);
+    let n_mean = noise["mean"].as_f64().unwrap_or(0.0);
+    let s_mean = signal["mean"].as_f64().unwrap_or(0.0);
+    let _s_max = signal["max"].as_i64().unwrap_or(0);
+    // 判据：信号要明显高过噪声底（2 倍且至少高出 0.3）；否则只能说"看不出差别"
+    // 判据：**同号块数**（系统性变化）明显高过噪声底的同号块数
+    let s_blocks = signal["systematicBlocks"].as_u64().unwrap_or(0);
+    let n_blocks = noise["systematicBlocks"].as_u64().unwrap_or(0);
+    let s_signed = signal["signedMean"].as_f64().unwrap_or(0.0).abs();
+    let n_signed = noise["signedMean"].as_f64().unwrap_or(0.0).abs();
+    // 只用「同号块数」判：带符号均值在稀疏亮点（粒子/流星）上不可靠（实测对照组也会有 0.04 的偏）
+    let need = (n_blocks.max(2) * 2).max(6);
+    let verdict = if s_blocks <= n_blocks.max(2) {
+        "no_change"
+    } else if (s_blocks as u64) < need {
+        "negligible"
+    } else {
+        "changed"
+    };
+    let _ = (s_signed, n_signed);
+    let advice = match verdict {
+        "no_change" => "两组属性下的差异**没有超过动画噪声底** —— 该字段/开关很可能没生效",
+        "negligible" => "差异刚过噪声底：**判不准**。动态壁纸（粒子/流星/波纹/时钟）的整帧 A/B 噪声底很高，细微变化会被淹没 —— 请把该元素单独放进一个 1~2 层的**静态探针工程**再量（实测：静态探针下差异干净到可以直接判定）",
+        _ => "该字段/开关确实改变了画面：同号块数明显高过噪声底（系统性变化，不是粒子抖动那种噪声）",
+    };
+    Ok(json!({
+        "itemId": item_id,
+        "verdict": verdict,
+        "advice": advice,
+        "diff": signal,
+        "noiseFloor": noise,
+        "signal": {
+            "mean": s_mean,
+            "overFloor": ((s_mean - n_mean) * 1000.0).round() / 1000.0,
+            "systematicBlocks": s_blocks,
+            "noiseBlocks": n_blocks,
+        },
+        "threshold": threshold,
+        "frames": {
+            "A": path_a.to_string_lossy(),
+            "A2": path_a2.to_string_lossy(),
+            "B": path_b.to_string_lossy(),
+        },
+                "caveat": "**动态壁纸不适合当 A/B 试验台**：实测本示例（粒子+流星+波纹+时钟+颗粒）噪声底达 2.6~3.0 差均值，细致变化（暗角开关）只有 5 个同号块 vs 噪声 3 个 → 判不出。要验证某个能力，请建一个 1~2 层的静态探针工程（无粒子/无动画）再测，那里差异是干净可判的；本工具的价值在大位移与开关级变化（实测矢量绑定 56/144 块 vs 噪声 3）",
+        "note": "三帧法：A 与 A2 同属性（= 动画噪声底），B 用第二组属性。判定看 diff.systematicBlocks（16x9 块里同号偏超过阈值的块数）是否高过 noiseFloor.systematicBlocks —— 均值类指标在动态壁纸上会被粒子抖动淹没。三帧都已落盘。",
+    }))
+}
+
 /// 图层自检：**渲染一次 + 量该层矩形 + 交叉核对诊断** —— 判定「画出来没有、是不是白块、为什么」。
 ///
 /// 为什么不用 A/B 差分：差分只能告诉你"有没有贡献"，说不出**原因**；而渲染库把
@@ -1932,6 +2176,9 @@ fn effect_scaffold(args: &Value) -> Result<Value, String> {
         ],
         "layer": layer,
         "mustKnow": [
+            "**泛光优先用内置的 general.bloom**（bloomstrength/bloomthreshold/bloomtint，库侧有精确均值验证）；post_bloom 脚手架是给\"库没有的后期效果\"（暗角/颗粒/色散）用的，两边叠加会过曝",
+            "**combos（组合开关）写在材质 pass 里**（materials/effects/<名>.json 的 passes[0].combos），写在效果文件里不会被读；shader 里用 // [COMBO] {...} 声明、#if 使用",
+            "**判定效果是否生效请用 wallpaper_diff 的逐像素差**，别用全图均值/灰阶数（alpha<1 混合与薄带图层上看不出来）",
             "effects/<名>.json 的 passes[] 只写 material；shader 写在材质里（直写 shader 会被当命令 pass → 整条链静默不画）",
             "shaders/effects/<名>.frag 与 .vert **必须成对**：缺 .vert 会被静默跳过，图层只剩纯色块",
             "可用 uniform：g_Time / g_Daytime / g_PointerPosition(Last,State) / g_AudioSpectrum16/32/64Left+Right / g_Color / g_Alpha / g_Brightness / g_Texture0 / g_TexelSize / g_ModelViewProjectionMatrix",

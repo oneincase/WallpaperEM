@@ -1186,18 +1186,10 @@ impl SceneWalk<'_> {
                 if let Some(anim) = map.get("animation") {
                     check_animation(anim, path, self.errors, self.warnings);
                 }
-                // ⚠️ 渲染库已知问题（webwallgl#9）：**带关键帧动画的 angles** 会让首帧永不
-                // 完成 —— mount() 永远不 resolve，诊断停在 "renderer started" 之后，
-                // 没有异常也没有超时。角度摆动请改用 shader 内动画（g_Time）或 alpha 动画。
-                if map.contains_key("animation")
-                    && (path.ends_with(".angles") || path == "angles")
-                {
-                    self.warnings.push(format!(
-                        "{path} 带关键帧动画：渲染库已知问题（webwallgl#9）—— angles 动画会让首帧永不完成 \
-                         （mount 永久挂起、无报错）。取角度变化请改用在 shader 里按 g_Time 做，\
-                         或用 alpha/color 这类标量字段做动画；origin 的动画不受影响"
-                    ));
-                }
+                // 注：angles 动画曾会让首帧永不完成（webwallgl#9），已在渲染库提交 38e877c
+                // 修掉（实测同一条场景现在正常 ready）。校验器**不再对此告警** —— 常驻警报
+                // 会变成噪音，而且它无法知道调用方链接的是哪一版库。
+                // 「链接到旧 dist」这个坑记在 wallpaperem://reference/pitfalls 里。
                 for (k, v) in map {
                     self.visit(v, &format!("{path}.{k}"), depth + 1);
                 }
@@ -3436,31 +3428,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// angles 带关键帧动画 → 主动警告（渲染库会让首帧永不完成，webwallgl#9）
+    /// angles 带关键帧动画**不再告警** —— 渲染库 38e877c 已修（#9），常驻警报会变成噪音。
+    /// 这条测试是"防止误报回归"的闸门：如果哪天有人再加回 angles 告警，这里会红。
     #[test]
-    fn angles_animation_is_warned() {
-        let dir = tmpdir("angles-anim");
+    fn angles_animation_is_not_warned_anymore() {
+        let dir = tmpdir("angles-no-warn");
         std::fs::create_dir_all(dir.join("materials")).unwrap();
         std::fs::create_dir_all(dir.join("models")).unwrap();
         std::fs::write(dir.join("project.json"),
             r#"{"type":"scene","title":"t","file":"scene.json","version":1,"tags":["Everyone"],"general":{"properties":{}}}"#).unwrap();
         std::fs::write(dir.join("materials/bg.json"), r#"{"passes":[{"shader":"genericimage2","textures":[]}]}"#).unwrap();
         std::fs::write(dir.join("models/bg.json"), r#"{"autosize":true,"material":"materials/bg.json"}"#).unwrap();
-        let scene = |angles: &str| format!(r#"{{"general":{{"orthogonalprojection":{{"width":1920,"height":1080}}}},"objects":[
-            {{"id":1,"name":"A","image":"models/bg.json","origin":"960 540 0","size":"1920 1080","angles":{angles}}}]}}"#);
-        // 带动画 → 警告
-        std::fs::write(dir.join("scene.json"), scene(
-            r#"{"value":"0 0 0","animation":{"c0":[{"frame":0,"value":"0 0 -0.05"},{"frame":150,"value":"0 0 0.05"}],"options":{"fps":30,"length":300,"mode":"loop"}}}"#)).unwrap();
+        std::fs::write(dir.join("scene.json"), r#"{"general":{"orthogonalprojection":{"width":1920,"height":1080}},"objects":[
+            {"id":1,"name":"A","image":"models/bg.json","origin":"960 540 0","size":"1920 1080",
+             "angles":{"value":"0 0 0","animation":{"c0":[{"frame":0,"value":"0 0 -0.05"},{"frame":150,"value":"0 0 0.05"}],
+             "options":{"fps":30,"length":300,"mode":"loop"}}}}]}"#).unwrap();
         let v = validate_dir(&dir, "t");
-        let warns: Vec<String> = v["warnings"].as_array().unwrap().iter()
-            .map(|w| w.as_str().unwrap_or("").to_string()).collect();
-        assert!(warns.iter().any(|w| w.contains("webwallgl#9")), "angles 动画必须警告: {warns:?}");
-        // 静态 angles → 不警告
-        std::fs::write(dir.join("scene.json"), scene(r#""0 0 0""#)).unwrap();
-        let v2 = validate_dir(&dir, "t");
-        let warns2 = v2["warnings"].as_array().unwrap().iter()
-            .filter(|w| w.as_str().unwrap_or("").contains("webwallgl#9")).count();
-        assert_eq!(warns2, 0, "静态 angles 不该警告: {v2:?}");
+        assert!(v["ok"].as_bool().unwrap_or(false), "{v}");
+        let hits: Vec<String> = v["warnings"].as_array().unwrap().iter()
+            .map(|w| w.as_str().unwrap_or("").to_string())
+            .filter(|w| w.contains("angles") || w.contains("webwallgl#9"))
+            .collect();
+        assert!(hits.is_empty(), "angles 动画不该再告警（库已修 38e877c）: {hits:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

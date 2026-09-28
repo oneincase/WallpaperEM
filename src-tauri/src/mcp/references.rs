@@ -67,7 +67,7 @@ pub fn effects_json() -> Value {
             "验证方法": "layer_selfcheck 会量该层矩形并核对诊断；判「后期是不是生效」也可以拿属性做 A/B（item_props_set 改强度 → wallpaper_screenshot 两次对比）",
         },
         "recipes": {
-            "post_bloom": "全屏后期一趟做完：亮部阈值 0.55 提取 + 5x5 高斯泛光 + 暗角 + 胶片颗粒 + 轻微径向色散（g_TexelSize 取偏移步长）",
+            "post_bloom": "全屏后期一趟做完：亮部阈值 0.55 提取 + 5x5 高斯泛光 + 暗角 + 胶片颗粒 + 轻微径向色散（g_TexelSize 取偏移步长）。**注意**：泛光其实优先用内置 general.bloom（更便宜、库侧验证过）；这个脚手架留给\"库没有的后期\"或需要与其它后期合并成一趟时用",
             "film_grain": "廉价的胶片质感：暗角 + 时间驱动颗粒 + 轻微提对比（不采样邻域，比泛光便宜）",
             "water_ripple": "三层交叉正弦扰动 UV 采样 g_Texture0 + 以 g_PointerPosition 为心的同心环（sin(dist*k - g_Time*ω) * exp(-dist*d)）",
             "pointer_aura": "v_TexCoord 与 g_PointerPosition 求距离做高斯柔光；再拿 g_PointerPositionLast→当前位置做胶囊形状的拖尾；g_PointerState.z 控制点击涟漪环强度",
@@ -265,22 +265,30 @@ pub fn pitfalls_json() -> Value {
         "items": [
             {
                 "id": "angles-animation-hangs",
-                "症状": "壁纸永远挂不上：诊断停在 \"renderer started: N layers\" 之后，没有 ready，也没有任何错误；截图/预览一直等到超时",
-                "原因": "图层的 angles 带关键帧动画 —— 渲染库会让首帧永不完成，mount() 永久挂起（webwallgl#9）",
-                "改法": "角度变化改在 shader 里用 g_Time 做，或用 alpha/color 这类标量字段动画；origin 的动画**不受影响**，可以正常用",
-                "验证": "同工程只去掉 angles 动画 → 立刻 ready",
+                "状态": "**已在渲染库 38e877c 修复**（2026-09-28）。当前链接的库实测同一条最小复现正常 ready；校验器不再对此告警。",
+                "历史症状": "旧版（≤ 2.0.1 / b11e839）里：图层 angles 带关键帧动画会让首帧永不完成，诊断停在 \"renderer started: N layers\" 之后，没有 ready 也没有错误，mount() 永久挂起（webwallgl#9）",
+                "若你现在仍遇到": "八成是**链接的 dist 比源码旧**（见下一条 stale-linked-dist）：重建库 + 同步 + 重启 dev 即可",
+            },
+            {
+                "id": "stale-linked-dist",
+                "症状": "改了渲染库源码（或拉了新提交），但应用行为完全没变：该修的问题还在、该有的新诊断没有",
+                "原因": "应用链接的是**渲染库的构建产物** `node_modules/.pnpm/webwallgl@file+..+webwallgl-github+dist+lib/node_modules/webwallgl/`，源码改动不会自动生效；而且 Vite 忽略 node_modules 变化，即使同步了文件也要**重启 dev server**",
+                "改法": "① `cd <库仓库> && npm run build:lib`；② `rsync -a --delete dist/lib/ <上面那个链接目录>/`；③ 重启 `pnpm tauri dev`",
+                "验证": "同步后 grep 新字符串：`grep -c \"效果文件不支持直接写 shader\" <链接目录>/webwallgl.global.js`（新构建应为 1）",
             },
             {
                 "id": "effect-missing-vert",
-                "症状": "效果完全不生效，图层变成一块纯色（内置材质的白块）；诊断里只有一条含糊的编译错误",
-                "原因": "效果 shader 只写了 shaders/effects/<名>.frag，缺 .vert → 顶点阶段没有 main → 链接失败 → 整趟被跳过（webwallgl#10）。\n**注意**：渲染库会把它报进诊断（scene-mount 有一段 console.warn→diag 桥），但报错文本不带 stage、行号是 -1:-1，长这样：`跳过效果（pass 编译失败）: effects/x shader=effects/x 着色器编译失败: ERROR: -1:-1: '' : Missing main()` —— 容易被误读成\"frag 里没写 main\"",
-                "改法": "成对提供 .frag + .vert（顶点着色器照抄资源里的 vertexTemplate）；project_validate 现在也会对缺 .vert 主动 warning",
-                "验证": "缺 .vert：该区域红像素 0%、均值 255/方差 0（白块），layer_selfcheck 返回 effect_skipped 并带回上面那条诊断原文；补上 .vert 后 23%",
+                "状态": "**已在渲染库 38e877c 补上点名诊断**：`renderer: effect shader effects/x: 缺少 shaders/effects/x.vert（效果 shader 必须 .frag/.vert 成对），该 pass 无法编译、已跳过 —— 图层会退回内置材质`",
+                "症状": "效果完全不生效，图层变成一块纯色（内置材质的白块）",
+                "原因": "效果 shader 只写了 shaders/effects/<名>.frag，缺 .vert → 顶点阶段没有 main → 链接失败 → 整趟被跳过（webwallgl#10）。旧版只报一条不带 stage、行号 -1:-1 的 GLSL 错误（`Missing main()`），容易被误读成\"frag 里没写 main\"；新版会先点名缺哪个 stage",
+                "改法": "成对提供 .frag + .vert（顶点着色器照抄资源里的 vertexTemplate）；project_validate 也会对缺 .vert 主动 warning",
+                "验证": "缺 .vert：layer_selfcheck 返回 effect_skipped，证据里能看到上面那条点名诊断；区域均值 255/方差 0（白块）。补上 .vert 后恢复",
             },
             {
                 "id": "effect-shader-field-wrong",
-                "症状": "整条效果链什么都不画（只剩内置材质底色），**诊断里一条记录都没有**",
-                "原因": "effects/<名>.json 的 passes[] 里直写了 shader；渲染库在效果文件里只认 material（shader 写在材质里）。直写会被当成「无 material 的命令 pass」静默丢弃，且这条路径没有任何日志（webwallgl#11，已实测复核：与缺 .vert 不同，连 console 都没有）",
+                "状态": "**已在渲染库 38e877c 补上点名诊断**：`effect effects/x.json: pass 0 未识别（检测到直写 shader=\"effects/x\" —— 效果文件不支持直接写 shader，要写在 material 指向的材质里…）`",
+                "症状": "整条效果链什么都不画（只剩内置材质底色）。旧版这里**一条日志都没有**（连 console 都没有）",
+                "原因": "effects/<名>.json 的 passes[] 里直写了 shader；渲染库在效果文件里只认 material（shader 写在材质里）。直写会被当成「无 material 的命令 pass」丢弃（webwallgl#11）",
                 "改法": "三段式：effects/<名>.json(passes[].material) → materials/effects/<名>.json(passes[].shader) → shaders/effects/<名>.{frag,vert}；project_validate 现在会对\"效果文件里直写 shader\"主动 warning",
                 "验证": "错格式=白块且诊断无记录；改对后立刻出效果",
             },
@@ -304,6 +312,26 @@ pub fn pitfalls_json() -> Value {
                 "原因": "shader 在图层边界处仍输出亮像素（柱高顶满时柱头正好压在边界上）",
                 "改法": "留头寸（上限 0.86 而不是 1.0）+ 在 shader 里对自己四边乘 margin 淡出",
                 "验证": "该行跳变 178 → 消失",
+            },
+            {
+                "id": "combos-must-be-in-material",
+                "症状": "shader 里写了 `#if FOO`、也按官方格式声明了 `// [COMBO] {...}`，但把 combos 写进 effects/<名>.json 后开关毫无作用（画面完全不变）",
+                "原因": "渲染库取的是**材质 pass** 的 combos（effects-parse.js:174 `combos: mp.combos`，mp = materials/effects/<名>.json 的 passes[i]）；效果文件里的 combos 不会被读",
+                "改法": "把 `\"combos\": {\"FOO\": 1}` 写进 materials/effects/<名>.json 的 passes[0]（官方 effects/blurprecise 就是这么写的）",
+                "验证": "POSTERIZE 0→1：wallpaper_diff 报逐像素差均值 ~9.4、极值 243",
+            },
+            {
+                "id": "ab-metric-must-be-pixel-diff",
+                "症状": "明明改了东西，测出来却\"没生效\"：全图均值只动 0.8、灰阶数还是 256、峰值行没变",
+                "原因": "间接指标会骗人 —— postfx 层 alpha=0.62（与下层混合）时色阶化把通道量化到 6 级，但**唯一灰度数仍是 256**；一个 2200x300 的辉光带上下移动 300px，全图均值也只动 0.8。我在 combo 与矢量绑定上各误判过一次",
+                "改法": "① 判定大位移/开关级变化：用 `wallpaper_diff`（三帧法：A/A2 同属性得噪声底，B 用另一组属性；看 systematicBlocks 同号块数）。② 判定**细微**变化：**别拿动态壁纸当试验台** —— 本示例（粒子+流星+波纹+时钟）噪声底就有差均值 2.6~3.0，暗角开关只让 5 个块偏 vs 噪声 3 个，判不出。请在 1~2 层的**静态探针工程**里测（实测静态下 combo 差均值 9.4、矢量绑定 5.3，干净可判）",
+                "验证": "同一次实验换指标即可复现：间接指标≈无变化，逐像素差一眼可见",
+            },
+            {
+                "id": "composelayer-is-not-solidlayer",
+                "症状": "加了 composelayer 分组后画面糊出一块**不透明白屏**",
+                "原因": "composelayer 是一块\"画布\"，不是纯色层；给它写 `solid: true`（编辑器从 solidlayer 改过来时常留这个旗标）会让它拿到纯白底",
+                "改法": "composelayer 不要写 solid；分组用 `childIds` 列成员、子层写 `parent`，容器的 effects 作用于整块画布",
             },
             {
                 "id": "postprocess-layer-basics",
@@ -392,9 +420,15 @@ mod tests {
         let items = t["items"].as_array().unwrap();
         assert!(items.len() >= 10);
         for it in items {
-            for k in ["症状", "原因", "改法"] {
-                assert!(it[k].is_string(), "坑清单缺 {k}: {it}");
-            }
+            assert!(it["id"].is_string(), "坑清单条目缺 id: {it}");
+            // 条目有两种形态：现行问题（症状/原因/改法）与已修问题（状态/历史症状/若你现在仍遇到）。
+            // 已修条目保留在清单里是为了让"链接到旧 dist"这类情况有迹可循。
+            let has_symptom = it["症状"].is_string() || it["历史症状"].is_string();
+            let has_fix = it["改法"].is_string()
+                || it["若你现在仍遇到"].is_string()
+                || it["状态"].is_string();
+            assert!(has_symptom, "坑清单条目缺症状描述: {it}");
+            assert!(has_fix, "坑清单条目缺改法/状态: {it}");
         }
     }
 
@@ -474,4 +508,116 @@ mod tests {
             );
         }
     }
+}
+
+/// 场景能力矩阵（`wallpaperem://reference/capabilities`）。
+///
+/// 与 scene_support_json 的分工：那份是**校验器用的白名单**（字段/枚举/上限），
+/// 这份是**agent 用的能力清单** —— 每条都写清「JSON 长什么样、怎么算生效、有什么坑」，
+/// 并且注明是"实测验证过"还是"仅从源码确认"。凡是本文件里写"已验证"的，
+/// 都在示例工程 deep-space-aurora 里真跑过并量出了数值。
+pub fn capabilities_json() -> Value {
+    json!({
+        "summary": "渲染库已支持能力的实测清单。写场景前先扫这里，能省的自己去翻库源码/试错。每条给出 JSON 形状 + 生效判据 + 已知坑。",
+        "howToVerify": {
+            "原则": "判定「某个字段/效果到底生效没有」必须用**像素差**（A/B 两帧逐像素比较），不要用全图均值、灰阶数、峰值行这类间接指标",
+            "为什么": "实测教训：postfx 层 alpha=0.62（与下层混合）时，色阶化把通道量化到 6 级，但**唯一灰度数仍是 256、全图均值几乎不变**；一个 2200x300 的发光带上下移动 300px，全图均值也只动 0.8。两次都被误判成\"没生效\"",
+            "工具": "`wallpaper_diff`：给两组用户属性值，各渲染一帧并返回逐像素差（均值/极值/变化像素占比）+ 两帧落盘路径",
+            "数值参考": "combo 开关：差均值 ~9.4、极值 243；矢量绑定移动辉光带：差均值 ~5.3、极值 236；音频条/粒子这类局部动效：单区域差 10~20",
+        },
+        "verified": [
+            {
+                "能力": "文字对象（真文本层）",
+                "status": "已验证",
+                "fields": {
+                    "text": "字符串，或 {value, script, scriptproperties}（script 可驱动动态文本，如时钟/日期挂件）",
+                    "font": "字体名（渲染库会做 font-sanitize 落到浏览器可用字体）",
+                    "pointsize": "字号，缺省 24",
+                    "color": "颜色（可绑 color 属性）",
+                    "anchor": "盒子相对 origin 的锚点，缺省 center（none 也按 center）",
+                    "maxwidth / maxrows": "排版限宽/限行（0 = 不限）",
+                },
+                "shape": "{\"text\":\"DEEP SPACE AURORA\",\"font\":\"Segoe UI\",\"pointsize\":64,\"color\":{\"value\":\"0.86 0.92 1\",\"user\":\"title_color\"},\"anchor\":\"center\",\"origin\":\"960 250 0\",\"size\":\"1200 160\"}",
+                "note": "文字渲到离屏 2D 画布再作为**普通图层**进管线：z 序、效果链、混合、视差都照常。**不需要**为了文字去写七段数码管 shader（我一开始就是这么绕的，属于走错路）。",
+            },
+            {
+                "能力": "内置整屏泛光 Bloom",
+                "status": "已验证",
+                "fields": {
+                    "general.bloom": "true（可绑 bool 属性，形如 {user,value}）",
+                    "general.bloomstrength": "强度（示例 1.15）",
+                    "general.bloomthreshold": "亮部阈值（示例 0.72）",
+                    "general.bloomtint": "染色（示例 \"0.86 0.88 0.98\"）",
+                    "HDR 一族": "bloomhdrfeather / bloomhdriterations / bloomhdrscatter / bloomhdrstrength / bloomhdrthreshold + general.hdr:true",
+                },
+                "measured": "同一场景 bloom 开/关：高光像素(>200) 3.75% → 7.23%，全图均值 +3.5（+8.5% 量级与库自带 verify-bloom.mjs 的结论一致）",
+                "note": "这是官方通道（light_map → 双向高斯 → Add）。**不要**再自己写一个泛光叠上去，两边叠加会过曝。自定义后期留给暗角/颗粒/色散这类库没有的东西。",
+            },
+            {
+                "能力": "composelayer 分组容器",
+                "status": "已验证",
+                "shape": "{\"id\":16,\"name\":\"Particle Group\",\"image\":\"models/util/composelayer.json\",\"childIds\":\"7 8 9 12\",\"effects\":[{\"file\":\"effects/groupfade.json\",\"name\":\"Group Fade\",\"visible\":true}],\"origin\":\"960 540 0\",\"size\":\"1920 1080\"}；子层写 \"parent\": 16",
+                "note": "容器是一块**画布**：子层画在画布上，容器的 effects 作用于**整块画布**（一次给 4 套粒子加组级呼吸/上浮，不用逐层加）。子层继承父层的视差与可见性。",
+                "陷阱": "composelayer **不是** solidlayer：别给它写 solid/solid:true，否则会拿到纯白底、糊出一块不透明白屏（库侧 CASEBOOK 有记录，已踩）。",
+            },
+            {
+                "能力": "parent 父子层",
+                "status": "已验证",
+                "shape": "子层对象里写 \"parent\": <父层 id>；容器用 childIds 列出成员",
+                "note": "可见性沿父链继承；父子关系与 composelayer 可以叠加使用。",
+            },
+            {
+                "能力": "变换关键帧动画（origin / angles / scale）",
+                "status": "已修并验证（渲染库 38e877c）",
+                "history": "旧版（≤2.0.1）angles 带关键帧动画会让首帧永不完成、mount 永久挂起（webwallgl#9）",
+                "shape": "\"angles\": {\"value\":\"0 0 0\", \"animation\": {\"c0\":[{\"frame\":0,\"value\":\"0 0 -0.02\"},{\"frame\":300,\"value\":\"0 0 0.02\"},{\"frame\":600,\"value\":\"0 0 -0.02\"}], \"options\":{\"fps\":30,\"length\":600,\"mode\":\"loop\",\"name\":\"极光摆动\"}}}",
+                "note": "示例里极光层已重新启用 angles 摆动（±0.02 rad / 20s）。若你的库还是旧 dist，症状见 pitfalls「stale-linked-dist」。",
+            },
+            {
+                "能力": "用户属性绑定 vector 字段（含 text 类型属性）",
+                "status": "已验证",
+                "shape": "scene: \"origin\": {\"value\":\"960 400 0\", \"user\":\"horizon_y\"}；project.json: \"horizon_y\": {\"type\":\"text\", \"value\":\"960 400 0\"}；运行期 item_props_set {horizon_y:\"960 700 0\"}",
+                "rule": "渲染库按**形状匹配**决定用不用属性值：`valueShape(快照值) === propShape(属性声明值)` 才替换（user-props.js resolveUserValue）。所以属性类型叫 text 没关系，声明值写成 \"960 400 0\"（解析为 vec3）就能驱动 origin。",
+                "measured": "960 400 0 → 960 700 0：逐像素差均值 ~5.3、极值 236",
+            },
+            {
+                "能力": "组合开关 combos（shader 变体）",
+                "status": "已验证",
+                "declaration": "shader 源码里写声明注释（官方格式）：// [COMBO] {\"material\":\"ui_editor_properties_posterize\",\"combo\":\"POSTERIZE\",\"type\":\"options\",\"default\":0}，正文用 #if POSTERIZE",
+                "wiring": "**combos 写在材质 pass 里**（materials/effects/<名>.json 的 passes[0].combos = {\"POSTERIZE\":1}）。写在 effects/<名>.json 里不会被读（effects-parse.js:174 取的是材质 pass 的 mp.combos）",
+                "measured": "POSTERIZE 0→1：逐像素差均值 ~9.4、极值 243（色阶化肉眼可见）",
+            },
+            {
+                "能力": "camera.zoom",
+                "status": "已验证（解析层面）",
+                "shape": "\"camera\": {\"center\":\"0 0 -1\",\"eye\":\"0 0 0\",\"up\":\"0 1 0\",\"zoom\":1.02}",
+                "note": "parse.js 会读 cameraNode.zoom（缺省 1）；示例设为 1.02 做轻微推近。",
+            },
+            {
+                "能力": "全屏后期层（自定义）",
+                "status": "已验证",
+                "shape": "图层 image = models/util/fullscreenlayer.json，effects 走效果链；shader 里 g_Texture0 = 当前已渲染画面",
+                "note": "**图层 alpha 就是强度**（与下层混合）→ 绑个 slider 属性即强度滑条；必须放在 objects 最后。示例用它做暗角+胶片颗粒+色散（泛光交给 general.bloom）。",
+            },
+            {
+                "能力": "粒子系统的库内置贴图",
+                "status": "已验证",
+                "note": "贴图名按关键字程序化生成（star/ember/fog/meteor…），工程里不用带位图；组件白名单见 wallpaperem://reference/particles。示例 4 套共 268 粒子。",
+            },
+        ],
+        "knownUnverified": [
+            "Puppet 骨骼动画（MDL）与 animationlayers —— 库有实现与 CASEBOOK 案例，本示例未使用",
+            "scene 内 script / text.script 脚本沙箱 —— 库支持（SCRIPT-COMPAT.md），本示例只用静态文本",
+            "音频驱动发射（emitter.audioprocessingmode）与粒子子发射器（children.type=eventspawn）—— 库支持，本示例未接",
+            "多趟效果链（passes[].target/bind 的 _rt_ ping-pong、command copy/swap）—— 库支持，本示例只用单趟",
+            "视频/音频/网页类图层混进场景 —— 库支持（媒体类壁纸走同一引擎），本示例未用",
+        ],
+        "libDocs": {
+            "说明": "渲染库自带更权威的文档与可执行校验（本机路径，agent 可以直接读）",
+            "仓库": "~/Documents/workspace/webwallgl-github",
+            "CASEBOOK": "docs/CASEBOOK.md —— 11000+ 行「现象 → 根因」案例集（粒子/文字/Puppet/蒙版/视差/HLSL 转译…）",
+            "其他": "docs/SCRIPT-COMPAT.md、docs/INTEGRATION.md、docs/ARCHITECTURE.md、docs/we-docs/",
+            "可执行规格": "npm run verify:* （text/bloom/groups/animation/props/media/attachments/camera/pointer/audio/particles/shaders/textures/resolution/quality）—— 想知道某个能力「官方认为该怎么写」，读对应 verify 脚本最快",
+        },
+    })
 }

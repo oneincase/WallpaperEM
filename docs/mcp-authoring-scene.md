@@ -21,6 +21,8 @@ prompt `create_scene_wallpaper`（完整闭环流程）。
 | `effect_scaffold` 工具 | 直接返回自写 shader 的**四件套**（effects json + 材质 + `.frag` + `.vert`）：水面波纹 / 指针光晕 / 音频条 / 七段时钟 / **全屏后期泛光** / **胶片颗粒** |
 | `layer_selfcheck` 工具 | **判定某层到底画出来没有**：量该层矩形的均值/方差（白块 = 高均值低方差）+ 交叉核对渲染器诊断（会把「跳过效果（pass 编译失败）」原文带回来）→ verdict + 改法 |
 | `pitfall_search` 工具 | 按关键词查坑（比通读 pitfalls 省 token） |
+| `wallpaper_diff` 工具 | **判定某个字段/效果到底有没有改变画面**：三帧法（A/A2 同属性得"动画噪声底"，B 换属性）→ 逐像素差 + 16×9 分块同号分析。**动态壁纸不适合当 A/B 试验台**，细微变化请用 1~2 层静态探针工程 |
+| `wallpaperem://reference/capabilities` | **能力矩阵（实测）**：文字对象 / 内置泛光 `general.bloom` / composelayer 分组 / parent / 变换关键帧动画 / 属性绑定 vector 字段 / combos 变体 / camera.zoom / 全屏后期 / 内置粒子贴图 —— 每条含 JSON 形状、生效判据、实测数值与坑 |
 
 **全屏后期**（泛光/暗角/颗粒/色散）：图层用 `models/util/fullscreenlayer.json`（内容 = 当前已渲染画面，`g_Texture0` 即画面），放在 `objects` **最后**，**强度就是图层 alpha**（绑 slider 属性即可）。实测 alpha 0→0.62：边缘/中心亮度比 0.21→0.12（暗角）、高光像素 8.32%→8.48%（泛光）。
 
