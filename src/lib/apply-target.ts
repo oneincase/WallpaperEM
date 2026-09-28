@@ -1,5 +1,5 @@
 // 应用目标（哪块屏）的两项跨组件状态：
-// ① armed  —— 显示器页「更换壁纸」锁定的目标屏，下一次应用动作只落它（然后自动解除）；
+// ① armed  —— 显示器坞「更换壁纸」锁定的目标屏，下一次应用动作只落它（然后自动解除）；
 // ② last   —— 独立模式下「上次选择」（"" = 全部显示器），供目标菜单记忆。
 import { useSyncExternalStore } from "react";
 
@@ -25,7 +25,7 @@ function getArmed(): ApplyTarget | null {
   return armed;
 }
 
-/** 显示器页「更换壁纸」：锁定目标屏（供 Library 页横幅展示 + 下一次应用消费） */
+/** 显示器坞「更换壁纸」：锁定目标屏（供 Library 页横幅展示 + 下一次应用消费） */
 export function armApplyTarget(t: ApplyTarget) {
   armed = t;
   emit();

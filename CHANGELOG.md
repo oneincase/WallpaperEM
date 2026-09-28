@@ -28,32 +28,252 @@
   显示器 id 迁移（旧 `CGDirectDisplayID` → 稳定 id）也把标记一起搬走，老版本升级上来的
   用户不会看到「之前停掉的壁纸又回来了」。
 
-### 🔍 MCP 审计收尾 / Audit follow-up
+### 🗂 本地库筛选 / Library filter
+
+- 「类型」组里的 **预设** 改为 **项目**：`$project` 只命中"有对应工程目录"的条目，也就是
+  用 `project_*` 建出来、再 `scene_pack(install=true)` / `project_install` 装进库的自建工程
+  —— WallpaperEM 独有的类型。工坊的「分类」维度本来就有 `Preset`（本地库筛选面板的分类组里
+  也有），类型维度再来一份是重复入口，故让位。
+- 真源是 `Projects/` 下的工程目录（`workspace::project_item_ids`），不看库表：库里没有
+  "这行是不是自建工程"这一列，工程目录在就算项目、删掉就不再算，不需要 schema 迁移。
+  空集合用恒假条件（选了就是空结果），不会退化成"不过滤"。
+- 顺带对齐 MCP：`library_list` 工具过去**完全忽略 `tagGroups`**（只有界面那条路带标签筛选），
+  现在两处同源（`$project` / `$local` 都能用），schema 里也写明了这两个库内专用值。
+- 英文界面不再显示 `$project` / `$local` 这种内部值：标签元数据补了 `en` 与逐标签 `hint`
+  （原来「本地导入」在英文界面显示的就是 `$local`）。
+
+### 🔍 审计收尾 / Audit follow-up（MCP 场景创作第三批）
 
 - **多屏点名截图**：`wallpaper_screenshot` 新增 `displayId` —— 多屏各挂不同壁纸时用它指定
   拍哪一块屏（`apply` 也只作用于该屏）；屏上没有目标条目时明确报错，不再"拍到哪张算哪张"。
 - **两级资源锁**：锁从「按工程名」升级为 `project:<名>` + `item:<id>` 两个命名空间。
-  安装/更新会**同时**读工程、写库目录，因此两把都拿；预览/截图/删除持条目锁。原先只锁
-  工程时，「正在增量同步库目录」与「正在读同一库条目的预览」会撞车（偶发黑屏/旧画面）。
-  多把键按字典序获取，不会死锁。
-- **离屏预览空闲自释放**：`keepOpen:true` 保留的实例在 180s 没有新抓帧请求时自动释放。
+  安装/更新会**同时**读工程、写库目录，因此两把都拿；预览/截图/删除持条目锁。
+  原先只锁工程时，「正在增量同步库目录」与「正在读同一库条目的预览」会撞车（偶发黑屏/旧画面）。
+  多把键按字典序获取，不会死锁；单测用确定性等待证明同键互斥、异键不互等。
+- **离屏预览空闲自释放**：`keepOpen:true` 保留的实例在 180s 没有新抓帧请求时自动释放
+  （实测：临时把阈值调到 12s，12s 后诊断出现「空闲 12s 无抓帧请求，自动释放预览」）。
 - **修掉图片 mime 错标**：单帧截图走兼容字段 `_image` 时**丢掉了 mime**，于是一律被当成
   `image/png` —— 渲染器自抓帧产出的是 JPEG，客户端按 PNG 解会失败（严格客户端尤其明显）。
-  现在 mime 一路带到内容块，缺声明时按魔术字节嗅探；"原生快照一定返回 png"这个硬编码也改成
-  按字节判断。
+  现在 mime 一路带到内容块，缺声明时按魔术字节嗅探；顺手把"原生快照一定返回 png"这个
+  硬编码也改成按字节判断。
 - **`onscreen_item` 增加 DB 兜底**：重启后窗口可能由恢复流程"接管"而非重建，内存会话表里
   未必有它 —— 曾因此让 `apply=false` 的一致性校验静默跳过（正是上面那条"拍到别的壁纸"）。
-- **`wallpaper_preview` 对「主窗口不在」的处理**：主窗口被关闭、或被内存压力看门狗回收时
-  没有渲染面了。默认返回可操作的错误并给替代方案，新增 `openMainWindow: true` 显式允许
-  宿主重新打开主界面（结果里带 `openedMainWindow`）；预览挂载的每一步都有诊断，
+- 清理 MCP/场景创作链路的 clippy 风格项（文档列表缩进、无谓借用/闭包/`return`、
+  `% 8` → `is_multiple_of`、`map_or`/`filter_map` 等）；余下 3 条 `result_large_err`
+  与无关模块的风格项未动（属既有设计取舍，改动面大于收益）。
+
+- **`wallpaper_preview` 对「主窗口不在」的处理**：主窗口被关闭、或被内存压力看门狗回收
+  （`main_window.rs` 的既有机制）时没有渲染面了。默认返回可操作的错误并给替代方案，
+  新增 `openMainWindow: true` 显式允许宿主重新打开主界面（结果里带 `openedMainWindow`）。
+  预览挂载的每一步（按需加载渲染库 / 取配置 / 取属性 / 开始挂载）现在都有诊断，
   "卡在哪一步"一眼可见。
-- **大请求体与写入上限对齐**：axum 的 `Bytes` 提取器默认只收 2 MB，agent 用 base64 写贴图
-  （一张 2048² PNG 轻松超过）会被传输层用**纯文本** 413 打回 —— 那不是 JSON-RPC 错误，
-  客户端可能直接判会话故障。现在自己读 body、上限 64 MB，超了回明确的 JSON-RPC 错误；
-  同时把工程内单文件写入上限从 512 MB 收到 40 MB（远高于常见贴图，且与工具说明里
-  「单文件上限 40 MB」一致）。
-- 截图链路统一走**渲染器自抓帧**（宿主 `request_capture` → 渲染器 `__wpCapture` 回传），
-  平台专属截图退为兜底。
+
+### 📝 勘误与加固（对齐 webwallgl issue 的复核结果）
+
+- **更正了一处对外结论**：我在 webwallgl#10 里写「效果编译失败只在 console.warn、诊断通道看不到」
+  —— 实测**是错的**：渲染库 `scene-mount.ts:307-330` 有一段 `console.warn → reportDiag` 桥
+  （`[we-scene]` 前缀，场景清理时还原），设计诊断本来就能读到
+  `跳过效果（pass 编译失败）: … Missing main()`。已在 issue 里更正标题与正文，诉求收窄为
+  「把缺 stage 这类文件级错误直说出来，别退化成没有 stage/行号的 GLSL 报错」。
+- **#11 复核成立**：效果文件里直写 `shader`（而非 `material`）这条路**确实全静默**（连 console 都没有），
+  已在 issue 下补实测证据。对应的**宿主侧加固**：`project_validate` 现在会对
+  「效果文件里 `passes[].shader`」主动 warning（以前我把它当合法形态放过，等于给了假安慰）。
+- `wallpaperem://reference/pitfalls` 里这两条的「症状/原因/验证」同步更正，
+  避免 agent 拿到过期地图（明确区分「有日志但难定位」与「真的一条都没有」）。
+
+### 🔧 MCP 知识化 · 第二批（自检 / 检索 / 全屏后期）
+
+- **`layer_selfcheck` 工具**：判定"这一层到底画出来没有"。做法是**只渲染一次**，
+  按 cover 折算该层矩形 → 量区域内均值/方差（高均值+低方差 = 白块）→ 再**交叉核对渲染器诊断**
+  （渲染库其实会把「跳过效果（pass 编译失败）」写进诊断，工具把这行原文带回来）→ 给出
+  `content / flat_white / flat_color / blank / effect_skipped / offscreen` 之一 + 改法。
+  实测：缺 `.vert` 的层 → `effect_skipped` + 证据 `跳过效果（pass 编译失败）: … Missing main()`、
+  区域均值 255/方差 0；正常层 → `content`（方差 84）。**不可见的失败第一次变成可判定结论。**
+- **`pitfall_search` 工具**：按关键词查坑清单（中英文/文件名都行），空查询返回目录（id + 症状首句）；
+  比让 agent 通读 15 条省 token。
+- **全屏后期能力打通并固化成脚手架**：验证了 `models/util/fullscreenlayer.json` +
+  `_rt_` 语义（`g_Texture0` = 当前已渲染画面、**图层 alpha = 强度**、必须放在 `objects` 最后）。
+  新增两类脚手架 `post_bloom`（亮部泛光 + 暗角 + 颗粒 + 轻微色散，一趟做完）与
+  `film_grain`（廉价暗角+颗粒+提对比），并补进 `reference/effects`（含实测数据）与坑清单
+  （全屏后期层放错位置/用错模型是新的坑源）。
+- **秀场顺带升级**：示例壁纸加了 PostFX 层与 `postfx` 属性（泛光/暗角/颗粒强度），
+  实测开启后边缘/中心亮度比 0.21 → 0.12。
+- 防漂移测试：`effect_scaffold` 声明的每个 kind 都必须在 `src/mcp/templates/` 有模板、
+  且出现在 `reference/effects` 的 recipes 里。
+
+### 📚 MCP 知识化 / Knowledge surfacing（让 agent 不必再翻渲染库源码）
+
+这一轮做示例壁纸时，大量时间花在**逆向渲染库**上（粒子贴图怎么解析、效果链为什么必须写
+`material`、缺 `.vert` 为什么会静默跳过、`angles` 动画为什么会让 mount 永久挂起……）。
+把这些结论固化进 MCP 服务本身：
+
+- **三份新的机器可读资源**（agent 直接读，不用读源码）：
+  - `wallpaperem://reference/effects` —— 效果链三段式文件布局、15 个可用 `g_*` uniform
+    （`g_Time` / `g_Daytime` / `g_PointerPosition(Last,State)` / `g_AudioSpectrum16/32/64Left+Right`
+    / `g_Color` …）、顶点与片段模板、四类配方（水面波纹 / 指针光晕 / 音频条 / 七段时钟）与坑；
+  - `wallpaperem://reference/particles` —— 内置粒子贴图的**关键字表**（star→尖星、ember/fire→火苗、
+    smoke/fog→絮状、meteor/shooting→流星尾迹…按名字程序化生成，工程里不必带位图）、已实现的
+    emitter/initializer/operator/renderer 白名单、**未实现名单**（`turbulentvelocityrandom` 会被静默忽略），
+    以及星尘/余烬/星云絮/流星四套完整预设；
+  - `wallpaperem://reference/pitfalls` —— 14 条「症状 → 原因 → 改法」，全部实测复现过。
+- **两个"直接给模板"的工具**：`particle_recipe`（返回可落盘的预设+材质两文件）、
+  `effect_scaffold`（返回自写 shader 的**四件套**，缺一即静默失效的那种）。四类 shader 的
+  脚手架直接取自本轮验证过的实现。
+- **校验器主动拦两个最痛的坑**（以前只有踩过才知道）：
+  - `angles` 带关键帧动画 → warning 指出这是渲染库已知问题（webwallgl#9），并给出替代写法；
+  - 效果 shader 只有 `.frag` 缺 `.vert` → warning 说明会被**静默跳过**、图层会退回内置材质的纯色块。
+- `instructions` 改成「先读资源、先拿配方」，并明确 reference 三份就是渲染库能力边界的真源。
+- 资源与实现的一致性由单测保证：配方里出现的粒子组件名必须都在白名单里（防止"配方反而害人"），
+  未实现名不得出现。
+
+### ✨ 新增 / Added（MCP 场景创作第三批）
+
+- **`wallpaper_preview`：离屏预览（不碰桌面）**。把壁纸挂在**主窗口里一张屏外画布**上渲染
+  并抓帧，桌面壁纸会话完全不动 —— 迭代时不再需要「应用 → 看图 → 停掉」那条会反复刷用户
+  桌面的路。支持 `framesMs` 多帧、`maxWidth` 缩放、`keepOpen` 调试。
+  > 为什么不是「另开一扇预览窗」：macOS 会把不可见窗口判为遮挡并**停止出帧**，实测预览窗
+  > 把 `scene.pkg` 全部解析完、贴图也传完了，却永远等不到首帧 ready（诊断停在 mount 中途）。
+  > 主窗口本来就可见在跑，画布放到屏外既不露给用户、三平台还同一套代码。
+- **跨平台抓帧（渲染器 / 主窗口自己抓，宿主下发指令）**：截图的「抓」从各平台原生 API
+  改成**页面自己抓**（画布是 `preserveDrawingBuffer: true`，视频帧与页面同源可 `drawImage`），
+  宿主经 `eval` 下发、页面 `POST /capture` 回传。于是 `wallpaper_screenshot` 对
+  **scene / video / gif / image 在三个平台都能用**（以前只有 macOS 有原生快照；
+  Linux/Windows 直接报错）。`web` 类型仍是独立 iframe，只能走 macOS 原生快照。
+  抓帧产物统一 JPEG（截图只用于看效果/当封面），`maxWidth` 默认 1920。
+- **`structuredContent` + `outputSchema`**：11 个形状稳定的工具（`projects_list` /
+  `project_validate` / `scene_inspect` / `scene_pack` / `project_install` / `project_update` /
+  `renderer_diag` / `wallpaper_preview` / `wallpaper_screenshot` 等）在 `tools/list` 里声明
+  `outputSchema`，结果除了文本块再带一份 `structuredContent`（MCP 2025-06-18）——
+  新客户端可直接按类型消费，老客户端读文本块，两边都不破。
+- **工程级串行锁**：同一个工程上的 `project_write_file` / `scene_pack` / `project_install` /
+  `project_update` / `scene_inspect` … 按工程名分槽互斥执行，不同工程照旧并行。
+  并发写文件 + 打包不再可能读到写了一半的 JSON（实测两条并发 `scene_pack` 都正常返回）。
+
+### 🐛 修复 / Fixed（MCP 场景创作第三批）
+
+- **`wallpaper_screenshot(apply=false)` 会干等到超时**：不重新应用时 `t0` 仍取「当前 ready
+  时间戳」，等待条件就变成「等一个比现在更新的时间戳」—— 只能靠轮播换纸之类的偶然事件救场。
+  现在 `apply=false` 时 `t0` 一律为 0（拍「现在屏上是什么」），实测 1.9s 返回（原先 60s 超时）。
+- **主窗口没有任何诊断通道**：`/diag` 一直只有渲染器页在用，于是「预览不出图」在宿主侧只能
+  看到超时。现在离屏预览也按 `win=main` 上报（开始/挂载完成/收到抓帧/回传字节/失败原因），
+  `renderer_diag` 工具直接可见；预览桥没装上时宿主 **3s 内快速失败**并提示「刷新主窗口」，
+  不再干等满超时。
+
+### ✨ 新增 / Added（MCP 场景创作第二批）
+
+- **`renderer_diag`：渲染器诊断历史**。以前诊断只留「最近一条」、且只在截图超时的报错里
+  露一句 —— 效果 pass 编译失败（`[we-scene]` 那条 console.warn 桥过来的告警）、贴图 404、
+  视频纹理失败这些「画面不对但没有任何报错」的问题基本拿不到。现在按 label + 时间留
+  **300 条**环形历史，工具可按 label / itemId / sinceMs 过滤、可 `clear` 后重跑一轮；
+  返回里带累计条数与缓存条数（不必猜「是不是被冲掉了」）。
+- **`scene_inspect`：场景工程结构化体检**。图层树与类型、每张贴图的尺寸/体积/引用者、
+  手写 `.tex` 标记、没人引用的素材、属性绑定命中表（谁绑了谁、谁声明了没绑）、粒子组件
+  支持/不支持清单、关键帧摘要、工程用到的 shader 集合，外加性能提示（贴图边长超 4096、
+  素材总量超 96 MB、粒子总数超 2000）。`errors/warnings` 一并返回，省一次往返。
+- **`scene_pack(install=true)`**：打包 + 装/更新一步到位（已装过则增量更新、itemId 不变）。
+  **`project_update` 改成增量同步**：只拷「新增 / 大小变了 / 源比库新」的文件、删源里已经
+  删掉的，没变的素材一个字节都不动（以前每轮迭代全量重拷，贴图几十上百 MB 的场景吃不消），
+  返回 `copied/removed/unchanged/bytes`。
+- **`wallpaper_screenshot(framesMs=[0,1000,3000])` 多帧截图**：一次调用按时刻返回多帧
+  （每帧一个 image 块，上限 8）—— 动画/循环/关键帧这类**时间维度**的问题单张图看不出来。
+- **`project_import_asset`**：把宿主上的大素材直接拷进工程（单文件 512 MB，走文件系统，
+  不占 JSON-RPC 请求体）—— 越过 `project_write_file` 的 40 MB base64 上限。来源限
+  图片/下载/桌面/文稿/音乐/影片/临时目录与工程根 + 扩展名白名单（**避免 MCP 变成任意文件
+  读取器**：`~/.ssh/id_rsa` → 拷进工程 → `project_read_file` 这条路径被堵死）。
+- **`wallpaperem://reference/scene-support` 资源**：内置 shader / 内置模型 / 贴图解析规则 /
+  粒子组件白名单 / 属性类型 / 体积上限的**机器可读**版本，与校验器共用同一份常量。
+
+### 🐛 修复 / Fixed
+
+- **文档里的粒子名单与库实现脱节**（被这批新增的守卫测试当场抓出来）：文档写的
+  `turbulentvelocityrandom`、`sphererandom` 在库里**不是**实现名，而库实际支持的
+  `capvelocity` / `positionoffsetrandom` / `collisionquad` / `collisionplane` /
+  `mapsequencearoundcontrolpoint` 等 9 个名字文档里没有。发射器的真相是「只特判
+  `boxrandom`，其余一律按球壳发射」——所以现在**不对发射器名字报 warning**（报了是误导），
+  只提醒别漏写 `name`；initializer / operator 名单按库的 `switch` 分支补齐到 9 / 20 项。
+  新增测试 `scene_support_names_exist_in_library_bundle` 拿渲染库 bundle 里的
+  `case "…":` 字面量逐个核对，防止再次漂移。
+- `project_update` 的整目录暂存 / 回滚机制随增量同步移除（`stage_aside` / `restore_aside`
+  与其单测一并删掉）：失败语义改为「先校验（绝大多数失败在此拦下）+ 单文件临时名落位」，
+  错误信息里明确提示「库内副本可能处于半更新状态，再跑一次即可修复」。
+
+### 🐛 修复 / Fixed
+
+- **MCP 写大贴图会被传输层静默打回**：`/mcp` 的 JSON-RPC 请求体走 axum 默认 **2 MB**
+  上限，而 agent 写贴图是 base64（2048² PNG 轻松超）—— 工具还没执行就收到纯文本的
+  HTTP `413 length limit exceeded`（不是 JSON-RPC 错误，客户端可能直接判会话故障）。
+  现在自己读 body、上限 **64 MB**，超限回一条说明上限与替代做法的 JSON-RPC 错误；
+  `project_write_file` 的单文件上限同步从名义 512 MB 收到 **40 MB**（与传输上限对齐，
+  超了拿到的是可操作的提示而不是 413），并把限制写进工具描述。
+- **同名 `.tex` 会静默顶掉源图**：`scene_pack` 对 `materials/<名字>` 只认一份，旧实现按
+  `read_dir` 的无序结果「先遍历到谁用谁」——同一工程可能这次静默用旧 `.tex`（画面和源图
+  不一致），下次报「打包条目重名」。现在「同名 `.tex` + 源图」在校验器里是 **error**
+  （指出删哪一份）、打包器再兜一道底，`project_write_file` 写源图时顺手删掉同名 `.tex`
+  并在返回里说明；反向写 `.tex` 会提醒它会盖住源图。
+- **改完工程截图/封面可能还是上一版**：`wallpaper_screenshot` 的「跳过重复应用」只比对
+  `itemId`，而 `project_update` **刻意保持 itemId 不变**、库导入路径也不碰壁纸引擎 ——
+  第二轮迭代默认截到旧画面，还会把旧画面覆盖写成 `preview.png`。现在判据多了「屏幕上这份
+  不比库文件旧」（条目目录 + `scene.pkg`/`project.json`/入口文件的 mtime 对 ready 时刻），
+  并新增 `force` 参数可无条件重挂。
+- **MCP 自检脚本早已跑不通**：`scripts/mcp-e2e.mjs` 还在调 `project_snapshot` /
+  `project_versions` / `project_rollback`（三个工具已随方案调整移除），必然在第 6 步报
+  「未知工具」。已按现有工具重写，并补一条**「改画面 → 重新打包 → 更新 → 再截图必须
+  `applied: true`」**的回归断言（就是上面那个「改了看不到变化」的哨兵）。
+- 清掉指向已删除工具的文案：`.version/` 拒写提示不再叫 agent 去用
+  `project_snapshot`/`project_rollback`。
+
+### ✨ 新增 / Added
+
+- **场景工程字段级校验（`project_validate` 大幅补齐）**：以前只查引用链与形状，文档里写了
+  的字段一半不查 —— 实测一个「属性绑定指向不存在的属性 / parent 悬空 / effects 指向不存在
+  的文件 / 关键帧结构错乱 / 粒子组件名瞎写 / 粒子材质 shader 不是 genericparticle」的场景
+  能 `ok=true` 并顺利打包。现在这些全部有明确判定：
+  - **error**：`{"user":"…"}` 绑定的属性名在 `project.json` 里不存在、`parent` 悬空/自指/成环、
+    `effects[].file` 缺失、粒子预设不可解析或材质首个 pass 不是 `genericparticle`、
+    `animation.c0` 缺失或关键帧缺 `frame`/`value`、`options.fps ≤ 0`、`options.length < 1`、
+    贴图同名冲突；
+  - **warning**：声明了却没人绑的属性、不受支持的粒子组件名（附支持清单）、
+    非内置 shader 缺 `shaders/*.frag`、关键帧长度不足、`alpha`/`brightness` 越界、
+    `scale`/`size` 有 0、`origin` 落在设计分辨率之外、`colorBlendMode` 不在文档取值里。
+  这些坑的共同点是**渲染器不报错、只是不生效**，所以必须在校验阶段说出来。
+- **场景模板顺手修好**：`templates/scene` 声明了 `glow` 属性却没人绑（拖滑块毫无反应），
+  现在绑在 Aurora Glow 图层的 `alpha` 上；新增的「声明未绑定」提醒也是靠它守住的。
+
+### 🚀 性能 / Performance
+
+- **视频壁纸改走硬解直通（loop + direct）**：视频类型不再经 `webwallgl` 挂载，改为独立的
+  `<video>` 直通层，VideoToolbox 解出的 `IOSurface` 零拷贝交给窗口合成器。此前每帧
+  `texImage2D` 上传纹理，4K 一帧 3840×2160×4 ≈ 33MB（60fps ≈ 2GB/s），且 WKWebView 下
+  `texImage2D(视频帧)` 要同步跨进程取像素 —— 这是 4K 视频壁纸掉帧的根因，代价随像素数
+  线性。现在像素搬运量归零。循环策略用原生 `loop`（单解码会话）。
+
+### ✨ 新增 / Added
+
+- **本地库批量删除 / 批量移除**：开启多选后，底部批量条在原有的「加入切换列表 / 移出列表」
+  之外新增两个库级动作。**批量移除**只清库记录（自定义属性、列表归属、下载历史一并清掉，
+  下次导入不会复活旧配置），**壁纸文件保留在磁盘上**；**批量删除**连磁盘文件一起删。
+  两者都走二次确认，逐条串行执行 —— 一条失败（文件被占用等）不会中断整批，结果按
+  「成功 N 张 / 失败 M 张（附首条原因）」汇报。
+- **卡片新增「壁纸属性 / 壁纸信息 / 移除壁纸」三个入口**：属性直接开原有的配置面板
+  （作者属性 + 播放设置，与详情页同一个组件）；信息面板汇总标题、类型、条目 ID、标签、
+  大小与文件数、入库时间、所属切换列表、引用模式的来源目录、工坊条目 ID 与文件是否丢失，
+  ID / 路径可一键复制；移除与删除靠图标 + 文案分开（减号＝保留文件，垃圾桶＝连文件删），
+  移除同样要二次确认。后端新增 `library_remove`（与 `library_delete` 共用停屏 / 清库逻辑，
+  只是不删目录），并按惯例暴露给 MCP。
+- **本地库卡片操作按钮重排为 2×4**：预览 / 应用 / 属性 / 信息＋打开位置 / 分享 / 移除 / 删除 ——
+  「看和配这张壁纸」在前，「文件、分享、移出库」在后，破坏性最强的删除压轴。
+
+### 🛠 改变 / Changed
+
+- **视频壁纸不再参与全局滤镜**：滤镜挂在祖先容器上会强制整棵子树离屏渲染，与直通在物理上
+  互斥。视频改挂独立的 `video-layer` 容器（不带任何 `filter`/`opacity`/`transform`），
+  设置页「滤镜」的说明里补上了这条约束。scene / web / gif / image 的滤镜行为不变。
+- 视频壁纸的显形不再走 `reveal` 的 transform/filter 关键帧（那套是为 WebGL 画布设计的），
+  改为只对 `<video>` 元素自身做 opacity 过渡 —— 层属性，合成器直接混合，不触发离屏。
+- 视频壁纸的 `fit` 改由 `object-fit` 就地生效；`renderDpr` 对直通视频没有可生效的环节，
+  改为只记配置不重挂（此前会白断一次播放重新 buffer）。
+- `clear()` 换壁纸时显式清空视频 `src` 并 `load()`，让 VideoToolbox 的解码会话当场归还 ——
+  否则连续换几个 4K 视频壁纸，会话只增不减。
 
 ## [v2.0.0] - 2026-09-27
 

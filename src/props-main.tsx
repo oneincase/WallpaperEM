@@ -24,8 +24,7 @@ function PropsWindow() {
   // 与主窗口同一套玻璃：当前壁纸模糊背景 + 按封面亮度自适应 tint
   const backdrop = useWallpaperBackdrop();
   // 同主窗口：材质没落实到窗口时，无壁纸态要自己垫底（见 useBackdropMaterial）
-  const material = useBackdropMaterial();
-  // 最大化/全屏时去圆角与描边（同主窗口壳）
+  const material = useBackdropMaterial();  // 最大化/全屏时去圆角与描边（同主窗口壳）
   const rounded = useWindowRounded();
   const [itemId] = useState(() => new URLSearchParams(location.search).get("item") ?? "");
   const [title, setTitle] = useState(itemId);

@@ -49,3 +49,6 @@ src-tauri/bundled/
 # --- 界面截图工具的工作目录 / 编译产物（scripts/ui-shots）---
 .ui-shots/
 scripts/ui-shots/.bin/
+
+# --- 4K 视频无缝循环原型的测试片（20MB+，由 tools/make-clips.sh 用 ffmpeg 生成）---
+proto-video-loop/clips/

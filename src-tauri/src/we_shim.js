@@ -1569,6 +1569,23 @@
   // —— rAF 节流（带 __weThrottled，避免父页 injectGpuThrottle 双层减半）——
 
   function installRafThrottle() {
+    // 交付节拍用**单调墙钟**：rAF 回调收到的 now 是「该帧的 vsync 时刻」，不是回调真正
+    // 执行的时刻 —— 长任务期间被推迟的回调会带着块内的时间戳执行，浏览器「追赶」时同一
+    // 时刻连发两个回调、时间戳相差可达上百毫秒（实测 11.9 / 145.2）。拿它算「距上次交付
+    // 多久」会把紧接着的第二次交付误判成「已经过点」，一帧连交两次。作者回调拿到的仍是
+    // 原生 now（契约不变）。
+    var clock =
+      w.performance && w.performance.now
+        ? function () {
+            return w.performance.now();
+          }
+        : function () {
+            return Date.now();
+          };
+    // 上一次交付的墙钟时刻（所有链共用；-1 = 还没交付过）。相位基准不能挂在链内：作者
+    // 回调普遍在交付里立刻登记下一帧（自递归主循环），每次交付都换一条新链，新链的
+    // lastNow 从 0 起步 —— 饿死恰好落在链首那次回调时链内什么都看不到。
+    var lastDeliverNow = -1;
     var throttled = function (cb) {
       if (typeof cb !== "function") return 0;
       if (paused) {
@@ -1594,29 +1611,37 @@
         rafMap[idNative] = { kind: "native", id: idNative };
         return idNative;
       }
-      // 跳帧节流：每帧都挂原生 rAF（与显示器 vsync 同相位），只把第 n 帧交给作者
+      // 跳帧节流：每帧都挂原生 rAF（与显示器 vsync 同相位），到点的那一帧交给作者
       // 回调。旧实现是 `setTimeout(1000/fps)` 之后再 rAF —— 定时器回调落在刷新的
       // 任意相位上，30fps 上限会产出 17/33/50ms 的抖动间隔，观感就是「限了 30 反而
-      // 更卡」。n 按实测的原生 rAF 间隔自适应（60Hz→2，120Hz→4，90Hz→3）。
+      // 更卡」。目标是**落在 fps 上限以下的均匀帧**：60Hz→每 4 帧一交付，120Hz→每 8 帧。
       var id = ++rafCounter;
-      var slot = 0;
       var lastNow = 0;
       var nativeMs = 0;
       var step = function (now) {
+        var nowMs = clock();
         if (lastNow > 0) {
-          var dt = now - lastNow;
+          var dt = nowMs - lastNow;
           if (dt > 1 && dt < 40) nativeMs = nativeMs > 0 ? nativeMs * 0.8 + dt * 0.2 : dt;
         }
-        lastNow = now;
-        slot++;
-        // 目标间隔 / 实测间隔向上取整 = 落在 fps 上限**以下**的均匀帧；留 0.05 容差，
-        // 否则 16.4ms 这类测量噪声会把 30fps 算成 20fps。
-        var n = nativeMs > 0 ? Math.max(1, Math.ceil(1000 / fps / nativeMs - 0.05)) : 2;
-        if (slot % n !== 0) {
+        lastNow = nowMs;
+        // 交付判据只看**经过的时间**（交付仍只发生在 vsync 回调上）：
+        //   到点就交付 —— 原判据是 `slot % n`，数的是**回调次数**，与经过的时间无关。
+        //     长任务/系统负载期间浏览器一个 vsync 只补发一个回调，slot 只 +1 而墙钟过去了
+        //     上百毫秒，于是还要再等 (n - slot%n) 帧才交付，间隔被放大成「饿死时长 + 最多
+        //     (n-1)×vsync」，尾部呈目标间隔的整数倍（67/133/199/265…）—— 中位数准确、
+        //     尾部飘，观感就是偶发卡顿。相位基准挂在链外（见 lastDeliverNow）。
+        //   没到点不交付 —— 长任务后浏览器「追赶」时会同一时刻连发几个回调，按次数计数
+        //     会在 26~50ms 内连交两帧，把 fps 上限顶穿（实测）。
+        // 容差 0.05 帧沿用原判据的标定：16.4ms 这类测量噪声不许把 30fps 算成 20fps。
+        var target = 1000 / fps;
+        var slack = nativeMs > 0 ? nativeMs * 0.05 : 0;
+        if (lastDeliverNow >= 0 && nowMs - lastDeliverNow < target - slack) {
           rafMap[id] = { kind: "native", id: origRaf(step) };
           return;
         }
         delete rafMap[id];
+        lastDeliverNow = nowMs;
         try {
           cb(now);
         } catch (_) {

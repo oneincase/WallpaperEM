@@ -45,7 +45,7 @@ export function useWallpaperMeta() {
     }
   }, []);
 
-  // 后端应用/停止（含显示器页、MCP 等旁路）会推送 sessions-changed，
+  // 后端应用/停止（含显示器坞、MCP 等旁路）会推送 sessions-changed，
   // 各页的「已应用」徽章随之对齐真实状态
   useEffect(() => {
     let un: (() => void) | undefined;

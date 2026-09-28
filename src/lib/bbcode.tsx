@@ -151,7 +151,7 @@ function renderNodes(nodes: BbNode[], keyPrefix: string): ReactNode[] {
         return (
           <code
             key={key}
-            className="my-1 block whitespace-pre-wrap rounded-md bg-white/10 px-2 py-1.5 font-mono text-[12px]"
+            className="my-1 block whitespace-pre-wrap rounded-md bg-[var(--glass-subtle)] px-2 py-1.5 font-mono text-[12px]"
           >
             {inner}
           </code>

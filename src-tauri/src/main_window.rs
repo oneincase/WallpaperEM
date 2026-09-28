@@ -246,6 +246,42 @@ fn on_tick(app: &AppHandle, pressure: Option<&mem_pressure::Reading>) {
     }
 }
 
+/// 窗口对象还在、但它的 WebContent 进程已经被系统/WebKit 结束了吗？
+///
+/// 这种情况下 `show()` 出来的是一个**空壳**——窗口在、位置对，内容一片空白，
+/// 而且因为 `get_webview_window` 仍返回 `Some`，重建路径永远不会被走到。
+///
+/// 这不是理论风险：macOS 内存压力下 WebKit 会自行结束 WebContent 进程
+/// （那条 memory pressure WARN 的注释里写过「界面若变成空白，关掉重开即可」），
+/// 而 [`MainWindowState::released`] 只反映「Rust 主动释放」，覆盖不到这条路径。
+/// 于是用户点托盘「显示主窗口」得到空白窗，只能自己关掉再开一次。
+///
+/// 返回 true = 进程已不在（调用方应销毁该窗口并走重建）。
+/// **拿不到 pid 时一律返回 false**：宁可维持现状，也不要误毁一个好窗口。
+fn web_content_gone(window: &WebviewWindow) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        // 内部会先检查主线程，非主线程返回 None → 落到上面的「当活着」分支
+        let Some(pid) = crate::wallpaper::macos::web_content_pid(window) else {
+            return false;
+        };
+        // SAFETY: 正数 pid + 信号量 0 = 只做存在性检查，不真的发信号
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return false;
+        }
+        // 进程号可能已被系统回收给别的进程 —— 但那本来就意味着它不是我们的
+        // WebContent 了，同样该重建。这里只记日志，不额外区分。
+        tracing::info!("main window: WebContent 进程 {pid} 已退出，窗口是空壳，将重建");
+        true
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // WebView2 / WebKitGTK 的 destroy 会连带销毁渲染进程，没有这种「空壳」形态
+        let _ = window;
+        false
+    }
+}
+
 /// 显示主窗口；若已被内存压力回收销毁，则按 tauri.conf.json 原配置重建。
 /// 供托盘菜单/托盘左键/Dock Reopen/单实例聚焦调用；可在任意线程调用
 /// （窗口操作经 runtime 派发到主线程，主线程调用则同步执行）。
@@ -263,13 +299,19 @@ pub fn ensure_main_window(app: &AppHandle) {
 
     if !released {
         if let Some(w) = app.get_webview_window("main") {
-            // 最小化（miniaturize 到 Dock）的窗口对 show() 无反应（macOS 的
-            // orderFront 不会自动 deminiaturize），必须显式还原，否则托盘点击
-            // 后主窗口永远停在 Dock 里，表现为「软件无响应」
-            let _ = w.unminimize();
-            let _ = w.show();
-            let _ = w.set_focus();
-            return;
+            // 空壳检测要放在 show() 之前：先 show 会把那片空白闪给用户看一遍。
+            // 检测到进程已死就销毁它，让控制流落到下面的重建路径。
+            if web_content_gone(&w) {
+                let _ = w.destroy();
+            } else {
+                // 最小化（miniaturize 到 Dock）的窗口对 show() 无反应（macOS 的
+                // orderFront 不会自动 deminiaturize），必须显式还原，否则托盘点击
+                // 后主窗口永远停在 Dock 里，表现为「软件无响应」
+                let _ = w.unminimize();
+                let _ = w.show();
+                let _ = w.set_focus();
+                return;
+            }
         }
     } else if let Some(zombie) = app.get_webview_window("main") {
         tracing::info!("stale main window entry after release; clearing");

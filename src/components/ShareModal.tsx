@@ -166,7 +166,7 @@ function CopyRow({
     <div className="flex items-center gap-2">
       <span className="w-14 shrink-0 text-[12px] text-[var(--text-2)]">{label}</span>
       <code
-        className={`flex-1 truncate rounded-lg border border-[var(--separator)] bg-white/5 px-2 py-1.5 text-[11.5px] ${
+        className={`flex-1 truncate rounded-lg border border-[var(--separator)] bg-[var(--glass-subtle)] px-2 py-1.5 text-[11.5px] ${
           mono ? "font-mono" : ""
         }`}
         title={text}

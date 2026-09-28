@@ -1,0 +1,82 @@
+# --- macOS ---
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# --- Node / 前端 ---
+node_modules/
+dist/
+*.local
+*.log
+*.tsbuildinfo
+
+# --- Rust / Cargo / Tauri ---
+src-tauri/target/
+# 本地 cargo 缓存（本仓库曾含 .cargo-home，勿提交）
+.cargo-home/
+# Tauri 打包产物（app / dmg 在 src-tauri/target 内，此处兜底）
+release/
+bundle/
+
+# --- 编辑器/脚本临时备份 ---
+*.bak
+*~
+
+# 注：DepotDownloader sidecar 二进制已用 Git LFS 纳入（见 .gitattributes），不再忽略。
+
+# --- 本地运行数据（若误放仓库内）---
+*.db
+*.db-journal
+*.db-wal
+credentials.dat
+
+# --- IDE / 编辑器 ---
+.idea/
+.vscode/
+*.swp
+*.swo
+.pnpm-store/
+
+.v2c/
+.video_agent/
+.zcode/
+dist-linux/
+
+# Linux 打包资源暂存（build.rs 按目标架构从 sdk/ 生成）
+src-tauri/bundled/
+
+# --- 界面截图工具的工作目录 / 编译产物（scripts/ui-shots）---
+.ui-shots/
+scripts/ui-shots/.bin/
+
+# ===== ↑ 以上同步自 .gitignore（「从 .gitignore 同步」只重写以上部分）=====
+.git/
+.hg/
+.svn/
+bower_components/
+jspm_packages/
+__pycache__/
+site-packages/
+venv/
+coverage/
+htmlcov/
+lcov-report/
+cmakefiles/
+cmake-build-*/
+bazel-*/
+pods/
+deriveddata/
+storybook-static/
+playwright-report/
+test-results/
+allure-results/
+allure-report/
+cdk.out/
+*.egg-info/
+*.dist-info/
+eggs/
+pip-wheel-metadata/
+wheels/
+# ----- ↑ 以上为 ZCode 默认排除规则（自定义规则请写在本行下方，不会被同步/恢复改动）-----
+# 自定义规则写在下方（本行提示可删除）

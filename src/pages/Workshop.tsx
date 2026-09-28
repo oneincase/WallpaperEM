@@ -67,7 +67,7 @@ function conditionKeyOf(
 }
 
 export function WorkshopPage({ onOpenDetail }: { onOpenDetail: (id: string) => void }) {
-  // 筛选条件全局共享：发现页复用同一套（见 useWorkshopFilter）。
+  // 筛选条件走 useWorkshopFilter（全局共享 + 持久化）。
   // 放在最前面：下面的初始 state 要用它算条件指纹
   const {
     selected,
@@ -512,7 +512,7 @@ export function WorkshopPage({ onOpenDetail }: { onOpenDetail: (id: string) => v
                     {/* 快捷操作：未下载 → 下载；已下载 → 应用到桌面 */}
                     {downloadedItems.has(item.id) ? (
                       <button
-                        className="rounded-md p-0.5 text-[var(--accent-strong)] transition-colors hover:bg-white/10"
+                        className="rounded-md p-0.5 text-[var(--accent-strong)] transition-colors hover:bg-[var(--glass-hover)]"
                         title={tr("应用到桌面")}
                         aria-label={tr("应用到桌面")}
                         onClick={(e) => void quickApply(item.id, e.currentTarget)}
@@ -521,7 +521,7 @@ export function WorkshopPage({ onOpenDetail }: { onOpenDetail: (id: string) => v
                       </button>
                     ) : (
                       <button
-                        className="rounded-md p-0.5 text-[var(--text-2)] transition-colors hover:bg-white/10 hover:text-[var(--accent-strong)] disabled:opacity-40"
+                        className="rounded-md p-0.5 text-[var(--text-2)] transition-colors hover:bg-[var(--glass-hover)] hover:text-[var(--accent-strong)] disabled:opacity-40"
                         title={tr("下载")}
                         aria-label={tr("下载")}
                         disabled={pendingIds.has(item.id)}

@@ -1079,7 +1079,7 @@ export function SettingsPage() {
             onClick={() => setTab(t.id)}
             className={`rounded-[7px] px-4 py-[5px] text-[13px] font-medium transition-colors ${tab === t.id
               ? "bg-[var(--accent)] text-[var(--accent-fg)] shadow-sm"
-              : "text-[var(--text-2)] hover:bg-white/8"
+              : "text-[var(--text-2)] hover:bg-[var(--glass-hover)]"
               }`}
           >
             {tr(t.label)}
@@ -2030,7 +2030,9 @@ export function SettingsPage() {
               />
               <Row
                 label={tr("滤镜")}
-                desc={tr("整个画面的色彩效果，实时热切、不重载壁纸；与托盘菜单「滤镜效果」是同一设置")}
+                desc={tr(
+                  "整个画面的色彩效果，实时热切、不重载壁纸；与托盘菜单「滤镜效果」是同一设置。视频壁纸不参与滤镜：它走硬解直通，而滤镜要求的离屏渲染与直通互斥，挂上滤镜就会让 4K 视频退回逐帧像素搬运。",
+                )}
                 control={
                   <div className="flex items-center gap-2">
                     <select
@@ -2210,10 +2212,10 @@ export function SettingsPage() {
           message={
             cache
               ? tr(
-                  "将删除 {size} 的预览图/网页缓存与壁纸首帧封面，并清空工坊、发现页的列表快照。已下载的壁纸与各项设置不受影响。",
+                  "将删除 {size} 的预览图/网页缓存与壁纸首帧封面，并清空工坊页的列表快照。已下载的壁纸与各项设置不受影响。",
                   { size: formatBytes(cache.bytes) },
                 )
-              : tr("将删除预览图/网页缓存与壁纸首帧封面，并清空工坊、发现页的列表快照。")
+              : tr("将删除预览图/网页缓存与壁纸首帧封面，并清空工坊页的列表快照。")
           }
           confirmText={tr("清除")}
           onCancel={() => setConfirmClearCache(false)}
@@ -2344,7 +2346,7 @@ function AboutPanel() {
   })();
 
   const linkBtn =
-    "rounded-lg border border-[var(--separator)] px-2.5 py-1 text-[12.5px] text-[var(--text-2)] transition-colors hover:bg-white/8 hover:text-[var(--text-1)]";
+    "rounded-lg border border-[var(--separator)] px-2.5 py-1 text-[12.5px] text-[var(--text-2)] transition-colors hover:bg-[var(--glass-hover)] hover:text-[var(--text-1)]";
   const primaryBtn =
     "rounded-lg bg-[var(--accent-fill)] px-3 py-1.5 text-[12.5px] font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-40";
 
@@ -2416,7 +2418,7 @@ function AboutPanel() {
               </div>
             )}
             {upd.notes.trim() !== "" && (
-              <div className="rounded-lg border border-[var(--separator)] bg-white/5">
+              <div className="rounded-lg border border-[var(--separator)] bg-[var(--glass-subtle)]">
                 <div className="border-b border-[var(--separator)] px-2.5 py-1.5 text-[11.5px] text-[var(--text-2)]">
                   {tr("更新内容")}
                 </div>

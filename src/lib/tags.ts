@@ -26,7 +26,16 @@ export type TagGroup = {
   /** 面板上的分组标题 */
   label: string;
   /** 标签英文原名（发给 Steam 的值） → 中文显示名 */
-  tags: { name: string; label: string; libraryOnly?: boolean }[];
+  tags: {
+    name: string;
+    label: string;
+    /** 非中文界面的显示名。缺省回落到 `name`（工坊标签的英文名就是规范写法） */
+    en?: string;
+    /** 自由文本标签（`$` 开头的库内专用值）需要一句人话提示，工坊标签直接显示原名 */
+    hint?: string;
+    /** 本地库独有维度：工坊筛选面板不展示 */
+    libraryOnly?: boolean;
+  }[];
 };
 
 /**
@@ -44,10 +53,19 @@ export const TAG_GROUPS: TagGroup[] = [
       { name: "Scene", label: "场景" },
       { name: "Video", label: "视频" },
       { name: "Web", label: "网页" },
-      // 预设类内容（可玩预设壁纸，如载具预设场景）：Steam 侧就是 `Preset` 标签，
-      // 与 场景/视频/网页 同级并列（WE 工坊的类型维度）。与下方「分类」组的
-      // 预设同值 —— 官方 Type / Category 两个维度都含它，选中态自然联动。
-      { name: "Preset", label: "预设" },
+      // 「项目」= 本软件自己的工程（MCP `project_*` 建出来、`scene_pack(install=true)`
+      // / `project_install` 装进库的那种），是 WallpaperEM 独有的类型，工坊没有它的对应
+      // 标签，所以用 `$project` 这个库内专用值（真源是工程目录，见 library.rs）。
+      //
+      // 这里原先是 `Preset`（预设）：工坊的「分类」维度本来就含 `Preset`，本地库筛选面板
+      // 的「分类」组里也有它，类型维度再来一份是重复入口，故让位给「项目」。
+      {
+        name: "$project",
+        label: "项目",
+        en: "Projects",
+        hint: "本软件自己的工程（MCP 建工程后安装的条目）",
+        libraryOnly: true,
+      },
       // 刻意不放 Application：本地 12k 条工坊缓存里零条，选了必然空结果。
       // 也不放 Vehicle：它是官方「题材/Genre」维度（载具主题壁纸），
       // 入口在下方题材组的「载具」
@@ -70,7 +88,13 @@ export const TAG_GROUPS: TagGroup[] = [
       { name: "Preset", label: "预设" },
       { name: "Asset", label: "素材" },
       // 仅本地库筛选面板展示（工坊没有这个维度）
-      { name: LOCAL_IMPORT_TAG, label: "本地导入", libraryOnly: true },
+      {
+        name: LOCAL_IMPORT_TAG,
+        label: "本地导入",
+        en: "Local import",
+        hint: "本地导入的壁纸（非工坊下载）",
+        libraryOnly: true,
+      },
     ],
   },
   {
@@ -158,6 +182,11 @@ export const TAG_LABEL: Record<string, string> = Object.fromEntries(
   TAG_GROUPS.flatMap((g) => g.tags.map((t) => [t.name, t.label])),
 );
 
+/** 标签元数据（`tagLabel` 要区分中英；`$` 开头的库内值没有"规范英文名"，得显式给） */
+const TAG_META: Record<string, { label: string; en?: string }> = Object.fromEntries(
+  TAG_GROUPS.flatMap((g) => g.tags.map((t) => [t.name, { label: t.label, en: t.en }])),
+);
+
 /**
  * 标签展示名：中文界面用中文标签，其它语言直接回落到 **Steam 原始英文标签名**。
  *
@@ -166,9 +195,10 @@ export const TAG_LABEL: Record<string, string> = Object.fromEntries(
  * 调用点都在渲染期，语言切换时随根组件重渲染自动更新。
  */
 export function tagLabel(name: string): string {
-  const label = TAG_LABEL[name];
-  if (!label) return name;
-  return getLocale() === "zh-CN" ? label : name;
+  const meta = TAG_META[name];
+  if (!meta) return name;
+  // `$project` 这类库内专用值没有对应的 Steam 英文名，非中文界面用它自己的 en
+  return getLocale() === "zh-CN" ? meta.label : (meta.en ?? name);
 }
 
 /** 工坊排序。实测只有 browsesort 生效，actualsort 完全无效 */

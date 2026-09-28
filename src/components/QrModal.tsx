@@ -42,7 +42,7 @@ export function QrModal({
         <div className="flex flex-col items-center gap-3">
           <QrImage text={text} size={200} />
           <code
-            className="w-full truncate rounded-lg border border-[var(--separator)] bg-white/5 px-2 py-1.5 text-center text-[11.5px]"
+            className="w-full truncate rounded-lg border border-[var(--separator)] bg-[var(--glass-subtle)] px-2 py-1.5 text-center text-[11.5px]"
             title={text}
           >
             {text}

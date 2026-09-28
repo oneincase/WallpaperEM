@@ -39,6 +39,31 @@ fn output_schema_for(name: &str) -> Option<Value> {
             "errors": arr_str(),
             "warnings": arr_str(),
         })),
+        "scene_inspect" => obj(json!({
+            "ok": { "type": "boolean" },
+            "project": { "type": "string" },
+            "layerCount": { "type": "integer" },
+            "layers": { "type": "array", "items": obj(json!({
+                "name": { "type": "string" },
+                "kind": { "type": "string" },
+                "textures": arr_str(),
+                "bindings": arr_str(),
+            })) },
+            "textures": { "type": "array", "items": obj(json!({
+                "name": { "type": "string" },
+                "bytes": { "type": "integer" },
+                "usedBy": arr_str(),
+                "builtin": { "type": "boolean" },
+            })) },
+            "unusedAssets": arr_str(),
+            "properties": obj(json!({
+                "declared": arr_str(),
+                "bound": { "type": "object" },
+                "unbound": arr_str(),
+            })),
+            "errors": arr_str(),
+            "warnings": arr_str(),
+        })),
         "scene_pack" => obj(json!({
             "project": { "type": "string" },
             "bytes": { "type": "integer" },
@@ -78,6 +103,15 @@ fn output_schema_for(name: &str) -> Option<Value> {
             "last": { "type": "string" },
             "failReason": { "type": "string" },
             "readyItem": { "type": "string" },
+        })),
+        "particle_recipe" => obj(json!({
+            "kind": { "type": "string" },
+            "texture": { "type": "string" },
+            "files": { "type": "array", "items": { "type": "object" } },
+        })),
+        "effect_scaffold" => obj(json!({
+            "kind": { "type": "string" },
+            "files": { "type": "array", "items": { "type": "object" } },
         })),
         "wallpaper_preview" => obj(json!({
             "itemId": { "type": "string" },
@@ -166,6 +200,21 @@ pub fn definitions() -> Vec<Value> {
                 "project": { "type": "string" },
                 "install": { "type": "boolean", "description": "打包后直接装/更新进本地库（已装过则增量更新，item_id 不变），默认 false" },
             }), json!(["project"])),
+        }),
+        json!({
+            "name": "scene_inspect",
+            "description": "场景工程结构化体检（比 project_validate 更宽）：图层树与类型、每张贴图的尺寸/体积/引用者、未使用素材、属性绑定命中表、粒子组件支持情况、关键帧摘要，外加一份性能提示。校验结果（errors/warnings）一并返回。",
+            "inputSchema": obj(json!({ "project": { "type": "string" } }), json!(["project"])),
+        }),
+        json!({
+            "name": "project_import_asset",
+            "description": "把宿主上的一个大素材直接拷进工程（不占 JSON-RPC 请求体，单文件上限 512 MB）—— 超过 project_write_file 的 40 MB base64 上限时用它。来源只允许：图片/下载/桌面/文稿/音乐/影片/临时目录与壁纸工程根，扩展名限 png/jpg/jpeg/tex/frag/vert/h/json/ogg/wav/mp3/gif/mp4。",
+            "inputSchema": obj(json!({
+                "project": { "type": "string" },
+                "path": { "type": "string", "description": "工程内目标相对路径，如 materials/bg.png" },
+                "source": { "type": "string", "description": "宿主上的绝对路径（必须位于允许的目录内）" },
+                "overwrite": { "type": "boolean", "description": "目标已存在时是否覆盖，默认 false" },
+            }), json!(["project", "path", "source"])),
         }),
         json!({
             "name": "renderer_diag",
@@ -347,6 +396,53 @@ pub fn definitions() -> Vec<Value> {
             "inputSchema": obj(json!({ "paused": { "type": "boolean" } }), json!(["paused"])),
         }),
         json!({
+            "name": "layer_selfcheck",
+            "description": "**判定某层/某效果到底画出来没有**：同一场景渲染两次（原样 vs 把该层 visible 置 false），按像素差分给出结论 —— drawn / flat_block（纯色块，通常就是「效果被静默跳过、退回内置材质」）/ invisible（没有任何贡献，通常就是「shader 没跑」）。比自己盯着截图猜靠谱，失败原因见 wallpaperem://reference/pitfalls。",
+            "inputSchema": obj(json!({
+                "project": { "type": "string", "description": "工程名" },
+                "layer": { "type": "string", "description": "图层名（name 字段）或图层 id（数字）" },
+                "settleMs": { "type": "integer", "description": "每次抓帧前的稳定等待，默认 1200" },
+                "timeoutMs": { "type": "integer", "description": "等渲染就绪上限，默认 60000" },
+                "maxWidth": { "type": "integer", "description": "抓帧宽度，默认 960（判定用途，不需要大图）" },
+                "threshold": { "type": "integer", "description": "像素判定为「有差异」的阈值，默认 8（0~255）" },
+            }), json!(["project", "layer"])),
+        }),
+        json!({
+            "name": "pitfall_search",
+            "description": "按关键词查踩坑清单（症状→原因→改法）。比通读 wallpaperem://reference/pitfalls 省 token；关键词支持中文/英文/文件名，如「.vert」「白块」「粒子」「angles」「硬边」。",
+            "inputSchema": obj(json!({
+                "query": { "type": "string", "description": "关键词（空则返回全部 id 列表与摘要）" },
+                "limit": { "type": "integer", "description": "最多返回条数，默认 5" },
+            }), json!([])),
+        }),
+        json!({
+            "name": "particle_recipe",
+            "description": "**先拿配方再写文件**：返回一套可直接用 project_write_file 落盘的粒子预设 + 材质（贴图走渲染库内置程序化贴图，工程里不用带位图）。比对着渲染库源码猜字段快得多，也避开已废弃/未实现的写法。",
+            "inputSchema": obj(json!({
+                "kind": {
+                    "type": "string",
+                    "enum": ["star_dust", "embers", "nebula_wisps", "meteors"],
+                    "description": "star_dust 星尘漂浮 / embers 上飘余烬 / nebula_wisps 巨大絮状 / meteors 偶发流星",
+                },
+                "name": { "type": "string", "description": "预设名（默认与 kind 同名）；决定 particles/presets/<名>.json 与 materials/presets/<名>.json 两个路径" },
+                "maxCount": { "type": "integer", "description": "覆盖粒子数上限（默认按配方：尘埃 170 / 余烬 64 / 絮 26 / 流星 8）" },
+                "rate": { "type": "number", "description": "覆盖发射率（每秒）；省略则用配方默认（尘埃/絮 = 维持池满，余烬 26，流星 0.8）" },
+            }), json!(["kind"])),
+        }),
+        json!({
+            "name": "effect_scaffold",
+            "description": "**先拿脚手架再写文件**：返回一个能直接跑通的自写效果着色器所需**全部文件**（effects/<名>.json + materials/effects/<名>.json + shaders/effects/<名>.frag + .vert）与图层片段。四类现成 shader：水面波纹 / 指针光晕 / 音频条 / 七段时钟。",
+            "inputSchema": obj(json!({
+                "kind": {
+                    "type": "string",
+                    "enum": ["water_ripple", "pointer_aura", "audio_bars", "clock", "post_bloom", "film_grain"],
+                    "description": "shader 类型（内容与 wallpaperem://reference/effects 的 recipes 一致）。post_bloom/film_grain 是**全屏后期**：图层要用 models/util/fullscreenlayer.json，g_Texture0 = 下面已画好的画面，强度绑图层 alpha",
+                },
+                "name": { "type": "string", "description": "效果名，决定 effects/<名>.json 与 shaders/effects/<名>.frag（默认与 kind 同名）" },
+                "layer": { "type": "string", "description": "可选：把图层声明片段也返回（写 scene.json 的对象里粘贴）" },
+            }), json!(["kind"])),
+        }),
+        json!({
             "name": "library_list",
             "description": "列出本地库壁纸（已安装/已下载），支持类型、标题关键字、标签与排序。tagGroups 里可用两个库内专用值：`$project` = 本软件自己的工程（project_* 建出来又装进库的），`$local` = 本地导入（custom-*）。",
             "inputSchema": obj(json!({
@@ -365,6 +461,11 @@ pub fn definitions() -> Vec<Value> {
         json!({
             "name": "library_delete",
             "description": "从本地库删除壁纸（含磁盘文件与数据库记录，不可撤销）。只想移出库、保留文件用 library_remove。",
+            "inputSchema": obj(json!({ "itemId": { "type": "string" } }), json!(["itemId"])),
+        }),
+        json!({
+            "name": "library_remove",
+            "description": "把壁纸移出本地库但保留磁盘文件（清库记录/自定义属性/列表归属，不可撤销）。",
             "inputSchema": obj(json!({ "itemId": { "type": "string" } }), json!(["itemId"])),
         }),
         json!({
@@ -640,6 +741,20 @@ async fn call_inner(app: &AppHandle, name: &str, args: &Value) -> Result<Value, 
             let project = req_str(args, "project")?;
             blocking(move || workspace::validate_project(&app, &project)).await
         }
+        "scene_inspect" => {
+            let app = app.clone();
+            let project = req_str(args, "project")?;
+            blocking(move || crate::scene_inspect::inspect(&app, &project)).await
+        }
+        "project_import_asset" => {
+            let app = app.clone();
+            let project = req_str(args, "project")?;
+            let path = req_str(args, "path")?;
+            let source = req_str(args, "source")?;
+            let overwrite = opt_bool(args, "overwrite");
+            blocking(move || workspace::import_asset(&app, &project, &path, &source, overwrite))
+                .await
+        }
         "renderer_diag" => {
             let q = crate::content_server::DiagQuery {
                 label: opt_str(args, "label"),
@@ -653,7 +768,8 @@ async fn call_inner(app: &AppHandle, name: &str, args: &Value) -> Result<Value, 
         "scene_pack" => {
             let app = app.clone();
             let project = req_str(args, "project")?;
-            blocking(move || workspace::pack_scene(&app, &project)).await
+            let install = opt_bool(args, "install");
+            blocking(move || workspace::pack_scene(&app, &project, install)).await
         }
         "project_delete" => {
             let app = app.clone();
@@ -704,6 +820,10 @@ async fn call_inner(app: &AppHandle, name: &str, args: &Value) -> Result<Value, 
             blocking(move || crate::wallpaper::resume_all(app)).await?;
             Ok(json!({ "paused": false }))
         }
+        "layer_selfcheck" => layer_selfcheck(app, args).await,
+        "pitfall_search" => pitfall_search(args),
+        "particle_recipe" => particle_recipe(args),
+        "effect_scaffold" => effect_scaffold(args),
         "wallpaper_screenshot" => screenshot(app, args).await,
         "wallpaper_preview" => preview(app, args).await,
         "list_sessions" => list_sessions(app),
@@ -857,6 +977,12 @@ async fn call_inner(app: &AppHandle, name: &str, args: &Value) -> Result<Value, 
             let item_id = req_str(args, "itemId")?;
             let removed = blocking(move || crate::library::library_delete(app, item_id)).await?;
             Ok(json!({ "deleted": removed }))
+        }
+        "library_remove" => {
+            let app = app.clone();
+            let item_id = req_str(args, "itemId")?;
+            let removed = blocking(move || crate::library::library_remove(app, item_id)).await?;
+            Ok(json!({ "removed": removed }))
         }
         "library_open_folder" => {
             let app = app.clone();
@@ -1402,6 +1528,423 @@ async fn preview(app: &AppHandle, args: &Value) -> Result<Value, String> {
     Ok(out)
 }
 
+/// 按关键词查踩坑清单（省 token：不用整份 pitfalls 都读进来）。
+fn pitfall_search(args: &Value) -> Result<Value, String> {
+    let q = opt_str(args, "query").unwrap_or_default();
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5)
+        .max(1) as usize;
+    let all = crate::mcp::references::pitfalls_json();
+    let items = all["items"].as_array().cloned().unwrap_or_default();
+    let needle = q.trim().to_lowercase();
+    if needle.is_empty() {
+        // 没给关键词 → 只给目录（id + 症状首句），让调用方再精查
+        let index: Vec<Value> = items
+            .iter()
+            .map(|it| {
+                json!({
+                    "id": it["id"],
+                    "症状": it["症状"].as_str().unwrap_or("").chars().take(70).collect::<String>(),
+                })
+            })
+            .collect();
+        return Ok(json!({ "total": items.len(), "index": index }));
+    }
+    let mut hits: Vec<Value> = Vec::new();
+    for it in &items {
+        let hay = serde_json::to_string(it).unwrap_or_default().to_lowercase();
+        if hay.contains(&needle) {
+            hits.push(it.clone());
+        }
+        if hits.len() >= limit {
+            break;
+        }
+    }
+    Ok(json!({
+        "query": q,
+        "matched": hits.len(),
+        "total": items.len(),
+        "items": hits,
+        "hint": if hits.is_empty() {
+            "没命中；可先不带 query 调用一次拿目录（id + 症状），或用更短的关键词"
+        } else {
+            "改法里提到的资源/工具都能直接调用：wallpaperem://reference/effects|particles、effect_scaffold、particle_recipe"
+        },
+    }))
+}
+
+/// 图层自检：**渲染一次 + 量该层矩形 + 交叉核对诊断** —— 判定「画出来没有、是不是白块、为什么」。
+///
+/// 为什么不用 A/B 差分：差分只能告诉你"有没有贡献"，说不出**原因**；而渲染库把
+/// 「跳过效果（pass 编译失败）」这类信息交给了诊断通道。所以这里改成：
+///   ① 按 cover 映射把图层矩形折算到截图像素；
+///   ② 量矩形内的均值/标准差（白块 = 高均值 + 低方差）；
+///   ③ 在 renderer_diag 里找与该层效果相关的跳过/编译失败记录；
+///   ④ 给出 verdict + 证据 + 改法。
+async fn layer_selfcheck(app: &AppHandle, args: &Value) -> Result<Value, String> {
+    let project = req_str(args, "project")?;
+    let target = req_str(args, "layer")?;
+    let settle = args
+        .get("settleMs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1000);
+    let timeout = args
+        .get("timeoutMs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(60_000);
+    let max_width = args
+        .get("maxWidth")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1280) as u32;
+
+    // 图层信息（name 或 id 定位）
+    let dir = workspace::project_dir(app, &project)?;
+    let scene_txt = std::fs::read_to_string(workspace::safe_join(&dir, "scene.json")?)
+        .map_err(|e| format!("读不到 scene.json: {e}"))?;
+    let scene: Value =
+        serde_json::from_str(&scene_txt).map_err(|e| format!("scene.json 不是合法 JSON: {e}"))?;
+    let objs = scene
+        .get("objects")
+        .and_then(|o| o.as_array())
+        .ok_or("scene.json 里没有 objects 数组")?;
+    let obj = objs
+        .iter()
+        .find(|o| o.get("name").and_then(|n| n.as_str()) == Some(target.as_str()))
+        .or_else(|| {
+            target.parse::<i64>().ok().and_then(|id| {
+                objs.iter()
+                    .find(|o| o.get("id").and_then(|v| v.as_i64()) == Some(id))
+            })
+        })
+        .ok_or_else(|| {
+            format!(
+                "找不到图层「{target}」；现有图层：{}",
+                objs.iter()
+                    .filter_map(|o| o.get("name").and_then(|n| n.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            )
+        })?;
+    let layer_name = obj
+        .get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or(&target)
+        .to_string();
+    let effects: Vec<String> = obj
+        .get("effects")
+        .and_then(|e| e.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| e.get("file").and_then(|f| f.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // 图层矩形（设计坐标，Y 向上、origin 是盒子中心）→ 屏幕像素
+    let design: (f64, f64) = {
+        let g = scene
+            .get("general")
+            .and_then(|g| g.get("orthogonalprojection"));
+        (
+            g.and_then(|o| o.get("width"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1920.0),
+            g.and_then(|o| o.get("height"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1080.0),
+        )
+    };
+    let num3 = |v: Option<&Value>| -> Option<[f64; 3]> {
+        let v = v?;
+        let s = match v {
+            Value::String(s) => s.clone(),
+            Value::Object(_) => v.get("value")?.as_str()?.to_string(),
+            _ => return None,
+        };
+        // WE 里 vector 字段常写成两分量（"600 400"）或三分量，都要认（缺的补 0）
+        let p: Vec<f64> = s
+            .split_whitespace()
+            .filter_map(|x| x.parse().ok())
+            .collect();
+        (p.len() >= 2).then(|| [p[0], p[1], *p.get(2).unwrap_or(&0.0)])
+    };
+    let origin = num3(obj.get("origin")).unwrap_or([design.0 / 2.0, design.1 / 2.0, 0.0]);
+    let size = num3(obj.get("size")).unwrap_or([design.0, design.1, 0.0]);
+    let scale = num3(obj.get("scale")).unwrap_or([1.0, 1.0, 1.0]);
+    let half_w = (size[0] * scale[0]).abs() / 2.0;
+    let half_h = (size[1] * scale[1]).abs() / 2.0;
+
+    // 应用到桌面并抓一帧
+    let item = match workspace::installed_item_id_of(app, &project) {
+        Some(id) => id,
+        None => workspace::install_project(app, &project)?.0,
+    };
+    let t0 = crate::system_wallpaper::ready_stamp(app);
+    {
+        let app_a = app.clone();
+        let item_a = item.clone();
+        blocking(move || crate::wallpaper::apply_item(app_a, item_a, None)).await?;
+    }
+    let (bytes, _mime) = capture_once(app, t0, settle, timeout, Some(max_width), None).await?;
+    let img = image::load_from_memory(&bytes)
+        .map_err(|e| format!("截图解码失败: {e}"))?
+        .to_rgb8();
+    let (w, h) = img.dimensions();
+
+    // cover 映射：设计高度铺满、宽度居中裁切（size 的宽高比与贴图不同的层会有偏差，
+    // 这里只用于"取一块区域做统计"，不要求像素级精确）
+    let view_w = design.1 * (w as f64) / (h as f64);
+    let view_left = design.0 / 2.0 - view_w / 2.0;
+    let to_px = |dx: f64| ((dx - view_left) / view_w * w as f64).round() as i64;
+    let to_py = |dy: f64| ((1.0 - dy / design.1) * h as f64).round() as i64;
+    let (x0, x1) = (to_px(origin[0] - half_w), to_px(origin[0] + half_w));
+    let (y0, y1) = (to_py(origin[1] + half_h), to_py(origin[1] - half_h));
+    let (cx0, cx1) = (x0.max(0).min(w as i64), x1.max(0).min(w as i64));
+    let (cy0, cy1) = (y0.max(0).min(h as i64), y1.max(0).min(h as i64));
+    let offscreen = cx1 - cx0 < 4 || cy1 - cy0 < 4;
+
+    // 区域内统计
+    let mut n = 0u64;
+    let (mut sr, mut sg, mut sb) = (0u64, 0u64, 0u64);
+    let (mut s2, mut s2g, mut s2b) = (0u64, 0u64, 0u64);
+    for y in cy0..cy1 {
+        for x in cx0..cx1 {
+            let p = img.get_pixel(x as u32, y as u32);
+            n += 1;
+            sr += p[0] as u64;
+            sg += p[1] as u64;
+            sb += p[2] as u64;
+            s2 += (p[0] as u64).pow(2);
+            s2g += (p[1] as u64).pow(2);
+            s2b += (p[2] as u64).pow(2);
+        }
+    }
+    let avg = |s: u64| if n > 0 { s as f64 / n as f64 } else { 0.0 };
+    let std = |s: u64, s2v: u64| {
+        if n > 0 {
+            ((s2v as f64 / n as f64) - (s as f64 / n as f64).powi(2))
+                .max(0.0)
+                .sqrt()
+        } else {
+            0.0
+        }
+    };
+    let (mr, mg, mb) = (avg(sr), avg(sg), avg(sb));
+    let (dr, dg, db) = (std(sr, s2), std(sg, s2g), std(sb, s2b));
+    let max_std = dr.max(dg).max(db);
+    let mean_all = (mr + mg + mb) / 3.0;
+
+    // 交叉核对诊断：渲染库把「跳过效果」也报进来了
+    let diag_hits: Vec<String> = crate::content_server::diag_snapshot(
+        app,
+        &crate::content_server::DiagQuery {
+            label: None,
+            item: None,
+            since_ms: 0,
+            limit: 60,
+            clear: false,
+        },
+    )
+    .get("entries")
+    .and_then(|e| e.as_array())
+    .map(|arr| {
+        arr.iter()
+            .filter_map(|e| e.get("msg").and_then(|m| m.as_str()))
+            .filter(|m| {
+                (m.contains("跳过效果") || m.contains("编译失败") || m.contains("failed"))
+                    && (effects.iter().any(|f| {
+                        let stem = f.trim_start_matches("effects/").trim_end_matches(".json");
+                        m.contains(stem)
+                    }) || effects.is_empty())
+            })
+            .map(|m| m.rsplit("] ").next().unwrap_or(m).to_string())
+            .collect()
+    })
+    .unwrap_or_default();
+
+    let verdict = if offscreen {
+        "offscreen"
+    } else if !diag_hits.is_empty() {
+        "effect_skipped"
+    } else if mean_all > 230.0 && max_std < 30.0 {
+        "flat_white"
+    } else if max_std < 6.0 {
+        "flat_color"
+    } else if n > 0 && mean_all < 3.0 {
+        "blank"
+    } else {
+        "content"
+    };
+    let advice = match verdict {
+        "offscreen" => "该层矩形几乎不在可见区内（cover 下左右会被裁掉）：换 origin 或缩小 size 再看",
+        "effect_skipped" => "效果被渲染库跳过了（诊断里有记录，见 evidence）：按 pitfall_search「.vert」「白块」逐条核对四件套是否齐全",
+        "flat_white" => "纯白块 —— 典型「内置材质被画出来、自写 shader 没跑」。检查 shaders/effects/<名>.{frag,vert} 是否成对、effects json 是否用 material 字段",
+        "flat_color" => "一片纯色、没有结构：可能 shader 只输出了常量，或贴图/uv 用错",
+        "blank" => "区域内几乎全黑：该层没画出来（被跳过或尺寸为 0）",
+        _ => "区域内有结构，看起来正常画出了内容",
+    };
+    Ok(json!({
+        "project": project,
+        "layer": layer_name,
+        "layerId": obj.get("id").cloned().unwrap_or(Value::Null),
+        "effects": effects,
+        "verdict": verdict,
+        "advice": advice,
+        "rect": {
+            "design": { "x": [origin[0] - half_w, origin[0] + half_w], "y": [origin[1] - half_h, origin[1] + half_h] },
+            "pixels": [cx0, cy0, cx1, cy1],
+            "image": [w, h],
+            "clipped": [x0, y0, x1, y1],
+        },
+        "regionStats": {
+            "mean": [mr.round(), mg.round(), mb.round()],
+            "std": [dr.round(), dg.round(), db.round()],
+            "sampled": n,
+        },
+        "evidence": diag_hits,
+        "note": "只渲染一次量该层矩形 + 交叉核对诊断（回答「这块看起来是什么」与「日志说了什么」，不回答「有没有贡献」）。矩形按 fit=cover 折算；若该层被其它层盖住，统计会包含上层内容。",
+    }))
+}
+
+/// 一套现成粒子配方 → 两个文件的内容（预设 + 材质），贴图用渲染库内置程序化贴图。
+fn particle_recipe(args: &Value) -> Result<Value, String> {
+    let kind = req_str(args, "kind")?;
+    let name = opt_str(args, "name").unwrap_or_else(|| kind.clone());
+    let refs = crate::mcp::references::particles_json();
+    let recipe = refs
+        .get("recipes")
+        .and_then(|r| r.get(&kind))
+        .ok_or_else(|| {
+            format!(
+                "未知的 kind「{kind}」；可用：{}",
+                refs["recipes"]
+                    .as_object()
+                    .map(|o| o.keys().cloned().collect::<Vec<_>>().join(" / "))
+                    .unwrap_or_default()
+            )
+        })?;
+    let mut preset = recipe["preset"].clone();
+    if let Some(n) = args.get("maxCount").and_then(|v| v.as_u64()) {
+        preset["maxcount"] = json!(n);
+    }
+    if let Some(r) = args.get("rate").and_then(|v| v.as_f64()) {
+        if let Some(em) = preset.get_mut("emitter").and_then(|e| e.as_array_mut()) {
+            if let Some(first) = em.first_mut() {
+                first["rate"] = json!(r);
+            }
+        }
+    }
+    let preset_path = format!("particles/presets/{name}.json");
+    let material_path = format!("materials/presets/{name}.json");
+    preset["material"] = json!(material_path);
+    if preset
+        .get("controlpoint")
+        .map(|c| c.is_string())
+        .unwrap_or(false)
+    {
+        preset["controlpoint"] = json!((0..8)
+            .map(|i| json!({ "flags": 0, "id": i, "offset": "0 0 0" }))
+            .collect::<Vec<_>>());
+    }
+    let texture = recipe["texture"].as_str().unwrap_or("particle/halo_1");
+    let material = json!({ "passes": [{
+        "shader": "genericparticle", "blending": "additive", "cullmode": "nocull",
+        "depthtest": "disabled", "depthwrite": "disabled", "textures": [texture],
+    }] });
+    Ok(json!({
+        "kind": kind,
+        "texture": texture,
+        "purpose": recipe["用途"],
+        "files": [
+            { "path": preset_path, "content": serde_json::to_string_pretty(&preset).unwrap_or_default() },
+            { "path": material_path, "content": serde_json::to_string_pretty(&material).unwrap_or_default() },
+        ],
+        "layer": {
+            "particle": preset_path,
+            "origin": "960 540 0",
+            "size": "1920 1080",
+            "note": "预设内的 emitter 坐标是层内局部坐标；整体位置/大小靠图层的 origin/size（Y 轴向上、origin 是盒子中心）",
+        },
+        "next": "把 files 里的两项用 project_write_file 落盘，再把 layer 片段贴进 scene.json 的 objects，然后 project_validate → scene_pack",
+        "reference": "wallpaperem://reference/particles",
+    }))
+}
+
+/// 自写效果 shader 脚手架：效果 json + 材质 json + .frag + .vert（四件套，缺一不可）。
+///
+/// 两种挂法：
+///   - 普通效果层：models/util/solidlayer.json（内置纯色层）+ 加法混合，shader 自己输出颜色
+///   - 全屏后期层（post_bloom / film_grain）：models/util/fullscreenlayer.json，
+///     内容 = 当前已渲染画面（g_Texture0），**图层 alpha 即强度**
+fn effect_scaffold(args: &Value) -> Result<Value, String> {
+    let kind = req_str(args, "kind")?;
+    let name = opt_str(args, "name").unwrap_or_else(|| kind.clone());
+    let refs = crate::mcp::references::effects_json();
+    let frag = match kind.as_str() {
+        "water_ripple" => include_str!("templates/water_ripple.frag"),
+        "pointer_aura" => include_str!("templates/pointer_aura.frag"),
+        "audio_bars" => include_str!("templates/audio_bars.frag"),
+        "clock" => include_str!("templates/clock.frag"),
+        "post_bloom" => include_str!("templates/post_bloom.frag"),
+        "film_grain" => include_str!("templates/film_grain.frag"),
+        other => {
+            return Err(format!(
+                "未知的 kind「{other}」；可用：water_ripple / pointer_aura / audio_bars / clock / post_bloom / film_grain"
+            ))
+        }
+    };
+    // 后期类：全屏后期层 + normal 混合，强度交给图层 alpha
+    let post = kind == "post_bloom" || kind == "film_grain";
+    let vert = refs["vertexTemplate"].as_str().unwrap_or("").to_string();
+    let effect = json!({ "passes": [{
+        "material": format!("materials/effects/{name}.json"), "target": null, "bind": [],
+    }] });
+    let material = json!({ "passes": [{
+        "shader": format!("effects/{name}"), "blending": "normal", "cullmode": "nocull",
+        "depthtest": "disabled", "depthwrite": "disabled",
+    }] });
+    let layer = if post {
+        json!({
+            "image": "models/util/fullscreenlayer.json",
+            "effects": [{ "file": format!("effects/{name}.json"), "name": name, "visible": true }],
+            "origin": "960 540 0", "size": "1920 1080", "colorBlendMode": 0, "alpha": 0.6,
+            "note": "fullscreenlayer = 全屏后期层（内容 = 当前已渲染画面），g_Texture0 即画面；                     它的**图层 alpha 就是强度**（与下层混合）→ 绑个 slider 属性就是强度滑条。                     必须放在 objects 的**最后**（读的是它下面的画面）",
+        })
+    } else {
+        json!({
+            "image": "models/util/solidlayer.json",
+            "effects": [{ "file": format!("effects/{name}.json"), "name": name, "visible": true }],
+            "origin": "960 540 0", "size": "1920 1080", "colorBlendMode": 9, "alpha": 1.0,
+            "note": "solidlayer = 内置纯色层（工程里不用带文件）。shader 自己输出颜色、忽略 g_Texture0；                     要在图层四边乘 margin 淡出，否则边界会留亮线",
+        })
+    };
+    let mut out = json!({
+        "kind": kind,
+        "files": [
+            { "path": format!("effects/{name}.json"),
+              "content": serde_json::to_string_pretty(&effect).unwrap_or_default() },
+            { "path": format!("materials/effects/{name}.json"),
+              "content": serde_json::to_string_pretty(&material).unwrap_or_default() },
+            { "path": format!("shaders/effects/{name}.frag"), "content": frag },
+            { "path": format!("shaders/effects/{name}.vert"), "content": vert },
+        ],
+        "layer": layer,
+        "mustKnow": [
+            "effects/<名>.json 的 passes[] 只写 material；shader 写在材质里（直写 shader 会被当命令 pass → 整条链静默不画）",
+            "shaders/effects/<名>.frag 与 .vert **必须成对**：缺 .vert 会被静默跳过，图层只剩纯色块",
+            "可用 uniform：g_Time / g_Daytime / g_PointerPosition(Last,State) / g_AudioSpectrum16/32/64Left+Right / g_Color / g_Alpha / g_Brightness / g_Texture0 / g_TexelSize / g_ModelViewProjectionMatrix",
+        ],
+        "next": "四个文件全部落盘（缺一个就静默失效）→ 图层片段贴进 scene.json → project_validate（会替你检查 .vert 是否成对）→ scene_pack → wallpaper_preview 看效果；不确定有没有生效就用 layer_selfcheck",
+        "reference": "wallpaperem://reference/effects",
+    });
+    if opt_str(args, "layer").is_some() {
+        out["layerSnippet"] = out["layer"].clone();
+    }
+    Ok(out)
+}
+
 fn list_sessions(app: &AppHandle) -> Result<Value, String> {
     let Some(state) = app.try_state::<crate::wallpaper::WallpaperEngineState>() else {
         return Err("壁纸引擎未就绪".into());
@@ -1745,7 +2288,12 @@ mod tests {
         }
         assert!(declared >= 8, "声明了 outputSchema 的工具太少: {declared}");
         // 反向：常用工具都应该声明
-        for want in ["project_validate", "scene_pack", "renderer_diag"] {
+        for want in [
+            "project_validate",
+            "scene_inspect",
+            "scene_pack",
+            "renderer_diag",
+        ] {
             assert!(
                 defs.iter()
                     .any(|d| d["name"] == json!(want) && d.get("outputSchema").is_some()),

@@ -84,10 +84,7 @@ fn authorized(app: &AppHandle, headers: &HeaderMap, query: &HashMap<String, Stri
             &json!({ "error": "服务未就绪" }),
         ));
     };
-    match authorize(&st, headers, query) {
-        Ok(()) => None,
-        Err(resp) => Some(resp),
-    }
+    authorize(&st, headers, query).err()
 }
 
 use std::collections::HashMap;

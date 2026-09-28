@@ -1,7 +1,7 @@
 // 本地库「导入壁纸」弹框：
-// - 添加壁纸目录：多选文件夹，先收集进「待添加文件夹」列表，可继续追加 / 逐个移除，
+// - 添加壁纸路径：多选文件夹，先收集进「待添加文件夹」列表，可继续追加 / 逐个移除，
 //   确认后统一以引用方式入库（扫描工程目录，不复制文件）
-// - 导入文件夹（单目录拷贝）／导入文件
+// - 导入单个壁纸文件夹（单目录拷贝）／导入单个文件
 // - 下方列出已导入的壁纸目录（引用条目），可移除（只删库记录，不动源文件）
 import { useCallback, useEffect, useState } from "react";
 import {
@@ -101,7 +101,7 @@ export function LibraryImportModal({
   };
 
   const btnCls =
-    "flex-1 rounded-lg border border-[var(--separator)] px-3 py-2 text-left text-[12.5px] font-medium hover:bg-white/10 disabled:opacity-60";
+    "flex-1 rounded-lg border border-[var(--separator)] px-3 py-2 text-left text-[12.5px] font-medium hover:bg-[var(--glass-hover)] disabled:opacity-60";
 
   return (
     <div
@@ -123,7 +123,7 @@ export function LibraryImportModal({
           >
             <span className="flex items-center gap-1.5">
               <IconUpload />
-              {tr("添加壁纸目录")}
+              {tr("添加壁纸路径")}
             </span>
             <p className="mt-1 text-[11px] font-normal text-[var(--text-2)]">
               {tr("多选文件夹，引用入库不复制")}
@@ -135,7 +135,7 @@ export function LibraryImportModal({
             disabled={importing}
             title={tr("把所选目录作为一个壁纸拷贝进库")}
           >
-            {tr("导入文件夹")}
+            {tr("导入单个壁纸文件夹")}
             <p className="mt-1 text-[11px] font-normal text-[var(--text-2)]">
               {tr("整个目录拷贝为一张壁纸")}
             </p>
@@ -146,7 +146,7 @@ export function LibraryImportModal({
             disabled={importing}
             title={tr("支持多选；也可以直接把文件/文件夹拖进窗口")}
           >
-            {tr("导入文件")}
+            {tr("导入单个文件")}
             <p className="mt-1 text-[11px] font-normal text-[var(--text-2)]">
               {tr("视频 / GIF / 图片 / 网页文件")}
             </p>
@@ -179,7 +179,7 @@ export function LibraryImportModal({
             <div className="mt-2 max-h-36 space-y-1.5 overflow-y-auto pr-1">
               {pending.length === 0 ? (
                 <p className="rounded-lg border border-dashed border-[var(--separator)] px-3 py-3 text-center text-[12px] text-[var(--text-2)]">
-                  {tr("点上方「添加壁纸目录」选择一个或多个文件夹")}
+                  {tr("点上方「添加壁纸路径」选择一个或多个文件夹")}
                 </p>
               ) : (
                 pending.map((p) => (

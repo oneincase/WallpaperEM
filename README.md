@@ -135,8 +135,9 @@ raised-desktop 与 Win10 的经典结构都做了适配）；Linux 上走 X11 �
 5. **让它跟着系统走** —— 系统「正在播放」（歌名 / 歌手 / 封面 / 进度）与系统音频频谱实时推送给
    壁纸；切到别的应用自动暂停、回到桌面恢复；还能把代表帧同步为系统静态壁纸，锁屏与引擎未运行时
    观感一致。
-6. **让 AI 也来做壁纸** —— 内置 MCP 服务把整条链路（建工程 → 写素材 → 校验 →
-   安装 → 应用 → 截图 → 上传工坊）开放给 AI 代理，壁纸工程可以被程序化地创作与迭代。
+6. **让 AI 也来做壁纸** —— 内置 MCP 服务把整条链路（建工程 → 写素材 → 校验/体检 →
+   打包安装（增量）→ 应用 → 截图（可多帧）→ 读渲染器诊断 → 上传工坊）开放给 AI 代理，
+   壁纸工程可以被程序化地创作、自查与迭代。
 
 **定位与边界。** 这是一个**独立的开源项目**，与 Wallpaper Engine 及其开发者、Valve 均无隶属关系；
 它不修改也不绕过 WE，创意工坊内容仍来自你自己的 Steam 账号，因此**需要账号拥有《Wallpaper
@@ -180,8 +181,9 @@ sit on top, and what you see as the "desktop background" is a live, interactive 
    switch to another app and resumes when you return to the desktop; a representative frame can be
    synced as the system static wallpaper so the lock screen matches while the engine isn't running.
 6. **Let AI make wallpapers too** — the built-in MCP server opens the whole pipeline (create project →
-   write assets → validate → install → apply → screenshot → workshop upload) to AI agents, so
-   wallpaper projects can be authored and iterated programmatically.
+   write assets → validate/inspect → pack & install, incrementally → apply → screenshot, multi-frame →
+   read renderer diagnostics → workshop upload) to AI agents, so wallpaper projects can be authored,
+   self-checked and iterated programmatically.
 
 **Positioning and boundaries.** This is an **independent open-source project**, not affiliated with
 Wallpaper Engine, its developers, or Valve. It neither modifies nor bypasses WE: Workshop content still
@@ -216,7 +218,7 @@ see [Build from Source](#从源码构建--build-from-source).
 - 🌍 **界面语言**：中文 / English 一键切换（界面、托盘菜单、原生文案、后端提示一起变）。
 - 📡 **壁纸分享**：生成分享链接（永久 / 限时，直链 / iframe 代码），手机等设备用浏览器打开即**实时渲染**该壁纸（支持竖屏 / 横屏切换、局域网二维码）；网络模式可选本机 / 局域网 / 任意。
 - 🔄 **应用内更新**：设置 → 关于 里「检查 → 下载 → 安装 → 重启生效」，更新产物带签名校验。
-- 🤖 **AI / MCP 创作**：内置 MCP 服务（默认 `127.0.0.1:7411`），30+ 工具覆盖「建工程 → 写素材 → 校验 → 安装 → 应用 → 截图 → 上传工坊」全流程（详见 [MCP 服务](#mcp-服务--mcp-server)）。
+- 🤖 **AI / MCP 创作**：内置 MCP 服务（默认 `127.0.0.1:7411`），47 个工具覆盖「建工程 → 写素材 → 校验/体检 → 打包安装（增量）→ **离屏预览**（不动桌面）/ 应用 → 截图（可多帧，三平台）→ 看诊断历史 → 上传工坊」全流程（详见 [MCP 服务](#mcp-服务--mcp-server)）。
 - 🧹 **首次安装不打扰**：从未应用过壁纸时不创建任何壁纸窗口，桌面保持系统壁纸；壁纸缺失/加载失败时只显示简洁的 SVG 提示。
 - 🧱 **原生集成**：macOS 桌面层窗口、Linux X11 桌面层、Windows `Progman` / `WorkerW` 桌面层（含 Win11 raised-desktop 适配），全部无边框透明、系统级置底。
 
@@ -238,7 +240,7 @@ see [Build from Source](#从源码构建--build-from-source).
 - 🌍 **UI language**: one-click switch between 中文 and English (UI, tray menu, native strings and backend messages all follow).
 - 📡 **Wallpaper sharing**: generate a share link (permanent or time-limited, direct link / iframe code); open it in any browser — e.g. on your phone — and the wallpaper **renders live** there (portrait / landscape toggle, LAN QR code included). Network modes: local-only / LAN / any.
 - 🔄 **In-app updates**: check → download → install → restart from Settings → About, with signature-verified update artifacts.
-- 🤖 **AI / MCP authoring**: a built-in MCP server (default `127.0.0.1:7411`) exposes 30+ tools covering "create project → write assets → validate → install → apply → screenshot → workshop upload" (see [MCP Server](#mcp-服务--mcp-server)).
+- 🤖 **AI / MCP authoring**: a built-in MCP server (default `127.0.0.1:7411`) exposes 47 tools covering "create project → write assets → validate/inspect → pack & install (incremental) → **offscreen preview** (desktop untouched) / apply → screenshot (multi-frame, all platforms) → read renderer diagnostics → workshop upload" (see [MCP Server](#mcp-服务--mcp-server)).
 - 🧹 **Non-intrusive first run**: no wallpaper window is created until you apply one, so the desktop keeps your system wallpaper; when a wallpaper is missing or fails to load, only a minimal SVG notice is shown.
 - 🧱 **Native integration**: macOS desktop-level windows, the Linux X11 desktop layer, and the Windows `Progman` / `WorkerW` desktop layer (including the Windows 11 raised-desktop layout) — all borderless, transparent and system-level.
 
@@ -467,7 +469,7 @@ The app ships an MCP (Model Context Protocol) server so AI clients (Claude Code,
 }
 ```
 
-- **能力**：项目 CRUD、文件读写、静态校验、`scene` 打包、安装到本地库、应用到桌面、壁纸截图（实拍当前窗口）、属性读写、工坊搜索与下载、**工坊上传**（`workshop_upload` / `workshop_upload_status`，需要 Steam 客户端运行且账号拥有 Wallpaper Engine；版本历史由创作者自行维护，不在 MCP 服务里）等 30+ 工具，另有 resources / prompts。
+- **能力**：项目 CRUD、文件读写、静态校验 + **场景体检（`scene_inspect`：图层树 / 贴图尺寸体积 / 未使用素材 / 属性绑定命中 / 粒子支持情况 / 性能提示）**、`scene` 打包（`install=true` 打包即安装，**增量更新**只同步变化的文件）、安装到本地库、应用到桌面、壁纸截图（实拍当前窗口，`framesMs` 可**多帧**验收动画）、**渲染器诊断历史（`renderer_diag`）**、大素材导入（`project_import_asset`，绕过 base64 体积上限）、属性读写、工坊搜索与下载、**工坊上传**（`workshop_upload` / `workshop_upload_status`，需要 Steam 客户端运行且账号拥有 Wallpaper Engine；版本历史由创作者自行维护，不在 MCP 服务里）等 47 个工具（含 `wallpaper_preview` 离屏预览与三平台抓帧；结果带 `structuredContent`），另有 resources（含机器可读的 `wallpaperem://reference/scene-support`）/ prompts。
 - **工程位置**：`<系统文稿目录>/WallpaperEM/Projects/<工程名>/`，用户可见可改；MCP 的文件工具只能读写该工作区内的文件。
 
 > 详见 [`docs/mcp-authoring-web.md`](docs/mcp-authoring-web.md)（网页壁纸）与 [`docs/mcp-authoring-scene.md`](docs/mcp-authoring-scene.md)（场景壁纸）。

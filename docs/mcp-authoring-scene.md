@@ -10,6 +10,24 @@ prompt `create_scene_wallpaper`（完整闭环流程）。
 
 ---
 
+## 0. 动手前先拿"地图"（不用翻渲染库源码）
+
+| 资源 / 工具 | 用途 |
+| --- | --- |
+| `wallpaperem://reference/pitfalls` | **症状 → 原因 → 改法**清单（14 条，全部实测复现过：angles 动画挂死、效果缺 `.vert` 静默跳过、solidlayer 硬边、粒子数太少……） |
+| `wallpaperem://reference/effects` | 效果链三段式契约、15 个可用 `g_*` uniform（时间/指针/音频频谱/颜色）、顶点与片段模板、四类配方 |
+| `wallpaperem://reference/particles` | 渲染库内置粒子贴图的**关键字表**（star/ember/smoke/meteor…按名字程序化生成，不用带位图）、已实现的组件白名单与未实现名单、四套完整预设 |
+| `particle_recipe` 工具 | 直接返回**可落盘**的预设 + 材质两个文件（星尘/余烬/星云絮/流星） |
+| `effect_scaffold` 工具 | 直接返回自写 shader 的**四件套**（effects json + 材质 + `.frag` + `.vert`）：水面波纹 / 指针光晕 / 音频条 / 七段时钟 / **全屏后期泛光** / **胶片颗粒** |
+| `layer_selfcheck` 工具 | **判定某层到底画出来没有**：量该层矩形的均值/方差（白块 = 高均值低方差）+ 交叉核对渲染器诊断（会把「跳过效果（pass 编译失败）」原文带回来）→ verdict + 改法 |
+| `pitfall_search` 工具 | 按关键词查坑（比通读 pitfalls 省 token） |
+
+**全屏后期**（泛光/暗角/颗粒/色散）：图层用 `models/util/fullscreenlayer.json`（内容 = 当前已渲染画面，`g_Texture0` 即画面），放在 `objects` **最后**，**强度就是图层 alpha**（绑 slider 属性即可）。实测 alpha 0→0.62：边缘/中心亮度比 0.21→0.12（暗角）、高光像素 8.32%→8.48%（泛光）。
+
+`project_validate` 也会主动拦两个最痛的坑：`angles` 带关键帧动画（渲染库会让首帧永不完成，见下）、效果 shader 缺 `.vert`（会被静默跳过）。
+
+---
+
 ## 1. 工程结构与交付物
 
 工程根：`~/Documents/WallpaperEM/Projects/<工程名>/`
@@ -170,6 +188,8 @@ prompt `create_scene_wallpaper`（完整闭环流程）。
 - `user` 是 `project.json` 里属性的名字；`value` 是**默认/快照值**。
 - **重要**：用户**没改**属性面板时，场景用 `value` 快照（不是 project.json 里的
   `value`）。所以两处默认值请保持一致，否则「用户还没动，画面就和预期不一样」。
+  模板里的 `glow` 已经绑在 Aurora Glow 图层的 `alpha` 上，照它写即可；
+  `project_validate` 会把「声明了却没人绑」的属性点名（拖了滑块没反应就是因为这个）。
 - 可绑定的字段不限于数值：`origin`/`scale`/`angles`/`size`/`alpha`/`brightness`/
   `color`/`visible`/`volume`/`zoom`/`maxwidth` 等都能绑。
 
@@ -213,9 +233,14 @@ prompt `create_scene_wallpaper`（完整闭环流程）。
 ### 贴图文件怎么放
 
 - 贴图源放 **`materials/<名字>.png`（或 `.jpg`/`.jpeg`）**，名字与 `textures` 里的
-  名字**逐字对应**；`scene_pack` 会就地转成同名 `.tex` 并打进包（源图片不进包）。
-- 想手写 `.tex` 也可以（同名 `.tex` 优先，不会被覆盖）。
+  名字**逐字对应**；`scene_pack` 会把它转成同名 `.tex` **打进包**（源图片不进包，
+  工程目录里也不会多出 `.tex`）。
+- 想手写 `.tex` 也可以，但**不能和同名源图并存**：`scene_pack` 会用 `.tex`、把源图
+  丢掉，画面于是和你改的源图不一致。校验器会把「同名 `.tex` + 源图」判为 **error**
+  （`贴图同名冲突`），`project_write_file` 写源图时会顺手删掉同名 `.tex`。
 - **不要用 WebP**：渲染库会把 WebP 当视频纹理，`scene_pack` 直接报错拒绝。
+- 单文件（base64 写入时）上限 **40 MB**；base64 会膨胀 4/3，所以原始图片建议 < 30 MB，
+  更大就直接写进工程目录再打包。
 
 ---
 
@@ -270,18 +295,26 @@ prompt `create_scene_wallpaper`（完整闭环流程）。
 }
 ```
 
-支持的名字（按全库使用频次实现，其余名字会被忽略）：
+支持的名字（**与渲染库的 `switch (name)` 分支逐个对齐**，名单外的会被静默忽略；
+`project_validate` 会对不认识的名字逐个 warning，`wallpaperem://reference/scene-support`
+是同一份清单的机器可读版）：
 
-- **emitter**：`sphererandom`（球形随机）、`boxrandom`（盒形随机，
-  支持 `directions`/`sign`/`distancemin|max`/`instantaneous`）。
-  `rate` 与 `instantaneous` 都缺省时按「常驻池」处理（灰尘/星空这类）。
+- **emitter**：**只特判 `boxrandom`**（盒形随机，支持
+  `directions`/`sign`/`distancemin|max`/`instantaneous`）；其余任何名字都按**球壳**发射
+  （WE 里那个名字是 `sphererandom`，库代码里没有它的字面量 —— 所以校验器不对发射器
+  名字报 warning，只提醒别忘了写 `name`）。`rate` 与 `instantaneous` 都缺省时按
+  「常驻池」处理（灰尘/星空这类）。
 - **initializer**：`lifetimerandom`、`sizerandom`、`colorrandom`、`alpharandom`、
   `velocityrandom`、`rotationrandom`、`angularvelocityrandom`、
-  `turbulentvelocityrandom`（都支持 `exponent` 偏置）。
+  `mapsequencearoundcontrolpoint`、`mapsequencebetweencontrolpoints`
+  （前几项都支持 `exponent` 偏置）。
 - **operator**：`movement`、`angularmovement`、`alphafade`、`alphachange`、
   `sizechange`、`colorchange`、`turbulence`、`oscillatealpha`、`oscillatesize`、
-  `oscillateposition`、`controlpointattract`、`vortex`、`remapvalue`。
-- **renderer**：`sprite`、`spritetrail`、`ropetrail`（`rope` 按 `sprite` 处理）。
+  `oscillateposition`、`controlpointattract`、`vortex`、`vortex_v2`、`remapvalue`、
+  `capvelocity`、`positionoffsetrandom`、`collisionquad`、`collisionplane`、
+  `reducemovementnearcontrolpoint`、`maintaindistancebetweencontrolpoints`。
+- **renderer**：`sprite`（缺省，名字不认识也按它画）、`spritetrail`、`ropetrail`
+  （`rope` 按 `sprite` 处理）。
 
 注意：
 
@@ -295,7 +328,9 @@ prompt `create_scene_wallpaper`（完整闭环流程）。
 
 ## 9. `project_validate` 会检查什么
 
-打包/安装前先过一遍校验（返回 `errors`/`warnings` 列表，不抛异常）：
+打包/安装前先过一遍校验（返回 `errors`/`warnings` 列表，不抛异常）。
+**`errors` 非空时 `scene_pack` / `project_install` 会直接拒绝**，所以这一步就是
+你自查的全部依据 —— 这里的每一条都对应一个「不查就会静默画错」的坑：
 
 - `project.json` 存在且是合法 JSON；`type` 在白名单里；`file` 指向的文件真实存在；
 - `version` 是 ≥ 1 的整数；`tags` 里**恰好有一个**年龄分级标签（`Everyone`/`Questionable`/`Mature`）；
@@ -303,12 +338,23 @@ prompt `create_scene_wallpaper`（完整闭环流程）。
   `combo` 有非空 `options` 且每项有 `value`；
 - `scene.json` 是合法 JSON；`general.orthogonalprojection` 有正数宽高（否则 warning）；
 - `objects[]` 每个图层：`id` 不重复、`origin`/`scale`/`angles` 是三元组、
-  `size` 是二元组、`image`/`particle` 引用可解析；
+  `size` 是二元组、`visible` 是布尔、`image`/`particle` 引用可解析；
 - **引用链**：`image` → `models/x.json` → `material` → `materials/y.json` → `passes[].textures`
-  → `materials/<name>.tex` 或 `.png` 存在（缺贴图 = error，还没转 `.tex` = warning）；
+  → `materials/<name>.tex` 或 `.png` 存在（缺贴图 = error；同名 `.tex` 与源图并存 = error）；
+- **用户属性绑定**：任何字段写成 `{"value":…,"user":"<属性名>"}` 时，该属性必须在
+  `project.json` 的 `general.properties` 里存在（对不上 = error）；声明了却没人绑的
+  属性会被点名（warning）；
+- `parent` 必须指向存在的图层 id、不能指向自己、不能成环（都是 error）；
+- `effects[].file` 必须存在；效果里用到非内置 shader 时工程要带 `shaders/<名字>.frag/.vert`
+  （缺源码 = warning，那个 pass 会被渲染器跳过）；
+- **粒子预设**：文件要能解析、`material` 要指向第一个 pass 是 `genericparticle` 的材质
+  （否则 error）、`renderer` 至少一项；`emitter`/`initializer`/`operator`/`renderer` 里
+  不受支持的名字会被逐个点名（warning）+ 附上支持清单；
+- **关键帧**：`animation.c0` 必须存在且非空、每个关键帧要有数字 `frame` 与 `value`、
+  `options.fps > 0`、`options.length ≥ 1`，`mode` 只认 `loop`/`mirror`/`single`；
+- 数值与几何合理性（warning）：`alpha`/`brightness` 越界、`scale`/`size` 有 0、
+  `origin` 落在设计分辨率之外、`colorBlendMode` 不在文档列出的取值里；
 - 还没 `scene.pkg` 时给 warning（提示先 `scene_pack`）。
-
-`errors` 非空时 `scene_pack` 会拒绝打包。
 
 ---
 
@@ -317,13 +363,41 @@ prompt `create_scene_wallpaper`（完整闭环流程）。
 1. 写 `scene.json` / `models` / `materials` / 贴图（贴图用 base64 写 `.png`）。
 2. （可选）版本备份由创作者自行维护（git 提交、拷贝目录均可）。
 3. `scene_pack`（自动转 `.tex` + 打 `scene.pkg`）→ 看返回的 `warnings`。
-4. `project_install` → `wallpaper_apply` → `wallpaper_screenshot`。
+   装进本地库后，界面「类型」里的 **项目** 筛选（MCP 侧传 `tagGroups: [["$project"]]`）就是
+   这一族条目 —— 自建工程是 WallpaperEM 独有的类型，与工坊下载的条目区分开。
+4. `project_install`（或 `scene_pack(install=true)` 一步到位）→ 看效果有两条路
+   （多屏各挂不同壁纸时，`wallpaper_screenshot` 用 `displayId` 点名拍哪一块屏）：
+   - **`wallpaper_preview`（推荐）**：把壁纸挂在主窗口里一张**屏外画布**上渲染并抓帧，
+     完全不动桌面壁纸会话，改一处看一眼的循环用它最省事（`framesMs` 可多帧）；
+   - `wallpaper_apply` → `wallpaper_screenshot`：看「真正挂到桌面上」的样子（会接管桌面，
+     截图走渲染器自抓帧，scene / video / gif / image 三个平台都能截）。
+   打包前可以跑 `scene_inspect` 做体检：图层树、每张贴图的尺寸/体积/引用者、没人引用的素材、
+   属性绑定命中表、粒子组件支持情况、关键帧摘要，外加一份性能提示（贴图过大/粒子过多）。
+   注意 `project_update` 现在是**增量同步**：只拷变化的文件、删源里没有的，返回里会告诉你
+   `copied/removed/unchanged`。
 5. **看截图**：黑屏多半是 `clearcolor` 太暗 / 图层不可见 / `origin.y` 反了 / 贴图没转成功；
    改完**必须重新 `scene_pack` + `project_install`** 再截图（源码不会自动重打包）。
    首次应用要解析 `scene.pkg`，**冷启动几十秒属正常**（工具默认等 60s，别急着传更小的 `timeoutMs`）；
-   同一张壁纸再拍会复用已挂载实例（返回里 `applied: false`），只花几百毫秒。超时报错会附上渲染器
-   最近一条诊断：停在哪一步就是卡在哪一步（`mount start` = 还在解析，不是加载失败）。
+   同一张壁纸紧接着再拍会复用已挂载实例（返回里 `applied: false`），只花几百毫秒 —— 但**改完工程
+   重新安装之后再拍一定会重新挂载**（判据是内容时间，不是 itemId），返回里是 `applied: true`；
+   想无条件重挂传 `force: true`。超时报错会附上渲染器最近一条诊断：停在哪一步就是卡在哪一步
+   （`mount start` = 还在解析，不是加载失败）。
 6. 改用户属性验证热更新（`item_props_set` 或属性面板），确认画面跟着变。
+7. 想「改一处看一眼」时把改动做小（一次只动 `clearcolor` 或一个图层），截图更容易判断因果。
+8. 验收动画/循环/关键帧用 `wallpaper_screenshot(framesMs=[0, 1000, 3000])`：一次调用返回多帧
+   （每帧一个 image 块，顺序与请求一致）——单张图看不出时间维度的问题。
+9. 结构化输出：`project_validate` / `scene_inspect` / `scene_pack` / `renderer_diag` /
+   `wallpaper_preview` 等工具在 `tools/list` 里声明了 `outputSchema`，调用结果除了文本块
+   还带一份 `structuredContent`（同一份 JSON）——客户端可以直接按类型消费，不必二次解析。
+   另外工具调用按**资源**串行：`project:<名>`（工程目录）与 `item:<id>`（库内条目）两个
+   命名空间，安装/更新两把都拿 —— 并发写文件、打包、预览同一个工程/条目不会读到半成品；
+   不同工程/条目照旧完全并行（多把键按字典序获取，不会死锁）。
+   离屏预览若用 `keepOpen:true` 保留，实例在 **180s** 没有新的抓帧请求时会自动释放
+   （不会把 WebGL 上下文与 pkg 缓存一直占住）。
+10. 画面和预期不符时**先读 `renderer_diag`**：效果 pass 被跳过（`[we-scene]` 告警）、
+   贴图 404、视频纹理失败、mount 停在哪一步都在那里（最近 300 条，可按 label/条目/时间过滤，
+   读之前可 `clear=true` 让下一轮从干净历史开始；主窗口的离屏预览也往这条通道上报，
+   所以「预览没出图」同样有迹可循）。
 
 ---
 
@@ -340,3 +414,24 @@ prompt `create_scene_wallpaper`（完整闭环流程）。
 - 贴图格式：PNG / JPEG；**WebP 会被拒绝**。
 - 打包格式 `PKGV0022`，`.tex` 用 `freeImage` 直接内嵌原图片
   （PNG 原样、JPEG 原样），渲染库按 V3 布局读。
+- **单次工具调用的请求体上限 64 MB**（`project_write_file` 的单文件上限 40 MB）；
+  更大的素材请让 agent 直接写工程目录下的文件，再 `scene_pack`。
+- **`wallpaper_screenshot` 目前仅 macOS**（Linux/Windows 会明确报错）；那两类平台上
+  只能靠应用内预览或自行截图确认画面。
+- **非 macOS 的 `web` 类型截图**：`web` 是独立 iframe，画布抓不到，只能靠平台原生快照
+  （只有 macOS 有）。补齐需要 Linux 的 WebKitGTK `webkit_web_view_get_snapshot()` 与
+  Windows WebView2 的 `ICoreWebView2CapturePreview`，两者都必须在对应平台编译+实机验证。
+- **`wallpaper_preview` 需要主窗口当渲染面**：它把画布挂在主窗口里（隐藏/屏外窗口会被
+  WebKit 停帧，实测等不到首帧）。主窗口被关掉或被内存压力看门狗回收时，默认**直接报错**
+  并给出替代方案；显式传 `openMainWindow: true` 才允许宿主重新打开主界面（会弹到前台，
+  结果里 `openedMainWindow=true`）。
+- **`wallpaper_preview` 的保真度**：它用最小挂载（源 + fit + 画质 + 用户属性覆盖），
+  不带音频/无缝切换那一套宿主适配 —— 看构图、配色、动画足够，声音相关的效果不做保证。
+  `web` 类型抓不到（独立 iframe），请用 `wallpaper_screenshot`（macOS 原生快照）。
+- **多帧截图在窗口被完全遮挡时可能拿到相同的几帧**：系统对不可见窗口会降频渲染。
+  验收动画时把应用/壁纸切到前台，或优先用 `wallpaper_preview`（主窗口在跑）。
+- 超过 `project_write_file` 的 40 MB（base64）时用 **`project_import_asset`** 直接拷宿主
+  文件进工程（单文件上限 512 MB）。来源被限制在图片/下载/桌面/文稿/音乐/影片/临时目录与
+  工程根，扩展名限 `png/jpg/jpeg/tex/frag/vert/h/json/ogg/wav/mp3/gif/mp4` —— 这是为了让
+  MCP 不被当成任意文件读取器，不是随意设的限制。
+

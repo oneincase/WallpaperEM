@@ -7,7 +7,7 @@
 //! 路由族：
 //! - `GET /share/{id}`                落地页（预览图 + 打开按钮）
 //! - `GET /share/{id}/render|/embed`  302 → 渲染页（query 按 resolve_item_config 复刻，
-//!                                     `mediaBase=/share/{id}/media`，audioToken=shareId）
+//!   `mediaBase=/share/{id}/media`，audioToken=shareId）
 //! - `GET /share/{id}/media/{item}/*` 限目录文件服务（ServeDir：防穿越 + Range + MIME）
 //! - `GET /share/{id}/api/local-assets/*` WE 官方素材只读代理（跟随全局设置；
 //!   spike 实测不带它观感明显劣化，见方案 §6.7）
@@ -259,10 +259,10 @@ pub(crate) fn set_enabled(app: &AppHandle, share_id: &str, enabled: bool) -> Res
     Ok(n > 0)
 }
 
-/// 定时清扫过期分享：懒校验已保证访问侧正确性，清扫只回收 DB 行 —— 由
-/// mod.rs 持 AppHandle spawn（`spawn_share_cleanup`），10 分钟一轮。
+// 定时清扫过期分享：懒校验已保证访问侧正确性，清扫只回收 DB 行 —— 由
+// mod.rs 持 AppHandle spawn（`spawn_share_cleanup`），10 分钟一轮。
 
-/// 浏览计数（落地页/render 命中时 +1），同 IP 5 分钟去重（P4）：
+// 浏览计数（落地页/render 命中时 +1），同 IP 5 分钟去重（P4）：
 /// 内存表记 (shareId, IP) → 5 分钟桶，同桶重复访问不计数；表超 4096 项顺手清桶。
 fn bump_views(app: &AppHandle, share_id: &str, peer: IpAddr) {
     static RECENT: std::sync::OnceLock<std::sync::Mutex<HashMap<(String, IpAddr), i64>>> =
@@ -442,7 +442,7 @@ fn render_query(app: &AppHandle, share: &ShareRow) -> Result<String, Response> {
             let marker = if cfg.r#type == "web" { "/web/" } else { "/media/" };
             let rel = src
                 .find(marker)
-                .and_then(|i| src[i + marker.len()..].splitn(2, '/').nth(1))
+                .and_then(|i| src[i + marker.len()..].split_once('/').map(|x| x.1))
                 .ok_or_else(|| simple(StatusCode::NOT_FOUND, "壁纸入口文件无法定位"))?;
             parts.push(format!(
                 "src={}",
@@ -612,7 +612,7 @@ async fn media_file(
     // 路由同款），裸 HTML 会让 wallpaperPropertyListener 类网页壁纸退化成默认值
     let lower = file_path.to_ascii_lowercase();
     if lower.ends_with(".html") || lower.ends_with(".htm") {
-        let file = dir.join(percent_decode_path(&file_path));
+        let file = dir.join(percent_decode_path(file_path));
         if file.is_file() {
             let html = std::fs::read(&file).unwrap_or_default();
             let injected = inject_share_html(&app, &share.item_id, html);
@@ -799,7 +799,7 @@ fn percent_decode_impl(s: &str, plus_as_space: bool) -> String {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() + 1 && i + 2 <= bytes.len() - 1 {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
             if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
                 out.push(v);
                 i += 3;

@@ -17,7 +17,7 @@ export function WorkshopUploadChoiceModal({
   const isUpdate = Boolean(item.publishedFileId);
 
   const cardCls =
-    "group flex w-full items-start gap-3 rounded-xl border border-[var(--separator)] p-3.5 text-left transition-colors hover:border-[var(--accent-strong)] hover:bg-white/10";
+    "group flex w-full items-start gap-3 rounded-xl border border-[var(--separator)] p-3.5 text-left transition-colors hover:border-[var(--accent-strong)] hover:bg-[var(--glass-hover)]";
 
   return (
     <div

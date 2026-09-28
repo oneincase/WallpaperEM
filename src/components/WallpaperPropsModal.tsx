@@ -554,7 +554,7 @@ export function WallpaperPropsPanel({
             <WindowControls />
           ) : (
             <button
-              className="shrink-0 rounded-lg px-2 py-0.5 text-[18px] leading-none text-[var(--text-2)] hover:bg-white/10"
+              className="shrink-0 rounded-lg px-2 py-0.5 text-[18px] leading-none text-[var(--text-2)] hover:bg-[var(--glass-hover)]"
               onClick={close}
               aria-label={tr("关闭")}
             >
@@ -581,7 +581,7 @@ export function WallpaperPropsPanel({
               className={`rounded-lg px-2.5 py-1 text-[12.5px] ${
                 tab === key
                   ? "border border-[var(--accent-strong)] bg-[var(--accent)] text-[var(--accent-fg)]"
-                  : "text-[var(--text-2)] hover:bg-white/10"
+                  : "text-[var(--text-2)] hover:bg-[var(--glass-hover)]"
               }`}
               onClick={() => setTab(key)}
             >

@@ -13,6 +13,7 @@
 
 mod api;
 mod protocol;
+mod references;
 pub(crate) mod shares;
 mod tools;
 

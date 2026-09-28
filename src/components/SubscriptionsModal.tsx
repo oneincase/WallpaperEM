@@ -352,7 +352,7 @@ export function SubscriptionsModal({
             {tr("拉取登录账号在 Wallpaper Engine 工坊的全部订阅，批量下载缺失项")}
           </span>
           <button
-            className="shrink-0 rounded-lg px-2 py-0.5 text-[18px] leading-none text-[var(--text-2)] hover:bg-white/10"
+            className="shrink-0 rounded-lg px-2 py-0.5 text-[18px] leading-none text-[var(--text-2)] hover:bg-[var(--glass-hover)]"
             onClick={() => !downloading && onClose()}
             aria-label={tr("关闭")}
           >

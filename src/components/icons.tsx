@@ -47,14 +47,6 @@ const Sparkle = ({ x, y, r = 1.9 }: { x: number; y: number; r?: number }) => (
 
 // ---------- 侧边栏导航 ----------
 
-/** 发现：圆顶小屋 + 一颗星 */
-export const IconHome = () => (
-  <Svg>
-    <path d="M4 11.2c0-.6.26-1.16.7-1.55l6-5.3a2 2 0 0 1 2.6 0l6 5.3c.44.39.7.95.7 1.55V18a2.6 2.6 0 0 1-2.6 2.6H6.6A2.6 2.6 0 0 1 4 18Z" />
-    <path d="M9.7 20.6v-4.3a2.3 2.3 0 0 1 4.6 0v4.3" />
-  </Svg>
-);
-
 /** 工坊：四格圆角方块，右上角一颗星 */
 export const IconGrid = () => (
   <Svg>
@@ -169,6 +161,24 @@ export const IconTrash = () => (
     <path d="M9.4 7.2V5.9A2 2 0 0 1 11.4 3.9h1.2a2 2 0 0 1 2 2v1.3" />
     <path d="M6.4 7.2l.72 10.5a2.6 2.6 0 0 0 2.6 2.4h4.56a2.6 2.6 0 0 0 2.6-2.4l.72-10.5" />
     <path d="M10.4 11.4v5M13.6 11.4v5" strokeWidth={1.6} />
+  </Svg>
+);
+
+/** 从本地库移除（**不删文件**）：圆 + 减号。刻意不用垃圾桶（那是连文件一起删），
+    也不用「托盘 + 箭头」那一家（与下载/上传撞脸），在 17px 上要和两者都能一眼分开 */
+export const IconRemove = () => (
+  <Svg>
+    <circle cx="12" cy="12" r="8.4" />
+    <path d="M8.2 12h7.6" strokeWidth={1.9} />
+  </Svg>
+);
+
+/** 壁纸信息：圆角圆形 + 小写 i，圆点用实心保持「信息」语义 */
+export const IconInfo = () => (
+  <Svg>
+    <circle cx="12" cy="12" r="8.6" />
+    <circle cx="12" cy="7.9" r="1" fill="currentColor" stroke="none" />
+    <path d="M12 11.2v5.6" strokeWidth={1.9} />
   </Svg>
 );
 

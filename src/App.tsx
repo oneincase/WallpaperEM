@@ -1,11 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { HomePage } from "./pages/Home";
 import { WorkshopPage } from "./pages/Workshop";
 import { DetailPage } from "./pages/Detail";
 import { DownloadsPage } from "./pages/Downloads";
 import { LibraryPage } from "./pages/Library";
 import { FavoritesPage } from "./pages/Favorites";
-import { DisplaysPage } from "./pages/Displays";
 import { SharesPage } from "./pages/Shares";
 import { HotkeysPage } from "./pages/Hotkeys";
 import { SettingsPage } from "./pages/Settings";
@@ -22,20 +20,18 @@ const PAGE_STORAGE_KEY = "nav.page";
 
 /**
  * 恢复上次所在页面。窗口被释放后重建是全新 JS 上下文，不持久化就必然落回
- * 发现页 —— 而发现页恰好是最慢的链路（workshop_random 三次串行网络请求）。
+ * 首页 —— 工坊页要发搜索请求，落回它就是白白等一轮网络。默认值因此取工坊。
  * 「设置」与「分享」刻意不恢复：那是一次性操作页，下次进来想看的多半是内容。
  */
 function readInitialPage(): PageId {
-  const p = readState<string>(PAGE_STORAGE_KEY, "home");
+  const p = readState<string>(PAGE_STORAGE_KEY, "workshop");
   const valid: PageId[] = [
-    "home",
     "workshop",
     "downloads",
     "library",
     "favorites",
-    "displays",
   ];
-  return (valid as string[]).includes(p) ? (p as PageId) : "home";
+  return (valid as string[]).includes(p) ? (p as PageId) : "workshop";
 }
 
 /** 浏览器直开渲染器页（无 Tauri IPC）时不接窗口事件 —— 见 lib/platform.ts */
@@ -152,9 +148,7 @@ function Shell() {
       <TopBar activeId={detailId ? null : page} onNavigate={navigate} />
 
       <div className="relative z-10 flex-1 flex flex-col min-h-0">
-        {page === "home" ? (
-          <HomePage onOpenDetail={openDetail} />
-        ) : page === "workshop" ? (
+        {page === "workshop" ? (
           <WorkshopPage onOpenDetail={openDetail} />
         ) : page === "downloads" ? (
           <DownloadsPage />
@@ -162,8 +156,6 @@ function Shell() {
           <LibraryPage onOpenDetail={openDetail} />
         ) : page === "favorites" ? (
           <FavoritesPage onOpenDetail={openDetail} />
-        ) : page === "displays" ? (
-          <DisplaysPage onNavigate={navigate} />
         ) : page === "shares" ? (
           <SharesPage onNavigate={navigate} />
         ) : page === "hotkeys" ? (

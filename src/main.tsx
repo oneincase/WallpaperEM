@@ -3,6 +3,11 @@ import App from "./App";
 import { MessageProvider } from "./components/Message";
 import { WorkshopFilterProvider } from "./hooks/useWorkshopFilter";
 import "./index.css";
+import { installPreviewBridge } from "./lib/preview";
+
+// MCP 的离屏预览控制面（window.__wpPreview / __wpCapture）：装一次即可，
+// 平时零开销（渲染库按需 import，见 lib/preview.ts）
+installPreviewBridge();
 
 // 全屏蔽浏览器默认右键菜单（WKWebView 的 Look Up/Copy 等原生项）：
 // 产品界面不出现右键菜单；文本编辑仍可用键盘 ⌘C/⌘V（Edit 菜单）

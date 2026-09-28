@@ -120,7 +120,7 @@ export function FilterButton({
       className={`relative flex shrink-0 items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-[12.5px] font-medium transition-colors ${
         activeCount > 0
           ? "border-[var(--accent-strong)] bg-[var(--accent)] text-[var(--accent-strong)]"
-          : "border-[var(--separator)] text-[var(--text-2)] hover:bg-white/10"
+          : "border-[var(--separator)] text-[var(--text-2)] hover:bg-[var(--glass-hover)]"
       }`}
       onClick={onClick}
     >
@@ -205,7 +205,7 @@ export function TagChip({
   const cls =
     state === "on"
       ? "border-[var(--accent-strong)] bg-[var(--accent)] text-[var(--accent-fg)]"
-      : "border-[var(--separator)] text-[var(--text-2)] hover:bg-white/10";
+      : "border-[var(--separator)] text-[var(--text-2)] hover:bg-[var(--glass-hover)]";
   return (
     <button
       className={`rounded-lg border px-2 py-[3px] text-[11.5px] transition-colors ${cls}`}

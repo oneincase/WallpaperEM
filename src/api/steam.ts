@@ -266,7 +266,7 @@ export const api = {
   // 工坊
   workshopSearch: (params: WorkshopSearchParams) =>
     invoke<WorkshopSearchResult>("workshop_search", { params }),
-  /** 随机推荐。接受与 workshopSearch 相同的筛选参数（发现页与工坊页共用条件） */
+  /** 随机推荐。接受与 workshopSearch 相同的筛选参数。 */
   workshopRandom: (params?: WorkshopSearchParams) =>
     invoke<WorkshopSearchResult>("workshop_random", { params }),
   workshopItem: (id: string) => invoke<WorkshopItem | null>("workshop_item", { id }),
@@ -319,6 +319,8 @@ export const api = {
   libraryList: (type?: WallpaperType | "", filter?: LibraryFilter) =>
     invoke<LibraryItem[]>("library_list", { type, filter }),
   libraryDelete: (itemId: string) => invoke<boolean>("library_delete", { itemId }),
+  /** 从本地库移除条目但**保留磁盘文件**（清库记录/自定义属性/列表归属） */
+  libraryRemove: (itemId: string) => invoke<boolean>("library_remove", { itemId }),
   /** 与磁盘对账：清理「有数据库记录但壁纸文件已丢失」的条目，返回被清理的 id */
   libraryPrune: () => invoke<string[]>("library_prune"),
   libraryOpenFolder: (itemId: string) => invoke<boolean>("library_open_folder", { itemId }),
@@ -337,8 +339,8 @@ export const api = {
   /** 文件选择框（支持多选）→ 批量导入 */
   libraryImportCustomPick: () => invoke<ImportBatchResult>("library_import_custom_pick"),
   /**
-   * 文件夹选择框。mode="scan"：扫描壁纸工程目录，引用模式入库（添加壁纸目录）；
-   * 其他/缺省：所选目录作为单个壁纸拷贝导入（导入文件夹；目录不含 project.json
+   * 文件夹选择框。mode="scan"：扫描壁纸工程目录，引用模式入库（添加壁纸路径）；
+   * 其他/缺省：所选目录作为单个壁纸拷贝导入（导入单个壁纸文件夹；目录不含 project.json
    * 时退回扫描）
    */
   libraryImportFolderPick: (mode?: "scan" | "copy") =>

@@ -124,14 +124,14 @@ export const EN_US: Record<string, string> = {
   "上传完成！条目已在 Steam 创意工坊。": "Upload complete! The item is live on the Steam Workshop.",
   "上传失败": "Upload failed",
   "导入壁纸": "Import Wallpapers",
-  "添加壁纸目录": "Add Wallpaper Folder",
-  "添加壁纸目录 / 导入文件夹 / 导入文件": "Add wallpaper folder / import folder / import files",
+  "添加壁纸路径": "Add Wallpaper Path",
+  "添加壁纸路径 / 导入单个壁纸文件夹 / 导入单个文件": "Add wallpaper path / import a single wallpaper folder / import a single file",
   "扫描目录中的壁纸工程，引用入库不复制": "Scan a folder for wallpaper projects and link them in place (no copies)",
   "整个目录拷贝为一张壁纸": "Copy the whole folder in as one wallpaper",
   "视频 / GIF / 图片 / 网页文件": "Video / GIF / image / web files",
   "已导入的壁纸目录": "Linked wallpaper folders",
   "（引用方式，删除目录前请先移除）": "(linked in place; remove them here before deleting the folder)",
-  "暂无壁纸目录，点上方「添加壁纸目录」试试": "No wallpaper folders yet — try “Add Wallpaper Folder” above",
+  "暂无壁纸目录，点上方「添加壁纸路径」试试": "No wallpaper paths yet — try “Add Wallpaper Path” above",
   "已移除壁纸目录「{t}」（源文件未删除）": "Removed wallpaper folder 「{t}」 (source files were not deleted)",
   "移除壁纸目录（不动源文件）": "Remove this folder from the library (source files untouched)",
   "上传他人制作的壁纸前请注意版权/授权：转载他人作品需要获得对方许可，并遵守 Steam 订阅者协议与工坊规则。": "Before uploading wallpapers made by others, check the copyright/license: you need the creator's permission to re-upload their work, and you must follow the Steam Subscriber Agreement and Workshop rules.",
@@ -143,7 +143,7 @@ export const EN_US: Record<string, string> = {
     "Removes all finished and failed task records from the list. Downloaded wallpaper files are kept.",
   "已清空 {n} 条任务记录": "Cleared {n} task record(s)",
 
-  // ---------------- 工坊 / 发现 ----------------
+  // ---------------- 工坊 ----------------
   "搜索壁纸…": "Search wallpapers…",
   "趋势时间范围": "Trending time range",
   "时间范围仅在「趋势」排序下有效": "Only applies to the Trending sort",
@@ -201,13 +201,15 @@ export const EN_US: Record<string, string> = {
   "同步订阅": "Sync subscriptions",
   "导入包含 project.json 的 WE 壁纸工程目录":
     "Import a WE wallpaper project folder containing project.json",
-  "导入文件夹": "Import folder",
+  "导入单个壁纸文件夹": "Import a single wallpaper folder",
   "支持多选；也可以直接把文件/文件夹拖进窗口":
     "Multi-select is supported; you can also drag files/folders into the window",
   "导入中…": "Importing…",
-  "导入文件": "Import files",
+  "导入单个文件": "Import a single file",
   "只看文件已丢失": "Only entries with missing files",
   "本地导入的壁纸（非工坊下载）": "Locally imported wallpaper (not from the workshop)",
+  "本软件自己的工程（MCP 建工程后安装的条目）":
+    "A project made in this app (built with MCP and installed from Projects)",
   "有 {n} 个壁纸的本地文件已丢失（可能被手动删除），仅剩数据库记录。":
     "{n} wallpaper(s) have lost their local files (possibly deleted by hand); only database records remain.",
   "清理中…": "Cleaning…",
@@ -665,10 +667,10 @@ export const EN_US: Record<string, string> = {
   "登出下载账号": "Sign out of the download account",
   "将清除本地保存的账号密码、steamcmd 登录态与订阅同步的网页登录会话。下次下载和订阅同步都需要重新登录并再过一次验证。":
     "Clears the locally saved credentials, the steamcmd session and the web session used by subscription sync. The next download and sync will ask you to sign in and verify again.",
-  "将删除 {size} 的预览图/网页缓存与壁纸首帧封面，并清空工坊、发现页的列表快照。已下载的壁纸与各项设置不受影响。":
-    "Deletes {size} of preview/web cache and wallpaper first-frame covers, and clears the workshop/discover list snapshots. Downloaded wallpapers and settings are unaffected.",
-  "将删除预览图/网页缓存与壁纸首帧封面，并清空工坊、发现页的列表快照。":
-    "Deletes preview/web cache and wallpaper first-frame covers, and clears the workshop/discover list snapshots.",
+  "将删除 {size} 的预览图/网页缓存与壁纸首帧封面，并清空工坊页的列表快照。已下载的壁纸与各项设置不受影响。":
+    "Deletes {size} of preview/web cache and wallpaper first-frame covers, and clears the workshop list snapshot. Downloaded wallpapers and settings are unaffected.",
+  "将删除预览图/网页缓存与壁纸首帧封面，并清空工坊页的列表快照。":
+    "Deletes preview/web cache and wallpaper first-frame covers, and clears the workshop list snapshot.",
   "清除": "Clear",
   "⚠️ 尚未授权：系统设置 → 隐私与安全性 → 录屏与系统录音 → 「仅系统录音」分组 → 打开 WallpaperEM，然后重新关闭/打开本开关（或重启应用）":
     "⚠️ Not authorized yet: System Settings → Privacy & Security → Screen & System Audio Recording → “System Audio only” → enable WallpaperEM, then re-toggle this switch (or restart the app)",
@@ -742,6 +744,20 @@ export const EN_US: Record<string, string> = {
   "全部停止": "Stop all",
   "已停止全部壁纸": "All wallpapers stopped",
   "未检测到显示器": "No displays detected",
+  "仅检测到一块显示器": "Only one display detected",
+  "选中一块屏后，在库里点「应用」就只设置该屏":
+    "Pick a display, then hit Apply on any wallpaper to set that screen only",
+  "取消选择「{name}」": "Clear selection “{name}”",
+  "已选中": "Selected",
+  "清除该屏壁纸": "Clear this screen's wallpaper",
+  "为该屏选择轮播列表": "Pick a playlist to rotate on this screen",
+  "应用壁纸时同步替换所有显示器的壁纸":
+    "Applying a wallpaper replaces it on every display at once",
+  "每块屏可以各自设置壁纸与轮播": "Each screen can have its own wallpaper and playlist",
+  "「{name}」的轮播": "Playlist for “{name}”",
+  "不轮播（固定当前壁纸）": "No rotation (pin the current wallpaper)",
+  "还没有切换列表 —— 先在本地库顶部新建一个":
+    "No playlists yet — create one at the top of the library first",
   "显示器布局": "Display layout",
   "主屏": "Primary",
   "当前：{title}": "Current: {title}",
@@ -795,7 +811,8 @@ export const EN_US: Record<string, string> = {
   "「{name}」已固定为当前壁纸": "“{name}” is now fixed to its current wallpaper",
   "「{name}」开始轮播": "“{name}” is now rotating",
   "「{name}」未在轮播": "“{name}” is not rotating yet",
-  "到「显示器」页选择该列表开始轮播": "Pick this list on the Displays page to start rotating",
+  "在底部显示器坞里，为某块屏选择该列表开始轮播":
+    "In the display dock at the bottom, pick this list for a screen to start rotating",
   "已绑定：{names}": "Bound to {names}",
   "未找到 ID 为 {id} 的壁纸": "No wallpaper found with ID {id}",
   "壁纸ID下载": "Download by ID",
@@ -842,7 +859,7 @@ export const EN_US: Record<string, string> = {
   "（引用方式，可添加多个不同文件夹后统一导入）":
     "(linked in place — add several different folders, then import them together)",
   "导入这 {n} 个文件夹": "Import these {n} folders",
-  "点上方「添加壁纸目录」选择一个或多个文件夹":
+  "点上方「添加壁纸路径」选择一个或多个文件夹":
     "Use “Add wallpaper folder” above to pick one or more folders",
   "从待添加列表移除（尚未入库，不影响源文件夹）":
     "Remove from the list (not imported yet — the source folder is untouched)",
@@ -957,6 +974,8 @@ export const EN_US: Record<string, string> = {
   "滤镜": "Filter",
   "整个画面的色彩效果，实时热切、不重载壁纸；与托盘菜单「滤镜效果」是同一设置":
     "Full-screen colour effect, switched live without reloading the wallpaper; the same setting as “Filter” in the tray menu",
+  "整个画面的色彩效果，实时热切、不重载壁纸；与托盘菜单「滤镜效果」是同一设置。视频壁纸不参与滤镜：它走硬解直通，而滤镜要求的离屏渲染与直通互斥，挂上滤镜就会让 4K 视频退回逐帧像素搬运。":
+    "Full-screen colour effect, switched live without reloading the wallpaper; the same setting as “Filter” in the tray menu. Video wallpapers are exempt: they use hardware-decoded direct compositing, which is mutually exclusive with the offscreen rendering a filter requires — applying one would push 4K video back to copying pixels frame by frame.",
   "切换效果": "Transition effect",
   "叠化（默认）：新壁纸淡入盖过旧壁纸。换到另一张壁纸时生效":
     "Cross-fade (default): the new wallpaper fades in over the old one. Applies when switching to another wallpaper.",
@@ -1034,6 +1053,48 @@ export const EN_US: Record<string, string> = {
   "下载更新并安装": "Download and install update",
   "重启并完成更新": "Restart and finish updating",
 
+  // ---- 本地库：卡片操作 / 批量删除与移除 / 壁纸信息 ----
+  // 「移除」= 只清库记录、保留磁盘文件；「删除」= 连文件一起删。英文里用不同动词
+  // （remove / delete）＋各自点明文件去留，否则用户分不清，点错就丢文件。
+  "壁纸属性（作者属性与播放设置）": "Wallpaper properties (author properties and playback settings)",
+  "壁纸信息": "Wallpaper info",
+  "移出本地库（保留壁纸文件）": "Remove from the library (keep the wallpaper files)",
+  "删除（同时删除壁纸文件）": "Delete (also deletes the wallpaper files)",
+  "移除壁纸": "Remove wallpaper",
+  "确定把「{title}」从本地库移除？磁盘上的壁纸文件会保留，但该壁纸的自定义属性、所属切换列表与下载记录会被清除。此操作不可恢复。":
+    "Remove “{title}” from the library? The wallpaper files on disk are kept, but its custom properties, playlist memberships and download history are cleared. This cannot be undone.",
+  "已移除「{title}」（壁纸文件保留）": "Removed “{title}” (wallpaper files kept)",
+  "批量删除壁纸": "Delete wallpapers in bulk",
+  "确定删除选中的 {n} 张壁纸及其本地文件？此操作不可恢复。":
+    "Delete the selected wallpaper and its local file? This cannot be undone.|Delete the selected {n} wallpapers and their local files? This cannot be undone.",
+  "批量删除": "Delete selected",
+  "批量移除壁纸": "Remove wallpapers in bulk",
+  "确定把选中的 {n} 张壁纸从本地库移除？磁盘上的壁纸文件会保留，但它们的自定义属性、所属切换列表与下载记录会被清除。此操作不可恢复。":
+    "Remove the selected wallpaper from the library? The wallpaper files on disk are kept, but its custom properties, playlist memberships and download history are cleared. This cannot be undone.|Remove the selected {n} wallpapers from the library? The wallpaper files on disk are kept, but their custom properties, playlist memberships and download history are cleared. This cannot be undone.",
+  "批量移除": "Remove selected",
+  "已删除 {n} 张壁纸": "{n} wallpaper deleted|{n} wallpapers deleted",
+  "已移除 {n} 张（壁纸文件保留）": "{n} wallpaper removed (files kept)|{n} wallpapers removed (files kept)",
+  "{n} 张失败：{err}": "{n} failed: {err}",
+  "从本地库移除选中的壁纸，不删除磁盘文件":
+    "Remove the selected wallpapers from the library without deleting files on disk",
+  "从本地库删除选中的壁纸，并删除磁盘文件":
+    "Delete the selected wallpapers from the library and delete their files on disk",
+  "处理中…": "Working…",
+  // 壁纸信息面板
+  "文件已丢失": "File missing",
+  "库内正常": "In library",
+  "条目 ID": "Item ID",
+  "工坊条目 ID": "Workshop item ID",
+  "大小": "Size",
+  "{n} 个文件": "{n} file|{n} files",
+  "入库时间": "Added on",
+  "标签": "Tags",
+  "所属列表": "Playlists",
+  "来源目录": "Source folder",
+  "引用方式入库：壁纸文件留在源目录，移动/删除源文件夹会导致条目失效":
+    "Imported by reference: the wallpaper files stay in the source folder, so moving or deleting that folder will break this entry",
+  "打开文件位置": "Show files",
+
   // ---- 界面杂项 ----
   "导航": "Navigation",
   "最小化": "Minimize",
@@ -1047,21 +1108,6 @@ export const EN_US: Record<string, string> = {
     "Cross-platform dynamic wallpaper engine · an elegant open-source wallpaper app, not merely a WE clone",
 };
 export const EN_US_BACKEND: Record<string, string> = {
-  // MCP 抓帧/审计链路（PR: fix/mcp-audit-followup）
-  "渲染器返回了空图": "The renderer returned an empty image",
-  "找不到壁纸窗口 {label}": "Wallpaper window {label} not found",
-  "派发抓帧指令失败: {e}": "Failed to dispatch the capture request: {e}",
-  "抓帧回执通道被丢弃": "The capture reply channel was dropped",
-  "等渲染器抓帧超时（{}s）—— 页面可能还没就绪，或该类型没有可读画面（web 类型是 iframe，抓不到）":
-      "Timed out waiting for the renderer to capture ({}s) — the page may not be ready yet, or this type has no readable surface (web wallpapers are a separate iframe and cannot be captured)",
-  "诊断缓冲不可用": "Diagnostic buffer unavailable",
-  "渲染器抓帧失败": "Renderer capture failed",
-  "请求体过大：单条 JSON-RPC 消息上限 {} MB。写大贴图请改用 encoding=base64 且单文件 < {} MB，或让 agent 直接写工程目录下的文件":
-      "Request body too large: a single JSON-RPC message is limited to {} MB. For large textures use encoding=base64 with a single file < {} MB, or let the agent write the file straight into the project folder",
-  "等待渲染器就绪超时（{limit}ms）：指定屏的壁纸窗口 {} 不存在（该屏没挂壁纸？用 displays_list 核对 id）。{hint}":
-      "Timed out waiting for the renderer ({limit}ms): no wallpaper window for the requested display {}. Is that display showing a wallpaper? Check the id with displays_list. {hint}",
-  "这个平台没有原生窗口快照（仅 macOS 有）；web 类型请用应用内预览，或改用 scene / video / gif / image 类型（那几类走渲染器自抓帧，三平台都能截）":
-      "This platform has no native window snapshot (macOS only); for web wallpapers use the in-app preview, or switch to scene / video / gif / image (those go through the renderer's own capture and work on all three platforms)",
   // ⚠️ 键 = Rust 侧**格式化后**会产出的中文原文（含 {} 占位符的位置，与后端 format!
   // 的写法逐字对齐；Rust 的 {:?} 这类格式说明符在译文里写成 {} 即可）。
   // 值里的 {} 按出现顺序回填捕获到的片段，片段本身若还是中文会再翻一次（嵌套消息）。
@@ -1424,8 +1470,8 @@ export const EN_US_BACKEND: Record<string, string> = {
   "「{name}」将在所选屏上轮播": "“{name}” will rotate on the selected display",
   "还没有切换列表，先到「切换列表」页新建":
     "No playlists yet — create one on the Playlists page first",
-  "独立模式：{n} 块屏在各自轮播，可在显示器页调整":
-    "Independent: {n} displays rotating on their own — manage them on the Displays page",
+  "独立模式：{n} 块屏在各自轮播，可在显示器坞调整":
+    "Independent: {n} displays rotating on their own — manage them in the display dock",
   "绑定到显示器": "Bind to display",
 
 
@@ -1687,8 +1733,8 @@ export const EN_US_BACKEND: Record<string, string> = {
   "queue 锁": "queue lock",
   "client 锁": "client lock",
   // 工程工作区（第二批）
-  "{VERSION_DIR}/ 是版本历史目录，不能直接写入；用 project_snapshot / project_rollback 管理版本":
-    "{VERSION_DIR}/ is the version-history folder and cannot be written directly; use project_snapshot / project_rollback to manage versions",
+  "{VERSION_DIR}/ 是创作者自己的版本历史目录，不能用 project_write_file 写；历史请用 git 或自行拷贝目录维护（打包/安装也不会带上它）":
+    "{VERSION_DIR}/ is the creator's own version-history folder and cannot be written with project_write_file; keep history with git or by copying the folder (packing/installing never includes it)",
   "未知模板类型 `{kind}`（可用：{}）": "Unknown template type `{kind}` (available: {})",
   "工程 `{}` 已存在（要覆盖请传 force=true）":
     "Project `{}` already exists (pass force=true to overwrite)",
@@ -1741,6 +1787,7 @@ export const EN_US_BACKEND: Record<string, string> = {
   "MULTILIB_REQUIRED|steamcmd 官方 Linux 引导程序是 32 位 x86 版本，需要 32 位运行时库。             Debian/Ubuntu：sudo dpkg --add-architecture i386 && sudo apt update &&              sudo apt install libc6:i386 libstdc++6:i386；             Fedora：sudo dnf install glibc.i686 libstdc++.i686；             Arch：启用 multilib 仓库后 sudo pacman -S lib32-glibc lib32-gcc-libs。             安装完成后重试。": "MULTILIB_REQUIRED|steamcmd's official Linux bootstrap is a 32-bit x86 build and needs 32-bit runtime libraries. Debian/Ubuntu: sudo dpkg --add-architecture i386 && sudo apt update && sudo apt install libc6:i386 libstdc++6:i386; Fedora: sudo dnf install glibc.i686 libstdc++.i686; Arch: enable the multilib repo, then sudo pacman -S lib32-glibc lib32-gcc-libs. Retry after installing.",
   "应用重启，任务中断": "The app restarted, so the task was interrupted",
   "目录里没有扫描到任何包含 project.json 的壁纸": "No wallpaper containing project.json was found in that folder",
+  "目录里没有可识别的壁纸内容（视频 / 图片 / 网页 / 场景包都没有），已跳过": "No recognisable wallpaper content in this folder (no video / image / web / scene package) — skipped",
   "视频无法渲染（壁纸黑屏）": "Video cannot render (the wallpaper stays black)",
   "无声": "No sound",
   "媒体无法播放": "Media cannot play",
@@ -1772,4 +1819,173 @@ export const EN_US_BACKEND: Record<string, string> = {
   "读数不可用": "Reading unavailable",
   "请先启动 Steam 客户端并登录你的账号": "Start the Steam client and sign in first",
   "project.json 没有 title（本地库里会显示目录名）": "project.json has no title (the library will show the folder name)",
+
+  // ---- 场景字段级校验（MCP 场景创作闭环：坏场景要在打包前拦下来）----
+  // 这些消息的主要读者是**创作 agent**（错误经 project_validate / scene_pack 返回），
+  // 所以译文保持「哪一层/哪个字段 + 为什么 + 怎么改」的结构，别只翻前半句。
+  "请求体过大：单条 JSON-RPC 消息上限 {} MB。写大贴图请改用 encoding=base64 且单文件 < {} MB，或让 agent 直接写工程目录下的文件":
+    "Request body too large: a single JSON-RPC message is limited to {} MB. For large textures use encoding=base64 with a single file < {} MB, or let the agent write the file straight into the project folder",
+  "贴图同名冲突：materials/{name}.tex 与 materials/{name}.{} 同时存在。scene_pack 会优先用 .tex（源图被忽略），画面会和预期不一致 —— 请删掉其中一份（一般删 .tex，让 scene_pack 从源图转）":
+    "Texture name collision: both materials/{name}.tex and materials/{name}.{} exist. scene_pack prefers the .tex (the source image is ignored), so the result will not match your source — delete one of them (usually the .tex, letting scene_pack convert from the source image)",
+  "已删除同名的 materials/{stem}.tex（打包会从这份源图重新转换）":
+    "Removed the same-named materials/{stem}.tex (packing will regenerate it from this source image)",
+  "materials/{stem}.tex 与这份源图同名且删不掉，请手动删除后再打包":
+    "materials/{stem}.tex has the same name as this source image but could not be removed — delete it manually before packing",
+  "materials/{stem}.tex 会盖住同名的 materials/{stem}.{src_ext}（打包优先用 .tex）；想用源图就先删掉这份 .tex":
+    "materials/{stem}.tex will shadow the same-named materials/{stem}.{src_ext} (packing prefers .tex); delete this .tex first if the source image should be used",
+  "对象 {label} 同时写了 image 与 particle（二选一；渲染器只会用其中一个）":
+    "Object {label} sets both image and particle (pick one — the renderer only uses one of them)",
+  "对象 {label} 有 parent，但自己没有 id（无法被其它层引用）":
+    "Object {label} has a parent but no id of its own (nothing can reference it)",
+  "对象 {label} 的 visible 不是布尔（受属性控制时用 {\"value\":true} 包装）":
+    "Object {label}'s visible is not a boolean (when driven by a property, wrap it as {\"value\":true})",
+  "对象 {label} 的第 {fi} 个 effects 项缺少 file（形如 effects/xxx.json）":
+    "Object {label}'s effects entry #{fi} is missing file (e.g. effects/xxx.json)",
+  "对象 {label} 的 effects 不是数组": "Object {label}'s effects is not an array",
+  "对象 {label}": "Object {label}",
+  "对象 {label} 的 {field}={n} 超出 0..1（渲染器按钳制后的值用）":
+    "Object {label}'s {field}={n} is outside 0..1 (the renderer clamps it)",
+  "对象 {label} 的 scale={} 有 0 分量（该方向会被压成 0 像素，看不见）":
+    "Object {label}'s scale={} has a zero component (that axis collapses to 0 pixels and becomes invisible)",
+  "对象 {label} 的 size=\"{} {}\" 不是正数（该层不会显示）":
+    "Object {label}'s size=\"{} {}\" is not positive (this layer will not show)",
+  "对象 {label} 的 origin=\"{} {} {}\" 落在设计分辨率 {dw}×{dh} 之外（坐标原点在左下角、Y 轴向上；画面正中是 \"{} {}\"）":
+    "Object {label}'s origin=\"{} {} {}\" falls outside the design resolution {dw}×{dh} (origin sits at the bottom-left with Y pointing up; the centre is \"{} {}\")",
+  "对象 {label} 的 colorBlendMode={blend} 不在文档列出的 0/2/6/7/9/31 里（多半按正常混合处理）":
+    "Object {label}'s colorBlendMode={blend} is not one of the documented 0/2/6/7/9/31 (most likely falls back to normal blending)",
+  "{path} 的 user 绑定是空字符串": "{path} has an empty user binding",
+  "project.json 的 general.properties 里一个属性都没有":
+    "project.json's general.properties declares no properties at all",
+  "已声明的属性：{}": "Declared properties: {}",
+  "{path} 绑定了属性「{u}」，但 project.json 里没有这个属性（{hint}）":
+    "{path} binds the property \"{u}\", but project.json has no such property ({hint})",
+  "{path} 的 animation 不是对象": "{path}'s animation is not an object",
+  "{path} 的 animation.c0[{i}] 缺少数字 frame（形如 {\"frame\":0,\"value\":…}）":
+    "{path}'s animation.c0[{i}] is missing a numeric frame (e.g. {\"frame\":0,\"value\":…})",
+  "{path} 的 animation.c0[{i}] 缺少 value": "{path}'s animation.c0[{i}] is missing value",
+  "{path} 的 animation.c0[{i}].front 没有数字 x（贝塞尔手柄不生效）":
+    "{path}'s animation.c0[{i}].front has no numeric x (the bezier handle has no effect)",
+  "{path} 的 animation.options.fps={fps} 必须大于 0":
+    "{path}'s animation.options.fps={fps} must be greater than 0",
+  "{path} 的 animation.options 没有 fps（按 30 处理）":
+    "{path}'s animation.options has no fps (30 is assumed)",
+  "{path} 的关键帧到第 {max_frame} 帧，但 options.length={len} —— 超出部分不会播":
+    "{path}'s keyframes run to frame {max_frame} but options.length={len} — anything past that will not play",
+  "{path} 的 animation.options.length={len} 必须 ≥ 1":
+    "{path}'s animation.options.length={len} must be ≥ 1",
+  "{path} 的 animation.options.mode=\"{mode}\" 不是 loop/mirror/single 之一":
+    "{path}'s animation.options.mode=\"{mode}\" is not one of loop/mirror/single",
+  "{path} 的 animation 没有 options（fps/length/mode 全按默认）":
+    "{path}'s animation has no options (fps/length/mode all use defaults)",
+  "{path} 的 animation.c0 是空数组（至少要有两个关键帧）":
+    "{path}'s animation.c0 is an empty array (at least two keyframes are needed)",
+  "{path} 有 animation 但没有 c0 关键帧通道（v1 只支持 c0）":
+    "{path} has an animation but no c0 keyframe channel (v1 only supports c0)",
+  "对象 {label} 的 particle 路径非法: {rel}": "Object {label}'s particle path is invalid: {rel}",
+  "粒子预设不是合法 JSON: {rel}": "Particle preset is not valid JSON: {rel}",
+  "粒子预设 {rel} 的材质 {mat_rel} 第一个 pass 的 shader 是 \"{shader}\"，必须是 genericparticle":
+    "Particle preset {rel}'s material {mat_rel} uses shader \"{shader}\" in its first pass; it must be genericparticle",
+  "粒子预设 {rel} 的材质不存在或没有 passes: {mat_rel}":
+    "Particle preset {rel}'s material is missing or has no passes: {mat_rel}",
+  "粒子预设 {rel} 缺少 material 字段": "Particle preset {rel} has no material field",
+  "粒子预设 {rel} 缺少 renderer（至少要一个 sprite）":
+    "Particle preset {rel} has no renderer (at least one sprite is required)",
+  "粒子预设 {rel} 的 {key}「{name}」不受支持，会被忽略；支持：{}":
+    "Particle preset {rel}'s {key} \"{name}\" is not supported and will be ignored; supported: {}",
+  "粒子预设 {rel} 没有 controlpoint 数组（模板里那份是 8 项，照抄最稳）":
+    "Particle preset {rel} has no controlpoint array (the template ships 8 entries — copying those is safest)",
+  "对象 {label} 的效果 {name} 路径非法: {rel}":
+    "Object {label}'s effect {name} has an invalid path: {rel}",
+  "效果文件不是合法 JSON: {rel}": "Effect file is not valid JSON: {rel}",
+  "效果文件 {rel} 缺少 passes 数组": "Effect file {rel} has no passes array",
+  "效果 {rel} 第 {pi} 个 pass 缺少 shader": "Effect {rel}'s pass #{pi} has no shader",
+  "对象 {label} 的效果「{name}」找不到文件: {rel}（effects/<名字>.json）":
+    "Object {label}'s effect \"{name}\" points at a missing file: {rel} (effects/<name>.json)",
+  "这些属性声明了但没有任何图层绑定（scene.json 里用 {\"value\":…,\"user\":\"属性名\"} 绑定）：{}":
+    "These properties are declared but not bound to any layer (bind them in scene.json with {\"value\":…,\"user\":\"<property>\"}): {}",
+  "对象 {label} 的 parent={pid} 指向不存在的图层 id（可用 id：{}）":
+    "Object {label}'s parent={pid} points at a non-existent layer id (available ids: {})",
+  "（没有任何图层带 id）": "(no layer has an id)",
+  "对象 {label} 的 parent 指向自己（id={id}）":
+    "Object {label}'s parent points at itself (id={id})",
+  "对象 {label} 的 parent 链成环（id={start}）":
+    "Object {label}'s parent chain forms a cycle (id={start})",
+  "效果 {rel} 第 {pi} 个 pass 用了 {shader}，工程里没有 shaders/{shader}.frag/.vert（渲染器会跳过该 pass）":
+    "Effect {rel}'s pass #{pi} uses {shader} but the project has no shaders/{shader}.frag/.vert (the renderer skips that pass)",
+  "贴图 materials/{name}.{ext} 无法解码（{e}）；scene_pack 转不出 .tex":
+    "Texture materials/{name}.{ext} cannot be decoded ({e}); scene_pack will not be able to produce a .tex",
+  "贴图同名冲突：{rel} 与 {tex_rel} 同时存在；请删掉其中一份再打包":
+    "Texture name collision: both {rel} and {tex_rel} exist; delete one of them before packing",
+  // ---- 场景体检 / 增量更新 / 素材导入 / 渲染器诊断（MCP 第二批）----
+  "诊断缓冲不可用": "Diagnostic buffer unavailable",
+  "（无名图层）": "(unnamed layer)",
+  "{} 张贴图边长超过 {BIG_TEXTURE_EDGE}（{}）—— 显存与首次解码时间随面积线性涨":
+    "{} texture(s) have an edge longer than {BIG_TEXTURE_EDGE} ({}): VRAM use and first-decode time grow with area",
+  "素材总量 {:.1} MB 偏大，场景壁纸冷启动会明显变慢":
+    "Total assets {:.1} MB is on the large side; cold start of the scene wallpaper will be noticeably slower",
+  "粒子总数 {particle_total}，中低端机会掉帧":
+    "{particle_total} particles in total — mid/low-end machines will drop frames",
+  "有 {} 份素材没有任何图层引用（会在包里白占体积）：{}":
+    "{} asset(s) are not referenced by any layer and just add package size: {}",
+  "粒子预设 {rel} 的第 {ei} 个 emitter 没有 name（boxrandom 之外都按球壳发射，缺名字等于发射器无效）":
+    "Particle preset {rel}'s emitter #{ei} has no name (everything except boxrandom emits from a sphere, so a missing name makes the emitter a no-op)",
+  "particle/<名字>（程序化重建，名字里带 {} 之一会被识别成对应形状）":
+    "particle/<name> (procedurally rebuilt; names containing one of {} map to that shape)",
+  "已装进本地库，可直接 wallpaper_screenshot（会自动重挂到新版）":
+    "Installed into the library — call wallpaper_screenshot next (it re-mounts the new build automatically)",
+  "增量同步失败：{e}（库内副本可能处于半更新状态，再跑一次 project_update 即可修复）":
+    "Incremental sync failed: {e} (the library copy may be half-updated; run project_update again to repair it)",
+  "拷贝 {rel} 失败: {e}": "Copying {rel} failed: {e}",
+  "落位 {rel} 失败: {e}": "Placing {rel} failed: {e}",
+  "source 必须是绝对路径": "source must be an absolute path",
+  "读不到来源文件: {e}": "Cannot read the source file: {e}",
+  "来源不能是符号链接（避免绕过目录白名单）":
+    "The source cannot be a symlink (it would bypass the directory allowlist)",
+  "source 必须是普通文件": "source must be a regular file",
+  "来源文件过大（{} > 上限 {}）": "Source file too large ({} > limit {})",
+  "不允许导入 .{ext}（可用：{}）；这样做是为了不让 MCP 变成任意文件读取器":
+    "Importing .{ext} is not allowed (allowed: {}); this keeps MCP from becoming an arbitrary file reader",
+  "解析来源路径失败: {e}": "Could not resolve the source path: {e}",
+  "来源必须在这几个目录里：图片 / 下载 / 桌面 / 文稿 / 音乐 / 影片 / 临时目录，或壁纸工程根":
+    "The source must live under Pictures / Downloads / Desktop / Documents / Music / Movies / temp, or the wallpaper projects root",
+  "目标已存在同名目录: {rel}": "A directory with that name already exists: {rel}",
+  "目标已存在: {rel}（要覆盖传 overwrite=true；或换个 path）":
+    "The target already exists: {rel} (pass overwrite=true to replace it, or use another path)",
+  // ---- 跨平台抓帧 / 离屏预览（MCP 第三批）----
+  "渲染器返回了空图": "The renderer returned an empty image",
+  "找不到壁纸窗口 {label}": "Wallpaper window {label} not found",
+  "派发抓帧指令失败: {e}": "Failed to dispatch the capture request: {e}",
+  "抓帧回执通道被丢弃": "The capture reply channel was dropped",
+  "等渲染器抓帧超时（{}s）—— 页面可能还没就绪，或该类型没有可读画面（web 类型是 iframe，抓不到）":
+    "Timed out waiting for the renderer to capture ({}s) — the page may not be ready yet, or this type has no readable surface (web wallpapers are a separate iframe and cannot be captured)",
+  "渲染器抓帧失败": "Renderer capture failed",
+  "这个平台没有原生窗口快照（仅 macOS 有）；web 类型请用应用内预览，或改用 scene / video / gif / image 类型（那几类走渲染器自抓帧，三平台都能截）":
+    "This platform has no native window snapshot (macOS only); for web wallpapers use the in-app preview, or switch to scene / video / gif / image (those go through the renderer's own capture and work on all three platforms)",
+  "等待渲染器就绪超时（{limit}ms）：指定屏的壁纸窗口 {} 不存在（该屏没挂壁纸？用 displays_list 核对 id）。{hint}":
+    "Timed out waiting for the renderer ({limit}ms): no wallpaper window for the requested display {}. Is that display showing a wallpaper? Check the id with displays_list. {hint}",
+  // ---- 校验器新增的主动拦截（效果链 + 渲染库已知问题）----
+  "{path} 带关键帧动画：渲染库已知问题（webwallgl#9）—— angles 动画会让首帧永不完成 （mount 永久挂起、无报错）。取角度变化请改用在 shader 里按 g_Time 做，或用 alpha/color 这类标量字段做动画；origin 的动画不受影响":
+    "{path} is keyframe-animated: a known renderer issue (webwallgl#9) — an animated `angles` makes the first frame never complete (mount hangs forever, no error). Drive rotation from g_Time in a shader instead, or animate a scalar field such as alpha/color; animating `origin` is unaffected",
+  "效果 {rel} 第 {pi} 个 pass 既没有 material / shader，也不是 command（copy/swap）":
+    "Effect {rel} pass #{pi} has neither material / shader nor a command (copy/swap)",
+  "效果 {rel} 第 {pi} 个 pass 的 material 路径非法: {material}":
+    "Effect {rel} pass #{pi} has an illegal material path: {material}",
+  "效果 {rel} 第 {pi} 个 pass 引用的材质不存在: {material}":
+    "Effect {rel} pass #{pi} references a material that does not exist: {material}",
+  "效果 {rel} 第 {pi} 个 pass 的材质 {material} 第一个 pass 没有 shader":
+    "Effect {rel} pass #{pi}: material {material} has no shader in its first pass",
+  "效果 {rel} 第 {pi} 个 pass 的 shader「{shader}」只有 .frag、缺 shaders/{shader}.vert —— 渲染库会**静默跳过**这一趟（图层只剩内置材质的纯色块，诊断通道也没有记录）。顶点着色器照抄官方效果那份 passthrough 即可（见资源 wallpaperem://reference/effects）":
+    "Effect {rel} pass #{pi}: shader \"{shader}\" only has .frag and is missing shaders/{shader}.vert — the renderer will **silently skip** this pass (the layer falls back to the built-in material's flat colour, with nothing in the diagnostics channel). Copy the official passthrough vertex shader (see the wallpaperem://reference/effects resource)",
+  "效果 {rel} 第 {pi} 个 pass 的 shader「{shader}」只有 .vert、缺 shaders/{shader}.frag":
+    "Effect {rel} pass #{pi}: shader \"{shader}\" only has .vert and is missing shaders/{shader}.frag",
+  "效果材质 {material} 不是合法 JSON":
+    "Effect material {material} is not valid JSON",
+  "效果 {where_} 第 {pi} 个 pass 用了 {shader}，工程里没有 shaders/{shader}.frag/.vert（渲染器会跳过该 pass）":
+    "Effect {where_} pass #{pi} uses {shader} but the project has no shaders/{shader}.frag/.vert (the renderer will skip this pass)",
+  "效果 {where_} 第 {pi} 个 pass 的 shader「{shader}」只有 .frag、缺 shaders/{shader}.vert —— 渲染库会**静默跳过**这一趟（图层只剩内置材质的纯色块，诊断通道也没有记录）。顶点着色器照抄官方效果那份 passthrough 即可（见资源 wallpaperem://reference/effects）":
+    "Effect {where_} pass #{pi}: shader \"{shader}\" only has .frag and is missing shaders/{shader}.vert — the renderer will **silently skip** this pass (the layer falls back to the built-in material's flat colour, with nothing in the diagnostics channel). Copy the official passthrough vertex shader (see the wallpaperem://reference/effects resource)",
+  "效果 {where_} 第 {pi} 个 pass 的 shader「{shader}」只有 .vert、缺 shaders/{shader}.frag":
+    "Effect {where_} pass #{pi}: shader \"{shader}\" only has .vert and is missing shaders/{shader}.frag",
+  "效果 {rel} 第 {pi} 个 pass 直写了 shader「{shader}」—— 渲染库在**效果文件里只认 material**，这一趟会被当成整块拷贝的命令 pass 静默丢弃（图层只会显示内置材质的底色）。改法：effects/{name}.json 写 material，shader 写到 materials/effects/*.json 里":
+    "Effect {rel} pass #{pi} writes shader \"{shader}\" directly — the renderer **only accepts `material` inside an effect file**, so this pass is silently treated as a whole-block copy command pass and dropped (the layer will only show the built-in material's base colour). Fix: put `material` in effects/{name}.json and the shader inside materials/effects/*.json",
 };

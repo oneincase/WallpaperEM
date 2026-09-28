@@ -74,9 +74,14 @@ fn initialize_result(params: &Value) -> Value {
         },
         "instructions": "WallpaperEM 壁纸引擎。推荐流程：projects_list 看现有工程 → project_create 建工程（web 或 scene）\
 → 用 project_write_file 写文件（或直接用你自己的文件工具改 ~/Documents/WallpaperEM/Projects/<工程>/ 下的文件）\
-→ project_validate 校验 → scene 类型再 scene_pack 打包 → project_install 装进本地库 → wallpaper_apply 应用到桌面\
-→ wallpaper_screenshot 截图看效果，不满意就改文件重来（改完要重新 scene_pack 与 project_install）。\
-动手前先读 resources 里的 wallpaperem://docs/web-project 或 wallpaperem://docs/scene-project。"
+→ project_validate 校验（scene 可再 scene_inspect 体检）→ scene_pack（install=true 直接覆盖安装）→ wallpaper_apply 应用到桌面\
+→ wallpaper_screenshot 截图看效果（framesMs 可多帧验收动画），不满意就改文件重来（改完重新 scene_pack + install，截图会自动重挂到新版）。\
+画面不对先读 renderer_diag（效果被跳过/贴图没找到这类问题只在那里可见）。\
+动手前先读 resources：wallpaperem://docs/scene-project（工程规范）、wallpaperem://reference/scene-support（支持范围）、\
+wallpaperem://reference/pitfalls（症状→原因→改法，**踩过的坑全在这**）、wallpaperem://reference/particles、wallpaperem://reference/effects。\
+**写粒子/自写 shader 前先要配方**：particle_recipe（星尘/余烬/星云絮/流星，贴图走渲染库内置）与 effect_scaffold\
+（水面波纹/指针光晕/音频条/七段时钟，一次给全 effects+材质+.frag+.vert 四件套）。\
+这三份 reference 资源就是渲染库能力边界的真源 —— **不需要去翻渲染库源码**。"
     })
 }
 
@@ -143,6 +148,30 @@ fn resources_list() -> Vec<Value> {
             "mimeType": "text/markdown",
         }),
         json!({
+            "uri": "wallpaperem://reference/scene-support",
+            "name": "场景支持范围（机器可读）",
+            "description": "内置 shader / 内置模型 / 贴图解析规则 / 粒子组件白名单 / 属性类型 / 体积上限 —— 校验器用的是同一份清单",
+            "mimeType": "application/json",
+        }),
+        json!({
+            "uri": "wallpaperem://reference/effects",
+            "name": "自写效果着色器契约（机器可读）",
+            "description": "效果链三段式文件布局、可用 g_* uniform（时间/指针/音频频谱/颜色）、顶点与片段模板、四类现成配方（水面波纹/指针光晕/音频条/时钟）与坑 —— 不用再翻渲染库源码",
+            "mimeType": "application/json",
+        }),
+        json!({
+            "uri": "wallpaperem://reference/particles",
+            "name": "粒子系统（机器可读）",
+            "description": "渲染库内置粒子贴图的关键字表与全名、已实现的 emitter/initializer/operator/renderer 白名单、未实现名单，以及星尘/余烬/星云絮/流星四套可直接抄的完整预设",
+            "mimeType": "application/json",
+        }),
+        json!({
+            "uri": "wallpaperem://reference/pitfalls",
+            "name": "踩坑清单（机器可读）",
+            "description": "症状 → 原因 → 改法：angles 动画挂死、效果缺 .vert 静默跳过、solidlayer 硬边、粒子数太少、autosize 覆盖 size、WebP/同名冲突、大素材通道……全部实测复现过",
+            "mimeType": "application/json",
+        }),
+        json!({
             "uri": "wallpaperem://templates/web-basic",
             "name": "网页壁纸模板",
             "description": "project_create(type=web) 会落盘的四个文件全文",
@@ -172,12 +201,28 @@ fn read_resource(app: &AppHandle, params: &Value) -> Result<Value, (i64, String)
         .and_then(|u| u.as_str())
         .ok_or((-32602, "resources/read 缺少 uri".to_string()))?;
     let text = match uri {
+        "wallpaperem://reference/scene-support" => {
+            serde_json::to_string_pretty(&crate::workspace::scene_support_json())
+                .map_err(|e| (-32603, e.to_string()))?
+        }
         "wallpaperem://docs/web-project" => {
             include_str!("../../../docs/mcp-authoring-web.md").to_string()
         }
         "wallpaperem://docs/scene-project" => {
             include_str!("../../../docs/mcp-authoring-scene.md").to_string()
         }
+        "wallpaperem://reference/effects" => serde_json::to_string_pretty(
+            &crate::mcp::references::effects_json(),
+        )
+        .map_err(|e| (-32603, e.to_string()))?,
+        "wallpaperem://reference/particles" => serde_json::to_string_pretty(
+            &crate::mcp::references::particles_json(),
+        )
+        .map_err(|e| (-32603, e.to_string()))?,
+        "wallpaperem://reference/pitfalls" => serde_json::to_string_pretty(
+            &crate::mcp::references::pitfalls_json(),
+        )
+        .map_err(|e| (-32603, e.to_string()))?,
         "wallpaperem://templates/web-basic" => template_bundle("web"),
         "wallpaperem://templates/scene-basic" => template_bundle("scene"),
         other => {

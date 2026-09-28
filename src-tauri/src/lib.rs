@@ -22,6 +22,7 @@ mod mem_watch;
 mod misc;
 mod now_playing;
 mod props_window;
+mod scene_inspect;
 mod secure_store;
 mod steam;
 mod subscriptions;
@@ -309,6 +310,7 @@ pub fn run() {
             download::download_clear_finished,
             library::library_list,
             library::library_delete,
+            library::library_remove,
             library::library_prune,
             library::library_open_folder,
             library::library_import_from_web,
@@ -940,7 +942,11 @@ pub(crate) fn apply_backdrop(window: &tauri::WebviewWindow) {
     #[cfg(target_os = "macos")]
     match window_vibrancy::apply_vibrancy(
         window,
-        window_vibrancy::NSVisualEffectMaterial::Sidebar,
+        // UnderWindowBackground = 「窗口背景之下」那层，比 Sidebar 通透得多：
+        // 没有壁纸时用户直接看到桌面。Sidebar 着色偏实，叠上页内 tint 后近黑/近白，
+        // 实测「一点都不通透」。有壁纸时这层材质被 .app-backdrop::before 的壁纸
+        // 模糊图整个盖住，所以换材质只影响「未设置壁纸」的观感。
+        window_vibrancy::NSVisualEffectMaterial::UnderWindowBackground,
         None,
         // 与渲染器 CSS 圆角对齐（App.tsx 根容器 rounded-[12px]）：borderless
         // 窗口没有系统圆角了，材质自己圆 12px，CSS 圆角外的四角才是透明桌面

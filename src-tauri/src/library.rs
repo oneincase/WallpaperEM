@@ -39,6 +39,21 @@ pub struct LibraryItem {
     pub missing: bool,
 }
 
+/// `$project` 标签的 SQL 片段 + 绑定值：`l.item_id IN (?, …)`；空集合 → 恒假。
+///
+/// 抽成纯函数是为了能单测（`library_list_impl` 需要 AppHandle，测不了）。
+pub(crate) fn project_filter_sql(ids: &[String]) -> (String, Vec<rusqlite::types::Value>) {
+    use rusqlite::types::Value;
+    if ids.is_empty() {
+        return ("0".to_string(), Vec::new());
+    }
+    let holes = vec!["?"; ids.len()].join(",");
+    (
+        format!("l.item_id IN ({holes})"),
+        ids.iter().map(|i| Value::Text(i.clone())).collect(),
+    )
+}
+
 /// 本地库筛选参数。全部可选，未提供即不约束该维度。
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -168,10 +183,16 @@ pub(crate) fn library_list_impl(
     // 「本地导入」标签：匹配本地导入条目（custom-* id 与引用模式条目），不走标签列
     const LOCAL_IMPORT_TAG: &str = "$local";
     let local_import_cond = "(l.item_id LIKE 'custom-%' OR l.source_path IS NOT NULL)";
+    // 「项目」标签：本软件自己的工程（MCP/工程安装的条目）。库里没有这一列，
+    // 真源是工程目录 → 现算 id 集合拼 IN。集合为空时用恒假条件（选了就是空结果）。
+    const PROJECT_TAG: &str = "$project";
+    let project_cond = project_filter_sql(&crate::workspace::project_item_ids(&app));
     // 单个标签的 SQL 片段 + 绑定值
     let tag_cond = |t: &str| -> (String, Vec<Value>) {
         if t == LOCAL_IMPORT_TAG {
             (local_import_cond.to_string(), Vec::new())
+        } else if t == PROJECT_TAG {
+            project_cond.clone()
         } else {
             (
                 format!("({tag_exists})"),
@@ -521,22 +542,19 @@ fn remove_from_playlists(conn: &Connection, item_id: &str) {
     }
 }
 
-#[tauri::command]
-pub fn library_delete(app: AppHandle, item_id: String) -> Result<bool, String> {
+/// 停止所有正挂着该条目的屏幕。
+///
+/// 只有「动的就是当前正应用的那张壁纸」时才停；否则不要动壁纸引擎，避免删一个
+/// 无关壁纸导致正在应用的壁纸消失。`library_delete` 与 `library_remove` 共用。
+fn stop_sessions_for(app: &AppHandle, item_id: &str) -> Result<(), String> {
     let db = app.state::<Arc<Mutex<Connection>>>();
-    // 引用模式条目的内容目录是用户的源目录：只删库记录，绝不碰磁盘文件
-    let linked = item_source_path(&app, &item_id).is_some();
-    let dir = item_dir(&app, &item_id)?;
-
-    // 只有「删除的是当前正应用的壁纸」时才停止对应屏幕；否则不要动壁纸引擎，
-    // 避免删一个无关壁纸导致正在应用的壁纸消失。
     let applied_displays: Vec<String> = {
         let conn = db.lock().map_err(|e| e.to_string())?;
         let mut stmt = conn
             .prepare("SELECT display_id FROM wallpaper_sessions WHERE item_id = ?1")
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map([&item_id], |r| r.get::<_, String>(0))
+            .query_map([item_id], |r| r.get::<_, String>(0))
             .map_err(|e| e.to_string())?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?
@@ -545,10 +563,40 @@ pub fn library_delete(app: AppHandle, item_id: String) -> Result<bool, String> {
     for d in applied_displays {
         let _ = wallpaper::stop(app.clone(), Some(d));
     }
+    Ok(())
+}
+
+/// 从本地库删除壁纸：**数据库记录 + 磁盘文件**一起删（引用模式条目只删记录）。
+///
+/// 想「不再出现在库里但保留文件」用 [`library_remove`]。
+#[tauri::command]
+pub fn library_delete(app: AppHandle, item_id: String) -> Result<bool, String> {
+    let db = app.state::<Arc<Mutex<Connection>>>();
+    // 引用模式条目的内容目录是用户的源目录：只删库记录，绝不碰磁盘文件
+    let linked = item_source_path(&app, &item_id).is_some();
+    let dir = item_dir(&app, &item_id)?;
+
+    stop_sessions_for(&app, &item_id)?;
 
     if !linked && dir.exists() {
         std::fs::remove_dir_all(&dir).map_err(|e| format!("删除文件失败: {e}"))?;
     }
+    let conn = db.lock().map_err(|e| e.to_string())?;
+    purge_item_records(&conn, &item_id)?;
+    Ok(true)
+}
+
+/// 把壁纸从本地库移除，但**保留磁盘上的壁纸文件**（引用模式与常规条目一视同仁）。
+///
+/// 与 `library_delete` 的唯一区别就是最后不删目录。库里那份记录（含自定义属性、
+/// 列表归属、下载历史）照旧清干净 —— 否则重新导入时旧配置会「复活」。
+/// 批量移除（不删壁纸）与卡片上的「移除壁纸」按钮都走这条。
+#[tauri::command]
+pub fn library_remove(app: AppHandle, item_id: String) -> Result<bool, String> {
+    let db = app.state::<Arc<Mutex<Connection>>>();
+
+    stop_sessions_for(&app, &item_id)?;
+
     let conn = db.lock().map_err(|e| e.to_string())?;
     purge_item_records(&conn, &item_id)?;
     Ok(true)
@@ -1579,25 +1627,71 @@ fn push_import_result(
 /// 批量扫描单次上限：防误选巨型目录（整个用户目录）扫出成千上万个工程拖死导入
 const MAX_SCAN_ITEMS: usize = 500;
 
+/// 扫描过的**目录总数**上限（不只是命中数）。
+///
+/// `MAX_SCAN_ITEMS` 只管「找到了多少个壁纸」，管不住「一个壁纸都没有、但要走完
+/// 几十万个目录」——用户选 Steam 库根（`steamapps/`）或用户主目录时正是这种形态：
+/// 命中数迟迟不到 500，遍历却停不下来，导入线程长时间占着磁盘与库锁，本地库页
+/// 的查询排在后面拿不到锁，表现就是「加完路径后页面再也打不开」。
+///
+/// 20k 目录对正常用法足够宽裕（`431960/` 下 500 个壁纸约 1k 目录）。
+const MAX_SCAN_DIRS: usize = 20_000;
+
+/// 递归深度上限。正常 Steam 路径约 10 层；留足余量即可拦住病态深目录爆栈。
+const MAX_SCAN_DEPTH: usize = 32;
+
+/// 递归时直接跳过的目录名（小写比较）。
+///
+/// `downloading` / `temp` 是 Steam 的**未完成下载区**：那里的 `project.json`
+/// 常是写了一半的文件，扫进来会得到「有工程文件但没有任何资源」的空壳条目，
+/// 也就是用户反馈的「写入了错误的数据」。其余是 WE 的生成物/缓存目录。
+const SCAN_SKIP_DIRS: &[&str] = &[
+    "downloading",
+    "temp",
+    "shadercache",
+    // WE 生成的着色器目录。实测 Steam 库里存在「只有 shaders/、没有 project.json
+    // 和任何资源」的残留目录（如 431960/2313880811），它们本来就走「未命中」
+    // 路径不入库，跳过只是省掉一层无意义的遍历
+    "shaders",
+    "steamapps", // 仅当它是 root 之下的**子**目录时才跳过（见 scan_walk 的 depth 判断）
+];
+
 /// 递归扫描目录树中含 project.json 的壁纸目录：命中即算一个壁纸，**不再深入**
-/// （工程内部嵌套的资源目录不是壁纸）。跳过隐藏目录与生成物目录。
+/// （工程内部嵌套的资源目录不是壁纸）。跳过隐藏目录、生成物目录与 Steam 下载中目录。
 /// 返回 (壁纸目录列表, 扫过但不是壁纸的目录数)。
 fn scan_project_dirs(root: &Path) -> (Vec<PathBuf>, usize) {
     let mut found = Vec::new();
     let mut scanned = 0usize;
-    scan_walk(root, &mut found, &mut scanned);
+    scan_walk(root, &mut found, &mut scanned, 0);
     (found, scanned)
 }
 
+/// 判断一个目录名是否该在扫描时跳过（纯函数，便于单测）
+fn scan_skip_dir(name: &str, depth: usize) -> bool {
+    if name.starts_with('.') || name == crate::workspace::VERSION_DIR {
+        return true;
+    }
+    let lower = name.to_ascii_lowercase();
+    // steamapps 仅在更深处跳过：用户完全可能直接选中 steamapps 本身作为 root
+    if lower == "steamapps" {
+        return depth > 0;
+    }
+    SCAN_SKIP_DIRS.contains(&lower.as_str())
+}
+
 /// 深度优先走子目录；返回 true = 已达上限，提前收工
-fn scan_walk(dir: &Path, found: &mut Vec<PathBuf>, scanned: &mut usize) -> bool {
+fn scan_walk(dir: &Path, found: &mut Vec<PathBuf>, scanned: &mut usize, depth: usize) -> bool {
+    if depth >= MAX_SCAN_DEPTH {
+        tracing::warn!("扫描深度超过 {MAX_SCAN_DEPTH} 层，跳过 {} 及其子目录", dir.display());
+        return false;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };
     let mut subdirs = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') || name == crate::workspace::VERSION_DIR {
+        if scan_skip_dir(&name, depth) {
             continue;
         }
         if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -1605,14 +1699,14 @@ fn scan_walk(dir: &Path, found: &mut Vec<PathBuf>, scanned: &mut usize) -> bool 
         }
     }
     for d in subdirs {
-        if found.len() >= MAX_SCAN_ITEMS {
+        if found.len() >= MAX_SCAN_ITEMS || *scanned >= MAX_SCAN_DIRS {
             return true;
         }
         if d.join("project.json").is_file() {
             found.push(d);
         } else {
             *scanned += 1;
-            if scan_walk(&d, found, scanned) {
+            if scan_walk(&d, found, scanned, depth + 1) {
                 return true;
             }
         }
@@ -1642,6 +1736,20 @@ fn import_one_linked(app: &AppHandle, src: &Path) -> Result<ImportOne, String> {
     } else {
         infer_type(src)
     };
+    // 目录里没有任何可识别的壁纸内容 → 直接拒绝入库。
+    //
+    // 这是「加完路径就写出错误数据」的主要来源：Steam 未完成下载的工程、只有
+    // project.json 却没有资源的空壳、以及非壁纸目录里恰好放了个 project.json。
+    // 它们入库后是无法打开、也无法应用的幽灵条目，还会让本地库全量对账多跑
+    // 一次磁盘 IO。宁可在这里逐条报「已跳过」，也不要写进库。
+    if wtype == "unknown" {
+        // 不带目录名：i18n::tr 返回 &str、不支持占位符，而失败条目的 path 由
+        // push_import_result 统一附上，前端展示时本来就会显示是哪个目录
+        return Err(crate::i18n::tr(
+            "目录里没有可识别的壁纸内容（视频 / 图片 / 网页 / 场景包都没有），已跳过",
+        )
+        .to_string());
+    }
     let title = if ptitle != "未命名" {
         ptitle
     } else {
@@ -1777,7 +1885,7 @@ pub(crate) fn import_project_dir(
 }
 
 /// 给库内条目追加标签：保留原有标签与顺序，只补没有的
-fn merge_item_tags(app: &AppHandle, item_id: &str, extra: &[String]) -> Result<(), String> {
+pub(crate) fn merge_item_tags(app: &AppHandle, item_id: &str, extra: &[String]) -> Result<(), String> {
     if extra.is_empty() {
         return Ok(());
     }
@@ -1824,6 +1932,26 @@ fn merge_item_tags_in(conn: &Connection, item_id: &str, extra: &[String]) -> Res
 /// 用户改过的属性覆盖（settings 表按 item_id 存）因此不会丢。
 pub(crate) fn project_item_id_for(name: &str) -> String {
     sanitize_id_stem(name)
+}
+
+/// 就地刷新库内条目的元数据（`project_update` 的增量快路径用）。
+///
+/// 不重装、不换目录：只按磁盘现状重算 title/type/size/file_count 并写回。
+/// 刻意**不动** `downloaded_at`（那是「入库时间」，排序与展示都按它）与 `tags`
+/// （工程标签由 `merge_item_tags` 增量合并，重刷会把用户/工坊来源的标签洗掉）。
+pub(crate) fn refresh_item_meta(app: &AppHandle, item_id: &str, dir: &Path) -> Result<(), String> {
+    let (wtype, title) = parse_project(dir);
+    let size = dir_size(dir);
+    let count = dir_count(dir);
+    let db = app.state::<Arc<Mutex<Connection>>>();
+    let conn = db.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE library_items SET title = ?2, type = ?3, size_bytes = ?4, file_count = ?5
+         WHERE item_id = ?1",
+        rusqlite::params![item_id, title, wtype, size, count],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// 目录内是否已有预览图（扩展名清单与 local_preview_url 保持一致）
@@ -1927,7 +2055,7 @@ fn infer_type(dir: &Path) -> String {
                 continue;
             }
             if let Some(t) = classify_ext(&ext_lower(&e.path())) {
-                if best.map_or(true, |b| rank(t) < rank(b)) {
+                if best.is_none_or(|b| rank(t) < rank(b)) {
                     best = Some(t);
                 }
             }
@@ -1976,7 +2104,7 @@ fn parse_project(dir: &Path) -> (String, String) {
             let title = v
                 .get("title")
                 .and_then(|t| t.as_str())
-                .unwrap_or_else(|| "未命名".into())
+                .unwrap_or("未命名")
                 .to_string();
             return (t, title);
         }
@@ -2332,6 +2460,26 @@ mod tests {
 
     /// 复刻 library_list 的 WHERE 构造，验证参数绑定与标签语义。
     /// （命令本身依赖 AppHandle，无法在单测里跑，这里验证 SQL 层。）
+    /// 同 `run_filter`，但绑定值是 `Value`（`$project` 这类条件带动态绑定）
+    fn run_filter_values(
+        conn: &Connection,
+        where_sql: &str,
+        binds: &[rusqlite::types::Value],
+    ) -> Vec<String> {
+        let sql = format!(
+            "SELECT l.item_id FROM library_items l
+             LEFT JOIN workshop_items w ON w.id = l.item_id
+             WHERE {where_sql} ORDER BY l.item_id"
+        );
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap();
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
     fn run_filter(conn: &Connection, where_sql: &str, binds: &[&str]) -> Vec<String> {
         let sql = format!(
             "SELECT l.item_id FROM library_items l
@@ -2449,6 +2597,34 @@ mod tests {
             ),
             vec!["b"]
         );
+    }
+
+    /// 「项目」标签：只命中"有对应工程目录"的那些 id，可与普通标签并集；空集合 → 空结果
+    #[test]
+    fn project_tag_matches_project_ids_only() {
+        let conn = filter_db();
+        // fixture 里 a/b/c 是工坊条目、custom-* 是本地导入；项目 id 由工程目录而来
+        let (cond, binds) = project_filter_sql(&["a".to_string(), "custom-abcd1234".to_string()]);
+        assert_eq!(
+            run_filter_values(&conn, &cond, &binds),
+            vec!["a", "custom-abcd1234"]
+        );
+        // 单独一个项目 id
+        let (cond2, binds2) = project_filter_sql(&["b".to_string()]);
+        assert_eq!(run_filter_values(&conn, &cond2, &binds2), vec!["b"]);
+        // 工程目录一个都没有 → 恒假（不是"不过滤"！否则会显示整库）
+        let (cond3, binds3) = project_filter_sql(&[]);
+        assert_eq!(cond3, "0");
+        assert!(binds3.is_empty());
+        assert!(run_filter_values(&conn, &cond3, &binds3).is_empty());
+        // 与普通标签并集：[项目 b] OR [Anime] → a、b
+        let or_group = format!("({cond2}) OR ({TAG_EXISTS})");
+        let mut vals: Vec<rusqlite::types::Value> = binds2;
+        vals.extend([
+            rusqlite::types::Value::Text("Anime".into()),
+            rusqlite::types::Value::Text("Anime".into()),
+        ]);
+        assert_eq!(run_filter_values(&conn, &or_group, &vals), vec!["a", "b"]);
     }
 
     /// 「本地导入」分类标签：匹配 custom-* id 的本地导入条目，可与普通标签并集
@@ -3031,6 +3207,46 @@ mod tests {
         let (found, _) = scan_project_dirs(&root);
         assert_eq!(found.len(), MAX_SCAN_ITEMS, "必须在上限处停住");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Steam 的未完成下载区里，project.json 常是半截文件；扫进来会得到
+    /// 「有工程文件但没有任何资源」的空壳条目（用户反馈的「写入了错误的数据」）。
+    #[test]
+    fn scan_walk_skips_steam_temp_and_downloading_dirs() {
+        let root = tmpdir("scanskip");
+        // 正常的壁纸
+        let good = root.join("431960").join("1234567890");
+        std::fs::create_dir_all(&good).unwrap();
+        std::fs::write(good.join("project.json"), "{}").unwrap();
+        // 半截下载：有 project.json 但没有资源
+        let half = root.join("steamapps").join("downloading").join("9999999999");
+        std::fs::create_dir_all(&half).unwrap();
+        std::fs::write(half.join("project.json"), "{}").unwrap();
+        let temp = root.join("steamapps").join("temp").join("8888888888");
+        std::fs::create_dir_all(&temp).unwrap();
+        std::fs::write(temp.join("project.json"), "{}").unwrap();
+
+        let (found, _) = scan_project_dirs(&root);
+        let names: Vec<String> = found
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["1234567890"], "下载中/临时目录必须被跳过");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 用户完全可能直接选中 `steamapps` 本身当 root —— 那时它不该被跳过，
+    /// 否则「添加壁纸路径」在 Steam 库根上会永远扫不到东西。
+    #[test]
+    fn scan_skip_dir_keeps_steamapps_at_root_but_skips_it_below() {
+        assert!(!scan_skip_dir("steamapps", 0), "root 层的 steamapps 必须保留");
+        assert!(scan_skip_dir("steamapps", 1), "更深层的 steamapps 跳过");
+        assert!(scan_skip_dir("downloading", 1));
+        assert!(scan_skip_dir("Temp", 1), "大小写不敏感");
+        assert!(scan_skip_dir("shaders", 1), "WE 着色器残留目录");
+        assert!(scan_skip_dir("ShaderCache", 1));
+        assert!(scan_skip_dir(".hidden", 1));
+        assert!(!scan_skip_dir("431960", 1), "正常目录不跳过");
     }
 
     #[test]

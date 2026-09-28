@@ -8,12 +8,10 @@ import { type ReactNode } from "react";
 import { tr } from "../lib/i18n";
 import { useOs } from "../lib/platform";
 import {
-  IconHome,
   IconGrid,
   IconDownload,
   IconLibrary,
   IconHeart,
-  IconMonitor,
   IconShare,
   IconGear,
   IconKeyboard,
@@ -21,23 +19,19 @@ import {
 import { WindowControls } from "./WindowControls";
 
 export type PageId =
-  | "home"
   | "workshop"
   | "downloads"
   | "library"
   | "favorites"
-  | "displays"
   | "shares"
   | "hotkeys"
   | "settings";
 
 const NAV: { id: PageId; label: string; icon: ReactNode }[] = [
-  { id: "home", label: "发现", icon: <IconHome /> },
   { id: "workshop", label: "工坊", icon: <IconGrid /> },
-  { id: "downloads", label: "下载", icon: <IconDownload /> },
   { id: "library", label: "本地库", icon: <IconLibrary /> },
+  { id: "downloads", label: "下载", icon: <IconDownload /> },
   { id: "favorites", label: "收藏", icon: <IconHeart /> },
-  { id: "displays", label: "显示器", icon: <IconMonitor /> },
   { id: "shares", label: "分享", icon: <IconShare /> },
   { id: "hotkeys", label: "快捷键", icon: <IconKeyboard /> },
   { id: "settings", label: "设置", icon: <IconGear /> },

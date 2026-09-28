@@ -1,0 +1,707 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>WebKit 4K 硬解 + 无缝循环 · 最小原型</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden; background: #000; color: #e8e8ea;
+    font: 12px/1.55 -apple-system, "SF Pro Text", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ── 舞台 ─────────────────────────────────────────────────────────
+     两个 video 实例 + 一块 canvas 都铺满视口，靠 visibility 决定谁在合成。
+     注意用的是 visibility 而不是 display:none —— 后者在部分 WebKit 版本会
+     让被隐藏的视频停止解码，rVFC 也不再回调，测出来的数据就没意义了。 */
+  #stage { position: fixed; inset: 0; background: #000; }
+
+  /* 故意打断直通合成的开关：filter 会强制元素走离屏渲染，
+     视频帧不再能直接交给窗口合成器，必须经过一次离屏 pass。
+     这是「明明硬解了却还是卡」最常见的原因，留个开关方便亲眼看到差异。 */
+  #stage.offscreen { filter: opacity(1); }
+
+  .v, #c2d, #glc {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    /* 提升为独立合成层：让 VideoToolbox 解出的 IOSurface 直通窗口合成器。
+       4K 直通合成能不能成立，基本就取决于这一行和「祖先上别挂 filter」。 */
+    transform: translateZ(0);
+    backface-visibility: hidden;
+  }
+  .v { object-fit: cover; visibility: hidden; }
+  .v[data-on="1"] { visibility: visible; }
+  /* 交叉淡化的过渡只挂在 video 元素自己身上。
+     video 已是独立合成层（见上面的 translateZ(0)），层级的 opacity 由合成器
+     在 GPU 上直接 alpha 混合，不需要离屏 pass。
+     对比：对**祖先**做 opacity/filter 才会强制整棵子树离屏 —— 那才是昂贵的。 */
+  .v { transition: opacity var(--fade-ms, 200ms) linear; }
+  /* 两块 canvas 分开：同一块 canvas 只能有一种 context 类型，
+     先 getContext('2d') 再 getContext('webgl2') 会直接返回 null。 */
+  #c2d, #glc { display: none; }
+  #c2d[data-on="1"], #glc[data-on="1"] { display: block; }
+
+  /* ── 面板 ─────────────────────────────────────────────────────── */
+  .card {
+    position: fixed; z-index: 10; background: rgba(20, 20, 23, .93);
+    border: 1px solid rgba(255, 255, 255, .11); border-radius: 12px;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, .55);
+  }
+  #panel { top: 12px; right: 12px; width: 302px; padding: 13px;
+           max-height: calc(100vh - 24px); overflow: auto; }
+  #hud   { top: 12px; left: 12px; width: 268px; padding: 11px 13px; }
+
+  h1 { font-size: 12px; margin: 0 0 10px; letter-spacing: .3px; color: #fff; font-weight: 600; }
+  h1 small { font-weight: 400; color: #8b8b93; margin-left: 6px; }
+  .row { margin-bottom: 9px; }
+  .row > label { display: block; color: #9a9aa2; margin-bottom: 4px; font-size: 11px; }
+  .seg { display: flex; gap: 4px; flex-wrap: wrap; }
+  .seg button {
+    flex: 1 1 auto; min-width: 0; padding: 5px 7px; font-size: 11px; cursor: pointer;
+    background: rgba(255, 255, 255, .07); color: #c9c9d0;
+    border: 1px solid rgba(255, 255, 255, .1); border-radius: 7px;
+    transition: background .12s, color .12s, border-color .12s;
+    white-space: nowrap;
+  }
+  .seg button:hover { background: rgba(255, 255, 255, .13); }
+  .seg button[data-on="1"] { background: #2f6df6; border-color: #2f6df6; color: #fff; }
+  select, input[type=file] {
+    width: 100%; padding: 5px 7px; font-size: 11px; color: #dcdce2;
+    background: rgba(255, 255, 255, .07); border: 1px solid rgba(255, 255, 255, .1);
+    border-radius: 7px; font-family: inherit;
+  }
+  input[type=range] { width: 100%; accent-color: #2f6df6; }
+  .inline { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .inline span { color: #7f7f88; font-variant-numeric: tabular-nums; }
+  .hint { color: #7a7a83; font-size: 10.5px; line-height: 1.45; margin: 2px 0 9px; }
+  .hint b { color: #b9b9c2; font-weight: 600; }
+  hr { border: 0; border-top: 1px solid rgba(255, 255, 255, .09); margin: 11px 0; }
+  .chk { display: flex; align-items: center; gap: 7px; color: #c9c9d0; cursor: pointer; }
+  .chk input { accent-color: #2f6df6; }
+
+  /* ── 指标 ─────────────────────────────────────────────────────── */
+  #hud dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; }
+  #hud dt { color: #85858e; font-size: 11px; white-space: nowrap; }
+  #hud dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums;
+            font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px; }
+  .sep { grid-column: 1 / -1; border-top: 1px solid rgba(255,255,255,.08); margin: 6px 0 4px; }
+  .good { color: #4ade80; } .warn { color: #fbbf24; } .bad { color: #f87171; }
+  #err { margin-top: 8px; color: #f87171; font-size: 11px; word-break: break-all; }
+  .cap { color: #6f6f78; font-size: 10px; grid-column: 1 / -1; margin-top: 5px; line-height: 1.4; }
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <!-- 两个实例：pingpong / crossfade 需要一个在播、一个在 0 位待命 -->
+  <video id="vA" class="v" data-on="0" muted playsinline preload="auto"
+         disablepictureinpicture disableremoteplayback x-webkit-airplay="deny"></video>
+  <video id="vB" class="v" data-on="0" muted playsinline preload="auto"
+         disablepictureinpicture disableremoteplayback x-webkit-airplay="deny"></video>
+  <canvas id="c2d" data-on="0"></canvas>
+  <canvas id="glc" data-on="0"></canvas>
+</div>
+
+<aside id="hud" class="card">
+  <h1>指标</h1>
+  <dl>
+    <dt>合成帧率</dt><dd id="m-fps">–</dd>
+    <dt>视频帧率</dt><dd id="m-vfps">–</dd>
+    <div class="sep"></div>
+    <dt>已解码</dt><dd id="m-total">–</dd>
+    <dt>丢帧</dt><dd id="m-dropped">–</dd>
+    <div class="sep"></div>
+    <dt>循环次数</dt><dd id="m-cycles">0</dd>
+    <dt>淡化状态</dt><dd id="m-fade">–</dd>
+    <dt>接缝 中位</dt><dd id="m-seam-med">–</dd>
+    <dt>接缝 p95</dt><dd id="m-seam-p95">–</dd>
+    <dt>接缝 最大</dt><dd id="m-seam-max">–</dd>
+    <div class="sep"></div>
+    <dt>像素上传</dt><dd id="m-comp">–</dd>
+    <dt>视频尺寸</dt><dd id="m-dim">–</dd>
+    <div class="cap" id="m-note">接缝 = 回绕那一帧的呈现间隔 减去 正常帧间隔。0 = 无缝。</div>
+  </dl>
+  <div id="err"></div>
+</aside>
+
+<aside id="panel" class="card">
+  <h1>WebKit 4K 硬解 + 无缝循环<small>最小原型</small></h1>
+
+  <div class="row">
+    <label>素材</label>
+    <select id="clip"><option value="">加载中…</option></select>
+  </div>
+  <div class="row">
+    <label>或选择本地文件（拿你自己的 4K 片测）</label>
+    <input type="file" id="file" accept="video/*" />
+  </div>
+
+  <hr />
+
+  <div class="row">
+    <label>循环模式</label>
+    <div class="seg" id="seg-mode">
+      <button data-v="loop">原生 loop</button>
+      <button data-v="seek">seek 回绕</button>
+      <button data-v="pingpong">双实例乒乓</button>
+      <button data-v="crossfade">交叉淡入</button>
+    </div>
+  </div>
+  <div class="hint" id="hint-mode"></div>
+
+  <div class="row">
+    <label>合成路径（像素怎么到屏幕）</label>
+    <div class="seg" id="seg-path">
+      <button data-v="direct">direct 直通</button>
+      <button data-v="canvas2d">canvas2d</button>
+      <button data-v="webgl">webgl</button>
+    </div>
+  </div>
+  <div class="hint" id="hint-path"></div>
+
+  <hr />
+
+  <div class="row">
+    <label class="inline"><span style="color:#9a9aa2">乒乓提前切换</span><span id="lead-v">1.0 帧</span></label>
+    <input type="range" id="lead" min="0" max="4" step="0.5" value="1" />
+  </div>
+  <div class="row">
+    <label class="inline"><span style="color:#9a9aa2">淡入时长</span><span id="fade-v">200 ms</span></label>
+    <input type="range" id="fade" min="0" max="500" step="20" value="200" />
+  </div>
+
+  <hr />
+
+  <div class="row">
+    <label class="chk"><input type="checkbox" id="offscreen" />
+      强制离屏合成（stage 加 filter）</label>
+  </div>
+  <div class="hint">打开后视频帧不再直通合成器，必须多走一次离屏 pass。
+    <b>硬解没变，但帧率会掉</b>——用来验证「卡顿未必是解码的锅」。</div>
+
+  <div class="row">
+    <label class="chk"><input type="checkbox" id="pause" /> 暂停</label>
+  </div>
+
+  <hr />
+
+  <div class="hint">
+    硬解到底有没有生效，JS 查不到，要另开终端：<br />
+    <b>bash tools/probe-decode.sh</b><br />
+    看 VTDecoderXPCService 是否在跑、渲染进程 CPU 多少。
+  </div>
+</aside>
+
+<script type="module">
+// ════════════════════════════════════════════════════════════════════════
+//  这个原型只回答三个问题：
+//    1. 4K 视频在 WebKit 里走了哪条解码/合成路径，代价差多少？
+//    2. 四种循环方案，接缝各是多少毫秒？
+//    3. 哪些写法会悄悄把直通合成打掉？
+//  所以每个变量都做成可切换的，指标全部现场量。
+// ════════════════════════════════════════════════════════════════════════
+
+const $ = (id) => document.getElementById(id);
+const V = [$("vA"), $("vB")];
+const stage = $("stage"), errBox = $("err");
+const canvas2d = $("c2d"), canvasGL = $("glc");
+
+const S = {
+  mode: "loop",     // loop | seek | pingpong | crossfade
+  path: "direct",   // direct | canvas2d | webgl
+  lead: 1,          // pingpong：提前多少帧切到备胎
+  fade: 200,        // crossfade：淡入淡出时长 ms（默认 200，够盖住常见接缝）
+  src: "",
+};
+
+let active = 0;        // 当前在播/在显示的实例下标
+let epoch = 0;         // 世代号：切换模式时递增，旧 rVFC 回调自行退场
+let fading = false;    // 交叉淡化进行中（此时两层同时参与合成）
+let fadeTimer = 0;     // 淡化收尾定时器
+let switchArmed = true; // 本周期是否还没切过（防止每帧重复触发切换）
+let seekGuard = false; // seek 模式下防止一帧内重复触发回绕
+const hasRVFC = "requestVideoFrameCallback" in HTMLVideoElement.prototype;
+
+// ── 统计 ──────────────────────────────────────────────────────────────
+const M = {
+  rafFrames: 0, rafFps: 0, lastRafTick: performance.now(),
+  frameDurs: [],        // 相邻帧 mediaTime 差 → 估计真实帧率
+  lastExpected: 0,      // 上一次呈现的预期时刻（所有实例共用一条时间轴）
+  lastMedia: 0,
+  pendingCycle: false,  // 双实例模式：等下一帧来结算接缝
+  seams: [],
+  compositeMs: 0,
+  cycles: 0,
+};
+const mid = (a) => (a.length ? [...a].sort((x, y) => x - y)[a.length >> 1] : NaN);
+const pct = (a, p) => (a.length ? [...a].sort((x, y) => x - y)[Math.min(a.length - 1, Math.floor(a.length * p))] : NaN);
+/** 估计的单帧时长（ms）。比硬编码 30fps 靠谱——素材可能是 24/25/60。 */
+const nominalMs = () => (M.frameDurs.length ? mid(M.frameDurs) * 1000 : 1000 / 30);
+
+// ── 合成后端 ──────────────────────────────────────────────────────────
+let gl = null, glProg = null, glTex = null;
+let ctx2d = null;
+let cw = 0, ch = 0;   // canvas 尺寸 = 视频原生分辨率
+
+function initGL() {
+  if (gl) return;
+  gl = canvasGL.getContext("webgl2", {
+    alpha: false, antialias: false, depth: false, stencil: false,
+    powerPreference: "high-performance", desynchronized: true,
+  }) || canvasGL.getContext("webgl", { alpha: false, antialias: false, depth: false });
+  if (!gl) throw new Error("WebGL 不可用");
+
+  const vs = `#version 300 es
+  in vec2 p; out vec2 uv;
+  void main(){ uv = vec2(p.x*.5+.5, .5-p.y*.5); gl_Position = vec4(p,0.,1.); }`;
+  const fs = `#version 300 es
+  precision mediump float; in vec2 uv; uniform sampler2D t; out vec4 c;
+  void main(){ c = texture(t, uv); }`;
+  const mk = (type, src) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  };
+  glProg = gl.createProgram();
+  gl.attachShader(glProg, mk(gl.VERTEX_SHADER, vs));
+  gl.attachShader(glProg, mk(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(glProg);
+  if (!gl.getProgramParameter(glProg, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(glProg));
+  gl.useProgram(glProg);
+
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(glProg, "p");
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+  glTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, glTex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.viewport(0, 0, cw || canvasGL.width, ch || canvasGL.height);
+}
+
+function init2D() {
+  if (!ctx2d) ctx2d = canvas2d.getContext("2d", { alpha: false });
+  return ctx2d;
+}
+
+/** canvas 按视频原生分辨率建，这样上传量就是真实的 4K 像素量，不缩水。 */
+function syncCanvasSize() {
+  const v = V[active];
+  if (!v.videoWidth || !v.videoHeight) return;
+  if (cw === v.videoWidth && ch === v.videoHeight) return;
+  cw = v.videoWidth;
+  ch = v.videoHeight;
+  canvas2d.width = cw; canvas2d.height = ch;
+  canvasGL.width = cw; canvasGL.height = ch;
+  // 改 canvas 尺寸会重置绘图状态：viewport 必须重设
+  if (gl) gl.viewport(0, 0, cw, ch);
+  $("m-dim").textContent = `${cw}×${ch}`;
+}
+
+/** 每帧的合成：direct 路径不做任何事（这正是它快的原因）。 */
+function composite() {
+  if (S.path !== "direct") {
+    const v = V[active];
+    if (v.readyState >= 2 && v.videoWidth) {
+      syncCanvasSize();
+      const t0 = performance.now();
+      try {
+        if (S.path === "canvas2d") {
+          init2D().drawImage(v, 0, 0, cw, ch);
+        } else {
+          initGL();
+          gl.bindTexture(gl.TEXTURE_2D, glTex);
+          // 这一行就是 4K 的代价所在：WebKit 必须把硬解出来的
+          // CVPixelBuffer 从 GPU 侧拉回，再当纹理上传一次。
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, v);
+          gl.drawArrays(gl.TRIANGLES, 0, 3);
+        }
+      } catch (e) {
+        fail(`合成失败(${S.path}): ${e.message}`);
+      }
+      // 取指数滑动均值，避免数字狂跳看不清趋势
+      M.compositeMs = M.compositeMs * 0.9 + (performance.now() - t0) * 0.1;
+    }
+  }
+  requestAnimationFrame(composite);
+}
+
+// ── 帧回调：唯一的观测点 ───────────────────────────────────────────────
+//
+// rVFC 的 meta 给了两样关键东西：
+//   mediaTime          —— 这帧对应视频里的哪个时刻（用来判断回绕）
+//   expectedDisplayTime —— 这帧预期在什么时候上屏（用来量帧间隔，不抖）
+//
+function onFrame(i, meta) {
+  if (i !== active) return; // 备胎的帧不算数，否则时间轴会被污染
+
+  const mt = meta.mediaTime;
+  const ed = meta.expectedDisplayTime;
+
+  // 估计真实帧时长：只在 mediaTime 单调前进时采样
+  if (M.lastMedia > 0 && mt > M.lastMedia) {
+    const d = mt - M.lastMedia;
+    if (d > 0.002 && d < 0.2) {
+      M.frameDurs.push(d);
+      if (M.frameDurs.length > 90) M.frameDurs.shift();
+    }
+  }
+
+  // 结算一次循环：间隔超出正常帧间隔的部分，就是人眼看到的「卡那一下」
+  const settleSeam = () => {
+    if (!M.lastExpected) return;
+    const gap = ed - M.lastExpected;
+    if (gap > 0 && gap < 3000) {
+      M.seams.push(gap - nominalMs());
+      if (M.seams.length > 60) M.seams.shift();
+      M.cycles++;
+    }
+  };
+
+  if (S.mode === "loop" || S.mode === "seek") {
+    // 单实例：mediaTime 突然回退就是回绕点，这一帧本身就是新周期首帧
+    if (M.lastMedia > 0.2 && mt < M.lastMedia - 0.15) {
+      settleSeam();
+      seekGuard = false;
+    }
+  } else if (M.pendingCycle) {
+    // 双实例：切换动作发生在上一实例的末帧回调里，新首帧到这里才结算
+    settleSeam();
+    M.pendingCycle = false;
+  }
+
+  M.lastExpected = ed;
+  M.lastMedia = mt;
+
+  // seek 回绕：赶在视频真正 ended 之前一帧动手，比监听 ended 少一次解码器 flush
+  if (S.mode === "seek" && !seekGuard) {
+    const dur = V[i].duration;
+    if (Number.isFinite(dur) && mt >= dur - nominalMs() / 1000) {
+      seekGuard = true;
+      V[i].currentTime = 0;
+    }
+  }
+
+  // 双实例切换点：这是 pingpong 与 crossfade 唯一的分歧处。
+  // 必须先挡住 loop / seek —— 它们是单实例自循环，走到下面会误调 crossfadeSwap。
+  if (S.mode !== "pingpong" && S.mode !== "crossfade") return;
+
+  const dur = V[i].duration;
+  if (!Number.isFinite(dur)) return;
+
+  // 后一个 clamp 是防呆：素材极短时（dur 小于 lead），不加限制会每帧都在切
+  const leadS = Math.min(
+    S.mode === "pingpong" ? (nominalMs() / 1000) * S.lead  // 硬切：提前 lead 帧
+                          : S.fade / 2000,                 // 淡化：提前半个淡化时长
+    dur * 0.4,
+  );
+
+  if (mt < dur - leadS) {
+    switchArmed = true;               // 离开尾段就重新武装 → 每个周期只切一次
+  } else if (switchArmed) {
+    // 切失败（备胎还没解出画面）就保持武装，下一帧再试 —— 它可能刚好就绪。
+    // 少这一次重试的代价是多等一个周期，比硬切出黑帧好。
+    if (S.mode === "pingpong" ? swap() : crossfadeSwap()) switchArmed = false;
+  }
+}
+
+function frameLoop(i) {
+  const v = V[i];
+  if (!hasRVFC) {
+    // 兜底：没有 rVFC 的引擎退化成 rAF 观测（指标精度会差很多）
+    const tick = () => {
+      if (v.__epoch !== epoch) return;
+      const mt = v.currentTime;
+      if (M.lastMedia > 0.2 && mt < M.lastMedia - 0.15) { /* 只能粗测 */ }
+      M.lastMedia = mt;
+      v.__raf = requestAnimationFrame(tick);
+    };
+    v.__epoch = epoch;
+    tick();
+    return;
+  }
+  const my = epoch;
+  const step = (now, meta) => {
+    if (my !== epoch) return; // 世代变了，安静退场
+    onFrame(i, meta);
+    v.requestVideoFrameCallback(step);
+  };
+  v.requestVideoFrameCallback(step);
+}
+
+// ── 循环策略 ──────────────────────────────────────────────────────────
+
+/** 双实例乒乓：真正的无缝来自「把 seek 藏起来」。
+ *  旧实例整整一个循环时长的余量去完成 seek + 重解码，切换时它已经停在第 0 帧等好。 */
+function swap() {
+  const cur = V[active], nxt = V[1 - active];
+  if (nxt.readyState < 2) return false;  // 备胎没准备好就别切，宁可留个小接缝
+  M.pendingCycle = true;                 // 让新首帧去结算接缝
+  active = 1 - active;
+  nxt.play().catch(fail);
+  applyView();
+  cur.pause();
+  cur.currentTime = 0;                   // 藏起来的那次 seek
+  return true;
+}
+
+/**
+ * 交叉淡化兜底：pingpong 做不成真无缝时用它顶上。
+ *
+ * 与 swap() 的区别不止是「加个淡入」：
+ *   - 触发点提前半个淡化时长，接缝落在两层各 50% 的中点，跳变被稀释得最狠
+ *   - 对时序不敏感：备胎迟几帧才出画面也无所谓，反正那会儿还是半透明
+ *   - 旧层在动画期间继续播（prime 里给它挂了 loop），所以画面不会冻住
+ *
+ * 代价说清楚：只在 `fade` 那几十~几百毫秒内两层同时参与合成。
+ * 这是**层混合**，不是离屏渲染 —— video 已是独立合成层，合成器直接在 GPU 上
+ * 把两层 alpha 混合即可。真正会强制离屏的是对**祖先**做 opacity/filter，
+ * 那和这里是两回事（面板上的「强制离屏」开关演示的正是后者）。
+ * 所以交叉淡化的真实账单是：2 个解码会话 + 淡化窗口内约 2 倍的合成像素量。
+ */
+function crossfadeSwap() {
+  const cur = V[active], nxt = V[1 - active];
+  if (nxt.readyState < 2) return false;   // 备胎没画面就没什么可淡入的
+  M.pendingCycle = true;
+  active = 1 - active;
+
+  const ms = Math.max(1, S.fade);
+  document.documentElement.style.setProperty("--fade-ms", `${ms}ms`);
+
+  // 淡入层：先让它参与合成（visibility），并把起点钉在全透明。
+  // 这里必须先临时关掉 transition 再设 0 —— 否则「设 0 → 设 1」两次变更会被
+  // 合并成同一次样式更新，transition 根本不触发，看起来就是硬切。
+  // （靠外部状态保证 opacity 已是 0 不可靠：第一次淡化时它就是默认的 1。）
+  nxt.dataset.on = "1";
+  nxt.style.transition = "none";
+  nxt.style.opacity = "0";
+  nxt.currentTime = 0;
+  nxt.play().catch(fail);
+  void nxt.offsetWidth;             // 强制样式重算，让上面的 0 真正生效
+  nxt.style.transition = "";        // 交还给 CSS 里的 var(--fade-ms)
+
+  fading = true;
+  nxt.style.opacity = "1";
+  cur.style.opacity = "0";          // 淡出层：保持参与合成直到过渡结束
+
+  // 收尾用定时器而不是 transitionend：两个元素的 transitionend 时机不同，
+  // 且中途切模式可能吞掉事件，定时器更可预测。
+  clearTimeout(fadeTimer);
+  fadeTimer = setTimeout(() => {
+    fading = false;
+    cur.pause();
+    cur.currentTime = 0;
+    cur.style.opacity = "0";
+    applyView();                    // 把淡出层移出合成，回到单层
+  }, ms + 40);
+  return true;
+}
+
+/** 可见性总调度：direct 路径下由 video 元素自己上屏，其余路径交给 canvas。
+ *  非过渡期间只保留一层参与合成，交叉淡化的双层开销被限制在淡化窗口内。 */
+function applyView() {
+  const direct = S.path === "direct";
+  V.forEach((v, i) => {
+    v.dataset.on = direct && i === active ? "1" : "0";
+  });
+  canvas2d.dataset.on = S.path === "canvas2d" ? "1" : "0";
+  canvasGL.dataset.on = S.path === "webgl" ? "1" : "0";
+}
+
+// ── 装载 ──────────────────────────────────────────────────────────────
+const once = (el, ev, ms = 15000) => new Promise((res, rej) => {
+  const t = setTimeout(() => rej(new Error(`${ev} 超时`)), ms);
+  el.addEventListener(ev, () => { clearTimeout(t); res(); }, { once: true });
+});
+
+async function prime(src) {
+  epoch++;                       // 让所有旧的 rVFC 回调失效
+  M.pendingCycle = false;
+  fading = false;
+  switchArmed = true;
+  clearTimeout(fadeTimer);
+  seekGuard = false;
+  V.forEach((v) => { v.pause(); v.style.opacity = ""; v.removeAttribute("loop"); });
+
+  S.src = src;
+  V.forEach((v) => { v.src = src; v.load(); });
+  await Promise.all(V.map((v) => once(v, "loadeddata")));
+
+  V[0].currentTime = 0;
+  V[1].currentTime = 0;
+  // 让备胎真解出首帧：play 一下就暂停，逼解码器把第 0 帧填进缓冲。
+  // 少了这一步，第一次切换必然看到黑帧或卡顿。
+  try { await V[1].play(); V[1].pause(); } catch { /* 忽略 */ }
+  V[1].currentTime = 0;
+
+  active = 0;
+  // 除 seek 外都给播放实例挂 loop。这不只是为了原生循环：
+  // 万一切换逻辑失效（备胎没就绪、素材异常），视频至少还能自己转下去，
+  // 不会停在最后一帧变成一张静态图。crossfade 还依赖它 —— 旧层在淡出的
+  // 那半个窗口里要继续出画面，否则会冻在末帧。
+  if (S.mode !== "seek") V[0].loop = true;
+  applyView();
+  V.forEach((_, i) => frameLoop(i));
+  await V[0].play();
+  resetStats();
+}
+
+function resetStats() {
+  M.seams.length = 0; M.frameDurs.length = 0;
+  M.cycles = 0; M.lastExpected = 0; M.lastMedia = 0;
+  M.compositeMs = 0; M.pendingCycle = false;
+  V.forEach((v) => { v.__lastQuality = null; });
+}
+
+function fail(e) {
+  const msg = e?.message || String(e);
+  errBox.textContent = msg;
+  console.error(e);
+}
+
+async function restart() {
+  try {
+    await prime(S.src);
+  } catch (e) {
+    fail(e);
+  }
+}
+
+// ── UI ────────────────────────────────────────────────────────────────
+const MODE_HINT = {
+  loop: "<b>原生 loop</b>：解码器跑到末尾要 flush 再 seek 回 0，这一段没有新帧可上屏 → 接缝最大。作为基线。",
+  seek: "<b>seek 回绕</b>：提前一帧手动 currentTime=0。比原生 loop 少一次 flush，接缝略小，但仍在一个解码会话里硬扛。",
+  pingpong: "<b>双实例乒乓</b>：备胎早就在第 0 帧待命，切换瞬间出帧；seek 被藏进一整个循环时长。接缝应当趋近 0，代价是 2 个硬解会话。",
+  crossfade: "<b>交叉淡入</b>：提前半个淡化时长动手，让接缝正落在两层各 50% 的中点，跳变被稀释得最狠。对时序不敏感 —— 这是 pingpong 做不成真无缝时的兜底。代价只发生在淡化窗口内：两层同时合成（层混合，非离屏）+ 2 个解码会话。",
+};
+const PATH_HINT = {
+  direct: "<b>direct</b>：video 元素直接上屏，VideoToolbox 的 IOSurface 零拷贝交给合成器。4K 唯一不烧 CPU 的路径。",
+  canvas2d: "<b>canvas2d</b>：每帧 drawImage 一次，WebKit 有加速路径但仍要过一遍绘制。",
+  webgl: "<b>webgl</b>：每帧 texImage2D 上传整帧。4K = 3840×2160×4 ≈ 33MB/帧，60fps 就是 2GB/s —— 这正是壁纸引擎里「硬解了还是掉帧」的根因。",
+};
+
+function seg(id, key, hintId, after) {
+  const box = $(id);
+  const sync = () => {
+    box.querySelectorAll("button").forEach((b) => (b.dataset.on = b.dataset.v === S[key] ? "1" : "0"));
+    if (hintId) $(hintId).innerHTML = (key === "mode" ? MODE_HINT : PATH_HINT)[S[key]];
+  };
+  box.addEventListener("click", async (e) => {
+    const b = e.target.closest("button");
+    if (!b) return;
+    S[key] = b.dataset.v;
+    sync();
+    await after();
+  });
+  sync();
+}
+
+function boot() {
+  initGL();  // 提前建好 context，切换路径时才不用等
+  seg("seg-mode", "mode", "hint-mode", restart);
+  seg("seg-path", "path", "hint-path", async () => {
+    applyView();
+    syncCanvasSize();
+  });
+
+  $("lead").addEventListener("input", (e) => {
+    S.lead = Number(e.target.value);
+    $("lead-v").textContent = `${S.lead.toFixed(1)} 帧`;
+  });
+  $("fade").addEventListener("input", (e) => {
+    S.fade = Number(e.target.value);
+    $("fade-v").textContent = `${S.fade} ms`;
+  });
+  $("offscreen").addEventListener("change", (e) => stage.classList.toggle("offscreen", e.target.checked));
+
+  $("pause").addEventListener("change", (e) => {
+    V.forEach((v, i) => {
+      if (e.target.checked) v.pause();
+      else if (i === active) v.play().catch(fail);
+    });
+  });
+
+  // 素材清单由 serve.mjs 提供，省得手改 HTML
+  fetch("/api/clips")
+    .then((r) => r.json())
+    .then((list) => {
+      const sel = $("clip");
+      if (!list.length) {
+        sel.innerHTML = `<option value="">clips/ 为空 —— 先跑 bash tools/make-clips.sh</option>`;
+        return;
+      }
+      sel.innerHTML = list.map((f) => `<option value="clips/${f}">${f}</option>`).join("");
+      sel.value = `clips/${list.find((f) => /seamless-4k\.mp4$/.test(f)) || list[0]}`;
+      return restart();
+    })
+    .catch((e) => fail(e));
+
+  $("clip").addEventListener("change", (e) => { if (e.target.value) restart(); });
+  $("file").addEventListener("change", (e) => {
+    const f = e.target.files?.[0];
+    if (f) { S.src = URL.createObjectURL(f); restart(); }
+  });
+
+  // 统计刷新：10Hz 足够看清趋势，也不会自己变成负担
+  setInterval(() => {
+    const now = performance.now();
+    const dt = (now - M.lastRafTick) / 1000;
+    if (dt > 0) { M.rafFps = M.rafFrames / dt; M.rafFrames = 0; M.lastRafTick = now; }
+
+    $("m-fps").textContent = M.rafFps.toFixed(1);
+    $("m-vfps").textContent = M.frameDurs.length ? (1000 / nominalMs()).toFixed(1) : "–";
+
+    const v = V[active];
+    const q = v.getVideoPlaybackQuality?.() || {
+      totalVideoFrames: v.webkitDecodedFrameCount ?? NaN,
+      droppedVideoFrames: v.webkitDroppedFrameCount ?? NaN,
+    };
+    const total = q.totalVideoFrames, dropped = q.droppedVideoFrames;
+    $("m-total").textContent = Number.isFinite(total) ? total : "–";
+    const dEl = $("m-dropped");
+    if (Number.isFinite(dropped) && Number.isFinite(total) && total > 0) {
+      const r = dropped / total;
+      dEl.textContent = `${dropped} (${(r * 100).toFixed(2)}%)`;
+      dEl.className = r > 0.02 ? "bad" : r > 0.005 ? "warn" : "good";
+    } else dEl.textContent = "–";
+
+    $("m-cycles").textContent = M.cycles;
+
+    // 淡化窗口内是双层合成 —— 对照这段窗口里合成帧率的变化，
+    // 就能看出「层混合」在你这台机器上的真实开销
+    const fadeEl = $("m-fade");
+    fadeEl.textContent = fading ? "◆ 双层合成" : "–";
+    fadeEl.className = fading ? "warn" : "";
+    const nom = nominalMs();
+    const fmt = (ms) => {
+      if (!Number.isFinite(ms)) return "–";
+      const frames = ms / nom;
+      return `${ms >= 0 ? "+" : ""}${ms.toFixed(1)}ms (${Math.max(0, frames).toFixed(1)}帧)`;
+    };
+    const med = mid(M.seams), p95 = pct(M.seams, 0.95), mx = M.seams.length ? Math.max(...M.seams) : NaN;
+    for (const [id, val] of [["m-seam-med", med], ["m-seam-p95", p95], ["m-seam-max", mx]]) {
+      const el = $(id);
+      el.textContent = fmt(val);
+      el.className = !Number.isFinite(val) ? "" : val > nom ? "bad" : val > nom * 0.5 ? "warn" : "good";
+    }
+    $("m-comp").textContent = S.path === "direct" ? "不过 JS（直通）" : `${M.compositeMs.toFixed(2)} ms/帧`;
+  }, 100);
+
+  const raf = () => { M.rafFrames++; requestAnimationFrame(raf); };
+  requestAnimationFrame(composite);
+  requestAnimationFrame(raf);
+}
+
+window.addEventListener("error", (e) => fail(e.error || e.message));
+boot();
+</script>
+</body>
+</html>

@@ -39,9 +39,14 @@ import {
   IconTrash,
   IconUpload,
   IconShare,
+  IconSliders,
+  IconRemove,
+  IconInfo,
 } from "../components/icons";
 import { AnchoredMenu, MenuItem, MenuInputRow } from "../components/AnchoredMenu";
 import { ShareModal } from "../components/ShareModal";
+import { WallpaperPropsModal } from "../components/WallpaperPropsModal";
+import { WallpaperInfoModal } from "../components/WallpaperInfoModal";
 import { formatCountdown } from "../lib/format";
 import { SubscriptionsModal } from "../components/SubscriptionsModal";
 import { LibraryImportModal } from "../components/LibraryImportModal";
@@ -52,13 +57,18 @@ import {
 } from "../components/WorkshopUploadChoiceModal";
 import { WorkshopWebUploadModal } from "../components/WorkshopWebUploadModal";
 import { VirtualGrid } from "../components/VirtualGrid";
+import { DisplayDock } from "../components/DisplayDock";
 import { useApplyWallpaper } from "../hooks/useApplyWallpaper";
 import { cancelApplyTarget, useArmedApplyTarget } from "../lib/apply-target";
 import { tr, trMsg } from "../lib/i18n";
 
 /** 筛选条件持久化：窗口会在内存压力下被回收重建（全新 JS 上下文），不落盘的话
     用户调好的标签/排序会静默回到默认值（与工坊页 useWorkshopFilter 同一套
-    做法与键约定） */
+    做法与键约定）。
+
+    **按列表上下文各存一份**：过滤「全部」和每个播放列表各有独立的搜索/排序/
+    标签/只看失效，互不影响 —— 之前在切换列表时会 `clearFilters()`，等于把用户
+    在 A 列表调好的条件清掉，切回来已经没了。 */
 const FILTER_STATE_KEY = "filter.library";
 
 /** 上传到创意工坊：功能代码（弹框 / state / 后端）完整保留，入口暂时隐藏，
@@ -79,29 +89,68 @@ const FILTER_DEFAULTS: PersistedFilter = {
   onlyMissing: false,
 };
 
-function readPersistedFilter(): PersistedFilter {
-  const raw = readState<Partial<PersistedFilter> | null>(FILTER_STATE_KEY, null);
-  if (!raw || typeof raw !== "object") return { ...FILTER_DEFAULTS, selected: {} };
-  // 逐字段校验：localStorage 的内容可能来自旧版本，形状不能假定。
-  // 旧版三态（"on"/"excluded"）里只有 "on" 迁移为选中；"excluded" 两态化后无对应物，丢弃
+/** 列表上下文 → 持久化键。全部 = "all"，某播放列表 = "pl-<id>"。
+    id 是数据库自增主键、删除后不会复用，所以直接拿 id 当键是稳的。 */
+function filterKeyOf(listId: number | null): string {
+  return listId === null ? "all" : `pl-${listId}`;
+}
+
+/** 逐字段校验一份筛选：localStorage 的内容可能来自旧版本，形状不能假定。
+    旧版三态（"on"/"excluded"）里只有 "on" 迁移为选中；"excluded" 两态化后无对应物，丢弃 */
+function normalizeFilter(raw: unknown): PersistedFilter {
+  const o = (raw && typeof raw === "object" ? raw : {}) as Partial<PersistedFilter> & {
+    tagState?: Record<string, string>;
+  };
   const selected: TagSelection = {};
-  const rawSel =
-    raw.selected && typeof raw.selected === "object"
-      ? raw.selected
-      : ((raw as { tagState?: Record<string, string> }).tagState ?? {});
+  const rawSel = o.selected && typeof o.selected === "object" ? o.selected : (o.tagState ?? {});
   for (const [k, v] of Object.entries(rawSel)) {
     if (v === true || v === "on") selected[k] = true;
   }
   return {
-    search: typeof raw.search === "string" ? raw.search : FILTER_DEFAULTS.search,
+    search: typeof o.search === "string" ? o.search : FILTER_DEFAULTS.search,
     // 排序值可能来自旧版本已删除的选项，必须仍合法
     sort:
-      typeof raw.sort === "string" && LIBRARY_SORTS.some((s) => s.value === raw.sort)
-        ? raw.sort
+      typeof o.sort === "string" && LIBRARY_SORTS.some((s) => s.value === o.sort)
+        ? o.sort
         : FILTER_DEFAULTS.sort,
     selected,
-    onlyMissing: raw.onlyMissing === true,
+    onlyMissing: o.onlyMissing === true,
   };
+}
+
+/** 读出全部列表上下文的筛选表。
+    兼容旧格式：早期这里直接存一份 PersistedFilter（带 search/sort 字段），
+    那种情况整体当作「全部」的一份，用户原来的习惯不会丢。 */
+function readFilterMap(): Record<string, PersistedFilter> {
+  const raw = readState<unknown>(FILTER_STATE_KEY, null);
+  if (!raw || typeof raw !== "object") return {};
+  const obj = raw as Record<string, unknown>;
+  // 旧格式判别：顶层直接有筛选字段，而不是「键 → 筛选」的映射
+  if ("search" in obj || "sort" in obj || "selected" in obj || "onlyMissing" in obj) {
+    return { all: normalizeFilter(obj) };
+  }
+  const out: Record<string, PersistedFilter> = {};
+  for (const [k, v] of Object.entries(obj)) out[k] = normalizeFilter(v);
+  return out;
+}
+
+/** 读某个列表上下文的筛选；没存过就是默认值（各列表互不影响） */
+function readFilterFor(listId: number | null): PersistedFilter {
+  return readFilterMap()[filterKeyOf(listId)] ?? { ...FILTER_DEFAULTS, selected: {} };
+}
+
+/** 写某个列表上下文的筛选（读-改-写整张表，只覆盖自己那一格） */
+function persistFilter(listId: number | null, f: PersistedFilter): void {
+  const map = readFilterMap();
+  map[filterKeyOf(listId)] = f;
+  writeState(FILTER_STATE_KEY, map);
+}
+
+/** 丢弃某个列表上下文的筛选（列表被删除时清掉，免得留一份永远读不到的孤儿） */
+function forgetFilter(listId: number): void {
+  const map = readFilterMap();
+  delete map[filterKeyOf(listId)];
+  writeState(FILTER_STATE_KEY, map);
 }
 
 export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => void }) {
@@ -111,7 +160,8 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
   const [loading, setLoading] = useState(true);
   // 筛选：本地库全部走数据库查询，不在前端过滤
   const [filterOpen, setFilterOpen] = useState(false);
-  const [initialFilter] = useState(readPersistedFilter);
+  // 初始进入「全部」上下文，用它自己那份筛选（各列表独立持久化，见 readFilterFor）
+  const [initialFilter] = useState(() => readFilterFor(null));
   const [search, setSearch] = useState(initialFilter.search);
   // debouncedSearch 直接用还原值初始化：避免首帧先按空查询拉一遍、
   // 400ms 防抖到期后再按还原的搜索词重拉一次
@@ -122,6 +172,15 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
   const msg = useMessage();
   const [previewItem, setPreviewItem] = useState<LibraryItem | null>(null);
   const [deleteItem, setDeleteItem] = useState<LibraryItem | null>(null);
+  // 从本地库移除（保留壁纸文件）的确认目标
+  const [removeItem, setRemoveItem] = useState<LibraryItem | null>(null);
+  // 壁纸属性面板（作者属性 + 播放设置）
+  const [propsItem, setPropsItem] = useState<LibraryItem | null>(null);
+  // 壁纸信息面板
+  const [infoItem, setInfoItem] = useState<LibraryItem | null>(null);
+  // 批量操作确认（删除 = 连文件一起删；移除 = 保留文件）
+  const [bulkConfirm, setBulkConfirm] = useState<"delete" | "remove" | null>(null);
+  const [bulkBusy, setBulkBusy] = useState(false);
   // 分享弹窗目标（卡片分享按钮 → ShareModal）
   const [shareItem, setShareItem] = useState<LibraryItem | null>(null);
   const [appliedItems, setAppliedItems] = useState<Set<string>>(new Set());
@@ -261,16 +320,22 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
     }
   };
 
-  // 任一条件变化就落盘。合成一个 effect 而不是在每个 setter 里写，
-  // 免得漏掉将来新增的入口
+  // 当前列表上下文（null = 全部）。声明必须早于筛选持久化 effect —— 它是那个
+  // effect 的依赖（各列表各存一份筛选）。
+  const [listFilter, setListFilter] = useState<number | null>(null);
+
+  // 任一条件变化就落盘 —— 只写**当前列表上下文**那一格（各列表独立）。
+  // 合成一个 effect 而不是在每个 setter 里写，免得漏掉将来新增的入口。
+  // 依赖里带 listFilter：切列表后这一跑会把新载入的值写到新键上（幂等）；
+  // 被切走的那个列表的值由 switchList 在切换前显式落盘。
   useEffect(() => {
-    writeState<PersistedFilter>(FILTER_STATE_KEY, {
+    persistFilter(listFilter, {
       search: search.trim(),
       sort,
       selected,
       onlyMissing,
     });
-  }, [search, sort, selected, onlyMissing]);
+  }, [search, sort, selected, onlyMissing, listFilter]);
 
   useEffect(() => {
     const t = setTimeout(() => setDebouncedSearch(search.trim()), 400);
@@ -294,7 +359,6 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
   const [boundNames, setBoundNames] = useState<Map<number, string[]>>(new Map());
   const [displays, setDisplays] = useState<DisplayInfo[]>([]);
   const [dispMode, setDispMode] = useState("unified");
-  const [listFilter, setListFilter] = useState<number | null>(null);
   const [selectMode, setSelectMode] = useState(false);
   const [picked, setPicked] = useState<Set<string>>(new Set());
   // 锚定菜单（加入列表 / 独立模式启用选屏）与内联新建
@@ -377,13 +441,39 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
       .sort((a, b) => (order.get(a.itemId) ?? 0) - (order.get(b.itemId) ?? 0));
   }, [items, listFilter, playlists]);
 
-  /** 切到列表上下文：清掉其它筛选，保证点开列表一定看到它的壁纸 */
+  /** 切到列表上下文：清掉当前上下文的筛选（只影响这一份，其它列表各自留着） */
   const clearFilters = useCallback(() => {
     setSearch("");
     setDebouncedSearch("");
     setSelected({});
     setOnlyMissing(false);
   }, []);
+
+  /**
+   * 切换列表上下文（「全部」↔ 某个播放列表）。
+   *
+   * 各列表的筛选**独立且持久化**：先把当前这份落盘，再读目标列表自己那份填回去。
+   * 之前这里是 `clearFilters()` 一刀切 —— 用户在 A 列表调好的条件会被清掉，
+   * 切回来已经没了，也就是「筛选条件相互影响」。
+   *
+   * 排序也跟着切：它同样属于「这个列表怎么看」的偏好，不是全局设置。
+   */
+  const switchList = useCallback(
+    (next: number | null) => {
+      if (next === listFilter) return;
+      // 先存当前列表（此刻 state 还是旧列表的值）
+      persistFilter(listFilter, { search: search.trim(), sort, selected, onlyMissing });
+      // 再载入目标列表自己那份
+      const f = readFilterFor(next);
+      setSearch(f.search);
+      setDebouncedSearch(f.search);
+      setSort(f.sort);
+      setSelected(f.selected);
+      setOnlyMissing(f.onlyMissing);
+      setListFilter(next);
+    },
+    [listFilter, search, sort, selected, onlyMissing],
+  );
 
   const plAct = useCallback(
     async (fn: () => Promise<unknown>, ok?: string) => {
@@ -457,6 +547,59 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
     }
   };
 
+  /** 单条：把壁纸从本地库移除（**保留磁盘文件**，与「删除」相对） */
+  const removeOne = async (item: LibraryItem) => {
+    setRemoveItem(null);
+    try {
+      await api.libraryRemove(item.itemId);
+      msg.success(tr("已移除「{title}」（壁纸文件保留）", { title: item.title }));
+    } catch (e) {
+      msg.error(String(e));
+    }
+    refresh();
+    loadApplied();
+  };
+
+  /**
+   * 批量删除 / 批量移除选中条目。
+   *
+   * 后端命令是**以条目为单位**的（每条要走一次停屏 + 清库记录，还要处理引用模式
+   * 不删文件的分支），所以这里串行逐条调用而不是并发：条目数上限也就是几百，
+   * 串行还能保证失败时前面的结果已经落库，并且能逐条收集错误原因。
+   * 失败不中断整批 —— 一条删不掉（比如文件被占用）不该阻止其余条目。
+   */
+  const runBulk = async (mode: "delete" | "remove") => {
+    const ids = [...picked];
+    setBulkConfirm(null);
+    if (!ids.length) return;
+    setBulkBusy(true);
+    const titles = new Map(items.map((it) => [it.itemId, it.title]));
+    let ok = 0;
+    let firstErr = "";
+    for (const id of ids) {
+      try {
+        if (mode === "delete") await api.libraryDelete(id);
+        else await api.libraryRemove(id);
+        ok += 1;
+      } catch (e) {
+        if (!firstErr) firstErr = `${titles.get(id) ?? id} — ${trMsg(String(e))}`;
+      }
+    }
+    setBulkBusy(false);
+    setPicked(new Set());
+    const failed = ids.length - ok;
+    if (ok) {
+      msg.success(
+        mode === "delete"
+          ? tr("已删除 {n} 张壁纸", { n: ok })
+          : tr("已移除 {n} 张（壁纸文件保留）", { n: ok }),
+      );
+    }
+    if (failed) msg.error(tr("{n} 张失败：{err}", { n: failed, err: firstErr }));
+    refresh();
+    loadApplied();
+  };
+
   return (
     // relative：筛选抽屉用 absolute 覆盖在本页之上
     <div className="relative flex h-full flex-col overflow-hidden px-7 py-5">
@@ -468,7 +611,7 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
           </span>
         </div>
       )}
-      {/* 显示器页「更换壁纸」锁定的目标屏提示（应用后或点取消自动解除） */}
+      {/* 显示器坞「更换壁纸」锁定的目标屏提示（应用后或点取消自动解除） */}
       {armedTarget && (
         <div className="mb-3 flex shrink-0 items-center gap-2 rounded-lg border border-[var(--accent-strong)]/40 bg-[var(--accent)]/10 px-3 py-1.5 text-[12.5px]">
           <span className="flex-1 truncate">
@@ -503,7 +646,7 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
           className={`rounded-lg border px-3 py-1.5 text-[12.5px] font-medium transition-colors ${
             selectMode
               ? "border-[var(--accent-strong)] bg-[var(--accent-fill)] text-[var(--text-1)]"
-              : "border-[var(--separator)] hover:bg-white/10"
+              : "border-[var(--separator)] hover:bg-[var(--glass-hover)]"
           }`}
           onClick={() => {
             setSelectMode((v) => !v);
@@ -520,16 +663,16 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
         )}
         <div className="ml-auto flex shrink-0 items-center gap-1.5">
           <button
-            className="rounded-lg border border-[var(--separator)] px-3 py-1.5 text-[12.5px] font-medium hover:bg-white/10 disabled:opacity-60"
+            className="rounded-lg border border-[var(--separator)] px-3 py-1.5 text-[12.5px] font-medium hover:bg-[var(--glass-hover)] disabled:opacity-60"
             onClick={() => setSubsOpen(true)}
             title={tr("拉取登录账号的全部订阅，一键下载缺失壁纸（也可多选下载）")}
           >
             ⇓ {tr("同步订阅")}
           </button>
           <button
-            className="rounded-lg border border-[var(--separator)] px-3 py-1.5 text-[12.5px] font-medium hover:bg-white/10 disabled:opacity-60"
+            className="rounded-lg border border-[var(--separator)] px-3 py-1.5 text-[12.5px] font-medium hover:bg-[var(--glass-hover)] disabled:opacity-60"
             onClick={() => setImportOpen(true)}
-            title={tr("添加壁纸目录 / 导入文件夹 / 导入文件")}
+            title={tr("添加壁纸路径 / 导入单个壁纸文件夹 / 导入单个文件")}
           >
             ＋ {tr("导入壁纸")}
           </button>
@@ -542,7 +685,7 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
           {tr("切换列表")}
         </span>
         <button
-          onClick={() => setListFilter(null)}
+          onClick={() => switchList(null)}
           className={`rounded-full border px-2.5 py-0.5 text-[12px] transition-colors ${
             listFilter === null
               ? "border-[var(--accent-strong)] bg-[var(--accent-fill)] text-[var(--text-1)]"
@@ -555,12 +698,8 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
           <button
             key={p.id}
             onClick={() => {
-              if (listFilter === p.id) {
-                setListFilter(null);
-              } else {
-                clearFilters();
-                setListFilter(p.id);
-              }
+              // 再点当前选中项 = 回到「全部」；两者各自恢复自己的筛选
+              switchList(listFilter === p.id ? null : p.id);
             }}
             className={`rounded-full border px-2.5 py-0.5 text-[12px] transition-colors ${
               listFilter === p.id
@@ -673,7 +812,9 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
                 </button>
               </>
             ) : dispMode === "independent" ? (
-              <span className="opacity-80">{tr("到「显示器」页选择该列表开始轮播")}</span>
+              <span className="opacity-80">
+                {tr("在底部显示器坞里，为某块屏选择该列表开始轮播")}
+              </span>
             ) : (
               <button
                 title={tr("启用轮播")}
@@ -786,7 +927,7 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
           setSearch("");
         }}
       >
-        <label className="mb-2.5 flex cursor-pointer items-center gap-2 rounded-lg px-1 py-1 text-[12px] hover:bg-white/8">
+        <label className="mb-2.5 flex cursor-pointer items-center gap-2 rounded-lg px-1 py-1 text-[12px] hover:bg-[var(--glass-hover)]">
           <input
             type="checkbox"
             checked={onlyMissing}
@@ -810,7 +951,7 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
                   label={tagLabel(t.name)}
                   state={selected[t.name] ? "on" : "off"}
                   onClick={() => setSelected((prev) => toggleTagSelection(prev, t.name))}
-                  title={t.libraryOnly ? tr("本地导入的壁纸（非工坊下载）") : t.name}
+                  title={t.hint ? tr(t.hint) : t.name}
                 />
               ))}
             </FilterSection>
@@ -935,9 +1076,12 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
               metaLeft={<TypeChip label={tr(TYPE_LABELS[item.type])} />}
               actions={
                 selectMode ? undefined : (
+                /* 8 个按钮排 2×4。顺序 = 「看/配这张壁纸」在前、「文件/分享/移出库」
+                   在后，破坏性最强的删除压轴；两个「移出库」语义靠图标 + tooltip
+                   区分（移除＝保留文件，删除＝连文件一起删） */
                 <div className="grid grid-cols-4 gap-1">
                   <button
-                    className="flex items-center justify-center rounded-lg border border-[var(--separator)] px-0.5 py-1 text-[var(--text-2)] hover:text-[var(--accent-strong)] hover:bg-white/10"
+                    className="flex items-center justify-center rounded-lg border border-[var(--separator)] px-0.5 py-1 text-[var(--text-2)] hover:text-[var(--accent-strong)] hover:bg-[var(--glass-hover)]"
                     onClick={() => setPreviewItem(item)}
                     data-tip={tr("预览（可在预览中配置）")}
                   >
@@ -969,23 +1113,44 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
                     </button>
                   )}
                   <button
-                    className="flex items-center justify-center rounded-lg border border-[var(--separator)] px-0.5 py-1 text-[var(--text-2)] hover:text-[var(--accent-strong)] hover:bg-white/10"
+                    className="flex items-center justify-center rounded-lg border border-[var(--separator)] px-0.5 py-1 text-[var(--text-2)] hover:text-[var(--accent-strong)] hover:bg-[var(--glass-hover)]"
+                    onClick={() => setPropsItem(item)}
+                    data-tip={tr("壁纸属性（作者属性与播放设置）")}
+                  >
+                    <IconSliders />
+                  </button>
+                  <button
+                    className="flex items-center justify-center rounded-lg border border-[var(--separator)] px-0.5 py-1 text-[var(--text-2)] hover:text-[var(--accent-strong)] hover:bg-[var(--glass-hover)]"
+                    onClick={() => setInfoItem(item)}
+                    data-tip={tr("壁纸信息")}
+                  >
+                    <IconInfo />
+                  </button>
+                  <button
+                    className="flex items-center justify-center rounded-lg border border-[var(--separator)] px-0.5 py-1 text-[var(--text-2)] hover:text-[var(--accent-strong)] hover:bg-[var(--glass-hover)]"
                     onClick={() => api.libraryOpenFolder(item.itemId)}
                     data-tip={tr("打开文件所在位置")}
                   >
                     <IconOpenFile />
                   </button>
                   <button
-                    className="flex items-center justify-center rounded-lg border border-[var(--separator)] px-0.5 py-1 text-[var(--text-2)] hover:text-[var(--accent-strong)] hover:bg-white/10"
+                    className="flex items-center justify-center rounded-lg border border-[var(--separator)] px-0.5 py-1 text-[var(--text-2)] hover:text-[var(--accent-strong)] hover:bg-[var(--glass-hover)]"
                     onClick={() => setShareItem(item)}
                     data-tip={tr("分享")}
                   >
                     <IconShare />
                   </button>
                   <button
+                    className="flex items-center justify-center rounded-lg border border-[var(--separator)] px-0.5 py-1 text-[var(--text-2)] hover:text-amber-400 hover:border-amber-500/40 hover:bg-amber-500/10"
+                    onClick={() => setRemoveItem(item)}
+                    data-tip={tr("移出本地库（保留壁纸文件）")}
+                  >
+                    <IconRemove />
+                  </button>
+                  <button
                     className="flex items-center justify-center rounded-lg border border-[var(--separator)] px-0.5 py-1 text-[var(--text-2)] hover:text-red-500 hover:border-red-500/40 hover:bg-red-500/10"
                     onClick={() => setDeleteItem(item)}
-                    data-tip={tr("删除")}
+                    data-tip={tr("删除（同时删除壁纸文件）")}
                   >
                     <IconTrash />
                   </button>
@@ -1005,6 +1170,24 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
           title={shareItem.title}
           wtype={shareItem.type}
           onClose={() => setShareItem(null)}
+        />
+      )}
+
+      {/* 壁纸属性（作者属性 + 每壁纸播放设置）：与详情页共用同一个面板 */}
+      {propsItem && (
+        <WallpaperPropsModal
+          itemId={propsItem.itemId}
+          title={propsItem.title}
+          onClose={() => setPropsItem(null)}
+        />
+      )}
+
+      {infoItem && (
+        <WallpaperInfoModal
+          item={infoItem}
+          applied={appliedItems.has(infoItem.itemId)}
+          playlists={playlists.filter((p) => p.itemIds.includes(infoItem.itemId)).map((p) => p.name)}
+          onClose={() => setInfoItem(null)}
         />
       )}
 
@@ -1094,16 +1277,61 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
         />
       )}
 
+      {removeItem && (
+        <ConfirmModal
+          title={tr("移除壁纸")}
+          message={tr(
+            "确定把「{title}」从本地库移除？磁盘上的壁纸文件会保留，但该壁纸的自定义属性、所属切换列表与下载记录会被清除。此操作不可恢复。",
+            { title: removeItem.title },
+          )}
+          confirmText={tr("移除")}
+          danger
+          onCancel={() => setRemoveItem(null)}
+          onConfirm={() => void removeOne(removeItem)}
+        />
+      )}
+
+      {bulkConfirm === "delete" && (
+        <ConfirmModal
+          title={tr("批量删除壁纸")}
+          message={tr(
+            "确定删除选中的 {n} 张壁纸及其本地文件？此操作不可恢复。",
+            { n: picked.size },
+          )}
+          confirmText={tr("批量删除")}
+          danger
+          onCancel={() => setBulkConfirm(null)}
+          onConfirm={() => void runBulk("delete")}
+        />
+      )}
+
+      {bulkConfirm === "remove" && (
+        <ConfirmModal
+          title={tr("批量移除壁纸")}
+          message={tr(
+            "确定把选中的 {n} 张壁纸从本地库移除？磁盘上的壁纸文件会保留，但它们的自定义属性、所属切换列表与下载记录会被清除。此操作不可恢复。",
+            { n: picked.size },
+          )}
+          confirmText={tr("批量移除")}
+          danger
+          onCancel={() => setBulkConfirm(null)}
+          onConfirm={() => void runBulk("remove")}
+        />
+      )}
+
       {/* 批量选择浮动条 + 「加入切换列表」上拉菜单（锚定菜单，不是弹框） */}
       {selectMode && picked.size > 0 && (
         <div className="pointer-events-none fixed inset-x-0 bottom-6 z-[65] flex justify-center">
-          <div className="pointer-events-auto flex animate-modal-pop items-center gap-2 rounded-2xl border border-[var(--separator)] bg-[var(--card)]/95 px-4 py-2 shadow-xl backdrop-blur">
+          {/* max-w + flex-wrap：批量条上的按钮比原先多了两个，列表名又可能很长，
+              不封顶时窄窗口里会被顶出可视区（贴边即换行，不会溢出） */}
+          <div className="pointer-events-auto flex max-w-[calc(100vw-2.5rem)] animate-modal-pop flex-wrap items-center justify-center gap-2 rounded-2xl border border-[var(--separator)] bg-[var(--card)]/95 px-4 py-2 shadow-xl backdrop-blur">
             <span className="text-[13px] font-medium">
               {tr("已选 {n} 张", { n: picked.size })}
             </span>
             <span className="mx-1 h-4 w-px bg-[var(--separator)]" />
             <button
-              className="btn btn-primary !py-1 text-[12px]"
+              className="btn btn-primary !py-1 text-[12px] disabled:opacity-60"
+              disabled={bulkBusy}
               onClick={(e) => {
                 setNewName("");
                 const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
@@ -1114,13 +1342,36 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
             </button>
             {activeList && (
               <button
-                className="btn !py-1 text-[12px]"
+                className="btn !py-1 text-[12px] disabled:opacity-60"
+                disabled={bulkBusy}
                 onClick={() => void removeSelectionFromList()}
               >
                 {tr("移出「{name}」", { name: activeList.name })}
               </button>
             )}
-            <button className="btn !py-1 text-[12px]" onClick={() => setPicked(new Set())}>
+            <span className="mx-1 h-4 w-px bg-[var(--separator)]" />
+            {/* 库级批量操作：移除保留文件、删除连文件一起删，两者都要二次确认 */}
+            <button
+              className="btn !py-1 text-[12px] !border-amber-500/40 !text-amber-400 hover:!bg-amber-500/10 disabled:opacity-60"
+              disabled={bulkBusy}
+              title={tr("从本地库移除选中的壁纸，不删除磁盘文件")}
+              onClick={() => setBulkConfirm("remove")}
+            >
+              {bulkBusy ? tr("处理中…") : tr("批量移除")}
+            </button>
+            <button
+              className="btn btn-danger !py-1 text-[12px] disabled:opacity-60"
+              disabled={bulkBusy}
+              title={tr("从本地库删除选中的壁纸，并删除磁盘文件")}
+              onClick={() => setBulkConfirm("delete")}
+            >
+              {tr("批量删除")}
+            </button>
+            <button
+              className="btn !py-1 text-[12px] disabled:opacity-60"
+              disabled={bulkBusy}
+              onClick={() => setPicked(new Set())}
+            >
               {tr("清除")}
             </button>
           </div>
@@ -1159,9 +1410,18 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
           onConfirm={() => {
             const target = deleteList;
             setDeleteList(null);
-            if (listFilter === target.id) setListFilter(null);
+            // 先离开它的上下文（switchList 会把当前筛选存进 target 那一格），
+            // 删除成功后再把那格丢掉
+            if (listFilter === target.id) switchList(null);
             void plAct(
-              () => api.playlistDelete(target.id),
+              () =>
+                api
+                  .playlistDelete(target.id)
+                  .then(() => forgetFilter(target.id))
+                  .catch((e) => {
+                    // 删除失败就保留那份筛选：列表还在，用户切回去时偏好不该丢
+                    throw e;
+                  }),
               tr("已删除「{name}」", { name: target.name }),
             );
           }}
@@ -1169,6 +1429,15 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
       )}
 
       {applyMenu}
+
+      {/* 底部显示器坞：鼠标扫到屏幕底边滑出。它已承接原「显示器」页的日常操作
+          （选屏应用 / 统一独立模式 / 每屏轮播绑定），所以那一页已移除 */}
+      <DisplayDock
+        displays={displays}
+        mode={dispMode}
+        playlists={playlists}
+        onReload={() => void loadPlaylists()}
+      />
     </div>
   );
 }

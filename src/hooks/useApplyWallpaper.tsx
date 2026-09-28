@@ -1,7 +1,7 @@
-// 「应用到桌面」的统一入口：目标选择（统一/独立模式语义）+ 显示器页「更换壁纸」的锁定目标。
+// 「应用到桌面」的统一入口：目标选择（统一/独立模式语义）+ 显示器坞「更换壁纸」的锁定目标。
 //
 // 语义（P1）：
-//   - 锁定目标（armed）最优先：显示器页点过「更换壁纸」，下一次应用只去那一屏；
+//   - 锁定目标（armed）最优先：显示器坞点过「更换壁纸」，下一次应用只去那一屏；
 //   - 单屏 / 统合模式：一键应用到全部显示器（现状行为，零打扰）；
 //   - 独立模式 + 多屏：弹出目标选择菜单（全部 / 各屏），记住上次选择。
 //
@@ -43,7 +43,7 @@ export function useApplyWallpaper(opts: { onApplied?: (itemId: string) => void }
       new Promise((resolve, reject) => {
         void (async () => {
           try {
-            // ① 显示器页锁定的目标屏
+            // ① 显示器坞锁定的目标屏
             const armed = consumeApplyTarget();
             if (armed) {
               await api.wallpaperApplyItem(itemId, armed.id);
@@ -113,7 +113,7 @@ export function useApplyWallpaper(opts: { onApplied?: (itemId: string) => void }
             {tr("应用到哪块屏？")}
           </div>
           <button
-            className="flex w-full items-center justify-between gap-3 px-3 py-1.5 text-left text-[13px] hover:bg-white/10"
+            className="flex w-full items-center justify-between gap-3 px-3 py-1.5 text-left text-[13px] hover:bg-[var(--glass-hover)]"
             onClick={() => choose(null)}
           >
             <span>{tr("全部显示器")}</span>
@@ -122,7 +122,7 @@ export function useApplyWallpaper(opts: { onApplied?: (itemId: string) => void }
           {menu.displays.map((d) => (
             <button
               key={d.id}
-              className="flex w-full items-center justify-between gap-3 px-3 py-1.5 text-left text-[13px] hover:bg-white/10"
+              className="flex w-full items-center justify-between gap-3 px-3 py-1.5 text-left text-[13px] hover:bg-[var(--glass-hover)]"
               onClick={() => choose(d.id)}
             >
               <span className="truncate">

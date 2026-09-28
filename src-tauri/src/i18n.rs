@@ -143,6 +143,10 @@ fn en(zh: &str) -> Option<&'static str> {
         "抗锯齿已锁定为关闭（方案优化中，暂不支持更改）" => {
             "Anti-aliasing is locked to Off (being reworked; changes are disabled for now)"
         }
+        // ---- 本地库：添加壁纸路径时逐条跳过/失败的原因 ----
+        "目录里没有可识别的壁纸内容（视频 / 图片 / 网页 / 场景包都没有），已跳过" => {
+            "No recognisable wallpaper content in this folder (no video / image / web / scene package) — skipped"
+        }
         _ => return None,
     })
 }
