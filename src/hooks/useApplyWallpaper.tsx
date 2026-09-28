@@ -15,6 +15,7 @@
 // apply 返回 "done" | "stopped" | "cancelled"（"stopped" = 停了某屏的播放，调用方同样
 // 要刷新已应用集合，但不要弹「已应用」提示；菜单被点掉 = cancelled，不要报成功）。
 import { useCallback, useRef, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { api, type DisplayInfo } from "../api/steam";
 import {
   consumeApplyTarget,
@@ -125,8 +126,11 @@ export function useApplyWallpaper(opts: { onApplied?: (itemId: string) => void }
     p?.resolve("cancelled");
   }, []);
 
+  // portal 到 body：调用点可能埋在详情抽屉这类自带堆叠上下文的容器里，
+  // 菜单的 z-50 会被困在局部层级中被抽屉整体盖住（详见实机复测的截图）；
+  // 挂到 body 后 z-40/z-50 直接与抽屉同级比较，稳定可见。
   const menuNode: ReactNode =
-    menu === null ? null : (
+    menu === null ? null : createPortal(
       <>
         {/* 点击外部关闭（全屏透明捕获层，z 低于菜单本体） */}
         <div className="fixed inset-0 z-40" onClick={dismiss} onContextMenu={dismiss} />
@@ -184,7 +188,8 @@ export function useApplyWallpaper(opts: { onApplied?: (itemId: string) => void }
             );
           })}
         </div>
-      </>
+      </>,
+      document.body,
     );
 
   return { apply, menuNode };
