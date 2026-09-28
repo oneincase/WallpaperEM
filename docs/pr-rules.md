@@ -290,9 +290,9 @@ CI 检测到 `src/` 或 `src-tauri/src/` 有改动而 `CHANGELOG.md` 没动时�
 | `package.json` | 前端包版本 |
 | `src-tauri/tauri.conf.json` | **安装包版本**（打包实际用这个） |
 | `src-tauri/Cargo.toml` | Rust crate 版本 |
-| `src-tauri/bin-info.plist` | dev 二进制内嵌的 `CFBundleShortVersionString`（仅提示） |
+| `src-tauri/bin-info.plist` | dev 二进制内嵌的 `CFBundleShortVersionString` 与 `CFBundleVersion`（两个键，仅提示） |
 
-`pnpm versions:check` 一条命令查完。**当前 `bin-info.plist` 仍是 `1.1.0`**
+`pnpm versions:check` 一条命令查完。**当前 `bin-info.plist` 两个键都还是 `1.1.0`**
 （权威版本已是 `2.0.0`）—— dev 版 app 显示的版本号会偏旧，顺手同步掉。
 
 ### 发布流程
