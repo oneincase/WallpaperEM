@@ -236,6 +236,20 @@ jobs:
         with:
           workspaces: src-tauri
 
+      - name: 造出前端产物占位（冷克隆下 `cargo check` 必失败）
+        # `dist/` 是构建产物、不在仓库里，冷克隆下不存在。但：
+        #   · `tauri_build::build()` 校验 tauri.conf.json 的 resources ——
+        #     `../dist/renderer` 缺了就 `resource path ... doesn't exist` 直接 exit 1；
+        #   · `tauri::generate_context!` 的 codegen 要求 frontendDist（`../dist`）存在，
+        #     否则 panic「frontendDist ... doesn't exist」。
+        # 本机有 dev 产物所以看不见，CI 上这一步之前从没绿过。
+        # 本 job 只做类型检查，前端内容无关紧要 —— 造最小占位即可，不为了它去装 pnpm
+        # 跑一遍前端（真前端由 web job 负责，见文件头部「只跑该跑的」）。
+        run: |
+          mkdir -p dist/renderer
+          printf '%s\n' '<!doctype html>' '<title>CI 占位产物：cargo check 不读前端内容</title>' > dist/index.html
+          cp dist/index.html dist/renderer/index.html
+
       # ---- 阻断档 ----
 
       - name: Cargo.lock 是否与 Cargo.toml 一致
