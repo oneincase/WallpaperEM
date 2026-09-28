@@ -243,8 +243,12 @@ function lintPrSections(raw, opts) {
   const lines = body.split(/\r?\n/);
   const headings = [];
   lines.forEach((line, i) => {
-    const m = /^#{1,6}\s*(.+?)\s*$/.exec(line);
-    if (m) headings.push({ i, text: m[1] });
+    // CommonMark：`#` 后必须跟空格（或行尾）才算标题。写成 `\s*` 的话，正文里以
+    // 「#2」「#123」开头的行会被当成标题，把它所在小节的内容截断成空 —— 于是"引用
+    // 某条 PR"这种正常写法会换来一句「小节是空的」的假警告（实测：本仓库 #5 的
+    // 「背景 / 动机」就是这么被判空的）。
+    const m = /^#{1,6}(?:\s+(.*?))?\s*$/.exec(line);
+    if (m) headings.push({ i, text: m[1] ?? "" });
   });
 
   /** 取某小节标题下的正文；返回 null 表示没有这个小节。 */
