@@ -39,5 +39,6 @@
 - **#10**（fork `feat/apply-menu-stop`，6 条提交）：应用目标菜单 + 「再点播放中的屏 = 停止该屏」
   + 「统一应用」主按钮 + portal 渲染修复 + 实机截图。**基线停在 `5a10c5f`**，早于上面那批 UI 落地 ——
   直接合会把 `Home` / `Displays` / `Library` / `preview.ts` / `en-US.ts` 覆盖回旧版，**需要先 rebase 到最新 `main`**。
-- `backup/stash-wip-mcp-library`：后端侧在制 stash（442+/43-），归后端线。
+- ~~`backup/stash-wip-mcp-library`~~：已于 2026-09-29 落进 `main`（`aac457f`：`wallpaper_diff` +
+  `reference/capabilities` + 去掉 `angles` warning），stash 与备份分支都已清理。
 - `wip/standby-warm-window-abandoned`：被放弃的「热备窗」方向，仅作参考。
