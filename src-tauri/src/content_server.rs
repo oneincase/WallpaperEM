@@ -46,6 +46,21 @@ pub struct ContentServerState {
     /// label 分开记（渲染器建窗时经 query 拿到自己的 label，见 renderer 的
     /// WIN_LABEL）。
     pub label_diag: Arc<Mutex<HashMap<String, LabelDiag>>>,
+    /// 渲染器诊断的**环形缓冲**（最近 [`DIAG_LOG_CAP`] 条，按时间正序）。
+    ///
+    /// 上面两个快照只留「最近一条」，只够换纸/截图内部判状态用；而 agent 排错要的是
+    /// 「这一轮挂载都发生了什么」—— 效果 pass 编译失败、贴图 404、粒子名字不认这些
+    /// 都是中途一条 console.warn 桥过来的诊断（见 renderer 的 [we-scene] 桥），
+    /// 只留最后一条等于全丢。这里按 label + 时间留一段历史，由 `renderer_diag` 工具读。
+    pub diag_log: Arc<Mutex<DiagLog>>,
+    /// 抓帧等待队列：`req` → oneshot。
+    ///
+    /// 跨平台截图走「渲染器自己抓帧、POST 回宿主」这条路（见 [`request_capture`]）：
+    /// 原生快照 API 只有 macOS 有（WebKit/WebView2 的 capture 各写一套且没法在本仓
+    /// 验证），而渲染器页**本来就能读自己的画布**（场景画布是
+    /// `preserveDrawingBuffer: true`，视频帧也能 drawImage），于是把「抓」放在页面里、
+    /// 「要」由宿主下发，三个平台同一套代码。
+    pub capture_waiters: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<CaptureReply>>>>,
     /// 引擎事件的广播通道：**推送**首帧就绪 / 加载失败 / 换纸落地。
     ///
     /// 等待方（换纸任务、系统壁纸抽帧、MCP 截图）先 [`subscribe_engine`] 再查状态，
@@ -143,6 +158,77 @@ pub struct LabelDiag {
     pub fail_item: String,
 }
 
+/// 环形缓冲容量：一条诊断几十到几百字节，300 条约几十 KB。
+/// 够覆盖「一次挂载全过程 + 前一次换纸」，又不至于在 1Hz 的 video 诊断下无限涨。
+pub const DIAG_LOG_CAP: usize = 300;
+
+/// 诊断历史里的一条
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiagEntry {
+    /// 上报时刻（epoch millis）
+    pub at_ms: u64,
+    /// 上报窗口的 label（空 = 没带 win 的上报）
+    pub label: String,
+    /// 从诊断文本里解析出的本地库条目 id（可为空）
+    pub item: String,
+    /// 诊断原文（`[<type> <src>] <msg>`）
+    pub msg: String,
+    /// 是否 `failed:` 一类（工具侧好筛）
+    pub failed: bool,
+}
+
+/// 诊断环形缓冲：满了丢最旧的。
+#[derive(Default)]
+pub struct DiagLog {
+    entries: std::collections::VecDeque<DiagEntry>,
+    /// 累计写入条数（环形丢掉的也算，方便工具告诉 agent「你看到的不是全部」）
+    pub total: u64,
+}
+
+impl DiagLog {
+    pub fn push(&mut self, e: DiagEntry) {
+        self.total += 1;
+        while self.entries.len() >= DIAG_LOG_CAP {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(e);
+    }
+
+    /// 按条件取一段（时间正序）。`since_ms` 为闭区间下界。
+    pub fn query(
+        &self,
+        label: Option<&str>,
+        item: Option<&str>,
+        since_ms: u64,
+        limit: usize,
+    ) -> Vec<DiagEntry> {
+        let mut out: Vec<DiagEntry> = self
+            .entries
+            .iter()
+            .filter(|e| e.at_ms >= since_ms)
+            .filter(|e| label.map(|l| e.label == l).unwrap_or(true))
+            .filter(|e| item.map(|i| e.item == i).unwrap_or(true))
+            .cloned()
+            .collect();
+        // 只要最近 limit 条（时间正序返回，便于直接读）
+        if out.len() > limit {
+            out.drain(..out.len() - limit);
+        }
+        out
+    }
+
+    pub fn clear(&mut self, label: Option<&str>) {
+        match label {
+            Some(l) => self.entries.retain(|e| e.label != l),
+            None => self.entries.clear(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 impl ContentServerState {
     /// 当前存活的 SSE 客户端数（壁纸引擎唤醒后检测页面僵死用）
     pub fn sse_client_count(&self) -> usize {
@@ -153,13 +239,18 @@ impl ContentServerState {
 /// 从渲染器诊断文本里抽本地库条目 id。
 ///
 /// 诊断前缀是 `[<type> <src>] <msg>`（见 renderer/src/main.ts 的 reportDiag）：
-///   - scene：`src` 就是 itemId                       → `[scene 1948961570] ready`
-///   - web  ：`src` 是 `/web/<token>/<itemId>/…` 的 URL → 取 `<itemId>` 段
+///   - scene：`src` 就是 itemId → `[scene 1948961570] ready`
+///   - web：`src` 是 `/web/<token>/<itemId>/…` 的 URL → 取 `<itemId>` 段
+///
 /// 解析失败返回 None（比如原本就没有 src 的 canvas 类型）。
 fn diag_item_id(msg: &str) -> Option<String> {
     let inner = msg.strip_prefix('[')?.split_once(']')?.0;
     let (_ty, src) = inner.split_once(' ')?;
-    if let Some(rest) = src.split("/web/").nth(1).or_else(|| src.split("/media/").nth(1)) {
+    if let Some(rest) = src
+        .split("/web/")
+        .nth(1)
+        .or_else(|| src.split("/media/").nth(1))
+    {
         // rest = "<token>/<itemId>/…"
         let item = rest.split('/').nth(1).unwrap_or_default();
         return (!item.is_empty()).then(|| item.to_string());
@@ -192,6 +283,18 @@ fn now_epoch_ms() -> u64 {
 /// `win` = 上报窗口的 label（渲染器 query 的 `win` 键）：非空时同步记进
 /// [`ContentServerState::label_diag`] 分档，换纸按自己的 label 等 ready/failure。
 /// ready / failed 同时**广播**一条引擎事件，让等待方立刻醒来（不再轮询）。
+/// 宿主侧也往同一条诊断历史里记一笔（如「页面自抓帧失败、已回退原生快照」）。
+///
+/// 页面上报走 `record_renderer_diag`（同一份缓冲）；宿主侧的失败原因如果不记，
+/// 「回退成功」这条路上就完全看不到自抓帧为什么没用起来。
+pub fn note_diag(app: &tauri::AppHandle, msg: &str, win: Option<&str>) {
+    let Some(state) = app.try_state::<ContentServerState>() else {
+        return;
+    };
+    record_renderer_diag(&state, msg, win);
+    tracing::warn!("[host diag] {msg}");
+}
+
 fn record_renderer_diag(state: &ContentServerState, msg: &str, win: Option<&str>) {
     let now_ms = now_epoch_ms;
     let is_ready = msg.ends_with("] ready");
@@ -200,6 +303,16 @@ fn record_renderer_diag(state: &ContentServerState, msg: &str, win: Option<&str>
         state
             .wallpaper_ready_ms
             .store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+    }
+    // 历史（`renderer_diag` 工具用）：无论有没有 win 都记一条，带解析出的条目 id
+    if let Ok(mut log) = state.diag_log.lock() {
+        log.push(DiagEntry {
+            at_ms: now_ms(),
+            label: win.unwrap_or("").to_string(),
+            item: diag_item_id(msg).unwrap_or_default(),
+            msg: msg.to_string(),
+            failed: fail_reason.is_some(),
+        });
     }
     if let Ok(mut d) = state.renderer_diag.lock() {
         d.last = msg.to_string();
@@ -324,6 +437,202 @@ fn label_failure_since_state(
     Some(d.fail_reason)
 }
 
+/// 诊断缓冲里最近 `within_ms` 内有没有包含 `needle` 的记录。
+///
+/// 用途：主窗口的预览桥是**前端**装的控制面，前端版本旧/还没加载完时 `eval` 会静默
+/// 落空。宿主据此快速失败（3s 内没看到页面回话就别干等 60s），并给出可操作的提示。
+pub fn diag_has_recent(app: &tauri::AppHandle, needle: &str, within_ms: u64) -> bool {
+    let Some(st) = app.try_state::<ContentServerState>() else {
+        return false;
+    };
+    let Ok(log) = st.diag_log.lock() else {
+        return false;
+    };
+    let now = now_epoch_ms();
+    log.entries
+        .iter()
+        .rev()
+        .take(40)
+        .any(|e| e.msg.contains(needle) && now.saturating_sub(e.at_ms) <= within_ms)
+}
+
+/// 渲染器抓帧的回执（要么是一张图，要么一句为什么抓不到）
+#[derive(Debug)]
+pub enum CaptureReply {
+    Image(Vec<u8>, String),
+    Failed(String),
+}
+
+/// 干活的渲染器把图 POST 回宿主时走这里（见 [`request_capture`]）。
+pub struct CaptureRequest {
+    pub req: String,
+    pub mime: String,
+    pub bytes: Vec<u8>,
+    pub error: Option<String>,
+}
+
+/// 收下渲染器回传的抓帧结果。返回 false = 没有人在等这个 req（超时/陈旧上报）。
+pub fn deliver_capture(app: &tauri::AppHandle, r: CaptureRequest) -> bool {
+    let Some(state) = app.try_state::<ContentServerState>() else {
+        return false;
+    };
+    let tx = state
+        .capture_waiters
+        .lock()
+        .ok()
+        .and_then(|mut m| m.remove(&r.req));
+    let Some(tx) = tx else { return false };
+    let reply = match r.error {
+        Some(e) => CaptureReply::Failed(e),
+        None if r.bytes.is_empty() => CaptureReply::Failed("渲染器返回了空图".into()),
+        None => CaptureReply::Image(r.bytes, r.mime),
+    };
+    tx.send(reply).is_ok()
+}
+
+/// 让某个壁纸窗口**抓一帧**并等它回传。
+///
+/// 做法：注册一个一次性回执槽 → 用 `eval` 在页面里调 `window.__wpCapture(req, maxWidth)`
+/// → 等页面把图 POST 到 `/capture`。三个平台同一套（不依赖各平台的原生快照 API）。
+/// `max_width` 建议 ≤ 1920：抓帧要走一次 HTTP 回传，4K 原图没必要。
+pub async fn request_capture(
+    app: &tauri::AppHandle,
+    label: &str,
+    max_width: Option<u32>,
+    timeout: std::time::Duration,
+) -> Result<(Vec<u8>, String), String> {
+    let state = app
+        .try_state::<ContentServerState>()
+        .ok_or("内容服务器未就绪")?;
+    let window = app
+        .get_webview_window(label)
+        .ok_or_else(|| format!("找不到壁纸窗口 {label}"))?;
+    let req = format!("cap-{}", random_hex(8));
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .capture_waiters
+        .lock()
+        .map_err(|e| e.to_string())?
+        .insert(req.clone(), tx);
+    let mw = max_width.unwrap_or(0);
+    // eval 里的字符串要转义（req 是自己生成的十六进制，安全，但仍按规范处理）
+    let js = format!(
+        "window.__wpCapture && window.__wpCapture({}, {mw})",
+        serde_json::to_string(&req).unwrap_or_else(|_| "''".into())
+    );
+    if let Err(e) = window.eval(&js) {
+        // 摘掉等待槽：不摘的话每失败一次就在 map 里留一条永不回收的记录
+        if let Ok(mut m) = state.capture_waiters.lock() {
+            m.remove(&req);
+        }
+        return Err(format!("派发抓帧指令失败: {e}"));
+    }
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(CaptureReply::Image(bytes, mime))) => Ok((bytes, mime)),
+        Ok(Ok(CaptureReply::Failed(why))) => Err(why),
+        Ok(Err(_)) => Err("抓帧回执通道被丢弃".into()),
+        Err(_) => {
+            if let Ok(mut m) = state.capture_waiters.lock() {
+                m.remove(&req);
+            }
+            Err(format!(
+                "等渲染器抓帧超时（{}s）—— 页面可能还没就绪，或该类型没有可读画面（web 类型是 iframe，抓不到）",
+                timeout.as_secs()
+            ))
+        }
+    }
+}
+
+/// `renderer_diag` 工具的查询参数（都在工具层解析好再进来）
+pub struct DiagQuery {
+    pub label: Option<String>,
+    pub item: Option<String>,
+    /// 只要这个时刻（epoch millis）之后的（0 = 不过滤）
+    pub since_ms: u64,
+    pub limit: usize,
+    /// 读之前先清空（对应工具参数 clear=true）
+    pub clear: bool,
+}
+
+/// 读渲染器诊断历史（`renderer_diag` 工具）。
+///
+/// 返回 `{ entries, shown, total, buffered, cap, last, failReason, readyItem, sessions }`：
+/// - `entries` 时间正序，`{at,label,item,msg,failed}`；
+/// - `total` 是**累计**写入条数（含环形丢掉的），`buffered` 是当前缓存条数 ——
+///   两者不等时说明 agent 看到的不是全部，可以据此判断「要不要早一点来读」。
+///
+pub fn diag_snapshot(app: &tauri::AppHandle, q: &DiagQuery) -> serde_json::Value {
+    let Some(state) = app.try_state::<ContentServerState>() else {
+        return serde_json::json!({ "error": "内容服务器未就绪", "entries": [] });
+    };
+    let entries = {
+        let Ok(mut log) = state.diag_log.lock() else {
+            return serde_json::json!({ "error": "诊断缓冲不可用", "entries": [] });
+        };
+        if q.clear {
+            log.clear(q.label.as_deref());
+        }
+        log.query(
+            q.label.as_deref(),
+            q.item.as_deref(),
+            q.since_ms,
+            q.limit.clamp(1, DIAG_LOG_CAP),
+        )
+        .into_iter()
+        .map(|e| {
+            serde_json::json!({
+                "at": e.at_ms,
+                "label": e.label,
+                "item": e.item,
+                "msg": e.msg,
+                "failed": e.failed,
+            })
+        })
+        .collect::<Vec<_>>()
+    };
+    let (total, buffered) = {
+        let log = state.diag_log.lock().ok();
+        log.map(|l| (l.total, l.len())).unwrap_or((0, 0))
+    };
+    let (last, fail_reason, ready_item) = {
+        let d = state.renderer_diag.lock().ok();
+        d.map(|d| (d.last.clone(), d.fail_reason.clone(), d.ready_item.clone()))
+            .unwrap_or_default()
+    };
+    // 分档快照：每个 label 的 ready/fail 时刻与归属条目（判断「哪扇页没起来」用）
+    let sessions: serde_json::Value = state
+        .label_diag
+        .lock()
+        .map(|m| {
+            let mut out = serde_json::Map::new();
+            for (k, v) in m.iter() {
+                out.insert(
+                    k.clone(),
+                    serde_json::json!({
+                        "last": v.last,
+                        "readyMs": v.ready_ms,
+                        "readyItem": v.ready_item,
+                        "failMs": v.fail_ms,
+                        "failReason": v.fail_reason,
+                    }),
+                );
+            }
+            serde_json::Value::Object(out)
+        })
+        .unwrap_or_else(|_| serde_json::json!({}));
+    serde_json::json!({
+        "entries": entries,
+        "shown": entries.len(),
+        "total": total,
+        "buffered": buffered,
+        "cap": DIAG_LOG_CAP,
+        "last": last,
+        "failReason": fail_reason,
+        "readyItem": ready_item,
+        "sessions": sessions,
+    })
+}
+
 /// 给「等待渲染器就绪超时」类错误配一句人能看懂的原因（渲染器自报失败优先，
 /// 否则给最近一条诊断 —— 常见是停在 `mount start`，说明还在解析大 scene.pkg）
 // 目前只有 macOS 的壁纸截图自检（system_wallpaper::capture_wallpaper_png）会用到
@@ -378,6 +687,8 @@ pub fn init(app: &AppHandle) -> Result<(), String> {
         wallpaper_ready_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         renderer_diag: Default::default(),
         label_diag: Default::default(),
+        diag_log: Default::default(),
+        capture_waiters: Default::default(),
         engine_events: tokio::sync::broadcast::channel(64).0,
     };
     app.manage(state.clone());
@@ -405,8 +716,9 @@ pub fn init(app: &AppHandle) -> Result<(), String> {
                 continue;
             };
             let state = state.clone();
+            let app2b = app2.clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = handle_conn(&mut stream, &state).await {
+                if let Err(e) = handle_conn(&mut stream, &state, &app2b).await {
                     // 视频/WebCodecs 拉流时中止 Range 请求是常态（缓冲够了就取消），
                     // Broken pipe / Connection reset 不算异常，不刷日志
                     if e.contains("Broken pipe") || e.contains("Connection reset") {
@@ -581,6 +893,7 @@ async fn proxy_static(
 async fn handle_conn(
     stream: &mut tokio::net::TcpStream,
     state: &ContentServerState,
+    app: &tauri::AppHandle,
 ) -> Result<(), String> {
     // 读取请求头（最多 16KB，直到空行）
     let mut buf = Vec::with_capacity(2048);
@@ -595,6 +908,8 @@ async fn handle_conn(
             break;
         }
     }
+    // 头/体边界（POST /capture 要把请求体读全）
+    let head_end = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4);
     let head = String::from_utf8_lossy(&buf);
     let mut lines = head.lines();
     let request_line = lines.next().unwrap_or("");
@@ -623,6 +938,119 @@ async fn handle_conn(
         )
         .await;
     }
+    // 渲染器抓帧回传（POST /capture?req=<id>）：体是图像原始字节，
+    // 或 `content-type: application/json` 的 `{"error":"…"}`（页面抓不到画面时）。
+    // 这是本服务器唯一的 POST 端点 —— 其它一律 405。
+    if path.starts_with("/capture") {
+        if method != "POST" {
+            return respond(stream, 405, "Method Not Allowed", "text/plain", b"", None).await;
+        }
+        let mut req = String::new();
+        let mut q_mime: Option<String> = None;
+        let mut q_error: Option<String> = None;
+        for kv in query.split('&') {
+            if let Some(v) = kv.strip_prefix("req=") {
+                req = percent_decode(v);
+            } else if let Some(v) = kv.strip_prefix("mime=") {
+                q_mime = Some(percent_decode(v));
+            } else if let Some(v) = kv.strip_prefix("error=") {
+                q_error = Some(percent_decode(v));
+            }
+        }
+        if req.is_empty() {
+            return respond(
+                stream,
+                400,
+                "Bad Request",
+                "text/plain",
+                b"missing req",
+                None,
+            )
+            .await;
+        }
+        // Content-Length：拿不到就当 0（JSON 错误回执走这条）
+        // 单张抓帧图的上限：1920 宽的 JPEG 通常几百 KB，32 MiB 足够宽松；
+        // **必须设限** —— Content-Length 是客户端给的，不设限时一个畸形/恶意请求
+        // 就能让本进程按声明值一路读下去（本机服务也不该有这种放大器）。
+        const MAX_CAPTURE_BYTES: usize = 32 << 20;
+        let mut content_length = 0usize;
+        for line in head.lines() {
+            if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                content_length = v.trim().parse().unwrap_or(0);
+            }
+        }
+        if content_length > MAX_CAPTURE_BYTES {
+            return respond(
+                stream,
+                413,
+                "Payload Too Large",
+                "text/plain",
+                b"capture body too large",
+                None,
+            )
+            .await;
+        }
+        let mut body: Vec<u8> = match head_end {
+            Some(i) if i <= buf.len() => buf[i..].to_vec(),
+            _ => Vec::new(),
+        };
+        // 头一次读可能只带了一部分体（4KB 一读），按 Content-Length 补齐
+        while body.len() < content_length {
+            let want = (content_length - body.len()).min(64 * 1024);
+            let mut more = vec![0u8; want];
+            match stream.read(&mut more).await {
+                Ok(0) => break,
+                Ok(n) => body.extend_from_slice(&more[..n]),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        // 失败回执有三种写法，都认：
+        //   ① `?error=<文本>`（无体，**跨源也不必预检** —— 主窗口预览走这条）
+        //   ② `content-type: application/json` + `{"error":"…"}`（同源页面用）
+        //   ③ 空体（没抓到但也没说原因）
+        let is_json = head
+            .lines()
+            .any(|l| l.to_ascii_lowercase().starts_with("content-type:") && l.contains("json"));
+        let from_header = head
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
+            .map(|l| {
+                l.split_once(':')
+                    .map(|(_, v)| v.trim().to_string())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let (bytes, mime, error) = if let Some(why) = q_error {
+            (Vec::new(), String::new(), Some(why))
+        } else if is_json {
+            let txt = String::from_utf8_lossy(&body).to_string();
+            let why = serde_json::from_str::<serde_json::Value>(&txt)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
+                .unwrap_or_else(|| "渲染器抓帧失败".to_string());
+            (Vec::new(), String::new(), Some(why))
+        } else {
+            // mime：query 优先（跨源走 text/plain 的简单请求时用它带真类型）
+            let mime = q_mime
+                .or_else(|| from_header.starts_with("image/").then_some(from_header))
+                .unwrap_or_else(|| "image/jpeg".to_string());
+            (body, mime, None)
+        };
+        let ok = deliver_capture(
+            app,
+            CaptureRequest {
+                req,
+                mime,
+                bytes,
+                error,
+            },
+        );
+        // 没人在等（超时后的陈旧上报）也回 200：这是 fire-and-forget 通道，
+        // 让页面别把一个 404 当成渲染错误打日志
+        let body_txt = if ok { "ok" } else { "stale" };
+        return respond(stream, 200, "OK", "text/plain", body_txt.as_bytes(), None).await;
+    }
+
     if method != "GET" {
         return respond(stream, 405, "Method Not Allowed", "text/plain", b"", None).await;
     }
@@ -664,7 +1092,7 @@ async fn handle_conn(
                 }
             }
         }
-        record_renderer_diag(&state, &msg, win.as_deref());
+        record_renderer_diag(state, &msg, win.as_deref());
         tracing::warn!("[renderer diag] {msg}");
         return respond(stream, 200, "OK", "text/plain", b"ok", None).await;
     }
@@ -757,21 +1185,17 @@ async fn handle_conn(
             return respond(stream, 401, "Unauthorized", "text/plain", b"", None).await;
         }
         // 条目存在性检查 + 引用模式条目的源目录解析，一次加锁完成
-        let base = state
-            .db
-            .lock()
-            .ok()
-            .and_then(|conn| {
-                let ok = conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM library_items WHERE item_id = ?1",
-                        [item_id.as_str()],
-                        |r| r.get::<_, i64>(0),
-                    )
-                    .map(|n| n > 0)
-                    .unwrap_or(false);
-                ok.then(|| crate::library::resolved_item_dir_in(&conn, &state.wallpapers_dir, &item_id))
-            });
+        let base = state.db.lock().ok().and_then(|conn| {
+            let ok = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM library_items WHERE item_id = ?1",
+                    [item_id.as_str()],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map(|n| n > 0)
+                .unwrap_or(false);
+            ok.then(|| crate::library::resolved_item_dir_in(&conn, &state.wallpapers_dir, &item_id))
+        });
         let Some(base) = base else {
             return respond(stream, 404, "Not Found", "text/plain", b"", None).await;
         };
@@ -837,21 +1261,17 @@ async fn handle_conn(
     }
     // itemId 白名单（guard 在闭包内释放，避免跨 await 持有非 Send 锁）
     // 条目存在性检查 + 引用模式条目的源目录解析，一次加锁完成
-    let base = state
-        .db
-        .lock()
-        .ok()
-        .and_then(|conn| {
-            let ok = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM library_items WHERE item_id = ?1",
-                    [item_id.as_str()],
-                    |r| r.get::<_, i64>(0),
-                )
-                .map(|n| n > 0)
-                .unwrap_or(false);
-            ok.then(|| crate::library::resolved_item_dir_in(&conn, &state.wallpapers_dir, &item_id))
-        });
+    let base = state.db.lock().ok().and_then(|conn| {
+        let ok = conn
+            .query_row(
+                "SELECT COUNT(*) FROM library_items WHERE item_id = ?1",
+                [item_id.as_str()],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n > 0)
+            .unwrap_or(false);
+        ok.then(|| crate::library::resolved_item_dir_in(&conn, &state.wallpapers_dir, &item_id))
+    });
     let Some(base) = base else {
         return respond(stream, 404, "Not Found", "text/plain", b"", None).await;
     };
@@ -897,7 +1317,7 @@ async fn handle_conn(
     // 每次请求都付出「读整个视频」的磁盘与内存代价；循环交接处备用元素的首批
     // 取数因此被拖慢 ~1s，表现为壁纸每圈卡一下。
     if !mime.starts_with("text/html") && rel_path != "project.json" {
-        return serve_file_stream(stream, &file, &mime, &range).await;
+        return serve_file_stream(stream, &file, mime, &range).await;
     }
 
     let data = tokio::fs::read(&file).await.map_err(|e| e.to_string())?;
@@ -946,7 +1366,7 @@ async fn handle_conn(
         stream,
         200,
         "OK",
-        &mime,
+        mime,
         &data,
         Some(&format!(
             "Accept-Ranges: bytes\r\nContent-Length: {}",
@@ -1063,7 +1483,7 @@ async fn now_playing_sse(
     loop {
         let (seq, snap) = state.media.snapshot();
         // 内容变了就发；否则每 ~2s 补一次让播放进度前进（约 8 * 250ms）
-        let heartbeat = snap.state == 1 && ticks % 8 == 0;
+        let heartbeat = snap.state == 1 && ticks.is_multiple_of(8);
         if seq != last_seq || heartbeat {
             last_seq = seq;
             let json = serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into());
@@ -1219,6 +1639,8 @@ mod tests {
             wallpaper_ready_ms: Default::default(),
             renderer_diag: Default::default(),
             label_diag: Default::default(),
+            diag_log: Default::default(),
+            capture_waiters: Default::default(),
             engine_events: tokio::sync::broadcast::channel(64).0,
         };
 
@@ -1340,6 +1762,8 @@ mod tests {
             wallpaper_ready_ms: Default::default(),
             renderer_diag: Default::default(),
             label_diag: Default::default(),
+            diag_log: Default::default(),
+            capture_waiters: Default::default(),
             engine_events: tokio::sync::broadcast::channel(64).0,
         }
     }
@@ -1353,7 +1777,8 @@ mod tests {
             Some("1948961570")
         );
         assert_eq!(
-            diag_item_id("[web http://127.0.0.1:8080/web/tok123/abc456/index.html] ready").as_deref(),
+            diag_item_id("[web http://127.0.0.1:8080/web/tok123/abc456/index.html] ready")
+                .as_deref(),
             Some("abc456")
         );
         assert_eq!(
@@ -1371,20 +1796,27 @@ mod tests {
     fn record_renderer_diag_tracks_ready_and_failure() {
         let state = diag_test_state();
         assert_eq!(
-            state.wallpaper_ready_ms.load(std::sync::atomic::Ordering::Relaxed),
+            state
+                .wallpaper_ready_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
             0
         );
 
         record_renderer_diag(&state, "[scene 111] mount start", None);
         assert_eq!(
-            state.wallpaper_ready_ms.load(std::sync::atomic::Ordering::Relaxed),
+            state
+                .wallpaper_ready_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
             0,
             "mount start 不是 ready，不该动时间戳"
         );
 
         record_renderer_diag(&state, "[scene 111] ready", None);
         assert!(
-            state.wallpaper_ready_ms.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            state
+                .wallpaper_ready_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0,
             "ready 必须记时间戳"
         );
         {
@@ -1409,8 +1841,18 @@ mod tests {
         let t0 = now_epoch_ms();
         record_renderer_diag(&state, "[scene 111] ready", Some("wallpaper-a"));
         record_renderer_diag(&state, "[scene 222] ready", Some("wallpaper-b"));
-        assert!(label_ready_since_state(&state, "wallpaper-a", t0, Some("111")));
-        assert!(label_ready_since_state(&state, "wallpaper-b", t0, Some("222")));
+        assert!(label_ready_since_state(
+            &state,
+            "wallpaper-a",
+            t0,
+            Some("111")
+        ));
+        assert!(label_ready_since_state(
+            &state,
+            "wallpaper-b",
+            t0,
+            Some("222")
+        ));
         assert!(
             !label_ready_since_state(&state, "wallpaper-a", t0, Some("222")),
             "A 的 ready 不该被 B 的条目覆盖"
@@ -1672,6 +2114,8 @@ mod tests {
             wallpaper_ready_ms: Default::default(),
             renderer_diag: Default::default(),
             label_diag: Default::default(),
+            diag_log: Default::default(),
+            capture_waiters: Default::default(),
             engine_events: tokio::sync::broadcast::channel(64).0,
         };
         let html =
@@ -1787,7 +2231,7 @@ async fn respond(
     // "Connection: close" 会多出一个空行，导致 "Connection: close" 被当成响应 body，
     // 浏览器会在页面顶部把这段文字渲染出来。这里统一保证 Connection: close 是最后一行头。
     let mut head = format!(
-        "HTTP/1.1 {code} {reason}\r\nContent-Type: {content_type}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\n"
+        "HTTP/1.1 {code} {reason}\r\nContent-Type: {content_type}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\n"
     );
     if let Some(extra) = extra_headers {
         head.push_str(extra);
@@ -1825,7 +2269,15 @@ async fn local_assets_route(
         .ok()
         .and_then(|conn| crate::db::get_setting(&conn, "wallpaper_we_assets_dir"));
     let Some(root) = crate::we_assets::resolve_root(custom.as_deref()) else {
-        return respond(stream, 200, "OK", "application/json", br#"{"ok":false,"roots":[]}"#, None).await;
+        return respond(
+            stream,
+            200,
+            "OK",
+            "application/json",
+            br#"{"ok":false,"roots":[]}"#,
+            None,
+        )
+        .await;
     };
 
     // 探测：根可用。id 固定 "we"（消费方只用 roots[0].id 拼后续 URL）
@@ -1893,15 +2345,15 @@ fn random_file_in_dir(dir: &Path, rel_prefix: &str) -> Option<String> {
     let files: Vec<String> = entries
         .flatten()
         .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
-        .filter_map(|e| {
+        .map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
             // 提前拒绝 HTML？WE 目录属性会返回任意文件（幻灯片场景以图片为主），
             // 不做类型过滤，交由壁纸自身处理
-            Some(if rel_prefix.is_empty() {
+            if rel_prefix.is_empty() {
                 name
             } else {
                 format!("{}/{}", rel_prefix.trim_end_matches('/'), name)
-            })
+            }
         })
         .collect();
     if files.is_empty() {

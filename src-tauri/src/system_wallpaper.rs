@@ -40,7 +40,7 @@ pub fn sync_after_apply(
         return;
     };
     // 引用模式条目：内容目录是源目录
-    let Ok(dir) = crate::library::item_dir(&app, &item_id) else {
+    let Ok(dir) = crate::library::item_dir(app, &item_id) else {
         return;
     };
     // scene/web：没有可直接解码的媒体文件，等渲染器 ready 后实拍截图
@@ -758,9 +758,60 @@ pub fn ready_stamp(app: &AppHandle) -> u64 {
         .unwrap_or(0)
 }
 
+/// 某块屏的壁纸窗口 label（`wallpaper-<displayId>`，见 wallpaper 模块的建窗命名）
+pub fn label_for_display(display_id: &str) -> String {
+    format!("wallpaper-{}", display_id.trim())
+}
+
+/// 屏幕上当前挂着哪一条壁纸：返回 `(窗口 label, 条目 id)`。
+///
+/// `display_id` 给定时只看那块屏（多屏各挂不同壁纸时，截图必须能指定拍哪一块）；
+/// 缺省优先 scene/web 那扇（截图自检针对的就是它们），否则取第一扇。
+///
+/// 截图工具用它做**一致性校验**：`apply=false` 表示「拍屏上现在这张」，那么屏上那张
+/// 必须就是调用方要的那张 —— 否则会把 A 的画面当成 B 交出去（比报错难查得多）。
+pub fn onscreen_item(app: &AppHandle, display_id: Option<&str>) -> Option<(String, String)> {
+    let want = display_id.map(str::trim).filter(|d| !d.is_empty());
+    let label = match want {
+        Some(d) => label_for_display(d),
+        None => {
+            // 没点名屏：优先 scene/web 那扇（截图自检针对的就是它们）
+            let engine = app.try_state::<crate::wallpaper::WallpaperEngineState>()?;
+            let windows = engine.windows.lock().ok()?;
+            windows
+                .iter()
+                .find(|(_, c)| matches!(c.r#type.as_str(), "scene" | "web"))
+                .or_else(|| windows.iter().next())
+                .map(|(l, _)| l.clone())?
+        }
+    };
+    // 条目 id：内存会话优先，**DB 兜底** —— 重启后窗口可能由恢复流程「接管」而不是
+    // 重建，内存 map 未必有它（曾因此让 apply=false 的一致性校验静默失效：查不到就跳过
+    // 校验，于是把屏上别的壁纸当成请求的那张交了出去）。
+    let from_mem = app
+        .try_state::<crate::wallpaper::WallpaperEngineState>()
+        .and_then(|st| {
+            let windows = st.windows.lock().ok()?;
+            windows.get(&label).and_then(crate::wallpaper::item_id_of)
+        });
+    let id = from_mem.or_else(|| {
+        let db = app.try_state::<std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>>()?;
+        let conn = db.lock().ok()?;
+        conn.query_row(
+            "SELECT item_id FROM wallpaper_sessions WHERE display_id = ?1",
+            [&label.trim_start_matches("wallpaper-")],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+    });
+    // 窗口不存在就当作「屏上什么都没有」：调用方据此报错，而不是拍一张别的东西
+    app.get_webview_window(&label)?;
+    Some((label, id.unwrap_or_default()))
+}
+
 /// 挑一面当前挂着壁纸的窗口 label（优先 scene/web：截图自检针对的就是它们）
 // Linux 下 capture_wallpaper_png 走「不支持」分支，这个挑窗口的辅助函数只被 macOS 用
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn pick_wallpaper_window(app: &AppHandle) -> Option<String> {
     let engine = app.try_state::<crate::wallpaper::WallpaperEngineState>()?;
     let windows = engine.windows.lock().ok()?;
@@ -771,17 +822,18 @@ fn pick_wallpaper_window(app: &AppHandle) -> Option<String> {
         .map(|(label, _)| label.clone())
 }
 
-/// 等渲染器就绪 → 再等一拍 → 对壁纸窗口实拍 PNG。
+/// 等渲染器就绪 → 再等一拍，返回**该拍哪扇窗**（label）。
 ///
-/// `t0` 必须是应用壁纸**之前**读到的 `ready_stamp`；`settle_ms` 是首帧上屏后
-/// 额外等待的时间（场景要几帧才稳定，截太早会拍到半成品）。
-#[cfg(target_os = "macos")]
-pub async fn capture_wallpaper_png(
+/// 跨平台共用：三条截图路（页面抓帧 / macOS 原生快照 / 未来的平台实现）都要先等
+/// 「这一张壁纸真的画完了」。`t0` 必须是应用壁纸**之前**读到的 `ready_stamp`；
+/// `settle_ms` 是首帧上屏后额外等待的时间（场景要几帧才稳定，截太早会拍到半成品）。
+pub async fn wait_renderer_ready(
     app: &AppHandle,
     t0: u64,
     settle_ms: u64,
     timeout_ms: u64,
-) -> Result<Vec<u8>, String> {
+    only_label: Option<&str>,
+) -> Result<String, String> {
     use std::sync::atomic::Ordering;
 
     let ready_ms = app
@@ -796,7 +848,9 @@ pub async fn capture_wallpaper_png(
     // 建窗本身要几十到几百毫秒；开头探一次会在建窗完成前就报「没有壁纸窗口」。
     // **事件驱动**：订阅引擎事件，渲染器报 ready / 换纸落地即醒；睡觉只为超时。
     let mut events = crate::content_server::subscribe_engine(app);
-    let mut label: Option<String> = None;
+    // 指定了 label（多屏时点名拍哪一块屏）就只认它
+    let fixed = only_label.map(|l| l.to_string());
+    let mut label: Option<String> = fixed.clone();
     loop {
         if label.is_none() {
             label = pick_wallpaper_window(app);
@@ -817,6 +871,10 @@ pub async fn capture_wallpaper_png(
                 Some(l) => format!(
                     "等待渲染器就绪超时（{limit}ms，窗口 {l}）。{hint}；可加大 timeoutMs 重试"
                 ),
+                None if fixed.is_some() => format!(
+                    "等待渲染器就绪超时（{limit}ms）：指定屏的壁纸窗口 {} 不存在（该屏没挂壁纸？用 displays_list 核对 id）。{hint}",
+                    fixed.clone().unwrap_or_default()
+                ),
                 None => format!("等待渲染器就绪超时（{limit}ms）：未找到正在显示的壁纸窗口。{hint}"),
             });
         }
@@ -828,6 +886,45 @@ pub async fn capture_wallpaper_png(
     if settle_ms > 0 {
         tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
     }
+    Ok(label)
+}
+
+/// **页面自抓帧**（三个平台同一套，见 [`crate::content_server::request_capture`]）。
+///
+/// 覆盖 scene / gif / image / canvas / video（视频帧与页面同源，drawImage 可用）；
+/// 只有 web 类型（独立 iframe）抓不到 —— 那时返回的错误信息里写明了原因，调用方
+/// 可回退到平台原生快照。
+pub async fn capture_via_renderer(
+    app: &AppHandle,
+    t0: u64,
+    settle_ms: u64,
+    timeout_ms: u64,
+    max_width: Option<u32>,
+    only_label: Option<&str>,
+) -> Result<(Vec<u8>, String, String), String> {
+    let label = wait_renderer_ready(app, t0, settle_ms, timeout_ms, only_label).await?;
+    // 抓帧本身给 20s：页面里是一次 drawImage + toDataURL + 一次 POST
+    let (bytes, mime) = crate::content_server::request_capture(
+        app,
+        &label,
+        max_width,
+        std::time::Duration::from_secs(20),
+    )
+    .await?;
+    Ok((bytes, mime, label))
+}
+
+/// 等渲染器就绪 → 再等一拍 → 对壁纸窗口实拍 PNG（macOS 原生快照，保真度最高：
+/// 视频/网页类型的合成结果都在里面）。
+#[cfg(target_os = "macos")]
+pub async fn capture_wallpaper_png(
+    app: &AppHandle,
+    t0: u64,
+    settle_ms: u64,
+    timeout_ms: u64,
+    only_label: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    let label = wait_renderer_ready(app, t0, settle_ms, timeout_ms, only_label).await?;
 
     let window = crate::wallpaper::wallpaper_window(app, &label)
         .ok_or_else(|| format!("壁纸窗口 {label} 已不存在"))?;
@@ -850,6 +947,16 @@ pub async fn capture_wallpaper_png(
     _t0: u64,
     _settle_ms: u64,
     _timeout_ms: u64,
+    _only_label: Option<&str>,
 ) -> Result<Vec<u8>, String> {
-    Err("壁纸截图自检目前仅支持 macOS（Linux/Windows 请用应用内预览或自行截图）".into())
+    // 只有 web 类型会走到这里（页面抓帧抓不到 iframe），且该平台没有原生快照实现。
+    //
+    // 要补齐这一步需要各平台的原生抓帧：Linux 走 WebKitGTK 的
+    // `webkit_web_view_get_snapshot()`（配 `webkit2gtk` crate），Windows 走 WebView2 的
+    // `ICoreWebView2CapturePreview`（配 `webview2-com`）。两者都需要在对应平台上编译与
+    // 实机验证，本仓的 CI 只出 macOS 产物 —— 与其盲写两份编不过的代码，不如在这里
+    // 明确说清代价与替代路径（见 docs/mcp-authoring-scene.md §11）。
+    Err("这个平台没有原生窗口快照（仅 macOS 有）；web 类型请用应用内预览，\
+         或改用 scene / video / gif / image 类型（那几类走渲染器自抓帧，三平台都能截）"
+        .into())
 }

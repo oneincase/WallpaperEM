@@ -9,10 +9,112 @@ use tauri::{AppHandle, Manager};
 use crate::library::LibraryFilter;
 use crate::workspace;
 
-/// 工具清单（name / description / inputSchema）
+/// 部分工具的**结构化输出** schema（MCP 2025-06-18 的 `outputSchema`）。
+///
+/// 只给形状稳定、agent 最常消费的几个声明：声明了就必须在结果里给
+/// `structuredContent` 且能对上（见 `protocol::call_tool_message`）。schema 刻意写得
+/// **宽松**（不写 required、`additionalProperties: true`）—— 目的是让客户端能做类型
+/// 分发/展示，不是当校验器用；写太严只会让未来的字段增补变成破坏性变更。
+fn output_schema_for(name: &str) -> Option<Value> {
+    let obj = |props: Value| json!({ "type": "object", "properties": props, "additionalProperties": true });
+    let arr_str = || json!({ "type": "array", "items": { "type": "string" } });
+    Some(match name {
+        "projects_list" => obj(json!({
+            "root": { "type": "string" },
+            "projects": { "type": "array", "items": obj(json!({
+                "project": { "type": "string" },
+                "path": { "type": "string" },
+                "type": { "type": "string" },
+                "title": { "type": "string" },
+                "packed": { "type": "boolean" },
+                "installedItemId": { "type": ["string", "null"] },
+            })) },
+        })),
+        "project_validate" => obj(json!({
+            "ok": { "type": "boolean" },
+            "project": { "type": "string" },
+            "type": { "type": "string" },
+            "title": { "type": "string" },
+            "entry": { "type": ["string", "null"] },
+            "errors": arr_str(),
+            "warnings": arr_str(),
+        })),
+        "scene_pack" => obj(json!({
+            "project": { "type": "string" },
+            "bytes": { "type": "integer" },
+            "convertedTextures": arr_str(),
+            "entries": { "type": "array", "items": obj(json!({
+                "name": { "type": "string" },
+                "bytes": { "type": "integer" },
+            })) },
+            "warnings": arr_str(),
+        })),
+        "project_install" => obj(json!({
+            "project": { "type": "string" },
+            "itemId": { "type": "string" },
+            "title": { "type": "string" },
+            "type": { "type": "string" },
+        })),
+        "project_update" => obj(json!({
+            "project": { "type": "string" },
+            "itemId": { "type": "string" },
+            "mode": { "type": "string", "enum": ["incremental", "install"] },
+            "copied": { "type": "integer" },
+            "removed": { "type": "integer" },
+            "unchanged": { "type": "integer" },
+        })),
+        "renderer_diag" => obj(json!({
+            "entries": { "type": "array", "items": obj(json!({
+                "at": { "type": "integer" },
+                "label": { "type": "string" },
+                "item": { "type": "string" },
+                "msg": { "type": "string" },
+                "failed": { "type": "boolean" },
+            })) },
+            "shown": { "type": "integer" },
+            "total": { "type": "integer" },
+            "buffered": { "type": "integer" },
+            "cap": { "type": "integer" },
+            "last": { "type": "string" },
+            "failReason": { "type": "string" },
+            "readyItem": { "type": "string" },
+        })),
+        "wallpaper_preview" => obj(json!({
+            "itemId": { "type": "string" },
+            "label": { "type": "string" },
+            "frames": { "type": "array", "items": obj(json!({
+                "tMs": { "type": "integer" },
+                "bytes": { "type": "integer" },
+                "mimeType": { "type": "string" },
+            })) },
+        })),
+        "wallpaper_screenshot" => obj(json!({
+            "itemId": { "type": "string" },
+            "bytes": { "type": "integer" },
+            "applied": { "type": "boolean" },
+        })),
+        _ => return None,
+    })
+}
+
+/// 把工具结果里的 JSON 文本块抽成 `structuredContent`（MCP 2025-06-18）。
+///
+/// 只在结果是对象/数组时给：标量（"ok"、数字）没有结构可言，硬塞反而让客户端为难。
+/// 文本块**照旧保留** —— 老客户端读 text、新客户端读 structuredContent，两边都不破。
+pub fn structured_content(content: &[Value]) -> Option<Value> {
+    let text = content
+        .iter()
+        .find(|c| c.get("type").and_then(|t| t.as_str()) == Some("text"))?
+        .get("text")?
+        .as_str()?;
+    let v: Value = serde_json::from_str(text).ok()?;
+    matches!(v, Value::Object(_) | Value::Array(_)).then_some(v)
+}
+
+/// 工具清单（name / description / inputSchema + 部分工具的 outputSchema）
 pub fn definitions() -> Vec<Value> {
     let obj = |props: Value, required: Value| json!({ "type": "object", "properties": props, "required": required });
-    vec![
+    let mut defs = vec![
         json!({
             "name": "projects_list",
             "description": "列出工作区（~/Documents/WallpaperEM/Projects）里的全部壁纸工程及其类型、是否已打包、是否已安装。",
@@ -30,7 +132,7 @@ pub fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": "project_write_file",
-            "description": "写工程内文件（自动建目录）。贴图等二进制内容用 encoding=base64。写入会让旧的 scene.pkg 失效并被删除。",
+            "description": "写工程内文件（自动建目录）。贴图等二进制内容用 encoding=base64（单文件上限 40 MB，base64 会膨胀 4/3，所以原图建议 < 30 MB；更大就写进工程目录再打包）。写入会让旧的 scene.pkg 失效并被删除。写 materials/<名字>.png 时会顺手删掉同名的 .tex，避免打包器优先用旧 .tex。",
             "inputSchema": obj(json!({
                 "project": { "type": "string" },
                 "path": { "type": "string", "description": "工程内相对路径，如 scene.json 或 materials/bg.png" },
@@ -59,8 +161,22 @@ pub fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": "scene_pack",
-            "description": "把 scene 工程打包成 scene.pkg（materials 下的 PNG/JPEG 自动转成 .tex 并内嵌）。打包前会先校验，有 error 会拒绝打包。",
-            "inputSchema": obj(json!({ "project": { "type": "string" } }), json!(["project"])),
+            "description": "把 scene 工程打包成 scene.pkg（materials 下的 PNG/JPEG 自动转成 .tex 并内嵌）。打包前会先校验，有 error 会拒绝打包。install=true 时紧接着装/更新进本地库（改完一步到位，省一次往返）。",
+            "inputSchema": obj(json!({
+                "project": { "type": "string" },
+                "install": { "type": "boolean", "description": "打包后直接装/更新进本地库（已装过则增量更新，item_id 不变），默认 false" },
+            }), json!(["project"])),
+        }),
+        json!({
+            "name": "renderer_diag",
+            "description": "读渲染器诊断历史（最近 300 条）：挂载过程、贴图/视频加载失败、效果 pass 被跳过（[we-scene] 告警）、ready/failed 时刻。截图或画面异常时先看它——「效果静默消失」「贴图没找到」这类问题只在这里可见。",
+            "inputSchema": obj(json!({
+                "label": { "type": "string", "description": "只看某个壁纸窗口 label（list_sessions 里的键）" },
+                "itemId": { "type": "string", "description": "只看某个本地库条目的诊断" },
+                "sinceMs": { "type": "integer", "description": "只要这个时间戳（epoch 毫秒）之后的" },
+                "limit": { "type": "integer", "description": "最多返回多少条（默认 50，上限 300）" },
+                "clear": { "type": "boolean", "description": "读之前先清空（下一轮迭代从干净历史开始），默认 false" },
+            }), json!([])),
         }),
         json!({
             "name": "project_delete",
@@ -105,15 +221,42 @@ pub fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": "wallpaper_screenshot",
-            "description": "对当前壁纸窗口实拍一张 PNG 并作为图片内容返回（仅 macOS）。默认先应用到桌面再看效果；可顺手存成工程的 preview.png 当封面。同一张壁纸已经挂在屏上时会跳过重复应用（不会把大 scene.pkg 再解析一遍），连拍很快。",
+            "description": "对当前壁纸窗口抓一帧并作为图片内容返回。优先让渲染器自己抓帧（scene/gif/image/video 三平台都可），抓不到时回退平台原生快照（仅 macOS，web 类型只有它能拍）。默认先应用到桌面再看效果；同一张壁纸已经挂在屏上、且库里的文件没比屏幕上这份更新时会跳过重复应用（不会把大 scene.pkg 再解析一遍），连拍很快。改完工程重新 project_update 之后，这里会自动重新挂载（比的是内容时间，不是 itemId），拿到的一定是新版画面；要强制重挂传 force=true。",
             "inputSchema": obj(json!({
                 "itemId": { "type": "string", "description": "要截图的本地库条目 id" },
+                "displayId": { "type": "string", "description": "可选：只拍这块屏（displays_list 返回的 id）。多屏各挂不同壁纸时用它点名；给了它就不走「已挂在屏上」快路径，且 apply 只作用于该屏" },
                 "apply": { "type": "boolean", "description": "是否先应用该壁纸，默认 true；该壁纸已就绪时自动跳过重复应用" },
+                "force": { "type": "boolean", "description": "强制重新应用（即使该壁纸已就绪），默认 false；改完工程想确保截到新版时用" },
                 "settleMs": { "type": "integer", "description": "渲染就绪后额外等待毫秒数，默认 1500" },
+                "maxWidth": { "type": "integer", "description": "抓帧最大宽度（等比缩放），默认 1920；截图只用于看效果/当封面，压小可显著减小回传体积" },
+                "framesMs": {
+                    "type": "array",
+                    "items": { "type": "integer" },
+                    "description": "多帧截图：相对首帧就绪的毫秒时刻数组（如 [0, 1000, 3000]，最多 8 个）。用于验收动画/循环/关键帧——单张图看不出时间维度的问题。每帧一个 image 内容块，顺序与请求一致。注意：窗口被完全遮挡时系统会降频渲染，几帧可能一模一样（此时把应用切到前台再看）",
+                },
                 "timeoutMs": { "type": "integer", "description": "等待渲染就绪的上限，默认 60000（大 scene.pkg 冷启动可能要 30s+）" },
                 "saveAsPreview": { "type": "boolean", "description": "是否把截图写成工程的 preview.png，默认 true" },
                 "project": { "type": "string", "description": "可选：工程名（存 preview 用；不传则按 itemId 反查）" },
             }), json!(["itemId"])),
+        }),
+        json!({
+            "name": "wallpaper_preview",
+            "description": "**离屏预览**：把某张壁纸（或工程）在一扇用户看不见的窗口里渲染并抓帧返回，**完全不碰桌面壁纸会话** —— 迭代时不必把它挂到桌面上。scene/gif/image/video 都可；web 类型需要平台原生快照（仅 macOS）。比 wallpaper_screenshot 更适合「改一处看一眼」的循环。",
+            "inputSchema": obj(json!({
+                "itemId": { "type": "string", "description": "本地库条目 id；给 project 时可以省略" },
+                "project": { "type": "string", "description": "工程名：会用它在本地库里的副本（没装过就先装一次），方便「改完直接看」" },
+                "width": { "type": "integer", "description": "预览窗逻辑宽，默认 1280" },
+                "height": { "type": "integer", "description": "预览窗逻辑高，默认 720" },
+                "maxWidth": { "type": "integer", "description": "抓帧最大宽度（等比缩放），默认等于 width" },
+                "framesMs": {
+                    "type": "array",
+                    "items": { "type": "integer" },
+                    "description": "多帧：相对首帧就绪的毫秒时刻数组（如 [0,1000,3000]，最多 8 个）",
+                },
+                "timeoutMs": { "type": "integer", "description": "等这扇预览窗首帧就绪的上限，默认 60000" },
+                "keepOpen": { "type": "boolean", "description": "保留离屏画布不释放（调试用），默认 false；保留的实例在 180s 内没有新的抓帧请求时会自动释放" },
+                "openMainWindow": { "type": "boolean", "description": "主窗口被关闭/回收时是否允许宿主重新打开它当作渲染面（会弹到前台）。默认 false：直接报错并提示替代方案" },
+            }), json!([])),
         }),
         json!({
             "name": "list_sessions",
@@ -205,10 +348,15 @@ pub fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": "library_list",
-            "description": "列出本地库壁纸（已安装/已下载），支持类型、标题关键字与排序。",
+            "description": "列出本地库壁纸（已安装/已下载），支持类型、标题关键字、标签与排序。tagGroups 里可用两个库内专用值：`$project` = 本软件自己的工程（project_* 建出来又装进库的），`$local` = 本地导入（custom-*）。",
             "inputSchema": obj(json!({
                 "type": { "type": "string", "description": "video / scene / web / gif，留空不过滤" },
                 "query": { "type": "string", "description": "标题模糊搜索" },
+                "tagGroups": {
+                    "type": "array",
+                    "items": { "type": "array", "items": { "type": "string" } },
+                    "description": "分组标签：组内并集、组间交集。Steam 标签名照工坊写（Scene/Video/Anime…）；两个库内专用值：$project（自建工程）、$local（本地导入）",
+                },
                 "sort": { "type": "string", "description": "downloaded_desc（默认）/ downloaded_asc / title_asc / title_desc / size_desc / size_asc" },
                 "limit": { "type": "integer", "description": "默认 50，上限 500" },
                 "offset": { "type": "integer", "description": "默认 0" },
@@ -216,7 +364,7 @@ pub fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": "library_delete",
-            "description": "从本地库删除壁纸（含磁盘文件与数据库记录，不可撤销）。",
+            "description": "从本地库删除壁纸（含磁盘文件与数据库记录，不可撤销）。只想移出库、保留文件用 library_remove。",
             "inputSchema": obj(json!({ "itemId": { "type": "string" } }), json!(["itemId"])),
         }),
         json!({
@@ -295,12 +443,120 @@ pub fn definitions() -> Vec<Value> {
             "description": "重试某个失败的下载任务。",
             "inputSchema": obj(json!({ "id": { "type": "integer" } }), json!(["id"])),
         }),
-    ]
+    ];
+    // 声明了 outputSchema 的工具，结果里必须有对应的 structuredContent（见 protocol）
+    for d in defs.iter_mut() {
+        let name = d
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .to_string();
+        if let Some(schema) = output_schema_for(&name) {
+            if let Some(o) = d.as_object_mut() {
+                o.insert("outputSchema".into(), schema);
+            }
+        }
+    }
+    defs
 }
 
 // ---------------------------------------------------------------- 调用入口
 
+// ---------------------------------------------------------------- 调用入口
+
+/// 一个工具调用需要持有的**串行化键**（0~2 个）。
+///
+/// 分两个命名空间，因为「工程目录」与「库内条目」是两份数据：
+///
+/// - `project:<名>`：工程内的读写/校验/体检/打包
+/// - `item:<id>`：库内条目的读（预览、截图）、写（删/移）、以及**安装/更新时的写入**
+///
+/// 安装/更新同时碰两边（读工程、写库），所以两把都要拿 —— 只锁工程的话，
+/// 「`scene_pack(install=true)` 正在增量同步库目录」与「`wallpaper_preview` 正在读同一
+/// 个库条目」会撞上：预览可能读到写了一半的 `scene.pkg`/贴图，表现为偶发黑屏或旧画面。
+///
+/// 多把键按**字典序**获取（见 `call`），因此不会出现 A 等 B、B 等 A 的死锁。
+fn lock_keys(name: &str, args: &Value) -> Vec<String> {
+    const PROJECT_TOOLS: [&str; 9] = [
+        "project_write_file",
+        "project_read_file",
+        "project_list_files",
+        "project_validate",
+        "scene_inspect",
+        "scene_pack",
+        "project_install",
+        "project_update",
+        "project_import_asset",
+    ];
+    // 会写库目录的工具：安装/更新（工程 → 库），以及删/移（库自身）
+    const INSTALL_TOOLS: [&str; 2] = ["project_install", "project_update"];
+    const ITEM_TOOLS: [&str; 4] = [
+        "wallpaper_preview",
+        "wallpaper_screenshot",
+        "library_delete",
+        "library_remove",
+    ];
+    let mut keys: Vec<String> = Vec::new();
+    let project = args
+        .get("project")
+        .and_then(|p| p.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if PROJECT_TOOLS.contains(&name) {
+        if let Some(p) = project {
+            keys.push(format!("project:{p}"));
+        }
+    }
+    // 条目 id：显式 itemId 优先；安装/更新时用「工程名 → 条目 id」的确定性映射
+    let mut item = args
+        .get("itemId")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    if item.is_none() && INSTALL_TOOLS.contains(&name) {
+        if let Some(p) = project {
+            item = Some(crate::library::project_item_id_for(p));
+        }
+    }
+    if ITEM_TOOLS.contains(&name) || INSTALL_TOOLS.contains(&name) || name == "scene_pack" {
+        // 没给 itemId 时按工程名推条目 id（工程名 → 条目 id 是确定性映射）。
+        // ⚠️ 预览/安装这类工具**允许只传 project**（"改完直接看"那条路），漏掉这一步
+        // 就等于「工程名调用完全没锁」—— 预览正读库目录、安装正在写同一份，正是要防的竞态。
+        if item.is_none() {
+            if let Some(p) = project {
+                item = Some(crate::library::project_item_id_for(p));
+            }
+        }
+        if let Some(id) = item {
+            keys.push(format!("item:{id}"));
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// 取（必要时创建）某个键的互斥锁
+fn resource_lock(key: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let map = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut m = map.lock().unwrap_or_else(|e| e.into_inner());
+    m.entry(key.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 pub async fn call(app: &AppHandle, name: &str, args: &Value) -> (Vec<Value>, bool) {
+    // 同一资源串行（不同资源并行）：见 lock_keys 的说明。
+    // 多把键按字典序获取 —— 全局一致的顺序 = 不会死锁。
+    let mut guards = Vec::new();
+    for key in lock_keys(name, args) {
+        guards.push(resource_lock(&key).lock_owned().await);
+    }
+    let _guards = guards;
     match call_inner(app, name, args).await {
         Ok(mut v) => {
             // 截图结果里夹着 base64 图（`_image`）：抽成 MCP 的 image 内容块，
@@ -316,6 +572,19 @@ pub async fn call(app: &AppHandle, name: &str, args: &Value) -> (Vec<Value>, boo
                     ],
                     false,
                 );
+            }
+            // 多帧截图（`framesMs`）：一帧一个 image 块，顺序与请求一致，元数据在文本块里
+            let frames = extract_images(&v);
+            if !frames.is_empty() {
+                if let Some(obj) = v.as_object_mut() {
+                    obj.remove("_images");
+                }
+                let mut blocks: Vec<Value> = frames
+                    .into_iter()
+                    .map(|(data, mime)| json!({ "type": "image", "data": data, "mimeType": mime }))
+                    .collect();
+                blocks.extend(text_content(&v));
+                return (blocks, false);
             }
             (text_content(&v), false)
         }
@@ -370,6 +639,16 @@ async fn call_inner(app: &AppHandle, name: &str, args: &Value) -> Result<Value, 
             let app = app.clone();
             let project = req_str(args, "project")?;
             blocking(move || workspace::validate_project(&app, &project)).await
+        }
+        "renderer_diag" => {
+            let q = crate::content_server::DiagQuery {
+                label: opt_str(args, "label"),
+                item: opt_str(args, "itemId"),
+                since_ms: args.get("sinceMs").and_then(|v| v.as_u64()).unwrap_or(0),
+                limit: args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize,
+                clear: opt_bool(args, "clear"),
+            };
+            Ok(crate::content_server::diag_snapshot(app, &q))
         }
         "scene_pack" => {
             let app = app.clone();
@@ -426,6 +705,7 @@ async fn call_inner(app: &AppHandle, name: &str, args: &Value) -> Result<Value, 
             Ok(json!({ "paused": false }))
         }
         "wallpaper_screenshot" => screenshot(app, args).await,
+        "wallpaper_preview" => preview(app, args).await,
         "list_sessions" => list_sessions(app),
         "displays_list" => crate::wallpaper::displays_list(app.clone()),
         "playlist_list" => {
@@ -460,11 +740,12 @@ async fn call_inner(app: &AppHandle, name: &str, args: &Value) -> Result<Value, 
             let app = app.clone();
             let id = args.get("id").and_then(|v| v.as_i64()).ok_or("缺少 id")?;
             let name = opt_str(args, "name");
-            let ids: Option<Vec<String>> = args.get("itemIds").and_then(|v| v.as_array()).map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_str().map(String::from))
-                    .collect()
-            });
+            let ids: Option<Vec<String>> =
+                args.get("itemIds").and_then(|v| v.as_array()).map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                });
             let interval = args.get("intervalSec").and_then(|v| v.as_i64());
             let shuffle = args.get("shuffle").and_then(|v| v.as_bool());
             let p = blocking(move || {
@@ -528,9 +809,30 @@ async fn call_inner(app: &AppHandle, name: &str, args: &Value) -> Result<Value, 
         "library_list" => {
             let app = app.clone();
             let wtype = opt_str(args, "type");
+            // tagGroups：组内并集、组间交集；`$project` / `$local` 两个库内专用值由
+            // library.rs 翻译（前者真源是工程目录，后者是 custom-* / 引用模式条目）
+            let tag_groups: Vec<Vec<String>> = args
+                .get("tagGroups")
+                .and_then(|v| v.as_array())
+                .map(|groups| {
+                    groups
+                        .iter()
+                        .filter_map(|g| g.as_array())
+                        .map(|g| {
+                            g.iter()
+                                .filter_map(|t| t.as_str())
+                                .map(|t| t.trim().to_string())
+                                .filter(|t| !t.is_empty())
+                                .collect::<Vec<_>>()
+                        })
+                        .filter(|g: &Vec<String>| !g.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
             let filter = Some(LibraryFilter {
                 query: opt_str(args, "query"),
                 sort: opt_str(args, "sort"),
+                tag_groups,
                 ..Default::default()
             });
             let items =
@@ -559,7 +861,8 @@ async fn call_inner(app: &AppHandle, name: &str, args: &Value) -> Result<Value, 
         "library_open_folder" => {
             let app = app.clone();
             let item_id = req_str(args, "itemId")?;
-            let opened = blocking(move || crate::library::library_open_folder(app, item_id)).await?;
+            let opened =
+                blocking(move || crate::library::library_open_folder(app, item_id)).await?;
             Ok(json!({ "opened": opened }))
         }
         "item_props_get" => {
@@ -615,13 +918,11 @@ async fn call_inner(app: &AppHandle, name: &str, args: &Value) -> Result<Value, 
                 Some(project),
                 opt_str(args, "title"),
                 opt_str(args, "description"),
-                args.get("tags")
-                    .and_then(|v| v.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|t| t.as_str().map(|s| s.to_string()))
-                            .collect()
-                    }),
+                args.get("tags").and_then(|v| v.as_array()).map(|a| {
+                    a.iter()
+                        .filter_map(|t| t.as_str().map(|s| s.to_string()))
+                        .collect()
+                }),
                 opt_str(args, "visibility"),
                 opt_str(args, "changelog"),
             )
@@ -664,11 +965,17 @@ async fn call_inner(app: &AppHandle, name: &str, args: &Value) -> Result<Value, 
 
 /// 该条目是否**正是**当前挂在所有屏上、且渲染器已就绪的那张。
 ///
-/// 两个条件都要满足才允许截图跳过 apply（省掉一次完整的 pkg 解析 + WebGL 重建）：
+/// 三个条件都要满足才允许截图跳过 apply（省掉一次完整的 pkg 解析 + WebGL 重建）：
 ///   - 每面屏的会话配置都指向这个条目 —— 只比「最近 ready 的条目」是不够的：
 ///     刚切到 B、B 还在挂载时，`ready_item` 仍是上一次的 A，只比 ready 会拿 A 的旧判断
 ///     去跳过 B 的挂载，截到的就是张正在换台的画面。
 ///   - 渲染器最近一次 ready 的条目也是它（渲染器还没报过 ready 就不能算挂好）。
+///   - **屏幕上的这份不比磁盘上的库文件旧**（见 [`item_content_stamp`]）。
+///
+/// 第三条是「改完看不到变化」的根治：agent 的迭代是
+/// 改文件 → scene_pack → project_update，而 `project_update` **刻意保持 itemId 不变**
+/// （用户改过的属性覆盖挂在 itemId 上），库导入路径也不会去碰壁纸引擎 —— 只比 itemId
+/// 的话，第二轮迭代会被判成「还是那张、跳过应用」，截图和 preview.png 都停留在上一版。
 fn already_ready(app: &AppHandle, item_id: &str) -> bool {
     let Some(state) = app.try_state::<crate::wallpaper::WallpaperEngineState>() else {
         return false;
@@ -685,15 +992,95 @@ fn already_ready(app: &AppHandle, item_id: &str) -> bool {
     drop(windows);
     // 换纸还在飞时 windows 里已登记新配置、ready 还是上一张的 —— 都不作数，
     // 等换纸整体落地再判「已挂在屏上」
-    all_match
-        && crate::content_server::ready_item(app).as_deref() == Some(item_id)
-        && !crate::wallpaper::any_swap_in_flight()
+    if !all_match
+        || crate::content_server::ready_item(app).as_deref() != Some(item_id)
+        || crate::wallpaper::any_swap_in_flight()
+    {
+        return false;
+    }
+    // ready 时刻早于库文件的最新 mtime = 屏幕上这份是旧的（重新安装过但没重挂）
+    let stamp = item_content_stamp(app, item_id);
+    crate::system_wallpaper::ready_stamp(app) >= stamp
+}
+
+/// 库内条目的内容指纹（epoch 毫秒）：条目目录 + 几个关键文件的 mtime 取最大。
+///
+/// 只 stat 5 个路径，几百张壁纸的库里也不会成为负担；条目的重新安装会重建目录或
+/// 覆盖 scene.pkg（`update_project` 先把旧目录 rename 走再导入），所以 mtime 一定会变。
+fn item_content_stamp(app: &AppHandle, item_id: &str) -> u64 {
+    let Ok(dir) = crate::library::item_dir(app, item_id) else {
+        return 0;
+    };
+    let mut newest = 0u64;
+    let mut bump = |p: &std::path::Path| {
+        if let Ok(m) = std::fs::metadata(p).and_then(|m| m.modified()) {
+            if let Ok(d) = m.duration_since(std::time::UNIX_EPOCH) {
+                newest = newest.max(d.as_millis() as u64);
+            }
+        }
+    };
+    bump(&dir);
+    for f in ["scene.pkg", "project.json", "scene.json", "index.html"] {
+        bump(&dir.join(f));
+    }
+    newest
+}
+
+/// 拍一张：**先让渲染器自己抓帧**（三个平台同一套），失败再回退到平台原生快照
+/// （macOS 有；web 类型只有它能拍）。
+///
+/// 返回 `(bytes, mime)`。
+async fn capture_once(
+    app: &AppHandle,
+    t0: u64,
+    settle: u64,
+    timeout: u64,
+    max_width: Option<u32>,
+    // 只拍这块屏的窗口（多屏各挂不同壁纸时用；None = 自动挑一扇）
+    only_label: Option<&str>,
+) -> Result<(Vec<u8>, String), String> {
+    match crate::system_wallpaper::capture_via_renderer(
+        app, t0, settle, timeout, max_width, only_label,
+    )
+    .await
+    {
+        Ok((bytes, mime, _label)) => Ok((bytes, mime)),
+        Err(js_err) => {
+            // 页面抓不到（web 类型 / 画布还没准备好）→ 试平台原生。
+            // 失败原因同时记进诊断：否则「回退成功了」这条路上，页面自抓帧为什么失败
+            // 完全看不出来（页面的成功日志只到「正在回传」为止）。
+            crate::content_server::note_diag(
+                app,
+                &format!("capture: 页面自抓帧失败，回退原生快照 —— {js_err}"),
+                only_label,
+            );
+            match crate::system_wallpaper::capture_wallpaper_png(
+                app, t0, settle, timeout, only_label,
+            )
+            .await
+            {
+                Ok(png) => {
+                    let mime = image_mime_of(&png).to_string();
+                    Ok((png, mime))
+                }
+                Err(native_err) => Err(format!("{js_err}；原生快照也不行：{native_err}")),
+            }
+        }
+    }
 }
 
 /// 截图自检：可选先应用 → 等渲染就绪 → 实拍 → 可选存 preview.png
 async fn screenshot(app: &AppHandle, args: &Value) -> Result<Value, String> {
     let item_id = req_str(args, "itemId")?;
     let apply = args.get("apply").and_then(|v| v.as_bool()).unwrap_or(true);
+    // 多屏各挂不同壁纸时要能点名拍哪一块屏：displayId（displays_list 里那个 id）
+    let display = opt_str(args, "displayId").filter(|d| !d.trim().is_empty());
+    let only_label = display
+        .as_deref()
+        .map(crate::system_wallpaper::label_for_display);
+    // force：即使「已挂在屏上」也重新应用。改完工程（同一个 itemId）想确保截到新版
+    // 时用；正常迭代不必传 —— already_ready 已经会用内容时间来判新旧。
+    let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
     let settle = args
         .get("settleMs")
         .and_then(|v| v.as_u64())
@@ -712,10 +1099,14 @@ async fn screenshot(app: &AppHandle, args: &Value) -> Result<Value, String> {
     // 已经挂在屏上且渲染器已就绪 → 跳过重复应用。
     // 否则每次截图都会走一遍 setWallpaper → 库重新解析 pkg + 重建 WebGL 上下文，
     // 连拍时既慢又容易撞超时（这正是「截图超时」高频出现的另一个来源）。
-    let skip_apply = apply && already_ready(app, &item_id);
+    // 指定了屏就不走「已挂好」快路径：already_ready 判的是「所有屏都是这张」，
+    // 与「只看这块屏」不是一回事，宁多重挂一次也不要拍错屏。
+    let skip_apply = apply && !force && only_label.is_none() && already_ready(app, &item_id);
     // 先读 ready 时间戳再应用：否则可能立刻读到上一张壁纸的旧时间戳。
-    // 跳过应用时 t0 置 0 —— 当前时间戳本就属于这张壁纸，不该再等它「变得更新」
-    let t0 = if skip_apply {
+    // 不重新应用时 t0 一律置 0 —— 当前时间戳本就属于屏幕上这张，不该再等它「变得更
+    // 新」（apply=false 只想拍「现在屏上是什么」，若还等新 ready 就必然等到超时，
+    // 只能靠轮播换纸之类的偶然事件救场）。
+    let t0 = if skip_apply || !apply {
         0
     } else {
         crate::system_wallpaper::ready_stamp(app)
@@ -723,32 +1114,292 @@ async fn screenshot(app: &AppHandle, args: &Value) -> Result<Value, String> {
     if apply && !skip_apply {
         let app2 = app.clone();
         let id = item_id.clone();
-        blocking(move || crate::wallpaper::apply_item(app2, id, None)).await?;
+        let disp = display.clone();
+        blocking(move || crate::wallpaper::apply_item(app2, id, disp)).await?;
     }
-    let png = crate::system_wallpaper::capture_wallpaper_png(app, t0, settle, timeout).await?;
+    // 多帧：`framesMs` 给的是「相对首帧就绪」的毫秒时刻（升序去重、上限 8 个）。
+    // 首帧仍走同一条等待路径（t0 判新旧 + settle），后续帧只是在已挂载的页面上
+    // 按时间差再拍 —— 一帧一个 image 块，顺序与请求一致。
+    let frames: Vec<u64> = match args.get("framesMs").and_then(|v| v.as_array()) {
+        Some(arr) => {
+            let mut v: Vec<u64> = arr.iter().filter_map(|x| x.as_u64()).collect();
+            v.sort_unstable();
+            v.dedup();
+            if v.len() > 8 {
+                return Err("framesMs 最多 8 个时刻（多了既慢又占上下文）".into());
+            }
+            v
+        }
+        None => Vec::new(),
+    };
+    // apply=false 表示「拍屏上现在这张」：那就必须确认屏上那张**就是**请求的这张。
+    // 否则 A 挂在屏上时请求 B，会把 A 的画面当成 B 交出去 —— 而且看起来一切正常。
+    if !apply {
+        if let Some((label, onscreen)) =
+            crate::system_wallpaper::onscreen_item(app, display.as_deref())
+        {
+            if onscreen != item_id {
+                return Err(format!(
+                    "屏幕上是 {onscreen}（窗口 {label}），不是请求的 {item_id}；\
+                     要拍它请传 apply=true（会先应用），或先把它应用上去"
+                ));
+            }
+        }
+    }
+
+    // 抓帧分辨率：截图只用于看效果/当封面，统一压到 1920 宽以内（也保证回传体积小）
+    let max_width = args
+        .get("maxWidth")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1920) as u32;
+    let (png, mime) = capture_once(
+        app,
+        t0,
+        settle,
+        timeout,
+        Some(max_width),
+        only_label.as_deref(),
+    )
+    .await?;
+
+    let mut images: Vec<Value> = vec![json!({
+        "tMs": frames.first().copied().unwrap_or(0),
+        "bytes": png.len(),
+        "data": B64.encode(&png),
+        "mimeType": mime,
+    })];
+    if frames.len() > 1 {
+        let base = std::time::Instant::now();
+        for t in frames.iter().skip(1) {
+            // 第一帧拍摄本身已经花掉一段时间，按绝对时刻补齐剩余等待
+            let elapsed = base.elapsed().as_millis() as u64;
+            if *t > elapsed {
+                tokio::time::sleep(std::time::Duration::from_millis(*t - elapsed)).await;
+            }
+            // t0=0：这张壁纸已经就绪，不该再等 ready 时间戳变新；settle 用调用方给的
+            let (extra, extra_mime) = capture_once(
+                app,
+                0,
+                settle,
+                timeout,
+                Some(max_width),
+                only_label.as_deref(),
+            )
+            .await?;
+            images.push(json!({
+                "tMs": t,
+                "bytes": extra.len(),
+                "data": B64.encode(&extra),
+                "mimeType": extra_mime,
+            }));
+        }
+    }
 
     let mut saved_to = Value::Null;
     if save_preview {
         let project = match opt_str(args, "project") {
             Some(p) => Some(p),
-            None => workspace::find_project_by_item(app, &item_id).ok().flatten(),
+            None => workspace::find_project_by_item(app, &item_id)
+                .ok()
+                .flatten(),
         };
         if let Some(project) = project {
             let app2 = app.clone();
             let bytes = png.clone();
-            let path = blocking(move || workspace::save_preview(&app2, &project, &bytes)).await?;
+            let ext = if mime.contains("jpeg") { "jpg" } else { "png" };
+            let path =
+                blocking(move || workspace::save_preview_as(&app2, &project, &bytes, ext)).await?;
             saved_to = json!(path);
         }
     }
 
-    Ok(json!({
+    let mut out = json!({
         "itemId": item_id,
         "bytes": png.len(),
         "previewPath": saved_to,
         // 本次是否真的重新应用过（false = 复用了已经挂好的同一张壁纸）
         "applied": apply && !skip_apply,
-        "_image": B64.encode(&png),
-    }))
+    });
+    if images.len() == 1 {
+        // 单帧走老字段（`_image`）保持与既有客户端兼容。
+        // ⚠️ mime 必须一起带上：老字段只放 base64，缺了它就只剩「按扩展名硬编码」这一条
+        // 路，渲染器自抓帧产出的是 JPEG，客户端却会按 PNG 去解。
+        let mut one = images.remove(0);
+        out["mimeType"] = one["mimeType"].clone();
+        out["_image"] = one["data"].take();
+    } else {
+        out["frames"] = json!(images
+            .iter()
+            .map(|f| json!({ "tMs": f["tMs"], "bytes": f["bytes"] }))
+            .collect::<Vec<_>>());
+        out["_images"] = json!(images);
+    }
+    Ok(out)
+}
+
+/// 离屏预览：让**主窗口**把这张壁纸挂在屏外的画布上渲染，再抓帧（可多帧）。
+///
+/// 为什么不是「另开一扇预览窗」：macOS 上不可见的窗口会被 WebKit 判为遮挡而停止出帧
+/// —— 实测预览窗把 scene.pkg 全部解析完、贴图也传完了，却永远等不到首帧 ready
+/// （诊断停在 mount 中途）。主窗口本来就可见在跑，把画布放到屏外既不露给用户、
+/// 三个平台也同一套代码，还省掉了建窗/销毁/数据存储回收这一圈。
+///
+/// 桌面壁纸会话**完全不动**，所以比 `wallpaper_screenshot` 更适合「改一处看一眼」。
+async fn preview(app: &AppHandle, args: &Value) -> Result<Value, String> {
+    // itemId 优先；只给 project 时用它在本地库里的副本（没装过就先装）
+    let item_id = match opt_str(args, "itemId") {
+        Some(id) if !id.trim().is_empty() => id,
+        _ => {
+            let project = req_str(args, "project")?;
+            match workspace::installed_item_id_of(app, &project) {
+                Some(id) => id,
+                None => {
+                    let (id, _title, _ty) = workspace::install_project(app, &project)?;
+                    id
+                }
+            }
+        }
+    };
+    let width = args.get("width").and_then(|v| v.as_u64()).unwrap_or(1280);
+    let height = args.get("height").and_then(|v| v.as_u64()).unwrap_or(720);
+    let max_width = args
+        .get("maxWidth")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(width) as u32;
+    let timeout = args
+        .get("timeoutMs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(60_000);
+    let keep_open = opt_bool(args, "keepOpen");
+    let frames: Vec<u64> = match args.get("framesMs").and_then(|v| v.as_array()) {
+        Some(arr) => {
+            let mut v: Vec<u64> = arr.iter().filter_map(|x| x.as_u64()).collect();
+            v.sort_unstable();
+            v.dedup();
+            if v.len() > 8 {
+                return Err("framesMs 最多 8 个时刻".into());
+            }
+            v
+        }
+        None => Vec::new(),
+    };
+
+    // 主窗口（label = "main"）：只有它装了 `__wpPreview` / `__wpCapture` 控制面。
+    //
+    // 主窗口可能被关掉、也可能被内存压力看门狗回收（见 main_window.rs）—— 那时
+    // 预览就没有渲染面了。**不自动把它弹出来**（agent 迭代时每调一次就弹一次主界面太扰人），
+    // 想要的话显式传 `openMainWindow: true`。
+    let mut opened_main = false;
+    if app.get_webview_window("main").is_none() {
+        if !opt_bool(args, "openMainWindow") {
+            return Err(
+                "主窗口当前不存在（已关闭或被内存压力回收）—— 离屏预览需要一个**可见的渲染面**\
+                 （隐藏/屏外窗口会被 WebKit 停帧，实测等不到首帧）。\
+                 两条路：① 传 openMainWindow=true 让宿主重新打开主界面；\
+                 ② 先在托盘/全局热键里打开主界面再重试；\
+                 ③ 或改用 wallpaper_screenshot（它借壁纸窗口渲染，不需要主窗口）"
+                    .into(),
+            );
+        }
+        let app2 = app.clone();
+        blocking(move || {
+            crate::main_window::ensure_main_window(&app2);
+            Ok(())
+        })
+        .await?;
+        // 建窗是异步的：等它真的出现再派发指令
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while app.get_webview_window("main").is_none() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        opened_main = app.get_webview_window("main").is_some();
+        if !opened_main {
+            return Err("尝试打开主窗口失败（8s 内未出现）".into());
+        }
+    }
+    let window = app
+        .get_webview_window("main")
+        .ok_or("主窗口不存在（预览依赖主窗口的离屏画布）")?;
+    let js = format!(
+        "window.__wpPreview && window.__wpPreview.start({}, {width}, {height})",
+        serde_json::to_string(&item_id).unwrap_or_else(|_| "''".into())
+    );
+    window
+        .eval(&js)
+        .map_err(|e| format!("派发预览指令失败: {e}"))?;
+
+    // 快速失败：预览桥是**前端**装的控制面，主窗口前端版本旧 / 还没加载完时上面那句
+    // eval 会静默落空（`window.__wpPreview && …`）。没看到页面回话就别干等满超时。
+    //
+    // 等待时长分两种：主窗口本来就在 → 3s 足够（桥早装好了，不该有"静默落空"以外的情况）；
+    // **刚被本工具打开** → 它的前端还在加载（dev 下还要拉 vite 的模块图），给 20s。
+    {
+        let wait = if opened_main { 20 } else { 3 };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
+        let mut answered = false;
+        while std::time::Instant::now() < deadline {
+            if crate::content_server::diag_has_recent(app, "[preview] start", 8_000) {
+                answered = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        }
+        if !answered {
+            return Err(format!(
+                "主窗口的预览桥没有响应（等了 {wait}s）—— 前端可能是旧版本（刷新一下主窗口即可），\
+                 或预览所需的 window.__wpPreview 未安装（见 src/lib/preview.ts）"
+            ));
+        }
+    }
+
+    // 抓帧：页面会等挂载落定再回图（超时/失败都会给原因）
+    let mut images: Vec<Value> = Vec::new();
+    let times: Vec<u64> = if frames.is_empty() { vec![0] } else { frames };
+    let started = std::time::Instant::now();
+    let result = async {
+        for (i, t) in times.iter().enumerate() {
+            if i > 0 {
+                let elapsed = started.elapsed().as_millis() as u64;
+                if *t > elapsed {
+                    tokio::time::sleep(std::time::Duration::from_millis(*t - elapsed)).await;
+                }
+            }
+            let (bytes, mime) = crate::content_server::request_capture(
+                app,
+                "main",
+                Some(max_width),
+                std::time::Duration::from_millis(timeout),
+            )
+            .await?;
+            images.push(json!({
+                "tMs": t,
+                "bytes": bytes.len(),
+                "data": B64.encode(&bytes),
+                "mimeType": mime,
+            }));
+        }
+        Ok::<(), String>(())
+    }
+    .await;
+
+    if !keep_open {
+        // 收掉离屏画布：不释放的话主窗口会替这张壁纸一直占着 WebGL 上下文与 pkg 缓存
+        let _ = window.eval("window.__wpPreview && window.__wpPreview.stop()");
+    }
+    result?;
+
+    let mut out = json!({
+        "itemId": item_id,
+        "size": { "width": width, "height": height },
+        "keptOpen": keep_open,
+        "openedMainWindow": opened_main,
+        "frames": images
+            .iter()
+            .map(|f| json!({ "tMs": f["tMs"], "bytes": f["bytes"], "mimeType": f["mimeType"] }))
+            .collect::<Vec<_>>(),
+    });
+    out["_images"] = json!(images);
+    Ok(out)
 }
 
 fn list_sessions(app: &AppHandle) -> Result<Value, String> {
@@ -816,10 +1467,68 @@ fn text_content(v: &Value) -> Vec<Value> {
     vec![json!({ "type": "text", "text": text })]
 }
 
-/// 截图结果里的 `_image`（base64）要转成 MCP 的 image 内容块，只取一次
+/// 多帧截图结果里的 `_images`（`[{data, mimeType}]`）
+pub fn extract_images(result: &Value) -> Vec<(String, String)> {
+    result
+        .get("_images")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|f| {
+                    let d = f.get("data")?.as_str()?.to_string();
+                    let m = f
+                        .get("mimeType")
+                        .and_then(|m| m.as_str())
+                        .map(|m| m.to_string())
+                        .unwrap_or_else(|| {
+                            let head = &d[..d.len().min(8)];
+                            let mut buf = Vec::with_capacity(6);
+                            B64.decode_vec(head, &mut buf).ok();
+                            image_mime_of(&buf).to_string()
+                        });
+                    Some((d, m))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 按魔术字节判图片格式：拿不到「生产者声明」时的兜底。
+///
+/// 为什么需要：`_image` 这条兼容通道只传 base64，不传 mime —— 声明与实际不一致时
+/// 客户端按声明去解码就会失败（曾经把渲染器自抓帧的 **JPEG** 一律标成 `image/png`）。
+pub fn image_mime_of(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "image/jpeg"
+    } else if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        "image/png"
+    } else if bytes.starts_with(b"RIFF") && bytes.len() >= 12 && &bytes[8..12] == b"WEBP" {
+        "image/webp"
+    } else if bytes.starts_with(b"GIF8") {
+        "image/gif"
+    } else {
+        "image/png"
+    }
+}
+
+/// 截图结果里的 `_image`（base64）要转成 MCP 的 image 内容块，只取一次。
+///
+/// mime 优先取结果里的声明（`mimeType`），没有就按前几个字节猜 —— 不再硬编码 png。
 pub fn extract_image(result: &Value) -> Option<(String, String)> {
     let b64 = result.get("_image").and_then(|v| v.as_str())?;
-    Some((b64.to_string(), "image/png".to_string()))
+    let mime = result
+        .get("mimeType")
+        .and_then(|m| m.as_str())
+        .map(|m| m.to_string())
+        .unwrap_or_else(|| {
+            // 只解前 8 个 base64 字符（6 字节）就够判魔术字节
+            let head = &b64[..b64.len().min(8)];
+            let n = head.len() / 4 * 3;
+            let mut buf = Vec::with_capacity(n);
+            B64.decode_vec(head, &mut buf).ok();
+            image_mime_of(&buf).to_string()
+        });
+    Some((b64.to_string(), mime))
 }
 
 fn req_str(args: &Value, key: &str) -> Result<String, String> {
@@ -870,6 +1579,181 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    /// 资源锁：同键同锁、异键异锁；键按字典序（保证加锁顺序一致、不死锁）
+    #[test]
+    fn resource_locks_are_per_key() {
+        let a = resource_lock("project:p1");
+        let b = resource_lock("project:p1");
+        let c = resource_lock("project:p2");
+        assert!(std::sync::Arc::ptr_eq(&a, &b), "同键必须是同一把锁");
+        assert!(!std::sync::Arc::ptr_eq(&a, &c), "不同键不能共用一把锁");
+    }
+
+    /// 锁原语本身：同键互斥、异键不互等（用确定性等待证明，不靠"跑得慢"来观察）
+    #[tokio::test]
+    async fn same_key_serializes_and_other_keys_do_not() {
+        use std::time::{Duration, Instant};
+        let held = resource_lock("item:probe").lock_owned().await;
+        let t0 = Instant::now();
+        let waiter = tokio::spawn(async move {
+            let _g = resource_lock("item:probe").lock_owned().await;
+            Instant::now()
+        });
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(!waiter.is_finished(), "同键任务不该在锁释放前就跑完");
+        drop(held);
+        let acquired = waiter.await.unwrap();
+        assert!(
+            acquired.duration_since(t0) >= Duration::from_millis(100),
+            "同键必须排队（实测 {:?}）",
+            acquired.duration_since(t0)
+        );
+
+        // 异键：互不阻塞（同一个工程域与条目域之间也如此）
+        let _a = resource_lock("item:x").lock_owned().await;
+        let t1 = Instant::now();
+        let _b = resource_lock("item:y").lock_owned().await;
+        let _c = resource_lock("project:z").lock_owned().await;
+        assert!(t1.elapsed() < Duration::from_millis(50), "不同键不该互相等");
+    }
+
+    /// 锁键的覆盖范围：工程域锁工程；安装/更新**同时**锁工程与库条目；
+    /// 预览/截图/删除锁库条目；两者顺序固定（字典序 → item 在前）。
+    #[test]
+    fn lock_keys_cover_both_namespaces() {
+        assert_eq!(
+            lock_keys("scene_pack", &json!({ "project": " p1 " })),
+            vec!["item:p1".to_string(), "project:p1".to_string()],
+            "打包会写库（install=true），两边都要锁；工程名要去空白"
+        );
+        assert_eq!(
+            lock_keys("scene_inspect", &json!({ "project": "p1" })),
+            vec!["project:p1".to_string()]
+        );
+        assert_eq!(
+            lock_keys("wallpaper_preview", &json!({ "itemId": "custom-x" })),
+            vec!["item:custom-x".to_string()]
+        );
+        assert_eq!(
+            lock_keys("wallpaper_screenshot", &json!({ "itemId": "7" })),
+            vec!["item:7".to_string()]
+        );
+        assert_eq!(
+            lock_keys("library_delete", &json!({ "itemId": "7" })),
+            vec!["item:7".to_string()]
+        );
+        // 只给工程名（"改完直接看"那条路）也必须锁到库条目 —— 否则预览与安装会撞车
+        assert_eq!(
+            lock_keys("wallpaper_preview", &json!({ "project": "p1" })),
+            vec!["item:p1".to_string()],
+            "预览只给 project 时也要按工程推出的条目 id 加锁"
+        );
+        assert_eq!(
+            lock_keys("project_install", &json!({ "project": "p1" })),
+            vec!["item:p1".to_string(), "project:p1".to_string()]
+        );
+        // 不同工程/条目互不阻塞；非资源域工具（如列表、播放控制）完全不锁
+        assert_ne!(
+            lock_keys("scene_pack", &json!({ "project": "p1" })),
+            lock_keys("scene_pack", &json!({ "project": "p2" }))
+        );
+        assert!(lock_keys("projects_list", &json!({ "project": "p1" })).is_empty());
+        assert!(lock_keys("wallpaper_apply", &json!({ "itemId": "7" })).is_empty());
+        assert!(lock_keys("scene_pack", &json!({})).is_empty());
+    }
+
+    /// 图片 mime：按魔术字节判，别再靠硬编码
+    #[test]
+    fn image_mime_sniffs_magic_bytes() {
+        assert_eq!(image_mime_of(&[0xFF, 0xD8, 0xFF, 0xE0]), "image/jpeg");
+        assert_eq!(image_mime_of(&[0x89, b'P', b'N', b'G', 0x0D]), "image/png");
+        assert_eq!(image_mime_of(b"RIFFaaaaWEBPVP8 "), "image/webp");
+        assert_eq!(image_mime_of(b"GIF89a"), "image/gif");
+        assert_eq!(image_mime_of(b"????"), "image/png", "认不出时退回 png");
+    }
+
+    /// 单帧截图（老字段 `_image`）必须带上真实 mime：
+    /// 声明优先；没有声明就按 base64 头几个字节嗅探（渲染器自抓帧给的是 JPEG）
+    #[test]
+    fn single_frame_image_keeps_real_mime() {
+        let jpeg = B64.encode([0xFFu8, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46]);
+        let declared = json!({ "_image": jpeg, "mimeType": "image/jpeg" });
+        assert_eq!(
+            extract_image(&declared),
+            Some((jpeg.clone(), "image/jpeg".to_string()))
+        );
+        // 没声明 → 按字节判出 jpeg（旧实现固定回 image/png，客户端按 png 解会失败）
+        let sniffed = json!({ "_image": jpeg });
+        assert_eq!(extract_image(&sniffed).unwrap().1, "image/jpeg");
+        // 真 PNG 仍然报 png
+        let png = B64.encode([0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        assert_eq!(
+            extract_image(&json!({ "_image": png })).unwrap().1,
+            "image/png"
+        );
+    }
+
+    /// 结构化输出：对象/数组才给，标量与坏 JSON 不给
+    #[test]
+    fn structured_content_only_for_json_containers() {
+        let obj = vec![json!({ "type": "text", "text": r#"{"a":1}"# })];
+        assert_eq!(structured_content(&obj), Some(json!({ "a": 1 })));
+        let arr = vec![json!({ "type": "text", "text": "[1,2]" })];
+        assert_eq!(structured_content(&arr), Some(json!([1, 2])));
+        let scalar = vec![json!({ "type": "text", "text": "ok" })];
+        assert_eq!(structured_content(&scalar), None);
+        let bad = vec![json!({ "type": "text", "text": "{not json" })];
+        assert_eq!(structured_content(&bad), None);
+        // 图片块在前、文本块在后也要能找到
+        let with_img = vec![
+            json!({ "type": "image", "data": "x", "mimeType": "image/png" }),
+            json!({ "type": "text", "text": r#"{"ok":true}"# }),
+        ];
+        assert_eq!(structured_content(&with_img), Some(json!({ "ok": true })));
+    }
+
+    /// 声明了 outputSchema 的工具名必须真实存在，且 schema 是宽松的 object
+    #[test]
+    fn output_schemas_match_tool_names() {
+        let defs = definitions();
+        let names: Vec<String> = defs
+            .iter()
+            .filter_map(|d| d["name"].as_str().map(String::from))
+            .collect();
+        let mut declared = 0;
+        for d in &defs {
+            let Some(schema) = d.get("outputSchema") else {
+                continue;
+            };
+            declared += 1;
+            let name = d["name"].as_str().unwrap();
+            assert!(names.contains(&name.to_string()));
+            assert_eq!(
+                schema["type"],
+                json!("object"),
+                "{name} 的 outputSchema 不是 object"
+            );
+            assert_eq!(
+                schema["additionalProperties"],
+                json!(true),
+                "{name} 的 outputSchema 要允许附加字段（未来加字段不该变成破坏性变更）"
+            );
+            assert!(
+                schema["properties"].is_object(),
+                "{name} 的 outputSchema 缺少 properties"
+            );
+        }
+        assert!(declared >= 8, "声明了 outputSchema 的工具太少: {declared}");
+        // 反向：常用工具都应该声明
+        for want in ["project_validate", "scene_pack", "renderer_diag"] {
+            assert!(
+                defs.iter()
+                    .any(|d| d["name"] == json!(want) && d.get("outputSchema").is_some()),
+                "{want} 应当声明 outputSchema"
+            );
+        }
+    }
+
     /// 工具清单与 call_inner 的 match 分派必须一一对应：
     /// 清单里有、分派里没有 = 客户端调这个工具永远得到「未知工具」。
     /// 没有活的 Tauri AppHandle 就没法真的调 call_inner（业务全在既有模块里），
@@ -896,7 +1780,11 @@ mod tests {
             // inputSchema 必须是合法的 object schema，且 required 字段都在 properties 里；
             // 写错的 schema 会让客户端在调用前就构造不出参数。
             let schema = &d["inputSchema"];
-            assert_eq!(schema["type"], json!("object"), "{name} 的 inputSchema 不是 object");
+            assert_eq!(
+                schema["type"],
+                json!("object"),
+                "{name} 的 inputSchema 不是 object"
+            );
             let props = schema["properties"]
                 .as_object()
                 .unwrap_or_else(|| panic!("{name} 的 properties 不是对象"));

@@ -21,8 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -44,6 +43,15 @@ const SETTING_PORT: &str = "mcp.port";
 const SETTING_TOKEN: &str = "mcp.token";
 /// 调用日志保留条数（只留在内存里，设置页展示用）
 const MAX_CALL_LOG: usize = 50;
+
+/// 单条 JSON-RPC 请求体上限。
+///
+/// axum 的 `Bytes` 提取器默认只收 **2 MB**，而 agent 写贴图走的是 base64
+/// （`project_write_file`）—— 一张 2048² 的 PNG 轻松超过 2 MB，于是工具还没执行就被
+/// 传输层用**纯文本**的 `413 length limit exceeded` 打回（不是 JSON-RPC 错误，客户端
+/// 可能直接判会话故障）。这里自己读 body 并给一个明确上限 + JSON-RPC 错误，
+/// 同时把上限压在工作区写入上限之上（见 `workspace::MAX_WRITE_BYTES`）。
+const MCP_MAX_BODY_BYTES: usize = 64 << 20;
 
 /// 网络模式：服务监听的位置与可访问范围（见 docs/network-service-and-sharing.md §4）
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -384,12 +392,7 @@ async fn renderer_page(State(app): State<AppHandle>, req: axum::extract::Request
         .unwrap_or_default();
     #[cfg(debug_assertions)]
     {
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .map_err(|e| e.to_string())
-            .and_then(|c| Ok(c));
-        let client = match client {
+        let client = match reqwest::Client::builder().no_proxy().build() {
             Ok(c) => c,
             Err(e) => {
                 return (StatusCode::BAD_GATEWAY, format!("proxy client error: {e}")).into_response()
@@ -399,6 +402,10 @@ async fn renderer_page(State(app): State<AppHandle>, req: axum::extract::Request
         // （text/html），模块脚本的 MIME 就错了 —— 内容服务器同款处理
         let vite_path = path.trim_start_matches('/');
         let upstream = format!("http://localhost:1420/{vite_path}{query}");
+        // 这里的 `return` 是必要的：下面还有 `#[cfg(not(debug_assertions))]` 分支，
+        // 两个 cfg 块都是语句，函数尾表达式为空 —— clippy 在 debug 配置下只看得到
+        // 前一个块，会误报 needless_return。
+        #[allow(clippy::needless_return)]
         return match client.get(&upstream).send().await {
             Ok(resp) => {
                 let status = StatusCode::from_u16(resp.status().as_u16())
@@ -845,7 +852,7 @@ async fn handle_post(
     State(app): State<AppHandle>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
-    body: Bytes,
+    req: Request,
 ) -> Response {
     let Some(st) = app.try_state::<McpState>() else {
         return json_response(
@@ -856,6 +863,26 @@ async fn handle_post(
     if let Err(resp) = authorize(&st, &headers, &query) {
         return resp;
     }
+    // 自己读 body（不用 Bytes 提取器）：默认的 2 MB 上限会把「写贴图」这类正常请求
+    // 变成传输层的纯文本 413；这里换成有明确上限、且**是 JSON-RPC 错误**的版本。
+    let body = match axum::body::to_bytes(req.into_body(), MCP_MAX_BODY_BYTES).await {
+        Ok(b) => b,
+        Err(_) => {
+            return json_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                &rpc_error(
+                    Value::Null,
+                    -32600,
+                    &format!(
+                        "请求体过大：单条 JSON-RPC 消息上限 {} MB。写大贴图请改用 \
+                         encoding=base64 且单文件 < {} MB，或让 agent 直接写工程目录下的文件",
+                        MCP_MAX_BODY_BYTES >> 20,
+                        crate::workspace::MAX_WRITE_MB
+                    ),
+                ),
+            )
+        }
+    };
     let parsed: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -995,7 +1022,7 @@ mod tests {
 
     #[test]
     fn lan_peer_filter_allows_private_rejects_public() {
-        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        use std::net::{IpAddr, Ipv6Addr};
         // 放行：回环 / RFC1918 / 链路本地 / ULA
         for ok in [
             "127.0.0.1", "10.0.0.5", "172.16.1.9", "192.168.1.100", "169.254.3.4",
@@ -1115,7 +1142,7 @@ mod tests {
     /// Origin 仍是攻击者域名，即使 Host 被劫持到本机地址）。
     #[test]
     fn authorize_origin_policy_follows_net_mode() {
-        let mut st = McpState::new(true, 7411, "secret-token".into(), NetMode::Lan);
+        let st = McpState::new(true, 7411, "secret-token".into(), NetMode::Lan);
         let query = |t: &str| HashMap::from([("token".to_string(), t.to_string())]);
         let with_origin = |o: &str| {
             let mut m = HeaderMap::new();
