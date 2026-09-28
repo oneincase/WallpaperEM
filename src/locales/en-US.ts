@@ -1047,6 +1047,21 @@ export const EN_US: Record<string, string> = {
     "Cross-platform dynamic wallpaper engine · an elegant open-source wallpaper app, not merely a WE clone",
 };
 export const EN_US_BACKEND: Record<string, string> = {
+  // MCP 抓帧/审计链路（PR: fix/mcp-audit-followup）
+  "渲染器返回了空图": "The renderer returned an empty image",
+  "找不到壁纸窗口 {label}": "Wallpaper window {label} not found",
+  "派发抓帧指令失败: {e}": "Failed to dispatch the capture request: {e}",
+  "抓帧回执通道被丢弃": "The capture reply channel was dropped",
+  "等渲染器抓帧超时（{}s）—— 页面可能还没就绪，或该类型没有可读画面（web 类型是 iframe，抓不到）":
+      "Timed out waiting for the renderer to capture ({}s) — the page may not be ready yet, or this type has no readable surface (web wallpapers are a separate iframe and cannot be captured)",
+  "诊断缓冲不可用": "Diagnostic buffer unavailable",
+  "渲染器抓帧失败": "Renderer capture failed",
+  "请求体过大：单条 JSON-RPC 消息上限 {} MB。写大贴图请改用 encoding=base64 且单文件 < {} MB，或让 agent 直接写工程目录下的文件":
+      "Request body too large: a single JSON-RPC message is limited to {} MB. For large textures use encoding=base64 with a single file < {} MB, or let the agent write the file straight into the project folder",
+  "等待渲染器就绪超时（{limit}ms）：指定屏的壁纸窗口 {} 不存在（该屏没挂壁纸？用 displays_list 核对 id）。{hint}":
+      "Timed out waiting for the renderer ({limit}ms): no wallpaper window for the requested display {}. Is that display showing a wallpaper? Check the id with displays_list. {hint}",
+  "这个平台没有原生窗口快照（仅 macOS 有）；web 类型请用应用内预览，或改用 scene / video / gif / image 类型（那几类走渲染器自抓帧，三平台都能截）":
+      "This platform has no native window snapshot (macOS only); for web wallpapers use the in-app preview, or switch to scene / video / gif / image (those go through the renderer's own capture and work on all three platforms)",
   // ⚠️ 键 = Rust 侧**格式化后**会产出的中文原文（含 {} 占位符的位置，与后端 format!
   // 的写法逐字对齐；Rust 的 {:?} 这类格式说明符在译文里写成 {} 即可）。
   // 值里的 {} 按出现顺序回填捕获到的片段，片段本身若还是中文会再翻一次（嵌套消息）。

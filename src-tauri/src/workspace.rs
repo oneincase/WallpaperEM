@@ -39,7 +39,10 @@ pub(crate) const DEFAULT_RATING: &str = "Everyone";
 /// 单个工程目录名长度上限（含中文按字符数算）
 const MAX_PROJECT_NAME_CHARS: usize = 64;
 /// 工程内单文件写入上限（base64 解码后）
-const MAX_WRITE_BYTES: usize = 512 << 20;
+const MAX_WRITE_BYTES: usize = 40 << 20;
+
+/// 给前端/MCP 报数用的 MB 值（错误信息里要写「单文件 < N MB」）。
+pub const MAX_WRITE_MB: usize = MAX_WRITE_BYTES >> 20;
 /// 打包时工程总大小上限（防止把整个图库塞进一个 pkg）
 const MAX_PACK_BYTES: u64 = 2 << 30;
 const PKG_MAGIC: &str = "PKGV0022";
@@ -264,6 +267,11 @@ fn installed_item_id(app: &AppHandle, project: &str) -> Option<String> {
     let id = crate::library::project_item_id_for(project);
     let dir = crate::library::wallpapers_dir(app).ok()?.join(&id);
     dir.is_dir().then_some(id)
+}
+
+/// 上面那位的公开版（MCP 的 `wallpaper_preview` 要按工程名找库里那份副本）
+pub fn installed_item_id_of(app: &AppHandle, project: &str) -> Option<String> {
+    installed_item_id(app, project)
 }
 
 fn read_project_meta(dir: &Path) -> (String, String) {
@@ -1369,11 +1377,34 @@ pub fn find_project_by_item(app: &AppHandle, item_id: &str) -> Result<Option<Str
     Ok(hit)
 }
 
-/// 把截图存成工程的 preview.png（安装后本地库卡片就有真实封面）
-pub fn save_preview(app: &AppHandle, name: &str, png: &[u8]) -> Result<String, String> {
+/// 同上，但可指定扩展名：渲染器自抓帧产出的是 **JPEG**（截图只用于看效果/当封面，
+/// 走一次 HTTP 回传的 JPEG 比 4K PNG 小一个数量级）。本地库认 preview.png/jpg/...
+/// 这一族扩展名，写对后缀才认得出封面。
+pub fn save_preview_as(
+    app: &AppHandle,
+    name: &str,
+    bytes: &[u8],
+    ext: &str,
+) -> Result<String, String> {
     let dir = project_dir(app, name)?;
-    let dest = safe_join(&dir, "preview.png")?;
-    std::fs::write(&dest, png).map_err(|e| format!("写入 preview.png 失败: {e}"))?;
+    let ext = match ext {
+        "jpg" | "jpeg" => "jpg",
+        _ => "png",
+    };
+    // 换扩展名时清掉同名的另一份，别在工程里留两张封面
+    if let Ok(old) = safe_join(
+        &dir,
+        if ext == "jpg" {
+            "preview.png"
+        } else {
+            "preview.jpg"
+        },
+    ) {
+        let _ = std::fs::remove_file(old);
+    }
+    let rel = format!("preview.{ext}");
+    let dest = safe_join(&dir, &rel)?;
+    std::fs::write(&dest, bytes).map_err(|e| format!("写入 {rel} 失败: {e}"))?;
     Ok(dest.to_string_lossy().to_string())
 }
 

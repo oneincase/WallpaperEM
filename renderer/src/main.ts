@@ -1029,6 +1029,121 @@ function shareSubscribeProps(token: string | null): void {
  * ready/failure —— 多屏并发时全局单槽会互相覆盖 */
 const WIN_LABEL = new URLSearchParams(location.search).get("win") ?? "";
 
+/**
+ * 抓帧回传：宿主用 `eval("window.__wpCapture(req, maxWidth)")` 点名要一帧，
+ * 这里把图 POST 回 `/capture?req=…`。
+ *
+ * 为什么抓帧在页面里做（而不是各平台的原生快照 API）：原生快照 macOS 走
+ * WKWebView、Linux 走 WebKitGTK、Windows 走 WebView2，三份实现各自为政；而这张
+ * 页面**本来就能读自己的画面** —— 场景/媒体画布是 `preserveDrawingBuffer: true`，
+ * 视频直通的那颗 `<video>` 与页面同源（内容服务器），`drawImage` 也不受污染。
+ * 于是「抓」放页面里、「要」由宿主下发，三个平台同一套代码，也没有跨进程取像素的
+ * 同步开销。抓不到的只有 web 类型（iframe 是独立文档，画不出来）—— 那种情况回一句
+ * 原因，宿主按平台回退（macOS 有原生快照兜底）。
+ *
+ * 统一输出 JPEG：截图只用于看效果/当封面，4K 原图几 MB 的 PNG 走一次 HTTP 回传
+ * 不划算；`maxWidth` 让宿主按需要求缩略图。
+ */
+function captureDataUrl(maxWidth?: number): string | null {
+  const limit = maxWidth && maxWidth > 0 ? maxWidth : 0;
+  const draw = (src: CanvasImageSource, w: number, h: number): string | null => {
+    if (!w || !h) return null;
+    try {
+      if (!limit || w <= limit) {
+        const c = document.createElement("canvas");
+        c.width = w;
+        c.height = h;
+        const ctx = c.getContext("2d");
+        if (!ctx) return null;
+        ctx.drawImage(src, 0, 0, w, h);
+        return c.toDataURL("image/jpeg", 0.85);
+      }
+      const scale = limit / w;
+      const c = document.createElement("canvas");
+      c.width = limit;
+      c.height = Math.max(1, Math.round(h * scale));
+      const ctx = c.getContext("2d");
+      if (!ctx) return null;
+      ctx.drawImage(src, 0, 0, c.width, c.height);
+      return c.toDataURL("image/jpeg", 0.85);
+    } catch {
+      // 跨源污染（toDataURL 抛 SecurityError）或 drawImage 失败
+      return null;
+    }
+  };
+
+  // 库实例的画布（scene / gif / image）与自绘 canvas 走这条
+  const canvas = state.inst?.canvas ?? state.canvas ?? document.querySelector("canvas");
+  if (canvas && canvas.width > 0) {
+    return draw(canvas, canvas.width, canvas.height);
+  }
+  // 视频直通：当前帧直接画到离屏画布
+  const video = document.querySelector("video");
+  if (video && video.videoWidth > 0) {
+    return draw(video, video.videoWidth, video.videoHeight);
+  }
+  return null;
+}
+
+declare global {
+  interface Window {
+    /** 宿主抓帧入口（见 captureDataUrl 的说明） */
+    __wpCapture?: (req: string, maxWidth?: number) => void;
+  }
+}
+
+window.__wpCapture = (req: string, maxWidth?: number) => {
+  const url = `/capture?req=${encodeURIComponent(req)}${
+    WIN_LABEL ? `&win=${encodeURIComponent(WIN_LABEL)}` : ""
+  }`;
+  // 抓帧也留一条诊断：宿主侧「截图拿不到画面」时，这条能区分「指令没到页面」
+  // 与「页面抓不到（web 类型/画布为空）」
+  try {
+    reportDiag(state.cfg, `capture: 收到抓帧请求（maxWidth=${maxWidth ?? 0}）`);
+  } catch {
+    /* 上报失败不影响抓帧 */
+  }
+  // 失败回执走 `?error=<文本>`（无体）：与主窗口预览共用同一套协议，
+  // 跨源时也不需要预检
+  const fail = (why: string) => {
+    void fetch(`${url}&error=${encodeURIComponent(why)}`, {
+      method: "POST",
+      cache: "no-store",
+    }).catch(() => {});
+  };
+  try {
+    const dataUrl = captureDataUrl(maxWidth);
+    if (!dataUrl) {
+      fail(
+        state.cfg.type === "web"
+          ? "web 类型是独立 iframe，画布抓不到（该平台需用原生快照）"
+          : "当前没有可读画面（还没挂载完，或画布/视频都为空）",
+      );
+      return;
+    }
+    try {
+      reportDiag(state.cfg, "capture: 已抓到画面，正在回传");
+    } catch {
+      /* 同上 */
+    }
+    // dataURL → Blob → POST（直接发 dataURL 字符串会让体积再涨 33%）
+    void fetch(dataUrl)
+      .then((r) => r.blob())
+      .then((blob) =>
+        fetch(`${url}&mime=${encodeURIComponent(blob.type || "image/jpeg")}`, {
+          method: "POST",
+          // 同源下 content-type 无所谓；沿用 blob 自带类型即可
+          headers: { "content-type": blob.type || "image/jpeg" },
+          body: blob,
+          cache: "no-store",
+        }),
+      )
+      .catch((e) => fail(`抓帧回传失败: ${String((e as Error)?.message || e)}`));
+  } catch (e) {
+    fail(`抓帧异常: ${String((e as Error)?.message || e)}`);
+  }
+};
+
 /** 诊断上报：转发到内容服务器的 /diag，由 Rust 侧记进日志 */
 function reportDiag(cfg: WallpaperConfig, msg: string) {
   const text = `[${cfg.type}${cfg.src ? ` ${cfg.src}` : ""}] ${msg}`;

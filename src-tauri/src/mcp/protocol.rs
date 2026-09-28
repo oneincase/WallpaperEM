@@ -112,11 +112,18 @@ async fn call_tool_message(
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0),
     });
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "result": { "content": content, "isError": is_error }
-    })
+    // MCP 2025-06-18：声明了 outputSchema 的工具要回 `structuredContent`。
+    // 文本块照旧保留（老客户端只读它），结构化那份给新客户端做类型分发/展示。
+    let structured = if is_error {
+        None
+    } else {
+        tools::structured_content(&content)
+    };
+    let mut result = json!({ "content": content, "isError": is_error });
+    if let Some(sc) = structured {
+        result["structuredContent"] = sc;
+    }
+    json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
 
 // ---------------------------------------------------------------- resources
@@ -193,6 +200,8 @@ fn read_resource(app: &AppHandle, params: &Value) -> Result<Value, (i64, String)
     // 资源在 list 里声明的是 text/markdown（模板则是纯文本），read 要保持同一口径
     let mime = if uri.starts_with("wallpaperem://docs/") {
         "text/markdown"
+    } else if uri.starts_with("wallpaperem://reference/") {
+        "application/json"
     } else {
         "text/plain"
     };
