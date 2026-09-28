@@ -279,7 +279,8 @@ pnpm hooks:uninstall   # 卸载（有备份则还原）
 
 - **Squash and merge**：一条 PR 变成 `main` 上的一条提交 —— **标题取 PR 标题、正文取 PR 描述**
   （仓库设置 `squash_merge_commit_title=PR_TITLE`、`squash_merge_commit_message=PR_BODY`，
-  2026-09-28 设定）。所以：
+  2026-09-28 设定；**GitHub 会在标题后追加上 `(#PR号)`**，例如 `… (#7)` —— 不想要这个后缀就
+  合并时显式传 `--subject`）。所以：
   - "PR 标题也要合规"的全部原因，就是它会成为 `main` 上的提交标题；
   - **PR 描述就是 `main` 上的提交正文** —— 按"给未来 `git log` 的人看"来写；模板里的 HTML
     注释与"本 PR 后续再改"这类只在评审时有意义的话，合并前删掉；
