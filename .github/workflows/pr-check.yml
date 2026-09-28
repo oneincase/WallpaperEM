@@ -238,17 +238,21 @@ jobs:
 
       - name: 造出前端产物占位（冷克隆下 `cargo check` 必失败）
         # `dist/` 是构建产物、不在仓库里，冷克隆下不存在。但：
-        #   · `tauri_build::build()` 校验 tauri.conf.json 的 resources ——
-        #     `../dist/renderer` 缺了就 `resource path ... doesn't exist` 直接 exit 1；
-        #   · `tauri::generate_context!` 的 codegen 要求 frontendDist（`../dist`）存在，
+        #   · `tauri_build::build()` 会校验 `bundle.resources` 里声明的**每一条**路径，
+        #     缺一条就是 `resource path ... doesn't exist` → build script exit 1。
+        #     三个平台 conf 里属于前端产物的都是同样两条：`../dist/renderer`、
+        #     `../dist/assets`（另一条 `bundled/libsteam_api.so` 由 build.rs 生成，
+        #     不能占位 —— 占位会把"复制失败"盖掉）；
+        #   · `tauri::generate_context!` 的 codegen 还要求 frontendDist（`../dist`）存在，
         #     否则 panic「frontendDist ... doesn't exist」。
         # 本机有 dev 产物所以看不见，CI 上这一步之前从没绿过。
         # 本 job 只做类型检查，前端内容无关紧要 —— 造最小占位即可，不为了它去装 pnpm
         # 跑一遍前端（真前端由 web job 负责，见文件头部「只跑该跑的」）。
         run: |
-          mkdir -p dist/renderer
+          mkdir -p dist/renderer dist/assets
           printf '%s\n' '<!doctype html>' '<title>CI 占位产物：cargo check 不读前端内容</title>' > dist/index.html
           cp dist/index.html dist/renderer/index.html
+          cp dist/index.html dist/assets/ci-stub.html
 
       # ---- 阻断档 ----
 
