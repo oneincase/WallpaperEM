@@ -147,10 +147,11 @@ export function WorkshopPage({ onOpenDetail }: { onOpenDetail: (id: string) => v
     async (id: string, anchor?: HTMLElement) => {
       try {
         const r = await applyWithTarget(id, anchor);
-        // 应用后重取权威集合（与本地库页同一纪律）；目标菜单被点掉时不报成功
-        if (r === "done") {
+        // 应用后重取权威集合（与本地库页同一纪律）；目标菜单被点掉时不报成功，
+        // 「stopped」= 停了某屏播放（桌面变化本身就是反馈，不弹「已应用」）
+        if (r !== "cancelled") {
           await refreshApplied();
-          msg.success(tr("已应用到桌面"));
+          if (r === "done") msg.success(tr("已应用到桌面"));
         }
       } catch (e) {
         msg.error(String(e));

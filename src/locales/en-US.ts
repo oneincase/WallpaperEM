@@ -768,6 +768,8 @@ export const EN_US: Record<string, string> = {
   "应用到哪块屏？": "Apply to which display?",
   "全部显示器": "All displays",
   "上次": "Last used",
+  "播放中": "Playing",
+  "点击停止该屏的壁纸播放": "Click to stop playback on this display",
   "正在为「{name}」选择壁纸 —— 点「应用」只设置该屏":
     "Choosing a wallpaper for “{name}” — clicking apply sets only that screen",
   "已应用到桌面（可点击重新应用或指定屏）":

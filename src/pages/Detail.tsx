@@ -174,7 +174,8 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
                     setApplying(true);
                     try {
                       const r = await applyWithTarget(item.id, e.currentTarget);
-                      if (r === "done") await refreshApplied();
+                      // 停止某屏播放同样要刷新（条目可能退出已应用集合）
+                      if (r !== "cancelled") await refreshApplied();
                     } catch (err) {
                       msg.error(String(err));
                     } finally {
@@ -193,7 +194,7 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
                     setApplying(true);
                     try {
                       const r = await applyWithTarget(item.id, e.currentTarget);
-                      if (r === "done") await refreshApplied();
+                      if (r !== "cancelled") await refreshApplied();
                     } catch (err) {
                       msg.error(String(err));
                     } finally {

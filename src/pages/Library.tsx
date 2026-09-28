@@ -539,9 +539,9 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
   const apply = async (itemId: string, anchor?: HTMLElement) => {
     try {
       const r = await applyWithTarget(itemId, anchor);
-      // 应用后须重取权威的已应用集合（多屏时可同时有多条「已应用」），
-      // 否则旧壁纸的「已应用」状态会残留（前端只 add 不删除旧 id）。
-      if (r === "done") await loadApplied();
+      // 应用/停止后须重取权威的已应用集合（多屏时可同时有多条「已应用」，
+      // 停掉一屏也会让条目退出集合），否则旧状态残留（前端只 add 不删除旧 id）。
+      if (r !== "cancelled") await loadApplied();
     } catch (e) {
       msg.error(String(e));
     }
