@@ -38,6 +38,7 @@ mod we_shim;
 mod workshop;
 
 use rusqlite::Connection;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{
     menu::{CheckMenuItem, CheckMenuItemBuilder, Menu, MenuItem, PredefinedMenuItem, Submenu},
@@ -212,6 +213,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::ping,
+            commands::platform_backdrop_material,
             hotkeys::hotkeys_list,
             hotkeys::hotkeys_set,
             hotkeys::hotkeys_reset,
@@ -930,7 +932,9 @@ pub(crate) fn apply_vibrancy(app: &AppHandle) -> tauri::Result<()> {
 /// - Windows：Acrylic（DWM 系统背景，Win10 1809+）；不可用时退回 Win7/10 的 blur
 ///   （Win11 22621 上 blur 有已知的拖动/缩放卡顿，只在 Acrylic 失败时才用）
 ///
-/// 失败只记日志：材质是纯装饰，不影响功能。
+/// 结果记进 [`BackdropMaterial`] 供前端查询。**材质不再是「纯装饰」**：无壁纸
+/// 封面时它是唯一压住桌面、保住白字可读性的东西（见 index.css 的
+/// --no-backdrop-fallback）；这里失败就意味着前端必须自己垫底。
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(crate) fn apply_backdrop(window: &tauri::WebviewWindow) {
     #[cfg(target_os = "macos")]
@@ -942,25 +946,114 @@ pub(crate) fn apply_backdrop(window: &tauri::WebviewWindow) {
         // 窗口没有系统圆角了，材质自己圆 12px，CSS 圆角外的四角才是透明桌面
         Some(12.0),
     ) {
-        Ok(_) => tracing::info!("vibrancy applied to {}", window.label()),
-        Err(e) => tracing::warn!("vibrancy apply failed for {}: {e}", window.label()),
+        Ok(_) => {
+            tracing::info!("vibrancy applied to {}", window.label());
+            record_backdrop_material(window, BackdropMaterial::Applied);
+        }
+        Err(e) => {
+            tracing::warn!("vibrancy apply failed for {}: {e}", window.label());
+            record_backdrop_material(window, BackdropMaterial::Unavailable);
+        }
     }
     #[cfg(target_os = "windows")]
     {
         // 深色半透明底：与 macOS 侧栏材质、KWin blur 的观感对齐
         let tint = Some((28u8, 28u8, 32u8, 180u8));
         match window_vibrancy::apply_acrylic(window, tint) {
-            Ok(_) => tracing::info!("acrylic applied to {}", window.label()),
+            Ok(_) => {
+                tracing::info!("acrylic applied to {}", window.label());
+                record_backdrop_material(window, BackdropMaterial::Applied);
+            }
             Err(e) => {
                 tracing::debug!(
                     "acrylic unavailable for {} ({e}); falling back to blur",
                     window.label()
                 );
-                if let Err(e2) = window_vibrancy::apply_blur(window, tint) {
-                    tracing::warn!("blur apply failed for {}: {e2}", window.label());
+                match window_vibrancy::apply_blur(window, tint) {
+                    Ok(_) => {
+                        tracing::info!("blur applied to {} (acrylic unavailable)", window.label());
+                        record_backdrop_material(window, BackdropMaterial::Applied);
+                    }
+                    Err(e2) => {
+                        tracing::warn!("blur apply failed for {}: {e2}", window.label());
+                        record_backdrop_material(window, BackdropMaterial::Unavailable);
+                    }
                 }
             }
         }
+    }
+}
+
+/// 平台窗口材质（macOS vibrancy / Windows Acrylic / Linux KWin blur）**是否真的
+/// 落到了窗口上**。前端据此决定「没有壁纸封面时要不要自己垫一层不透明底」：
+///
+/// - 材质可用 → 保持玻璃观感（不加底）；
+/// - 材质不可用 → 必须垫底，否则只剩 `.app-backdrop::after` 那 22% 的 tint，
+///   白字直接糊在用户的桌面壁纸上。
+///
+/// Linux 恒为 [`BackdropMaterial::Unknown`]：那里只给合成器设属性 / 走 KWin 专有
+/// 协议，**是否被采纳无法探测**（blur.rs 模块注释：「属性无害残留，不生效」；
+/// GNOME 等合成器根本没有窗口模糊能力）。所以前端把 Unknown 与 Unavailable
+/// 一并按「没落实到」保守处理。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BackdropMaterial {
+    Unknown,
+    Applied,
+    Unavailable,
+}
+
+const BACKDROP_MATERIAL_UNKNOWN: u8 = 0;
+const BACKDROP_MATERIAL_APPLIED: u8 = 1;
+const BACKDROP_MATERIAL_UNAVAILABLE: u8 = 2;
+
+/// 最近一次材质应用的结果。进程级一份即可：主窗口与属性窗口走同一套平台代码
+/// 路径，结果由平台能力决定，不随窗口而异。
+static BACKDROP_MATERIAL: AtomicU8 = AtomicU8::new(BACKDROP_MATERIAL_UNKNOWN);
+
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+fn set_backdrop_material(m: BackdropMaterial) {
+    let v = match m {
+        BackdropMaterial::Unknown => BACKDROP_MATERIAL_UNKNOWN,
+        BackdropMaterial::Applied => BACKDROP_MATERIAL_APPLIED,
+        BackdropMaterial::Unavailable => BACKDROP_MATERIAL_UNAVAILABLE,
+    };
+    BACKDROP_MATERIAL.store(v, Ordering::Relaxed);
+}
+
+/// 记下结果并主动推给前端。
+///
+/// 为什么必须推而不是只让前端查一次：`main_window.rs` 在主窗口被内存压力看门狗
+/// 回收后会重建窗口并**再次**调 [`apply_backdrop`]，而新窗口的 JS 挂载与这次应用
+/// 谁先谁后不确定。只靠挂载时那一次查询，重建后的那一瞬会把兜底底误挂在材质其实
+/// 可用的机器上（也就是把作者想干掉的深色框又请回来）。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn record_backdrop_material(window: &tauri::WebviewWindow, m: BackdropMaterial) {
+    set_backdrop_material(m);
+    let _ = window
+        .app_handle()
+        .emit("backdrop-material", backdrop_material_wire(m));
+}
+
+pub(crate) fn backdrop_material() -> BackdropMaterial {
+    match BACKDROP_MATERIAL.load(Ordering::Relaxed) {
+        BACKDROP_MATERIAL_APPLIED => BackdropMaterial::Applied,
+        BACKDROP_MATERIAL_UNAVAILABLE => BackdropMaterial::Unavailable,
+        _ => BackdropMaterial::Unknown,
+    }
+}
+
+/// 线协议名（前端契约）。单独抽出来是为了让「枚举 ↔ 前端字符串」能被测试钉住：
+/// 拼错既不报错，又会让兜底要么永不出现（白字压桌面）、要么永远出现（把作者想要
+/// 的玻璃又盖回黑框），两种都很难从现象反推。
+///
+/// 暴露给前端的命令在 `commands::platform_backdrop_material`
+/// —— `#[tauri::command]` 不能定义在 crate 根（那里同时有 `generate_handler!`，
+/// 宏会与自身生成的 `__cmd__*` 重名）。
+pub(crate) fn backdrop_material_wire(m: BackdropMaterial) -> &'static str {
+    match m {
+        BackdropMaterial::Unknown => "unknown",
+        BackdropMaterial::Applied => "applied",
+        BackdropMaterial::Unavailable => "unavailable",
     }
 }
 
@@ -1023,4 +1116,45 @@ fn check_gstreamer_elements() {
     tracing::warn!(
         "GStreamer 插件安装指引 — Debian/Ubuntu: sudo apt install          gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad          gstreamer1.0-libav | Fedora: sudo dnf install gstreamer1-plugins-base          gstreamer1-plugins-good gstreamer1-plugins-bad-free gstreamer1-libav |          Arch: sudo pacman -S gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 线协议名是前后端的契约：拼错不会报错，只会让「无壁纸兜底」要么永不出现
+    /// （白字压在用户桌面上）要么永远出现（把玻璃又盖回黑框）。三种取值都要钉住。
+    #[test]
+    fn backdrop_material_wire_names_are_stable() {
+        assert_eq!(backdrop_material_wire(BackdropMaterial::Unknown), "unknown");
+        assert_eq!(backdrop_material_wire(BackdropMaterial::Applied), "applied");
+        assert_eq!(
+            backdrop_material_wire(BackdropMaterial::Unavailable),
+            "unavailable"
+        );
+    }
+
+    /// 枚举 ↔ 存储值 ↔ 读回必须闭环（漏一个分支会让状态静默退化成 Unknown，
+    /// 也就是在材质其实可用的机器上永久垫底）。
+    #[test]
+    fn backdrop_material_roundtrip_through_storage() {
+        for m in [
+            BackdropMaterial::Unknown,
+            BackdropMaterial::Applied,
+            BackdropMaterial::Unavailable,
+        ] {
+            set_backdrop_material(m);
+            assert_eq!(backdrop_material(), m, "roundtrip 失败: {m:?}");
+        }
+        // 复位，避免影响同进程内其它测试
+        set_backdrop_material(BackdropMaterial::Unknown);
+    }
+
+    /// 默认（Linux 上永远不会被写入）必须是 Unknown —— 前端据此保守垫底。
+    /// 若默认值被改成 Applied，GNOME 等无模糊合成器的用户会看到白字压桌面。
+    #[test]
+    fn backdrop_material_defaults_to_unknown() {
+        assert_eq!(backdrop_material_wire(BackdropMaterial::Unknown), "unknown");
+        assert_eq!(BACKDROP_MATERIAL_UNKNOWN, 0);
+    }
 }

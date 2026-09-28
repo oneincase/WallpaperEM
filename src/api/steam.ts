@@ -237,6 +237,11 @@ export const api = {
     ),
   /** 原生文件夹选择框（单选）：返回选中的绝对路径，用户取消返回 null */
   appPickFolder: () => invoke<string | null>("app_pick_folder"),
+  /** 平台窗口材质是否真的落到窗口上（见 Rust BackdropMaterial）：
+   *  applied = macOS vibrancy / Windows acrylic|blur 成功；unavailable = 都失败；
+   *  unknown = Linux（不可探测）或还没应用过。前端据此决定无壁纸时要不要自己垫底 */
+  platformBackdropMaterial: () =>
+    invoke<"unknown" | "applied" | "unavailable">("platform_backdrop_material"),
   /** 检查更新（读 Release 里的 latest-{target}-{arch}.json 清单，semver 比对） */
   appUpdateCheck: () => invoke<UpdateInfo>("app_update_check"),
   /** 下载新版本（进度走 update:progress 事件）并原地安装；Windows 上装完进程直接退出 */

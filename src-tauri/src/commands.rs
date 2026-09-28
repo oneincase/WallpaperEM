@@ -11,6 +11,19 @@ pub fn ping() -> &'static str {
     "pong"
 }
 
+/// 平台窗口材质是否真的落到了窗口上（见 [`crate::BackdropMaterial`]）。
+///
+/// 前端据此决定「没有壁纸封面时要不要自己垫一层不透明底」：`applied` 时保持真
+/// 玻璃，`unavailable` / `unknown` 时垫底保白字可读性。Linux 恒为 `unknown`
+/// （合成器是否采纳 KWin blur 协议不可探测），前端按保守处理。
+///
+/// 放在这里而不是 lib.rs：`#[tauri::command]` 生成的 `__cmd__*` 宏与 crate 根的
+/// `generate_handler!` 同模块会重名（E0255）。
+#[tauri::command(rename = "platform_backdrop_material")]
+pub fn platform_backdrop_material() -> &'static str {
+    crate::backdrop_material_wire(crate::backdrop_material())
+}
+
 #[tauri::command]
 pub fn app_info(app: AppHandle) -> Value {
     // 平台相关的一句自我描述（设置页「关于」直接展示）
