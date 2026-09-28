@@ -15,6 +15,7 @@
     "hooks:status": "node scripts/install-hooks.mjs --status",
     "hooks:uninstall": "node scripts/install-hooks.mjs --uninstall",
     "lint:commit": "node scripts/commit-msg-lint.mjs",
+    "size:check": "node scripts/pr-size-check.mjs",
     "versions:check": "node scripts/check-versions.mjs"
   },
   "dependencies": {

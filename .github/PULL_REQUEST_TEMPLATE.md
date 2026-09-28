@@ -35,9 +35,16 @@ PR 标题请写成 conventional 形式：「类型(范围): 中文主题」—�
 - `CHANGELOG.md`：[Unreleased] 已补 / 不需要（说明为什么）
 - 破坏性变更：无 / 有（写清影响与迁移）
 
+## 体积说明
+
+<!-- 只在有效改动超过 400 行 / 15 个文件时保留这一节并写清（为什么没法拆 / 哪部分是机械改动）；
+     没超上限就把这一节整段删掉。超上限又没写，CI 直接红（scripts/pr-size-check.mjs）：
+     上限、机械产物豁免、三种写法见 docs/pr-rules.md 第 5 节。 -->
+
 ## 自检
 
 - [ ] 提交信息符合 `type(scope): 主题`，且已 `git log` 自查过这一串提交（规则见 `docs/pr-rules.md`）
+- [ ] **本 PR 只做一件事**（一个功能或一个修复）；两件不相干的事没有捆在一起，超上限时已写「体积说明」
 - [ ] 本地跑过与改动范围对应的门禁：`pnpm typecheck` / `node scripts/i18n-audit.mjs` / `cargo check --all-targets`
 - [ ] 新增或改动的代码 rustfmt 合规（全仓格式化是独立的事，不混进本 PR）
 - [ ] 本 PR 没有新增 clippy 警告（基线 57 条，见 `pr-check.yml` 头部）

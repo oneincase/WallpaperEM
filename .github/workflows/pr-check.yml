@@ -9,10 +9,12 @@ name: PR 校验（规则 / 前端 / Rust）
 #     · `i18n-audit.mjs`        → 基线通过（退出码 1 才代表缺译）　→ 阻断
 #     · `cargo check`           → 基线通过　　　　　　　　　　　　→ 阻断
 #     · 版本号三处一致　　　　　→ 基线通过　　　　　　　　　　　　→ 阻断
+#     · 体积 ≤ 400 行 / 15 文件　→ 基线通过（超上限时描述里写好理由即通过）→ 阻断
 #     · `cargo fmt --check`     → 基线**不过**（41 个文件 604 处差异）→ 报告
 #     · `cargo clippy`          → 基线**57 条警告**　　　　　　　　→ 报告
-#     · `cargo test --lib`      → 基线 249 passed / 3 failed（PTY 与
-#                                 钥匙串被沙箱拒绝，非代码缺陷）　　→ 报告
+#     · `cargo test --lib`      → 基线本机 249 passed / 3 failed（PTY 与
+#                                 钥匙串被沙箱拒绝，非代码缺陷）；CI 上是
+#                                 211 passed / 2 failed（平台不同）　→ 报告
 #   把没过基线的检查设成阻断，只会让每个 PR 都红、然后所有人学会无视 CI。
 #   要"翻正式"：先把基线清干净，再把对应的 continue-on-error 删掉 —— 一次一条。
 #
@@ -85,6 +87,19 @@ jobs:
             echo "rust=$rust"
           } >> "$GITHUB_OUTPUT"
           echo "→ 前端=$web Rust=$rust 纯文档=$docs_only"
+
+      - name: 体积（一个 PR 一件事）
+        # 放在这里是为了"失败得快"：超上限就不必再花 Rust job 那几十分钟。
+        # 判定逻辑在 scripts/pr-size-check.mjs（本地同一条命令可自查）；上限、机械产物豁免、
+        # 「体积说明」的写法见 docs/pr-rules.md 第 5 节 —— 超上限又没写理由就是红。
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          printf '%s' "$PR_BODY" > /tmp/pr-body-size.md
+          node scripts/pr-size-check.mjs \
+            --range "origin/${BASE_REF}...origin/pr-head" \
+            --body-file /tmp/pr-body-size.md
 
   # ---------------------------------------------------------------- 提交规则
   # commit-msg-lint.mjs 与本地钩子是同一份规则、同一个脚本 —— 本地能过，CI 就能过。
