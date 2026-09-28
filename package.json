@@ -9,7 +9,13 @@
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
     "i18n:audit": "node scripts/i18n-audit.mjs",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "prepare": "node scripts/install-hooks.mjs --if-possible",
+    "hooks:install": "node scripts/install-hooks.mjs",
+    "hooks:status": "node scripts/install-hooks.mjs --status",
+    "hooks:uninstall": "node scripts/install-hooks.mjs --uninstall",
+    "lint:commit": "node scripts/commit-msg-lint.mjs",
+    "versions:check": "node scripts/check-versions.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.0",

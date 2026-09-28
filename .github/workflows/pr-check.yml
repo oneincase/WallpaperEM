@@ -1,0 +1,305 @@
+name: PR 校验（规则 / 前端 / Rust）
+
+# 用途：每个 PR 自动跑**能挡住问题**的那几道门禁。规则全文见 docs/pr-rules.md。
+#
+# 设计原则（重要，改这个文件前先读）：
+#   门禁分两档 —— **阻断**（exit 非 0 就红）与**报告**（continue-on-error，只贴结果不挡人）。
+#   分档依据是"当前基线到底过不过"，不是"这条规则听起来重不重要"：
+#     · `tsc --noEmit`          → 基线通过（本次实测 exit 0）　　　→ 阻断
+#     · `i18n-audit.mjs`        → 基线通过（退出码 1 才代表缺译）　→ 阻断
+#     · `cargo check`           → 基线通过　　　　　　　　　　　　→ 阻断
+#     · 版本号三处一致　　　　　→ 基线通过　　　　　　　　　　　　→ 阻断
+#     · `cargo fmt --check`     → 基线**不过**（41 个文件 604 处差异）→ 报告
+#     · `cargo clippy`          → 基线**57 条警告**　　　　　　　　→ 报告
+#     · `cargo test --lib`      → 基线 249 passed / 3 failed（PTY 与
+#                                 钥匙串被沙箱拒绝，非代码缺陷）　　→ 报告
+#   把没过基线的检查设成阻断，只会让每个 PR 都红、然后所有人学会无视 CI。
+#   要"翻正式"：先把基线清干净，再把对应的 continue-on-error 删掉 —— 一次一条。
+#
+# 本 workflow **不发布任何东西**：发布仍由 build-dmg / build-linux / build-windows
+# 在推 v* 标签时完成；三平台整包测试仍是手动触发 build-test.yml。
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------- 变更范围
+  # 只跑该跑的：纯文档 PR 不该等 Rust 编译，纯 Rust PR 不该装 pnpm。
+  scope:
+    name: 变更范围
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      web: ${{ steps.diff.outputs.web }}
+      rust: ${{ steps.diff.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 要跟 base 分支算 diff，浅克隆没有共同祖先
+          fetch-depth: 0
+
+      - name: 取 PR head 到本地（fork 来的 PR 也取得到）
+        # 直接用 head.sha 在 fork PR 上可能不在 base 仓库的对象库里；PR 的 head ref
+        # 一定在：refs/pull/<N>/head。统一走它，同仓库 / fork 两种情况都成立。
+        run: |
+          git fetch --no-tags origin \
+            "+refs/pull/${{ github.event.pull_request.number }}/head:refs/remotes/origin/pr-head"
+
+      - name: 判定改动范围
+        id: diff
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          if ! git diff --name-only "origin/${BASE_REF}...origin/pr-head" > /tmp/changed.txt; then
+            # 拿不到 diff 时**保守跑全部**：宁可多花几分钟，也不要放过该跑的检查
+            echo "::warning title=无法与 ${BASE_REF} 比对::退化为跑全部检查"
+            : > /tmp/changed.txt
+            echo "src/__all__" >> /tmp/changed.txt
+            echo "src-tauri/__all__" >> /tmp/changed.txt
+          fi
+          echo "改动文件（$(wc -l < /tmp/changed.txt | tr -d ' ') 个）："
+          sed 's/^/  /' /tmp/changed.txt | head -50
+
+          web=false; rust=false; other=false
+          while IFS= read -r f; do
+            case "$f" in
+              src/*|public/*|index.html|vite.config.ts|tsconfig.json|package.json|pnpm-lock.yaml|pnpm-workspace.yaml|scripts/i18n-audit.mjs) web=true ;;
+              src-tauri/*) rust=true ;;
+              *) other=true ;;
+            esac
+          done < /tmp/changed.txt
+
+          docs_only=false
+          if [ "$web" = false ] && [ "$rust" = false ] && [ "$other" = true ]; then docs_only=true; fi
+
+          {
+            echo "web=$web"
+            echo "rust=$rust"
+          } >> "$GITHUB_OUTPUT"
+          echo "→ 前端=$web Rust=$rust 纯文档=$docs_only"
+
+  # ---------------------------------------------------------------- 提交规则
+  # commit-msg-lint.mjs 与本地钩子是同一份规则、同一个脚本 —— 本地能过，CI 就能过。
+  rules:
+    name: 提交规则
+    runs-on: ubuntu-latest
+    # fetch-depth: 0 要拉全量历史（本仓库 .git 约 180MB），留够时间
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 校验范围要能追到 base 分支的提交
+          fetch-depth: 0
+
+      - name: 取 PR head 到本地（fork 来的 PR 也取得到）
+        run: |
+          git fetch --no-tags origin \
+            "+refs/pull/${{ github.event.pull_request.number }}/head:refs/remotes/origin/pr-head"
+
+      - name: PR 标题（squash 后会成为 main 上的提交标题）
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: node scripts/commit-msg-lint.mjs --title "$PR_TITLE"
+
+      - name: 范围内所有提交
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          git log --oneline "origin/${BASE_REF}..origin/pr-head" || true
+          node scripts/commit-msg-lint.mjs --range "origin/${BASE_REF}..origin/pr-head"
+
+      - name: PR 描述（改动 / 验证必填）
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          printf '%s' "$PR_BODY" > /tmp/pr-body.md
+          node scripts/commit-msg-lint.mjs --body-file /tmp/pr-body.md --require-sections
+
+      - name: 版本号一致性（package.json / tauri.conf.json / Cargo.toml）
+        # 三处权威版本必须相同；bin-info.plist（dev 版内嵌）不一致只警告不阻断
+        run: node scripts/check-versions.mjs
+
+      - name: 代码变更是否补了 CHANGELOG（建议项，不阻断）
+        continue-on-error: true
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          files=$(git diff --name-only "origin/${BASE_REF}...origin/pr-head")
+          if echo "$files" | grep -qE '^(src/|src-tauri/src/)' && ! echo "$files" | grep -q '^CHANGELOG.md$'; then
+            echo "::warning title=未更新 CHANGELOG.md::改到了 src/ 或 src-tauri/src/ 但没动 CHANGELOG.md —— 用户可见的变更请在 [Unreleased] 下留一条"
+          else
+            echo "CHANGELOG 检查通过（或本次改动不需要）"
+          fi
+
+  # ---------------------------------------------------------------- 前端
+  web:
+    name: 前端校验
+    needs: scope
+    if: needs.scope.outputs.web == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # webwallgl 是同级自有仓库：package.json 依赖 `file:../webwallgl-github/dist/lib`，
+      # dist/lib 是构建产物不在源码里，必须先检出源码并构建，否则 pnpm install 解析不到。
+      - name: 检出 webwallgl（源码）
+        uses: actions/checkout@v4
+        with:
+          repository: oneincase/webwallgl
+          path: webwallgl-github-src
+
+      - name: 移到仓库平级目录
+        run: mv webwallgl-github-src ../webwallgl-github
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # 同 build-test.yml：webwallgl 在迭代，lockfile 可能滞后于源码，这里不要求 frozen
+      - name: 构建 webwallgl dist/lib
+        working-directory: ../webwallgl-github
+        run: |
+          pnpm install --no-frozen-lockfile
+          pnpm run build:lib
+
+      - name: 安装依赖（frozen，保证仓库状态可复现）
+        run: pnpm install --frozen-lockfile
+
+      - name: 类型检查（tsc --noEmit）
+        run: pnpm typecheck
+
+      - name: 中英词条审计
+        # 中文原文当键 + 查不到就原样显示中文 —— 漏翻编译器看不见，退出码 1 就是漏了
+        run: node scripts/i18n-audit.mjs
+
+      - name: 构建产物（vite build）
+        run: pnpm build
+
+  # ---------------------------------------------------------------- Rust
+  rust:
+    name: Rust 校验
+    needs: scope
+    if: needs.scope.outputs.rust == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # media-bridge 是同级自有仓库（Cargo.toml 里 `path = "../../media-bridge/..."`）
+      - name: 检出 media-bridge（源码）
+        uses: actions/checkout@v4
+        with:
+          repository: oneincase/media-bridge
+          path: media-bridge-src
+
+      - name: 移到仓库平级目录
+        run: mv media-bridge-src ../media-bridge
+
+      - name: 安装 Linux 系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl wget file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libdbus-1-dev \
+            patchelf \
+            xdg-utils
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Rust 构建缓存
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # ---- 阻断档 ----
+
+      - name: Cargo.lock 是否与 Cargo.toml 一致
+        working-directory: src-tauri
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+      - name: 编译全部目标（含测试）
+        # --all-targets：测试代码也要能编过，否则"本地没编测试"的坏改动会溜进 main
+        working-directory: src-tauri
+        run: cargo check --all-targets
+
+      # ---- 报告档（基线未清零，故不阻断；见文件头部说明）----
+
+      - name: rustfmt 差异（报告）
+        continue-on-error: true
+        working-directory: src-tauri
+        run: |
+          echo "基线：41 个文件 604 处差异 —— 全仓统一格式化是独立一件事，别混进功能 PR。"
+          echo "要求：**新增/改动的代码**请保持 rustfmt 合规（编辑器保存时格式化即可）。"
+          cargo fmt --all --check
+
+      - name: clippy 警告（报告）
+        continue-on-error: true
+        working-directory: src-tauri
+        run: |
+          echo "基线：57 条警告。要求：本 PR 不新增警告。"
+          cargo clippy --all-targets --message-format=short
+
+      - name: 单元测试（报告）
+        continue-on-error: true
+        working-directory: src-tauri
+        run: |
+          echo "本机基线：249 passed / 3 failed / 2 ignored —— 3 例失败是沙箱不给权限"
+          echo "（download::pty 要分配 PTY、keychain 要访问钥匙串），非代码缺陷，基线同样失败。"
+          echo "请在 PR 描述里贴**本地** cargo test --lib 的通过数与自己基线的对比。"
+          cargo test --lib
+
+  # ---------------------------------------------------------------- 汇总
+  # 分支保护只需要勾这一个 check：分档逻辑变化时不用去改 GitHub 设置。
+  summary:
+    name: PR 校验汇总
+    needs: [scope, rules, web, rust]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 汇总结果
+        env:
+          SCOPE: ${{ needs.scope.result }}
+          RULES: ${{ needs.rules.result }}
+          WEB: ${{ needs.web.result }}
+          RUST: ${{ needs.rust.result }}
+        run: |
+          echo "变更范围=$SCOPE　提交规则=$RULES　前端=$WEB　Rust=$RUST"
+          failed=false
+          for r in "$SCOPE" "$RULES"; do
+            [ "$r" = "success" ] || failed=true
+          done
+          # 前端 / Rust 可能是 skipped（本次没改到那条路径），skipped 不算失败
+          for r in "$WEB" "$RUST"; do
+            case "$r" in success|skipped) ;; *) failed=true ;; esac
+          done
+          if [ "$failed" = true ]; then
+            echo "::error title=PR 校验未通过::看上面各 job 的日志；规则见 docs/pr-rules.md"
+            exit 1
+          fi
+          echo "全部通过 ✅"
