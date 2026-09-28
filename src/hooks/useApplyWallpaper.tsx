@@ -158,16 +158,15 @@ export function useApplyWallpaper(opts: { onApplied?: (itemId: string) => void }
                     </span>
                   )}
                 </span>
-                {playingThis ? (
+                {playingThis && (
                   <span className="shrink-0 text-[11px] text-[var(--accent-strong)]">
                     ● {tr("播放中")}
                   </span>
-                ) : (
-                  menu.last === d.id && (
-                    <span className="shrink-0 text-[11px] text-[var(--accent-strong)]">
-                      ✓ {tr("上次")}
-                    </span>
-                  )
+                )}
+                {menu.last === d.id && (
+                  <span className="shrink-0 text-[11px] text-[var(--accent-strong)]">
+                    ✓ {tr("上次")}
+                  </span>
                 )}
               </button>
             );
