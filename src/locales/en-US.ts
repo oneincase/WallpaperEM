@@ -766,6 +766,7 @@ export const EN_US: Record<string, string> = {
   "同步到所有屏": "Sync to all displays",
   "已同步到所有显示器": "Synced to all displays",
   "应用到哪块屏？": "Apply to which display?",
+  "统一应用": "Apply to all",
   "全部显示器": "All displays",
   "上次": "Last used",
   "播放中": "Playing",

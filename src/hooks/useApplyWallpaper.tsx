@@ -2,9 +2,13 @@
 //
 // 语义（P1）：
 //   - 锁定目标（armed）最优先：显示器坞点过「更换壁纸」，下一次应用只去那一屏；
-//   - 单屏：一键应用到全部显示器（现状行为，零打扰）；
-//   - 多屏（无论统一/独立模式）：弹出目标选择菜单（全部 / 各屏），记住上次选择；
+//   - 单屏：一键直接应用（零打扰，不弹菜单）；
+//   - 多屏（无论统一/独立模式）：弹出目标选择菜单 —— 顶部「统一应用」= 所有显示器
+//     显示同一张，下面逐屏列出、可单独指定；记住上次选择；
 //   - 菜单里点「正在播放本张壁纸」的显示器 = 切换为停止该屏播放（再点可再应用）。
+//
+// 「统一应用」取代了先前含糊的「全部显示器」措辞：统一模式不再等于「点一下自动刷
+// 全部屏」，而是显式选一次 —— 否则多屏统一模式的用户根本没有入口去指定单屏。
 //
 // 用法：const { apply, menuNode } = useApplyWallpaper({ onApplied });
 //   onClick={(e) => apply(itemId, e.currentTarget)}，并把 {menuNode} 渲染出来。
@@ -25,7 +29,7 @@ type MenuState = {
   displays: DisplayInfo[];
   /** 本次待应用的条目；各屏的 itemId 与之相同 = 正在播放本张，点击应停止 */
   itemId: string;
-  /** "" = 上次选的全部显示器；null = 从没选过 */
+  /** "" = 上次选的「统一应用」（全部显示器）；null = 从没选过 */
   last: string | null;
 } | null;
 
@@ -133,13 +137,21 @@ export function useApplyWallpaper(opts: { onApplied?: (itemId: string) => void }
           <div className="px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wide text-[var(--text-2)]/70">
             {tr("应用到哪块屏？")}
           </div>
+          {/* 统一应用：所有显示器显示同一张。做成实心主按钮（填充/描边对齐
+              index.css 的 .btn-primary），与下面「逐屏」的列表项区分开 ——
+              多屏时这是最常用的一次性选择。刻意不挂 .btn：那套自带
+              padding/justify-content，覆盖它要动 important，不如直接写工具类 */}
           <button
-            className="flex w-full items-center justify-between gap-3 px-3 py-1.5 text-left text-[13px] hover:bg-[var(--glass-hover)]"
+            className="mx-1.5 my-0.5 flex w-[calc(100%-0.75rem)] items-center justify-between gap-3 rounded-lg border border-[var(--card-border)] bg-[var(--accent-fill)] px-2.5 py-1.5 text-left text-[13px] font-medium text-[var(--text-1)] transition-[filter] hover:brightness-125"
             onClick={() => choose(null)}
           >
-            <span>{tr("全部显示器")}</span>
-            {menu.last === "" && <span className="text-[11px] text-[var(--accent-strong)]">✓ {tr("上次")}</span>}
+            <span>{tr("统一应用")}</span>
+            {menu.last === "" && (
+              <span className="text-[11px] opacity-75">✓ {tr("上次")}</span>
+            )}
           </button>
+          {/* 与逐屏列表的分隔：上面是「一次刷全部」，下面是「挑一块屏」 */}
+          <div className="mx-1.5 my-1 h-px bg-[var(--separator)]" />
           {menu.displays.map((d) => {
             // 该屏正在播放本次要应用的那张：同一项再点 = 停止该屏播放
             const playingThis = d.itemId != null && d.itemId === menu.itemId;
