@@ -881,6 +881,15 @@ pub struct WallpaperEngineState {
     /// 这是比 `__wp.release()`（页面内 JS 释放）更彻底的一档：进程直接结束，
     /// 内存实打实归还。
     pub released: Mutex<HashSet<String>>,
+    /// 用户**显式清除**过壁纸的屏 label 集合（按屏独立）。
+    ///
+    /// 为什么需要它：`stop` 会把 label 从 `windows` 移除、把 `wallpaper_sessions`
+    /// 的 DB 行删掉，但 `default`（最近一次配置）是**全局**的、只在「全停」时才清 ——
+    /// 单屏清除后 default 还在，`ensure_windows` 的兜底链
+    /// （内存会话 > DB 会话 > default）就会拿 default 把窗口重新建回来，表现为
+    /// 「清掉的壁纸过两秒自己回来了」。集合内的 label 一律不建窗，直到用户重新
+    /// 应用壁纸（[`apply_on_main`]）或该屏被拔掉。
+    pub stopped: Mutex<HashSet<String>>,
     /// macOS：label -> 该窗口**独占**的 WKWebsiteDataStore 标识。
     ///
     /// 窗口被销毁（stop / 显示器移除 / 换纸降级到重建）时按它
@@ -902,6 +911,7 @@ impl Default for WallpaperEngineState {
             paused: Mutex::new(false),
             auto_paused: Mutex::new(HashSet::new()),
             released: Mutex::new(HashSet::new()),
+            stopped: Mutex::new(HashSet::new()),
             #[cfg(target_os = "macos")]
             data_stores: Mutex::new(HashMap::new()),
         }
@@ -916,6 +926,8 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
     platform::refresh_display_meta();
     migrate_display_ids(app);
     restore_sessions(app);
+    // 必须先于 ensure_windows：清过的屏这一轮就不该建窗
+    restore_stopped(app);
     // 等待内容服务器端口就绪（最长 3s），壁纸窗口从内容服务器同源加载渲染器页
     for _ in 0..30 {
         if let Some(st) = app.try_state::<Arc<Mutex<u16>>>() {
@@ -1043,6 +1055,8 @@ fn migrate_display_ids(app: &AppHandle) {
     let Ok(conn) = db.lock() else {
         return;
     };
+    // 「用户显式清除过」的标记也要跟着 id 迁移（见 migrate_stopped_labels）
+    migrate_stopped_labels(&conn, &pairs);
     for (old, new) in pairs {
         let moved = conn
             .execute(
@@ -1058,6 +1072,40 @@ fn migrate_display_ids(app: &AppHandle) {
                 [&old],
             );
         }
+    }
+}
+
+/// 显示器 id 迁移时把「用户显式清除过」的标记一起搬走。
+///
+/// 必须搬，两个原因：
+/// ① 标记是按 label（`wallpaper-<id>`）存的，id 变了 label 就变了，不搬等于那次清除
+///    被遗忘 —— 老版本升级上来的用户会看到「之前停掉的壁纸自己回来了」；
+/// ② [`migrate_display_ids`] 跑在 `restore_stopped` **之前**（见 `init` 的顺序），此刻
+///    内存里的 `stopped` 集合还是空的，标记只存在于 settings 里 —— 所以这里改的是
+///    落库值，不能只改内存。
+fn migrate_stopped_labels(conn: &Connection, pairs: &[(String, String)]) {
+    let Some(raw) = crate::db::get_setting(conn, STOPPED_DISPLAYS_KEY) else {
+        return;
+    };
+    let Some(mut set) = parse_stopped(&raw) else {
+        tracing::warn!("stopped displays: 解析失败，跳过 id 迁移");
+        return;
+    };
+    let mut moved: Vec<String> = Vec::new();
+    for (old, new) in pairs {
+        let old_label = format!("wallpaper-{old}");
+        if set.remove(&old_label) {
+            let new_label = format!("wallpaper-{new}");
+            set.insert(new_label.clone());
+            moved.push(format!("{old_label} -> {new_label}"));
+        }
+    }
+    if moved.is_empty() {
+        return;
+    }
+    tracing::info!("stopped displays migrated: {}", moved.join(", "));
+    if let Err(e) = crate::db::set_setting(conn, STOPPED_DISPLAYS_KEY, &encode_stopped(&set)) {
+        tracing::warn!("stopped displays: 迁移落库失败: {e}");
     }
 }
 
@@ -1130,6 +1178,84 @@ fn restore_sessions(app: &AppHandle) {
     tracing::info!("wallpaper sessions restored: {count}");
 }
 
+/// 「用户显式清除过的屏」的落库键（settings 表，存 label 的 JSON 数组）。
+///
+/// 必须持久化：`stop` 删掉了该屏的 `wallpaper_sessions` 行，但 `default`
+/// （最近一次配置）是**全局**的 —— 重启后 `init` 把它恢复回来，无会话的屏照样
+/// 被它填充，表现为「清掉的壁纸重启后又回来了」。用户的原话是「只有下次设置
+/// 壁纸才再次创建」，所以清除意图要跨重启记住。
+const STOPPED_DISPLAYS_KEY: &str = "wallpaper_stopped_displays";
+
+/// 解 settings 里的 label 数组。**解析失败返回 None**，调用方按「没有任何屏被清除」
+/// 处理 —— 这是安全方向：宁可壁纸复活一次，也不能因为一条坏数据把某块屏永久挡住
+/// （用户会遇到"怎么点都出不来壁纸"，且没有任何报错可循）。
+fn parse_stopped(raw: &str) -> Option<HashSet<String>> {
+    serde_json::from_str::<Vec<String>>(raw)
+        .ok()
+        .map(|list| list.into_iter().collect())
+}
+
+/// 编 settings 值。**排序后再写**：集合迭代序不定，不排的话同一份内容每次落库的
+/// 字节都不同 —— 往返测试没法比对，也白白制造无意义的写入。
+fn encode_stopped(set: &HashSet<String>) -> String {
+    let mut list: Vec<&String> = set.iter().collect();
+    list.sort();
+    serde_json::to_string(&list).unwrap_or_else(|_| "[]".into())
+}
+
+/// 载入 [`STOPPED_DISPLAYS_KEY`]（`restore_sessions` 之后调用）。
+fn restore_stopped(app: &AppHandle) {
+    let Some(st) = app.try_state::<WallpaperEngineState>() else {
+        return;
+    };
+    // db 必须绑定到局部变量：try_state 返回的 State 是临时值，若直接接 and_then，
+    // 闭包参数在闭包结束即 drop，后面 st.stopped 的借用会活不过它
+    let Some(db) = app.try_state::<Arc<Mutex<rusqlite::Connection>>>() else {
+        return;
+    };
+    let Some(raw) = db
+        .lock()
+        .ok()
+        .and_then(|c| crate::db::get_setting(&c, STOPPED_DISPLAYS_KEY))
+    else {
+        return;
+    };
+    let Some(set) = parse_stopped(&raw) else {
+        tracing::warn!("stopped displays: 解析失败，按未清除处理");
+        return;
+    };
+    if set.is_empty() {
+        return;
+    }
+    tracing::info!("restore stopped displays: {set:?}");
+    // 具名绑定而非 if let：if let 作为末句时临时 guard 的析构会晚于 st，
+    // 编译器按「st 先 drop」判定借用越界（E0597）。具名变量按声明逆序析构，安全。
+    let mut guard = match st.stopped.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    *guard = set;
+}
+
+/// 把当前的「已显式清除」集合落库。失败只记日志 —— 这是体验性状态，
+/// 不该因为一次磁盘抖动把 stop / apply 整个打回。
+fn persist_stopped(app: &AppHandle, state: &WallpaperEngineState) {
+    let Some(db) = app.try_state::<Arc<Mutex<rusqlite::Connection>>>() else {
+        return;
+    };
+    let Ok(json) = state.stopped.lock().map(|g| encode_stopped(&g)) else {
+        return;
+    };
+    // 同上：guard 具名绑定，保证它在 db 之前析构
+    let conn = match db.lock() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    if let Err(e) = crate::db::set_setting(&conn, STOPPED_DISPLAYS_KEY, &json) {
+        tracing::warn!("persist stopped displays failed: {e}");
+    }
+}
+
 // ---------- 壁纸窗口 label ----------
 //
 // 一块屏一扇窗口（label = 基 label），换壁纸就是把这扇窗换成新文档
@@ -1171,6 +1297,20 @@ pub(crate) fn wallpaper_window(app: &AppHandle, base: &str) -> Option<WebviewWin
 /// 确保每个活动显示器都有壁纸窗口（创建/缩放/回收）
 fn ensure_windows(app: &AppHandle) {
     ensure_windows_inner(app, platform::display_asleep());
+}
+
+/// 这一轮要不要为某块屏建窗。两个「别建」的来源：
+///
+/// - `released`（「暂停释放内存」已销毁渲染进程）：照常同步会把刚杀掉的进程立刻建
+///   回来；该屏由 [`resume_label`] 清标志后恢复。
+/// - `stopped`（用户显式清除过壁纸，见 [`STOPPED_DISPLAYS_KEY`]）：`default` 是全局的、
+///   单屏 `stop` 不会清它，不在这里挡住，2s 一轮的监控就会拿 `default` 把窗口建回来
+///   —— 表现是「清掉的壁纸自己又回来了」。重新应用壁纸时由 [`apply_on_main`] 移出。
+///
+/// 抽成纯函数是为了能直接测：这两条都是「不报错、只在两秒后表现为行为不对」的缺陷，
+/// 靠手点很难覆盖（也正是这个 bug 藏了这么久的原因）。
+fn should_build_window(label: &str, released: &HashSet<String>, stopped: &HashSet<String>) -> bool {
+    !released.contains(label) && !stopped.contains(label)
 }
 
 /// 「没有会话配置所以不建窗」只提示一次，避免每 2s 刷屏
@@ -1219,6 +1359,8 @@ fn ensure_windows_inner(app: &AppHandle, display_asleep: bool) {
     };
     let configs = state.windows.lock().unwrap().clone();
     let released = state.released.lock().unwrap().clone();
+    // 用户显式清除过壁纸的屏：不建窗，也不吃下面的 default 兜底
+    let stopped = state.stopped.lock().unwrap().clone();
     // 显示器 ID 变更/新增屏时，用最近一次会话配置兜底，保证壁纸仍能恢复
     let default_cfg = state.default.lock().unwrap().clone();
 
@@ -1247,6 +1389,11 @@ fn ensure_windows_inner(app: &AppHandle, display_asleep: bool) {
             if let Ok(mut g) = state.released.lock() {
                 g.remove(&base);
             }
+            // 屏已拔掉：显式清除标记一并清掉，否则集合会随着插拔无限增长，
+            // 而且同一块屏插回来后 label 不变、标记还在，会拒绝恢复壁纸
+            if let Ok(mut g) = state.stopped.lock() {
+                g.remove(&base);
+            }
         }
     }
 
@@ -1271,9 +1418,9 @@ fn ensure_windows_inner(app: &AppHandle, display_asleep: bool) {
             }
             continue;
         };
-        // 「暂停释放内存」挂起中的屏不建窗（渲染器已整窗销毁等恢复，照常同步
-        // 会把刚杀掉的进程立刻建回来）；该屏恢复时由 resume_label 清标志重建
-        if released.contains(label.as_str()) {
+        // 两道闸都收在这一个判据里（见 should_build_window）：漏一个是「暂停释放内存」
+        // 被立刻建回来，另一个是「清掉的壁纸两秒后自己回来」——两种都不报错
+        if !should_build_window(label, &released, &stopped) {
             continue;
         }
         let live = wallpaper_windows(app, label);
@@ -2258,6 +2405,11 @@ fn apply_on_main(
     for (label, frame) in &targets {
         let cfg2 = prepare_cfg(app, &cfg);
 
+        // 重新应用 = 用户又要这块屏有壁纸了：撤掉「已显式清除」标记，
+        // 否则 ensure_windows 会一直跳过它（窗口只在本次应用里建一次，
+        // 之后的布局变化/重启恢复都不会再同步它）。
+        state.stopped.lock().unwrap().remove(label);
+
         // 换了壁纸**不能**走 `setWallpaper` 热更新：同一文档里换实例实测会把
         // 上一张壁纸的 JS 堆与 GPU 资源一直攥着 —— 同一窗口逐张切换，Activity
         // Monitor 的 footprint 从 ~300MB 单调涨到 4GB+（复现 6 张场景
@@ -2334,6 +2486,10 @@ fn apply_on_main(
             );
         }
     }
+
+    // 本次应用把目标屏移出了「已显式清除」集合（见循环开头），落库同步 ——
+    // 否则重启后 restore_stopped 会把它们又标回已清除，那几屏再也不会自动同步。
+    persist_stopped(app, &state);
 
     // 会话已变化 → 前端刷新「已应用」徽章与显示器管理页
     let _ = app.emit("sessions-changed", ());
@@ -2857,6 +3013,10 @@ pub fn stop(app: AppHandle, display_id: Option<String>) -> Result<(), String> {
             // 留着会让监控的 ensure_windows 永久不建窗（布局变化无法同步）
             state.auto_paused.lock().unwrap().remove(label);
             state.released.lock().unwrap().remove(label);
+            // 标记为「用户显式清除」：default 是全局的，单屏 stop 清不掉它，
+            // 不记这一笔的话下一轮 ensure_windows 会拿 default 把窗口建回来。
+            // 重新应用壁纸（apply_on_main）或该屏被拔掉时移出。
+            state.stopped.lock().unwrap().insert(label.clone());
             if let Some(db) = &db {
                 if let Ok(conn) = db.lock() {
                     let key = label.strip_prefix("wallpaper-").unwrap_or(label);
@@ -2873,6 +3033,9 @@ pub fn stop(app: AppHandle, display_id: Option<String>) -> Result<(), String> {
         if display_id.is_none() {
             *state.default.lock().unwrap() = None;
         }
+        // 记下「这些屏是用户显式清掉的」并落库：单屏 stop 清不掉全局 default，
+        // 不记这一笔，下一轮 ensure_windows（以及重启后的 init）就会把它建回来。
+        persist_stopped(&app2, &state);
         let _ = app2.emit("sessions-changed", ());
         let _ = tx.send(Ok(()));
     })
@@ -5417,5 +5580,115 @@ mod tests {
         std::fs::write(d.join("project.json"), r#"{"type":"web"}"#).unwrap();
         assert_eq!(project_json_entry(&d), None);
         assert_eq!(project_json_entry(&fixture("empty")), None);
+    }
+
+    // ---------- 「用户显式清除过壁纸的屏」（state.stopped） ----------
+
+    /// 建窗判据：`released` 与 `stopped` 两道闸都必须挡住。漏任何一个的表现都是
+    /// 「不报错、两秒后行为不对」——前者是把刚释放的渲染进程建回来，后者是把用户
+    /// 清掉的壁纸用 default 兜底复活。
+    #[test]
+    fn window_build_gate_blocks_released_and_stopped() {
+        let empty = HashSet::new();
+        assert!(
+            should_build_window("wallpaper-1", &empty, &empty),
+            "两道闸都没命中时应建窗"
+        );
+
+        let released: HashSet<String> = ["wallpaper-1".to_string()].into_iter().collect();
+        assert!(
+            !should_build_window("wallpaper-1", &released, &empty),
+            "「暂停释放内存」挂起中的屏不该被立刻建回来"
+        );
+
+        let stopped: HashSet<String> = ["wallpaper-1".to_string()].into_iter().collect();
+        assert!(
+            !should_build_window("wallpaper-1", &empty, &stopped),
+            "用户清除过的屏不该被 default 兜底复活"
+        );
+
+        // 只闸住自己那一屏，别的屏照常
+        assert!(
+            should_build_window("wallpaper-6", &released, &stopped),
+            "闸只作用于集合里的屏"
+        );
+    }
+
+    /// 编解码往返 + 坏数据的方向。方向很重要：`parse_stopped` 失败必须退化成
+    /// 「没有任何屏被清除」（壁纸最多复活一次），而不能退化成「全都算清除」——
+    /// 后者会让某块屏永久出不来壁纸，且没有任何报错可循。
+    #[test]
+    fn stopped_set_encode_parse_roundtrip_and_garbage_is_safe() {
+        let mut set: HashSet<String> = HashSet::new();
+        set.insert("wallpaper-6".into());
+        set.insert("wallpaper-1".into());
+
+        let raw = encode_stopped(&set);
+        assert_eq!(
+            raw, r#"["wallpaper-1","wallpaper-6"]"#,
+            "排序后写入：集合迭代序不定，不排就无法比对、也白造无意义写入"
+        );
+        assert_eq!(parse_stopped(&raw).unwrap(), set);
+
+        assert!(parse_stopped("not-json").is_none());
+        assert!(parse_stopped("{}").is_none(), "类型不符也该退化为 None");
+        assert!(parse_stopped("[]").unwrap().is_empty());
+    }
+
+    /// 落库 → 重启后载入：清除意图必须跨重启还在 —— 这是它必须持久化的全部理由
+    /// （只放内存的话，重启后 default 又把它灌回来）。
+    #[test]
+    fn stopped_survives_persist_and_restore() {
+        let c = play_cfg_db();
+        let mut set: HashSet<String> = HashSet::new();
+        set.insert("wallpaper-1".into());
+        crate::db::set_setting(&c, STOPPED_DISPLAYS_KEY, &encode_stopped(&set)).unwrap();
+
+        // 模拟重启后的 restore_stopped：从 settings 读回
+        let raw = crate::db::get_setting(&c, STOPPED_DISPLAYS_KEY).unwrap();
+        let restored = parse_stopped(&raw).unwrap();
+        assert_eq!(restored, set);
+        assert!(
+            !should_build_window("wallpaper-1", &HashSet::new(), &restored),
+            "重启后仍不该把用户清掉的那屏建回来"
+        );
+    }
+
+    /// 显示器 id 迁移要把清除标记一起搬走：不搬则老版本升级上来的用户那次清除被
+    /// 遗忘、壁纸复活一次。注意迁移跑在 `restore_stopped` **之前**，此刻内存集合
+    /// 还是空的，所以这里改的必须是**落库值**。
+    #[test]
+    fn migrate_carries_stopped_labels() {
+        let c = play_cfg_db();
+        let mut set: HashSet<String> = HashSet::new();
+        set.insert("wallpaper-old".into());
+        crate::db::set_setting(&c, STOPPED_DISPLAYS_KEY, &encode_stopped(&set)).unwrap();
+
+        migrate_stopped_labels(&c, &[("old".to_string(), "new".to_string())]);
+
+        let after =
+            parse_stopped(&crate::db::get_setting(&c, STOPPED_DISPLAYS_KEY).unwrap()).unwrap();
+        assert!(
+            after.contains("wallpaper-new"),
+            "清除意图要跟到新 id，实际 {after:?}"
+        );
+        assert!(!after.contains("wallpaper-old"), "旧 label 不该残留");
+
+        // 与被迁移的屏无关的 pair 不该动标记
+        migrate_stopped_labels(&c, &[("zzz".to_string(), "yyy".to_string())]);
+        let after =
+            parse_stopped(&crate::db::get_setting(&c, STOPPED_DISPLAYS_KEY).unwrap()).unwrap();
+        assert_eq!(after.len(), 1, "无关迁移不该改动标记，实际 {after:?}");
+    }
+
+    /// 没有落库值（首次安装 / 从没清过）时迁移必须安全空转。
+    #[test]
+    fn migrate_without_marker_is_a_noop() {
+        let c = play_cfg_db();
+        migrate_stopped_labels(&c, &[("old".to_string(), "new".to_string())]);
+        assert!(
+            crate::db::get_setting(&c, STOPPED_DISPLAYS_KEY).is_none(),
+            "本来没有标记就不该凭空写一条出来"
+        );
     }
 }
