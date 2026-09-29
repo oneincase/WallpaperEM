@@ -128,6 +128,13 @@ jobs:
         # 三处权威版本必须相同；bin-info.plist（dev 版内嵌）不一致只警告不阻断
         run: node scripts/check-versions.mjs
 
+      - name: 拆分器自身的回归测试
+        # 提交粒度那条规则是本地的（CI 看不到当时的暂存边界，见 docs/pr-rules.md §2），
+        # 但这个脚本会拦本地提交、会替人写提交 —— 它坏了比规则松了更糟，所以在这里守一道。
+        # 零依赖、全在临时仓库里跑，不需要 pnpm install。
+        # 用 shell 展开的 glob（`node --test scripts/` 在 Node 24 上会把目录当模块加载而报错）。
+        run: node --test scripts/*.test.mjs
+
       - name: 代码变更是否补了 CHANGELOG（建议项，不阻断）
         continue-on-error: true
         env:

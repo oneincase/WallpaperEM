@@ -382,8 +382,9 @@ pnpm tauri build
 
 - 提交信息用 `type(scope): 主题`（conventional 形式，中文主题），主题要说清"什么条件下什么行为变了"。
 - PR 用仓库模板描述，**「改动」「验证」两节必填**（CI 校验）；单个 PR 只做一件事。
-- `pnpm install` 会自动装好 `commit-msg` 钩子，提交时本地校验；CI 用同一份规则再校验一次。
-- 自查：`pnpm lint:commit --range origin/main..HEAD`　·　`pnpm versions:check`
+- `pnpm install` 会自动装好两个钩子（`commit-msg` 校验提交信息、`pre-commit` 拦「一批改动含多个功能」）；
+  一批改动确实跨了多个功能时，`pnpm commit:split` 能按功能域拆成多条提交（`--apply` 落库、`--auto` 不问标题）。
+- 自查：`pnpm lint:commit --range origin/main..HEAD`　·　`pnpm commit:split`（看会被怎么拆）　·　`pnpm versions:check`
 
 Full rules: [`docs/pr-rules.md`](docs/pr-rules.md). Commits follow `type(scope): 主题`, PRs use the
 repository template (the “改动 / 验证” sections are required and checked in CI).

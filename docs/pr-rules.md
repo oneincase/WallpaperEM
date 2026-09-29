@@ -11,6 +11,7 @@
 | 事项 | 规则 |
 | --- | --- |
 | 分支 | `feat/` `fix/` `refactor/` `perf/` `docs/` `chore/` `release/` `hotfix/` + kebab-case；`wip/` 不准开 PR |
+| 提交粒度 | 一批改动含多个功能时，本地 `pre-commit` 拦下；`pnpm commit:split` 按功能域自动拆成多条（§2 提交粒度） |
 | 提交信息 | `type(scope): 中文主题`，主题说清"改了什么 + 什么条件下行为如何" |
 | 正文 | 空行分隔；推荐四段：背景 / 改动 / 验证 / 影响面 |
 | PR 标题 | 与提交信息同格式（squash 后它就是 `main` 上的标题） |
@@ -37,7 +38,8 @@
 三条底线，其余都是细节：
 
 1. **一条提交说清一件事。**（原「一个 PR 一件事」已取消，见 §0.1）两件不相干的事分开提交 ——
-   它们会共享同一次回滚、同一条"修复了什么"的记录，这是唯一还需要守的粒度约束。
+   它们会共享同一次回滚、同一条"修复了什么"的记录，这是唯一还需要守的粒度约束，
+   也是唯一被本地钩子盯着的一条（§2 提交粒度）。
 2. **说清为什么，而不只是改了什么。** diff 自己会说"改了什么"，只有你能说"为什么"。
 3. **证据先于结论。** 写"应该没问题"不如写"跑了什么命令、结果是多少、和基线差在哪"。
 
@@ -93,7 +95,8 @@ type(scope): 主题
 
 ```
 wallpaper playlist share workshop download render props apply hotkeys tray theme
-update db library network mcp steam i18n ui deps build bundle ci pr release
+update db library network mcp steam i18n ui core media quality security perf
+deps build bundle ci pr release
 scripts dev docs readme changelog windows macos linux
 ```
 
@@ -171,11 +174,60 @@ Refs #456
 
 带 `!`（如 `feat(api)!: …`）或写 `BREAKING CHANGE:` 时，正文里要给出迁移方式。
 
-### 提交粒度
+### 提交粒度（2026-09-29 起有机器兜底）
 
-- 一个提交一件事。"改功能 + 顺手格式化整个文件"是两个提交，不是一个。
-- 在制快照（`wip:`）可以随手提交，但**开 PR 前要整理**：`git rebase -i` 合并/改写，
-  让每条提交都能独立读懂。CI 校验的是 PR 范围内的**每一**条提交。
+规则本身没变：**一条提交说清一件事**。"改功能 + 顺手格式化整个文件"是两个提交，不是一个；
+不相干的两件事挤在一起，回滚时会连带把别的改动一起带走 —— 这是取消 PR 闸门（§0.1）之后
+**唯一还需要守的粒度约束**。变的是它现在不用靠记性：
+
+**一、本地 `pre-commit` 会拦。** 提交时把暂存区按**功能域**归堆（域表 = 后端模块 + 前端
+确有归属的功能模块，见 `scripts/split-commits.mjs` 的 `RULES`），命中下面任一条就拦下来：
+
+| 触发 | 形状 | 例子 |
+| --- | --- | --- |
+| 双峰 | 两个功能域各占改动量 40% 以上（各自 ≥ 40 行） | steam 60 行 + quality 60 行 |
+| 撒开 | 四个以上功能域各占 10% 以上（各自 ≥ 20 行），总量 ≥ 200 行 | 一次动 5 个模块各几十行 |
+| 摊大饼 | 总量 ≥ 600 行且没有任何域能主导（最大域 < 40%），至少 3 个实体域 ≥ 8% | 「在制品一次性落库」 |
+
+阈值是**对着本仓库全部 133 条提交校准**出来的（`node scripts/split-commits.mjs --audit <范围>`
+可复现，当前 8/133 = 6% 被拦，全是标题里自己就写着多件事的那种）。校准时要保证**不拦**这些
+正常提交：一个功能跨多个模块（`feat(playlist)`：wallpaper 74% / hotkeys 10%；`fix(mcp)`：
+mcp 54% / network 29%）、集成面跟随（页面 / 词条 / 命令层 / 内存性能基建）、发布提交
+（版本号 + CHANGELOG 全是 meta，天然不触发）。
+
+**二、拆是一行命令。** 拦住之后：
+
+```bash
+pnpm commit:split              # 看分组草案；同时写出计划文件 .git/we-split-plan.json
+#   → 改里面的标题（类型/scope/主题/正文都能改，文件也能在组间挪）
+pnpm commit:split --apply      # 按计划落库；标题还是草案时会拒绝，这是刻意的
+pnpm commit:split --apply --auto   # 不想写标题：直接按草案拆（标题会带"自动拆分草案"字样）
+pnpm commit:split --worktree   # 连未暂存/未跟踪的改动一起纳入
+```
+
+- 拆分粒度是**整文件**：同一文件里混着两件事时拆不开（按 hunk 做手术被 §0.1 明确否掉了），
+  这种情况脚本会把文件给"主域"，并让你在计划文件里改。
+- 提交用**临时索引**做，所以"只暂存了文件的一部分"也会精确落进对应提交：已暂存的那部分
+  进提交，未暂存的部分原样留在工作区。拆完索引会与新的 HEAD 对齐，`git status` 干净。
+- 每条拆分提交的信息都要先过 §2 的校验器（同一份 `commit-msg-lint.mjs`），不合规就整批停下，
+  不会写出一条坏历史。回退：`git reset --soft <拆分前的 sha>`（脚本会把这行打给你）。
+- 默认**先出计划、人来写标题**：标题是 `git log` 唯一值钱的部分，机器起草的东西不该冒充它。
+  急着提交时 `--auto` 才是"不改计划直接拆"的口子。
+
+**三、不想拆怎么办。** 三种都行，代价不同：
+
+```bash
+WE_ALLOW_MIXED=1 git commit …   # 本次放行（"我知道这是一件事"）—— 首选，留痕最多
+git commit --no-verify          # 绕过全部本地钩子（提交信息也不校验了）
+WE_AUTO_SPLIT=1 git commit …    # 反过来：钩子检测到多功能就直接拆，原提交被取消（全自动）
+```
+
+在制快照（`wip/` 分支上的 `wip:` 提交）照旧可以随手写，但**落 `main` 前要整理**：
+`git rebase -i` 合并/改写，让每条提交都能独立读懂；`--audit` 能先告诉你哪几条会被判成多功能。
+
+**为什么 CI 不管这条。** CI 看到的是提交结果，看不到你当时把哪些文件放在一起暂存的 ——
+判定必须发生在 `pre-commit`（本地）。所以这是本仓库少见的"**本地严、CI 松**"的一处：
+别指望 CI 兜底，`--no-verify` 是真的绕过去了。
 
 ## 3. PR 标题
 
@@ -217,8 +269,8 @@ node scripts/pr-size-check.mjs --range origin/main..HEAD
 
 ### 本地（提交时）
 
-`pnpm install` 会自动装好 `commit-msg` 钩子（`package.json` 的 `prepare` 调
-`scripts/install-hooks.mjs`）。手动装/查/卸：
+`pnpm install` 会自动装好两个钩子（`package.json` 的 `prepare` 调 `scripts/install-hooks.mjs`）。
+手动装/查/卸：
 
 ```bash
 pnpm hooks:install     # 安装（幂等）
@@ -226,11 +278,20 @@ pnpm hooks:status      # 看装了什么
 pnpm hooks:uninstall   # 卸载（有备份则还原）
 ```
 
-钩子只接管 `commit-msg`；`post-checkout` / `post-commit` / `post-merge` / `pre-push`
-是 **git-lfs 的**，安装脚本不碰它们。
+| 钩子 | 指向 | 管什么 | 绕过 |
+| --- | --- | --- | --- |
+| `commit-msg` | `scripts/commit-msg-lint.mjs` | §2 提交信息形状 | `git commit --no-verify`（**CI 仍会拦**） |
+| `pre-commit` | `scripts/split-commits.mjs --hook` | §2 提交粒度（一批改动含多个功能就拦） | `WE_ALLOW_MIXED=1`，或 `--no-verify`（**CI 拦不住**，见 §2） |
 
-急着提交时 `git commit --no-verify` 可以绕过钩子 —— 但 **CI 会拦**。绕过只该用于
-"我知道这条不合规且有意为之"（例如回滚提交）。
+这两个之外不碰别的钩子：`post-checkout` / `post-commit` / `post-merge` / `pre-push`
+是 **git-lfs 的**，安装脚本不碰它们。钩子在运行时自己找 node，找不到就放行并提示 ——
+钩子是"帮你不犯错"，不该因为环境缺 node 就把提交卡死。
+
+回归测试（`node:test`，零依赖，全在临时仓库里做）：
+
+```bash
+pnpm test:scripts      # 16 个用例：拆分内容守恒 / 部分暂存 / 计划文件 / 拒绝路径 / 钩子自动拆分
+```
 
 ### CI（PR 时）
 
@@ -371,7 +432,8 @@ git tag v2.0.0 && git push origin v2.0.0
 1. 提交信息是 `wip:` / `update` / `修改代码` 这类没有信息量的标题。
 2. PR 描述只有模板骨架，或「验证」写着"已测试"却没有命令与结果。
 3. 夹带无关改动：顺手重构、整文件格式化、临时调试代码、本地绝对路径。
-4. 不相干的两件事挤在**同一条提交**里：回滚时会连带把别的改动一起带走（体积不再设限，这条仍守）。
+4. 不相干的两件事挤在**同一条提交**里：回滚时会连带把别的改动一起带走（体积不再设限，这条仍守；
+   本地 `pre-commit` 会拦，见 §2 提交粒度）。
 5. 改了 `src/` 或 `src-tauri/src/` 但 `CHANGELOG.md` 没动（用户可见变更）。
 6. 引入新 warning（clippy / tsc）而不解释。
 7. 修了 bug 但没补能复现它的测试 —— 这类修复的失效方式是"不报错、过一会行为不对"，
@@ -384,7 +446,9 @@ git tag v2.0.0 && git push origin v2.0.0
 | --- | --- |
 | `docs/pr-rules.md` | 本文件：规则的唯一来源 |
 | `scripts/commit-msg-lint.mjs` | 提交信息 / PR 标题 / PR 正文校验（**零依赖**，本地与 CI 共用） |
-| `scripts/install-hooks.mjs` | 安装 / 卸载 / 查看 `commit-msg` 钩子（不碰 git-lfs 的钩子） |
+| `scripts/split-commits.mjs` | 提交粒度：多功能改动的判定、按功能域拆分、`pre-commit` 拦截（**零依赖**） |
+| `scripts/split-commits.test.mjs` | 上者的回归测试（`pnpm test:scripts`，全在临时仓库里跑） |
+| `scripts/install-hooks.mjs` | 安装 / 卸载 / 查看 `commit-msg` + `pre-commit` 钩子（不碰 git-lfs 的钩子） |
 | `scripts/check-versions.mjs` | 四处版本号一致性 |
 | `scripts/pr-size-check.mjs` | 体积自查（**不再拦 PR**，2026-09-29 取消闸门） |
 | `.github/PULL_REQUEST_TEMPLATE.md` | PR 描述模板（CI 据此校验小节） |
@@ -395,6 +459,10 @@ git tag v2.0.0 && git push origin v2.0.0
 ```bash
 pnpm lint:commit --message "feat(playlist): 手动设单张退出该屏轮播"
 pnpm lint:commit --range origin/main..HEAD        # 校验整个分支
+pnpm commit:split                                 # 提交粒度：看当前暂存区会被怎么拆（不会提交）
+node scripts/split-commits.mjs --audit origin/main..HEAD    # 拿历史回看这条规则拦了谁（只读）
+node scripts/split-commits.mjs --explain <文件>   # 某个文件算哪个功能域
+pnpm test:scripts                                 # 拆分器自身的回归测试
 node scripts/pr-size-check.mjs --range origin/main..HEAD    # 体积自查（可选，不拦）
 pnpm versions:check
 ```
