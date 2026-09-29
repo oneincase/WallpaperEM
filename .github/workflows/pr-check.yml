@@ -1,6 +1,8 @@
 name: PR 校验（规则 / 前端 / Rust）
 
-# 用途：每个 PR 自动跑**能挡住问题**的那几道门禁。规则全文见 docs/pr-rules.md。
+# 用途：每个 PR **以及每次直推 `main`** 都跑一遍**能挡住问题**的那几道门禁，
+#       手动触发（workflow_dispatch）可把同一套门禁跑在任意 ref 上。
+#       规则全文见 docs/pr-rules.md。
 #
 # 设计原则（重要，改这个文件前先读）：
 #   门禁分两档 —— **阻断**（exit 非 0 就红）与**报告**（continue-on-error，只贴结果不挡人）。
@@ -26,12 +28,22 @@ name: PR 校验（规则 / 前端 / Rust）
 on:
   pull_request:
     types: [opened, synchronize, reopened, edited, ready_for_review]
+  # §0.1 之后**直推 main 是常态**，而 PR 门禁拦不住它 —— 推送也跑一遍同样的校验。
+  # 这是**后置**校验（提交已经进 main 了），作用是"红得早、回滚得快"，不是挡住推送。
+  push:
+    branches: [main]
+  # 手动触发：想在推送前就把全量门禁跑一遍（§6 说的"直推前自己跑一遍"现在可以在服务端做：
+  #   gh workflow run pr-check.yml -r main ）；也是量 Linux 侧基线的入口（棘轮的平台键、
+  #   单元测试档）。跑哪个 ref 用 Run workflow 的分支下拉框选，不需要额外 input。
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: pr-check-${{ github.event.pull_request.number }}
+  # PR 按 PR 号去重（同一 PR 连续推只留最后一次）；push/dispatch 按 ref 去重。
+  # 用 github.ref 而不是 event 名：PR 的 ref 是 refs/pull/N/merge，天然按 PR 隔开。
+  group: pr-check-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -44,6 +56,8 @@ jobs:
     outputs:
       web: ${{ steps.diff.outputs.web }}
       rust: ${{ steps.diff.outputs.rust }}
+      # 供 rules job 复用：同一个范围用一处算，别让两个 job 各算一套再互相打架
+      range: ${{ steps.range.outputs.range }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -53,19 +67,48 @@ jobs:
       - name: 取 PR head 到本地（fork 来的 PR 也取得到）
         # 直接用 head.sha 在 fork PR 上可能不在 base 仓库的对象库里；PR 的 head ref
         # 一定在：refs/pull/<N>/head。统一走它，同仓库 / fork 两种情况都成立。
+        if: github.event_name == 'pull_request'
         run: |
           git fetch --no-tags origin \
             "+refs/pull/${{ github.event.pull_request.number }}/head:refs/remotes/origin/pr-head"
 
+      # 算出本次要 diff 的范围。原则：**范围拿不准就跑全部** —— 宁可多花几分钟，
+      # 也不要因为算错范围而漏掉该跑的检查。
+      #   pull_request → origin/<base>...origin/pr-head（三方点 = merge-base 之后）
+      #   push         → <before>..<sha>（这次推送改了什么）
+      #   dispatch     → all（手动触发的意图就是"整体跑一遍"）
+      - name: 算出改动范围
+        id: range
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          range=all
+          case "$EVENT" in
+            pull_request)
+              range="origin/${BASE_REF}...origin/pr-head" ;;
+            push)
+              if [ -n "$PUSH_BEFORE" ] && [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ] \
+                 && git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+                range="${PUSH_BEFORE}..${HEAD_SHA}"
+              else
+                echo "::warning title=拿不到 push 之前的提交::新分支或强推场景，退化为跑全部检查"
+              fi ;;
+          esac
+          echo "range=$range" >> "$GITHUB_OUTPUT"
+          echo "→ 范围：$range"
+
       - name: 判定改动范围
         id: diff
         env:
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          RANGE: ${{ steps.range.outputs.range }}
         run: |
           set -euo pipefail
-          if ! git diff --name-only "origin/${BASE_REF}...origin/pr-head" > /tmp/changed.txt; then
+          if [ "$RANGE" = "all" ] || ! git diff --name-only "$RANGE" > /tmp/changed.txt 2>/dev/null; then
             # 拿不到 diff 时**保守跑全部**：宁可多花几分钟，也不要放过该跑的检查
-            echo "::warning title=无法与 ${BASE_REF} 比对::退化为跑全部检查"
+            echo "::warning title=无法确定改动范围::退化为跑全部检查"
             : > /tmp/changed.txt
             echo "src/__all__" >> /tmp/changed.txt
             echo "src-tauri/__all__" >> /tmp/changed.txt
@@ -95,9 +138,17 @@ jobs:
   # commit-msg-lint.mjs 与本地钩子是同一份规则、同一个脚本 —— 本地能过，CI 就能过。
   rules:
     name: 提交规则
+    needs: scope
     runs-on: ubuntu-latest
     # fetch-depth: 0 要拉全量历史（本仓库 .git 约 180MB），留够时间
     timeout-minutes: 10
+    env:
+      # 三种事件各自要校验什么（范围的算法在 scope job，一处算、这里复用）
+      EVENT: ${{ github.event_name }}
+      BASE_REF: ${{ github.event.pull_request.base.ref }}
+      PUSH_BEFORE: ${{ github.event.before }}
+      HEAD_SHA: ${{ github.sha }}
+      RANGE: ${{ needs.scope.outputs.range }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -105,23 +156,40 @@ jobs:
           fetch-depth: 0
 
       - name: 取 PR head 到本地（fork 来的 PR 也取得到）
+        if: github.event_name == 'pull_request'
         run: |
           git fetch --no-tags origin \
             "+refs/pull/${{ github.event.pull_request.number }}/head:refs/remotes/origin/pr-head"
 
       - name: PR 标题（squash 后会成为 main 上的提交标题）
+        # 只有 PR 才有标题；push / 手动触发没有，跳过而不是拿空串去校验
+        if: github.event_name == 'pull_request'
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: node scripts/commit-msg-lint.mjs --title "$PR_TITLE"
 
       - name: 范围内所有提交
-        env:
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        # push 也查这一项 —— 它是「提交信息」这道规则**唯一**的服务端兜底：
+        # 本地 `--no-verify` 绕过钩子后，只有这里能发现。
         run: |
-          git log --oneline "origin/${BASE_REF}..origin/pr-head" || true
-          node scripts/commit-msg-lint.mjs --range "origin/${BASE_REF}..origin/pr-head"
+          case "$EVENT" in
+            pull_request) range="origin/${BASE_REF}..origin/pr-head" ;;
+            push)
+              if [ -n "$PUSH_BEFORE" ] && [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ] \
+                 && git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+                range="${PUSH_BEFORE}..${HEAD_SHA}"
+              else
+                range="${HEAD_SHA}~1..${HEAD_SHA}"
+              fi ;;
+            *) range="${HEAD_SHA}~1..${HEAD_SHA}" ;; # 手动触发：至少校验最新一条；更宽的范围本地跑
+                                                     #   pnpm lint:commit --range <范围>
+          esac
+          echo "→ 提交信息校验范围：$range"
+          git log --oneline "$range" || true
+          node scripts/commit-msg-lint.mjs --range "$range"
 
       - name: PR 描述（改动 / 验证必填）
+        if: github.event_name == 'pull_request'
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
@@ -132,19 +200,21 @@ jobs:
         # 三处权威版本必须相同；bin-info.plist（dev 版内嵌）不一致只警告不阻断
         run: node scripts/check-versions.mjs
 
-      - name: 拆分器自身的回归测试
+      - name: 门禁脚本自身的回归测试
         # 提交粒度那条规则是本地的（CI 看不到当时的暂存边界，见 docs/pr-rules.md §2），
-        # 但这个脚本会拦本地提交、会替人写提交 —— 它坏了比规则松了更糟，所以在这里守一道。
-        # 零依赖、全在临时仓库里跑，不需要 pnpm install。
+        # 但这些脚本会拦本地提交、会替人写提交 —— 它们坏了比规则松了更糟，所以在这里守一道。
+        # 零依赖、全在临时仓库/注入 runner 里跑，不需要 pnpm install。
         # 用 shell 展开的 glob（`node --test scripts/` 在 Node 24 上会把目录当模块加载而报错）。
         run: node --test scripts/*.test.mjs
 
       - name: 代码变更是否补了 CHANGELOG（建议项，不阻断）
         continue-on-error: true
-        env:
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
-          files=$(git diff --name-only "origin/${BASE_REF}...origin/pr-head")
+          if [ "$RANGE" = "all" ]; then
+            echo "::notice title=改动范围未知::跳过 CHANGELOG 提醒（范围拿不准时它没有判据）"
+            exit 0
+          fi
+          files=$(git diff --name-only "$RANGE")
           if echo "$files" | grep -qE '^(src/|src-tauri/src/)' && ! echo "$files" | grep -q '^CHANGELOG.md$'; then
             echo "::warning title=未更新 CHANGELOG.md::改到了 src/ 或 src-tauri/src/ 但没动 CHANGELOG.md —— 用户可见的变更请在 [Unreleased] 下留一条"
           else
@@ -322,7 +392,7 @@ jobs:
             case "$r" in success|skipped) ;; *) failed=true ;; esac
           done
           if [ "$failed" = true ]; then
-            echo "::error title=PR 校验未通过::看上面各 job 的日志；规则见 docs/pr-rules.md"
+            echo "::error title=校验未通过（PR / 推送 / 手动）::看上面各 job 的日志；规则见 docs/pr-rules.md"
             exit 1
           fi
           echo "全部通过 ✅"

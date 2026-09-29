@@ -18,7 +18,7 @@
 | PR 描述 | 「改动」「验证」两节必填且有实际内容（CI 校验）；「背景 / 动机」强烈建议 |
 | 推送 | **`main` 由维护者直接推**；分支 + PR 是可选的（§0.1） |
 | 用 PR 时 | Squash and merge；合并后删分支；描述按模板写给未来的自己看 |
-| 门禁 | 本地钩子（提交时）+ CI（PR 时）；**本地能过，CI 就能过** —— 同一份规则 |
+| 门禁 | 本地钩子（提交时）+ CI（PR 时**与直推 `main` 时**）；**本地能过，CI 就能过** —— 同一份规则 |
 | 发布 | 只推 `v*` 标签触发打包；推 tag 就是人工确认那一步 |
 
 ### 0.1 2026-09-29：取消「任何功能都要单开 PR」
@@ -293,9 +293,21 @@ pnpm hooks:uninstall   # 卸载（有备份则还原）
 pnpm test:scripts      # 门禁脚本的回归测试：拆分器（内容守恒 / 部分暂存 / 拒绝路径 / 钩子自动拆分）+ 棘轮（比较逻辑与测量）
 ```
 
-### CI（PR 时）
+### CI（PR 时、直推 `main` 时、手动触发）
 
-`.github/workflows/pr-check.yml`，按改动路径只跑该跑的：
+`.github/workflows/pr-check.yml`，按改动路径只跑该跑的。三种触发，跑的是**同一套**校验
+（差别只在「范围怎么算」与「PR 才有的步骤会不会跑」）：
+
+| 触发 | 时机 | 改动范围 | PR 专属步（标题 / 描述 / 取 PR head） |
+| --- | --- | --- | --- |
+| `pull_request` | 开 PR / 推分支 | `origin/<base>...origin/pr-head` | 跑 |
+| `push: branches: [main]` | **直推 `main` 之后** | `<before>..<sha>` | 跳过（`if: event_name == 'pull_request'`） |
+| `workflow_dispatch` | 手动 `gh workflow run pr-check.yml -r main` | `all`（全量） | 跳过 |
+
+范围拿不准（新分支、强推、拿不到 before）一律**退化为跑全部** —— 宁可多花几分钟，也不要
+因为算错范围漏掉检查。并发按 `PR 号 / ref` 分组，同一分支连推只跑最后一次。
+
+具体检查项（纯文档改动不会等 Rust 编译，纯 Rust 改动不会装 pnpm）：
 
 | 检查 | 命令 | 触发路径 | 档位 | 当前基线 |
 | --- | --- | --- | --- | --- |
@@ -345,14 +357,19 @@ pnpm test:scripts      # 门禁脚本的回归测试：拆分器（内容守恒 
 **翻正式的条件**：把基线清干净（测试档：Linux 侧量出来也是 0 failed），再删掉对应的
 `continue-on-error: true`。一次一条，别一口气全开。
 
-### 不在 PR 门禁里的事
+### 直推 `main` 之后发生什么
 
-三平台整包构建是**手动**触发的 `.github/workflows/build-test.yml`（只出 artifact、
+**2026-09-29 起，直推 `main` 也会跑同一套 CI**（`push: branches: [main]`）。这是**后置**校验：
+提交已经进 `main` 了，CI 拦不住它，作用是**红得早、回滚得快**。
+
+- 红了怎么办：看 Actions 日志，然后 `git revert <sha>`（别 rebase 改历史 —— 已经推上去了）。
+- 推送**之前**的本地自查照旧：至少 `cargo check --all-targets`、`pnpm typecheck`、
+  `pnpm test:scripts`、`pnpm gate:ratchet`。想把整套门禁推给服务端先跑：
+  `gh workflow run pr-check.yml -r main`。
+- PR 才有的两步（标题、描述小节）在 push / 手动触发时自动跳过，不是漏跑。
+
+三平台整包构建仍是**手动**触发的 `.github/workflows/build-test.yml`（只出 artifact、
 不发布）。PR 门禁只求快速反馈，不为出包正确性背书 —— 出包正确性由发布流程负责。
-
-**直推 `main` 不跑任何门禁**：`pr-check.yml` 只挂在 `pull_request` 事件上（§0.1 之后的常态）。
-想让 CI 过一遍就开个 PR；否则推送前把对应命令在本地跑一遍 —— 至少 `cargo check --all-targets`、
-`pnpm typecheck`、`cargo test --lib`。
 
 ## 7. 合并
 
@@ -466,7 +483,7 @@ git tag v2.0.0 && git push origin v2.0.0
 | `scripts/check-versions.mjs` | 四处版本号一致性 |
 | `scripts/pr-size-check.mjs` | 体积自查（**不再拦 PR**，2026-09-29 取消闸门） |
 | `.github/PULL_REQUEST_TEMPLATE.md` | PR 描述模板（CI 据此校验小节） |
-| `.github/workflows/pr-check.yml` | PR 门禁（规则 + 前端 + Rust，按路径触发） |
+| `.github/workflows/pr-check.yml` | 门禁（规则 + 前端 + Rust，按路径触发；PR / 直推 `main` / 手动三种触发） |
 
 自查一条命令搞定：
 
