@@ -1,0 +1,256 @@
+{
+  "$comment": "接入协议的共享用例：宿主的 Rust 单测与作者自查脚本（docs/plugin-template/scripts/validate-wem-plugin.mjs --self-test）都跑这一份，两边规则漂移会当场红。规则与错误码见 docs/plugin-protocol.md。",
+  "schemaVersion": 1,
+  "accept": [
+    {
+      "note": "最小清单：只有 name 与 entry.url",
+      "idHint": "wem-min",
+      "manifest": {
+        "name": "Minimal",
+        "entry": { "type": "url", "url": "https://example.com/" }
+      },
+      "expect": { "kind": "url", "open": "external", "capabilities": ["open-url"] }
+    },
+    {
+      "note": "完整清单：所有可选字段齐备",
+      "idHint": "wem-full",
+      "manifest": {
+        "schemaVersion": 1,
+        "id": "wem-full",
+        "name": "Full",
+        "summary": "一句话",
+        "description": "完整说明",
+        "category": "创作工具",
+        "icon": "✨",
+        "author": "someone",
+        "version": "1.2.3",
+        "homepage": "https://github.com/someone/wem-full",
+        "minAppVersion": "2.0.0",
+        "capabilities": ["open-url"],
+        "entry": { "type": "url", "url": "https://example.com/app", "open": "external" }
+      },
+      "expect": { "kind": "url", "open": "external", "capabilities": ["open-url"] }
+    },
+    {
+      "note": "应用内窗口入口",
+      "idHint": "wem-window",
+      "manifest": {
+        "name": "InApp",
+        "capabilities": ["open-window"],
+        "entry": { "type": "url", "url": "http://127.0.0.1:8080/", "open": "window" }
+      },
+      "expect": { "kind": "url", "open": "window", "capabilities": ["open-window"] }
+    },
+    {
+      "note": "容错形状：入口写在顶层",
+      "idHint": "wem-legacy",
+      "manifest": {
+        "name": "Legacy",
+        "url": "https://example.com/legacy",
+        "open": "external"
+      },
+      "expect": { "kind": "url", "open": "external", "capabilities": ["open-url"] }
+    },
+    {
+      "note": "dsh 型：往 DeepSeek Harness profile 装一个包",
+      "idHint": "wem-dsh",
+      "manifest": {
+        "name": "DSH wallpaper engine",
+        "category": "AI 助手",
+        "capabilities": ["dsh-profile"],
+        "entry": { "type": "dsh", "packages": ["dsh-plugin-wallpaper-engine"] }
+      },
+      "expect": { "kind": "dsh", "capabilities": ["dsh-profile"], "packages": ["dsh-plugin-wallpaper-engine"] }
+    },
+    {
+      "note": "容错形状：dsh 型入口平铺在顶层（入口字段写在顶层、不带 entry 对象）",
+      "idHint": "wem-dsh-flat",
+      "manifest": {
+        "name": "FlatDSH",
+        "category": "AI 助手",
+        "kind": "dsh",
+        "open": "window",
+        "capabilities": ["dsh-profile"],
+        "packages": ["dsh-better-sidebar"]
+      },
+      "expect": {
+        "kind": "dsh",
+        "capabilities": ["dsh-profile"],
+        "packages": ["dsh-better-sidebar"]
+      }
+    },
+    {
+      "note": "dsh 型：作用域包 + 版本范围/标签",
+      "idHint": "wem-dsh-scoped",
+      "manifest": {
+        "name": "Scoped",
+        "entry": {
+          "type": "dsh",
+          "packages": ["@linxin666/dsh-usage", "dsh-better-sidebar@^0.19.0", "dsh-plugin@next"]
+        }
+      },
+      "expect": {
+        "kind": "dsh",
+        "capabilities": ["dsh-profile"],
+        "packages": ["@linxin666/dsh-usage", "dsh-better-sidebar@^0.19.0", "dsh-plugin@next"]
+      }
+    },
+    {
+      "note": "未知分类归入「其他」，未知字段忽略",
+      "idHint": "wem-unknown-cat",
+      "manifest": {
+        "name": "Unknown",
+        "category": "随便写的",
+        "futureField": { "whatever": true },
+        "entry": { "type": "url", "url": "https://example.com/" }
+      },
+      "expect": { "kind": "url", "category": "其他" }
+    }
+  ],
+  "reject": [
+    {
+      "note": "不是 http(s) 的入口",
+      "idHint": "wem-x",
+      "manifest": { "name": "X", "entry": { "type": "url", "url": "file:///etc/passwd" } },
+      "code": "plugin-url"
+    },
+    {
+      "note": "javascript: 伪协议",
+      "idHint": "wem-x",
+      "manifest": { "name": "X", "entry": { "type": "url", "url": "javascript:alert(1)" } },
+      "code": "plugin-url"
+    },
+    {
+      "note": "没有入口",
+      "idHint": "wem-x",
+      "manifest": { "name": "X" },
+      "code": "plugin-manifest"
+    },
+    {
+      "note": "没有 name",
+      "idHint": "wem-x",
+      "manifest": { "entry": { "type": "url", "url": "https://example.com/" } },
+      "code": "plugin-name"
+    },
+    {
+      "note": "name 是空白",
+      "idHint": "wem-x",
+      "manifest": { "name": "   ", "entry": { "type": "url", "url": "https://example.com/" } },
+      "code": "plugin-name"
+    },
+    {
+      "note": "不支持的入口类型",
+      "idHint": "wem-x",
+      "manifest": { "name": "X", "entry": { "type": "shell", "url": "https://example.com/" } },
+      "code": "plugin-entry-type"
+    },
+    {
+      "note": "不支持的打开方式",
+      "idHint": "wem-x",
+      "manifest": {
+        "name": "X",
+        "entry": { "type": "url", "url": "https://example.com/", "open": "nowhere" }
+      },
+      "code": "plugin-open"
+    },
+    {
+      "note": "schemaVersion 比宿主新",
+      "idHint": "wem-x",
+      "manifest": {
+        "schemaVersion": 99,
+        "name": "X",
+        "entry": { "type": "url", "url": "https://example.com/" }
+      },
+      "code": "plugin-schema"
+    },
+    {
+      "note": "声明了白名单之外的能力",
+      "idHint": "wem-x",
+      "manifest": {
+        "name": "X",
+        "capabilities": ["open-url", "run-code"],
+        "entry": { "type": "url", "url": "https://example.com/" }
+      },
+      "code": "plugin-capability"
+    },
+    {
+      "note": "open: window 却只声明 open-url",
+      "idHint": "wem-x",
+      "manifest": {
+        "name": "X",
+        "capabilities": ["open-url"],
+        "entry": { "type": "url", "url": "https://example.com/", "open": "window" }
+      },
+      "code": "plugin-capability"
+    },
+    {
+      "note": "dsh 型没有声明 dsh-profile 能力",
+      "idHint": "wem-x",
+      "manifest": {
+        "name": "X",
+        "capabilities": ["open-url"],
+        "entry": { "type": "dsh", "packages": ["dsh-better-sidebar"] }
+      },
+      "code": "plugin-capability"
+    },
+    {
+      "note": "保留 id",
+      "idHint": "wem-x",
+      "manifest": {
+        "id": "dsh",
+        "name": "X",
+        "entry": { "type": "url", "url": "https://example.com/" }
+      },
+      "code": "plugin-id-reserved"
+    },
+    {
+      "note": "minAppVersion 格式错",
+      "idHint": "wem-x",
+      "manifest": {
+        "name": "X",
+        "minAppVersion": "not-a-version",
+        "entry": { "type": "url", "url": "https://example.com/" }
+      },
+      "code": "plugin-app-version"
+    },
+    {
+      "note": "dsh 型没有包",
+      "idHint": "wem-x",
+      "manifest": { "name": "X", "entry": { "type": "dsh", "packages": [] } },
+      "code": "plugin-packages"
+    },
+    {
+      "note": "包名以 - 开头（会被 pnpm 当 flag）",
+      "idHint": "wem-x",
+      "manifest": { "name": "X", "entry": { "type": "dsh", "packages": ["--force"] } },
+      "code": "plugin-packages"
+    },
+    {
+      "note": "包名是本机路径",
+      "idHint": "wem-x",
+      "manifest": { "name": "X", "entry": { "type": "dsh", "packages": ["../evil"] } },
+      "code": "plugin-packages"
+    },
+    {
+      "note": "包名是 git 源",
+      "idHint": "wem-x",
+      "manifest": {
+        "name": "X",
+        "entry": { "type": "dsh", "packages": ["git+https://github.com/a/b.git"] }
+      },
+      "code": "plugin-packages"
+    },
+    {
+      "note": "包名里带空白（参数走私）",
+      "idHint": "wem-x",
+      "manifest": { "name": "X", "entry": { "type": "dsh", "packages": ["a b"] } },
+      "code": "plugin-packages"
+    },
+    {
+      "note": "包名大写",
+      "idHint": "wem-x",
+      "manifest": { "name": "X", "entry": { "type": "dsh", "packages": ["NotLowercase"] } },
+      "code": "plugin-packages"
+    }
+  ]
+}

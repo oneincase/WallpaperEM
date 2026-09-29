@@ -60,7 +60,7 @@ const BANNED_TYPES = new Map([
 const SCOPE_HINTS = [
   "wallpaper", "playlist", "share", "workshop", "download", "render", "props",
   "apply", "hotkeys", "tray", "theme", "update", "db", "library", "network",
-  "mcp", "steam", "i18n", "ui", "core", "media", "quality", "security", "perf",
+  "mcp", "plugin", "steam", "i18n", "ui", "core", "media", "quality", "security", "perf",
   "deps", "build", "bundle", "ci", "pr", "release",
   "scripts", "dev", "docs", "readme", "changelog", "windows", "macos", "linux",
 ];

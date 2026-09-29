@@ -21,6 +21,7 @@ mod mem_pressure;
 mod mem_watch;
 mod misc;
 mod now_playing;
+mod plugin;
 mod props_window;
 mod scene_inspect;
 mod secure_store;
@@ -150,6 +151,10 @@ pub fn run() {
             // MCP 服务（默认关闭；开启后只绑回环地址）。放在 DB/壁纸引擎之后：
             // 工具全都依赖它们，早启动只会让首个请求撞上未就绪状态
             mcp::init(app.handle()).map_err(|e| e.to_string())?;
+            // 插件宿主状态（内置插件 DeepSeek Harness 的子进程句柄）。放在 MCP 之后
+            // ——「打开插件」要把 MCP 地址与令牌写进 dsh profile，插件页首次扫描时
+            // 也要求 MCP 状态可读
+            plugin::init(app.handle());
             download::init(app.handle()).map_err(|e| e.to_string())?;
             // 深色玻璃设计：先把 AppKit 外观钉成 dark 再上材质 —— vibrancy 材质
             // 亮度跟随系统外观，系统浅色模式下材质发白，深色 tint 盖不住、白字
@@ -348,6 +353,19 @@ pub fn run() {
             mcp::shares::share_set_enabled_cmd,
             mcp::shares::share_enabled_status_cmd,
             mcp::shares::share_set_service_enabled_cmd,
+            // 插件宿主（内置插件 DeepSeek Harness：扫描 / 打开 / 停止）
+            plugin::dsh::dsh_scan,
+            plugin::dsh::dsh_open,
+            plugin::dsh::dsh_stop,
+            plugin::dsh::dsh_install_pnpm,
+            // 插件市场与第三方插件（声明式清单的热插拔存储 + GitHub 话题搜索）
+            plugin::store::plugin_installed,
+            plugin::store::plugin_install_url,
+            plugin::store::plugin_uninstall,
+            plugin::store::plugin_open_dir,
+            plugin::store::plugin_dsh_open,
+            plugin::store::plugin_open_window,
+            plugin::store::plugin_market_search,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -367,6 +385,9 @@ pub fn run() {
                 tracing::info!("all windows destroyed; keep running in tray");
             }
             tauri::RunEvent::Exit => {
+                // 插件子进程（内置插件 dsh）与媒体桥一样，必须由我们自己收：
+                // 应用退出不等于第三方子进程会退出
+                plugin::shutdown_all(_app);
                 crate::media_bridge::stop();
             }
             _ => {}
