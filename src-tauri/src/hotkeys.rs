@@ -694,6 +694,10 @@ mod tests {
         assert!(!globals.is_empty(), "主窗口显示/隐藏 缺全局绑定");
     }
 
+    // ⌘+单键走菜单级（不劫持其它 App）—— 这条规则只在 macOS 上存在：is_mac_menu_accel
+    // 在非 macOS 恒返回 false（Cmd 不是那两个平台的修饰键），所以正向断言必须按平台
+    // gate，否则 Linux CI 每次都假红（docs/pr-rules.md §6 脚注 2 说的就是这条）。
+    #[cfg(target_os = "macos")]
     #[test]
     fn menu_accel_only_for_bare_cmd_key() {
         assert!(is_mac_menu_accel("cmd+m"));
@@ -701,6 +705,15 @@ mod tests {
         assert!(is_mac_menu_accel("cmd+p")); // ⌘+单键一律菜单级（不劫持其它 App）
         assert!(!is_mac_menu_accel("cmd+shift+m")); // 多修饰 → 全局
         assert!(!is_mac_menu_accel("ctrl+m")); // 非 ⌘ 修饰 → 全局
+    }
+
+    /// 非 macOS 上恒不是菜单加速键：那里的 `cmd` 绑定走全局快捷键，不会被当菜单拦截。
+    /// 这不是"没功能"，是平台契约 —— 钉住它，将来谁把 `is_mac_menu_accel` 里的 cfg! 删了会立刻红。
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn menu_accel_always_false_off_macos() {
+        assert!(!is_mac_menu_accel("cmd+m"));
+        assert!(!is_mac_menu_accel("ctrl+m"));
     }
 
     #[test]
