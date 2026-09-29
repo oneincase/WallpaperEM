@@ -406,6 +406,8 @@ pnpm test:scripts      # 门禁脚本的回归测试：拆分器（内容守恒 
 
 - 保护分支：`main`。**必需检查 `PR 校验汇总`**（`pr-check.yml` 的汇总 job —— 分档逻辑
   变化时不用改设置）、`strict: false`（不要求分支最新）、**禁止 force push 与删除分支**。
+  ⚠️ 改**汇总 job 的 `name:`** 才要同步 GitHub 设置（必需检查按名字匹配，改名后 PR 会
+  卡在"等待一个不存在的检查"）：`gh api -X PATCH .../branches/main/protection/required_status_checks`
 - **不开「需要 PR」、不开「限制推送者」** —— 这两项才是挡直推的开关。GitHub 的必需检查
   只管**合并路径**（官方 *About protected branches*：status checks 约束 merge；push 由
   restrict / require-PR / 签名 / 锁定这几项管，我们一项都没开），所以
