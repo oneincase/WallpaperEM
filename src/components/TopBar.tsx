@@ -12,6 +12,7 @@ import {
   IconDownload,
   IconLibrary,
   IconHeart,
+  IconPuzzle,
   IconShare,
   IconGear,
   IconKeyboard,
@@ -23,6 +24,7 @@ export type PageId =
   | "downloads"
   | "library"
   | "favorites"
+  | "plugins"
   | "shares"
   | "hotkeys"
   | "settings";
@@ -32,6 +34,7 @@ const NAV: { id: PageId; label: string; icon: ReactNode }[] = [
   { id: "library", label: "本地库", icon: <IconLibrary /> },
   { id: "downloads", label: "下载", icon: <IconDownload /> },
   { id: "favorites", label: "收藏", icon: <IconHeart /> },
+  { id: "plugins", label: "插件", icon: <IconPuzzle /> },
   { id: "shares", label: "分享", icon: <IconShare /> },
   { id: "hotkeys", label: "快捷键", icon: <IconKeyboard /> },
   { id: "settings", label: "设置", icon: <IconGear /> },

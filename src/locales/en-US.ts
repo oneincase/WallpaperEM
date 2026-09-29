@@ -1109,6 +1109,183 @@ export const EN_US: Record<string, string> = {
     "macOS dynamic wallpaper engine · an elegant open-source wallpaper app, not merely a WE clone",
   "跨平台动态壁纸引擎 · 极致优雅的开源壁纸软件，绝非单纯的WE复刻":
     "Cross-platform dynamic wallpaper engine · an elegant open-source wallpaper app, not merely a WE clone",
+
+  // ---- 插件页（内置 / 第三方插件货架，见 src/pages/Plugins.tsx） ----
+  "插件": "Plugins",
+  "内置": "Built-in",
+  "第三方": "Third-party",
+  "内置插件": "Built-in plugins",
+  "第三方插件": "Third-party plugins",
+  "内置插件由本应用直接实现；第三方插件在新窗口打开":
+    "Built-in plugins ship with the app; third-party plugins open in a new window",
+  "搜索插件…": "Search plugins…",
+  "全部分类": "All categories",
+  "共 {n} 个插件": "{n} plugin|{n} plugins",
+  "没有匹配的插件，换个关键词或分类试试":
+    "No plugins match. Try another keyword or category.",
+  "打开": "Open",
+  "打开窗口": "Open window",
+  "启动中…": "Starting…",
+  "安装引导": "Install guide",
+  "收起引导": "Hide guide",
+  "检测中…": "Checking…",
+  "重新检测": "Check again",
+  "详情": "Details",
+  "环境检测失败": "Environment check failed",
+  "未检测到 dsh 环境": "No dsh environment detected",
+  "dsh 已就绪": "dsh is ready",
+  "已注入 MCP 工具": "MCP tools injected",
+  "打开时注入 MCP 工具": "MCP tools injected on open",
+  "profile 已有自定义配置（保留不动）": "Profile already has custom config (kept as is)",
+  "profile：{name}": "Profile: {name}",
+  "目录：{path}": "Folder: {path}",
+  "命令行：{path}": "CLI: {path}",
+  "未检测到": "Not detected",
+  "MCP 服务：{state}": "MCP service: {state}",
+  "已开启但未监听": "enabled but not listening",
+  "关闭（打开插件时自动开启）": "off (enabled when you open the plugin)",
+  "已在新窗口打开 DeepSeek Harness": "DeepSeek Harness opened in a new window",
+  "停止后台进程": "Stop background process",
+  "已停止后台 dsh 进程": "Background dsh process stopped",
+  "停止后台进程失败": "Failed to stop the background process",
+  "未检测到 dsh 命令行，请先按引导安装":
+    "No dsh CLI detected — follow the install guide first",
+  "DeepSeek Harness 正在启动，请稍候": "DeepSeek Harness is starting, please wait",
+  "本机没有可用的空闲端口": "No free local port available",
+  "启动 dsh 进程失败": "Failed to start the dsh process",
+  "dsh 启动后立即退出": "dsh exited right after starting",
+  "等待 dsh 就绪超时": "Timed out waiting for dsh to become ready",
+  "无法读取 dsh 的输出": "Could not read dsh output",
+  "启动 dsh 失败": "Failed to start dsh",
+  "本应用的 MCP 服务启动失败": "This app's MCP service failed to start",
+  "本应用的 MCP 服务不可用": "This app's MCP service is unavailable",
+  "写入 dsh profile 失败": "Failed to write the dsh profile",
+  "打开插件窗口失败": "Failed to open the plugin window",
+  "打开插件失败": "Failed to open the plugin",
+  "安装 dsh 环境": "Install the dsh environment",
+  "1. 装 Node.js（已装可跳过）": "1. Install Node.js (skip if you already have it)",
+  "本机 node：{path}": "Local node: {path}",
+  "本机未检测到 node —— dsh 是 Node 应用，先装 Node.js 18+":
+    "No local node found — dsh is a Node app, install Node.js 18+ first",
+  "2. 全局安装 dsh 命令行": "2. Install the dsh CLI globally",
+  "已复制安装命令": "Install command copied",
+  "复制失败，请手动选择命令": "Copy failed — select the command manually",
+  "3. 或者装桌面版": "3. Or install the desktop app",
+  "打开下载页": "Open the download page",
+  "已检测到桌面版；本插件要的是命令行版 dsh，桌面版不能切换 profile":
+    "Desktop app detected; this plugin needs the dsh CLI, because the desktop app cannot switch profiles",
+  "装好后不用重启应用，点这里重新检测即可":
+    "No need to restart the app — check again here once installed",
+  // 插件目录（src/lib/plugins.ts）的文案
+  "AI 助手": "AI assistant",
+  "壁纸资源": "Wallpaper sources",
+  "创作工具": "Creation tools",
+  "把 dsh 智能体接进来：自动准备干净 profile，并注入本应用的 MCP 壁纸工具":
+    "Bring the dsh agent in: it prepares a clean profile and injects this app's MCP wallpaper tools",
+  "扫描本机 dsh 环境 → 在 ~/.dsh/profiles/wallpallperem 建一个干净 profile → 把本应用的 MCP 服务写进它的 patch 层 → 在新窗口打开 dsh 页面。":
+    "Detect the local dsh environment → create a clean profile at ~/.dsh/profiles/wallpallperem → write this app's MCP service into its patch layer → open the dsh page in a new window.",
+
+  // ---- 插件页：分栏、市场、热插拔（见 src/pages/Plugins.tsx） ----
+  "已安装": "Installed",
+  "插件市场": "Marketplace",
+  "搜索插件市场…": "Search the marketplace…",
+  "排序": "Sort",
+  "相关度": "Relevance",
+  "最热": "Most starred",
+  "名称": "Name",
+  "其他": "Other",
+  "已归档": "Archived",
+  "说明": "Details",
+  "这个插件没有写说明": "This plugin has no description",
+  "主页": "Homepage",
+  "打开仓库": "Open repository",
+  "重新扫描": "Rescan",
+  "扫描中…": "Scanning…",
+  "重新扫描第三方插件": "Rescan third-party plugins",
+  "打开插件目录": "Open plugins folder",
+  "去插件市场看看": "Browse the marketplace",
+  "还没有安装第三方插件": "No third-party plugins installed yet",
+  "插件目录：{path}": "Plugins folder: {path}",
+  "把插件文件夹放进这个目录，点「重新扫描」即可（不用重启应用）":
+    "Drop a plugin folder in here and hit Rescan — no app restart needed",
+  "第三方插件是声明式清单，装/卸都立刻生效，不需要重启应用":
+    "Third-party plugins are declarative manifests: install and uninstall take effect immediately, with no app restart",
+  "市场来自 GitHub 话题 {topic}，支持搜索与排序":
+    "The marketplace comes from the GitHub topic {topic}, with search and sorting",
+  "正在搜索 GitHub…": "Searching GitHub…",
+  "GitHub 话题 {topic}：{n} 个结果": "GitHub topic {topic}: {n} results",
+  "GitHub 搜索限流（匿名每分钟 10 次），稍后再试":
+    "GitHub search is rate limited (10 requests per minute anonymously) — try again shortly",
+  "GitHub 搜索不可用（离线或受限）": "GitHub search is unavailable (offline or rate limited)",
+  "市场暂时不可用：{reason}": "The marketplace is unavailable: {reason}",
+  "这个话题下还没有插件仓库；作者给仓库打上 {topic} 话题后就会出现在这里":
+    "No plugin repositories carry this topic yet; they appear here as soon as an author tags a repo with {topic}",
+  "结果来自缓存": "Cached results",
+  "从 wem-plugin.json 地址安装（粘贴 GitHub raw 链接…）":
+    "Install from a wem-plugin.json URL (paste a GitHub raw link…)",
+  "从地址安装": "Install from URL",
+  "这个插件没有可安装的清单地址": "This plugin has no manifest URL to install from",
+  "已安装「{name}」": "Installed \"{name}\"",
+  "已卸载「{name}」": "Uninstalled \"{name}\"",
+  // 第三方插件清单/网络错误（码 → 文案，见 src/api/plugins.ts）
+  "操作失败": "The operation failed",
+  "插件清单格式不正确": "The plugin manifest is malformed",
+  "插件名称缺失或过长": "The plugin name is missing or too long",
+  "插件入口地址无效（只支持 http/https）":
+    "The plugin entry URL is invalid (only http/https is supported)",
+  "不支持的插件入口类型": "Unsupported plugin entry type",
+  "不支持的打开方式": "Unsupported open mode",
+  "插件 id 不合法": "Invalid plugin id",
+  "这个 id 已被内置插件占用": "That id is already taken by a built-in plugin",
+  "写入插件目录失败": "Failed to write the plugins folder",
+  "删除插件失败": "Failed to remove the plugin",
+  "这个插件没有安装": "This plugin is not installed",
+  "插件目录不可用": "The plugins folder is unavailable",
+  "网络客户端初始化失败": "Failed to initialize the HTTP client",
+  "网络请求失败，检查网络或代理设置":
+    "Network request failed — check your connection or proxy settings",
+  "远端返回了错误状态": "The remote server returned an error status",
+  "下载插件清单失败": "Failed to download the plugin manifest",
+  "插件清单过大": "The plugin manifest is too large",
+  "插件清单不是合法的 JSON": "The plugin manifest is not valid JSON",
+  "打开插件目录失败": "Failed to open the plugins folder",
+  // 接入协议（docs/plugin-protocol.md）：能力、版本与 id 冲突规则
+  "打开网页": "Opens a web page",
+  "应用内窗口": "In-app window",
+  "需要 App ≥ {v}": "Requires app {v} or newer",
+  "插件清单协议版本比当前应用新，请升级应用":
+    "The plugin manifest targets a newer protocol version — update the app",
+  "插件声明了当前应用不支持的能力":
+    "The plugin declares a capability this app does not support",
+  "插件要求更高的应用版本": "The plugin requires a newer app version",
+  "这个 id 已被另一个来源的插件占用":
+    "That id is already taken by a plugin from a different source",
+  // 特权能力 dsh-profile：往 DeepSeek Harness 装第三方包（会在 harness 里运行）
+  "装进 DeepSeek Harness": "Installs into DeepSeek Harness",
+  "特权：会运行第三方代码": "Privileged: runs third-party code",
+  "安装特权插件？": "Install this privileged plugin?",
+  "「{name}」会把下面这些包装进 DeepSeek Harness 的 profile：{list}。它们会在 harness 里运行（等同于第三方代码），安装时可能需要联网下载。":
+    "\"{name}\" installs the following packages into its DeepSeek Harness profile: {list}. They run inside the harness (equivalent to third-party code), and installing may download from the network.",
+  "正在安装到 Harness…": "Installing into Harness…",
+  "已在 DeepSeek Harness 中打开「{name}」": "Opened \"{name}\" in DeepSeek Harness",
+  "本次装进 profile：{list}": "Installed into the profile this time: {list}",
+  "插件声明的 DeepSeek Harness 包名不合法":
+    "The plugin declares an invalid DeepSeek Harness package name",
+  "安装到 DeepSeek Harness 失败": "Failed to install into DeepSeek Harness",
+  "找不到 pnpm（DeepSeek Harness 装插件需要它）":
+    "pnpm was not found (DeepSeek Harness needs it to install plugins)",
+  "pnpm（装插件用）：{state}": "pnpm (used to install plugins): {state}",
+  "安装 pnpm": "Install pnpm",
+  "正在安装 pnpm…": "Installing pnpm…",
+  "pnpm 已安装：{path}": "pnpm installed: {path}",
+  "pnpm 已安装，但没在预期位置找到；重开应用后再试一次":
+    "pnpm was installed but not found where expected — restart the app and try again",
+  "安装 pnpm？": "Install pnpm?",
+  "DeepSeek Harness 装插件需要 pnpm，本机没有。要用 npm 全局安装一个吗？（执行 npm install -g pnpm，会写入你的 Node 全局 bin 目录）":
+    "DeepSeek Harness needs pnpm to install plugins, and it is missing. Install it globally with npm? (runs npm install -g pnpm, which writes into your Node global bin folder)",
+  "安装并继续": "Install and continue",
+  "本机没有 npm（需要先安装 Node.js）": "npm was not found (install Node.js first)",
+  "安装 pnpm 失败": "Failed to install pnpm",
 };
 export const EN_US_BACKEND: Record<string, string> = {
   // ⚠️ 键 = Rust 侧**格式化后**会产出的中文原文（含 {} 占位符的位置，与后端 format!

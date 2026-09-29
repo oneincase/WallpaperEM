@@ -4,6 +4,7 @@ import { DetailPage } from "./pages/Detail";
 import { DownloadsPage } from "./pages/Downloads";
 import { LibraryPage } from "./pages/Library";
 import { FavoritesPage } from "./pages/Favorites";
+import { PluginsPage } from "./pages/Plugins";
 import { SharesPage } from "./pages/Shares";
 import { HotkeysPage } from "./pages/Hotkeys";
 import { SettingsPage } from "./pages/Settings";
@@ -30,6 +31,7 @@ function readInitialPage(): PageId {
     "downloads",
     "library",
     "favorites",
+    "plugins",
   ];
   return (valid as string[]).includes(p) ? (p as PageId) : "workshop";
 }
@@ -156,6 +158,8 @@ function Shell() {
           <LibraryPage onOpenDetail={openDetail} />
         ) : page === "favorites" ? (
           <FavoritesPage onOpenDetail={openDetail} />
+        ) : page === "plugins" ? (
+          <PluginsPage />
         ) : page === "shares" ? (
           <SharesPage onNavigate={navigate} />
         ) : page === "hotkeys" ? (
