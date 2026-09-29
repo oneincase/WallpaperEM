@@ -321,17 +321,19 @@ pnpm test:scripts      # 门禁脚本的回归测试：拆分器（内容守恒 
 | 编译全部目标 | `cargo check --all-targets` | `src-tauri/` | **阻断** | 通过 |
 | rustfmt | `gate-ratchet.mjs --only fmt` | `src-tauri/` | **棘轮**³ | ⚠️ 551 处差异（`gate-baseline.json`） |
 | clippy | `gate-ratchet.mjs --only clippy` | `src-tauri/` | **棘轮**³ | ⚠️ 50 条警告（去重后） |
-| 单元测试 | `cargo test --lib` | `src-tauri/` | 报告 | 本机 255 passed / 0 failed / 2 ignored² |
+| 单元测试 | `cargo test --lib` | `src-tauri/` | **阻断**² | macOS 255/0/2；Linux 252/0/2 |
 | CHANGELOG 提醒 | 文件比对 | `src/`、`src-tauri/src/` | 提醒 | — |
 | §9 违禁物 | `repo-hygiene.mjs --all` + `--range` | 全部 | **阻断** | 通过（301 个追踪文件干净；大文件只查新增） |
 
 ¹ 三处权威版本（`package.json` / `tauri.conf.json` / `Cargo.toml`）不一致即失败；
 `bin-info.plist`（dev 版内嵌）不一致只警告。
-² 本机（macOS）2026-09-29 实测：**255 passed / 0 failed / 2 ignored**，那 2 个 `#[ignore]`
-   是设备依赖（`audio_restart_resumes_frames_after_stop`）与网络依赖（`real_subs_page_probe`）
-   —— 依赖机器的测试不能当门禁，`#[ignore]` 是正确归宿。**Linux 侧基线待第一次 push 校验
-   量出来**（量完这条就翻成阻断，见下面的翻正式条件）。文档里的数字**以 `gate-baseline.json` 为准**，
-   这里手抄的会过期 —— 2026-09-29 改这条时就发现它还写着 249/3。
+² **2026-09-29 翻成阻断的依据（两平台实测全绿）**：macOS **255 passed / 0 failed /
+   2 ignored**（本地）、Linux **252 passed / 0 failed / 2 ignored**
+   （run 36512763001，改了 `src-tauri/` 的 push）。两平台测试总数不同是正常的 ——
+   平台专属测试用 `cfg` gate，各跑各的集合。那 2 个 `#[ignore]` 是设备依赖
+   （`audio_restart_resumes_frames_after_stop`）与网络依赖（`real_subs_page_probe`）
+   —— 依赖机器的测试不能当门禁，`#[ignore]` 是正确归宿。fmt/clippy 的读数
+   **以 `gate-baseline.json` 为准**（那里还带工具链版本），文档里手抄的数字会过期。
 ³ **棘轮（ratchet）**：读数进 `scripts/gate-baseline.json`，**比基线差才阻断**，比基线好提示
    收紧（`pnpm gate:ratchet --update`，基线只许收紧）。它是"报告"与"一把梭阻断"之间的第三档：
    见下文。
@@ -352,11 +354,20 @@ pnpm test:scripts      # 门禁脚本的回归测试：拆分器（内容守恒 
 
 命令：`pnpm gate:ratchet`（全量）、`pnpm gate:ratchet --only fmt`、`pnpm gate:ratchet --update`。
 
-**单元测试**仍是报告档，**证据在本地** —— PR 描述里贴本地 `cargo test --lib`
-的通过/失败数与自己基线的对比（见第 2 节 `ef93848` 的写法）。
+**单元测试已经翻成阻断**（2026-09-29，本节最早写的"249 passed / 3 failed"就是那次要翻的对象）。
+翻正靠两件事，正好是翻正条件本身：
 
-**翻正式的条件**：把基线清干净（测试档：Linux 侧量出来也是 0 failed），再删掉对应的
-`continue-on-error: true`。一次一条，别一口气全开。
+- **平台专属断言按 `cfg` gate**：`hotkeys::menu_accel_only_for_bare_cmd_key` 在 Linux 上
+  拿 macOS 的期望去问一个恒返回 false 的函数（`c9bbeb6` 修）。产品行为没错，测试错了。
+- **依赖机器的测试 `#[ignore]`**：音频设备与联网探测那两条，谁的机器没有设备/网络就红的
+  测试不配当门禁。
+
+**证据仍然写在 PR 描述里**：门禁只说"过没过"，基线对比（你这次跑出来的数字 vs 你自己的
+基线）才有评审价值（见第 2 节 `ef93848` 的写法）。
+
+**翻正式的条件**（下次还想翻某条时照做）：把基线清干净，再删掉对应的
+`continue-on-error: true`，一次一条。测试档就是这么翻的；**fmt / clippy 还没到那一步** ——
+它们存量太大（551 处 / 50 条），先用棘轮守"不新增"，等存量清零再考虑直接阻断。
 
 ### 直推 `main` 之后发生什么
 

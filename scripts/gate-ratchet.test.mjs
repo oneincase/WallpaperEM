@@ -115,3 +115,17 @@ test("CLI：--help 走 0，未知选项走 2（都不碰 cargo）", () => {
   assert.equal(bad.status, 2);
   assert.match(bad.stderr, /--only 只能是/);
 });
+
+test("跨平台回填：参数不全 / 数值不对 → 2（这条会写基线文件，所以只测拒绝路径）", () => {
+  // 少 --toolchain
+  const missing = spawnSync(process.execPath, [SCRIPT, "--update", "--platform", "linux-x64", "--fmt", "551", "--clippy", "49"], { encoding: "utf8" });
+  assert.equal(missing.status, 2, missing.stdout + missing.stderr);
+  assert.match(missing.stderr, /--toolchain/);
+  // 只给了一半的指标
+  const half = spawnSync(process.execPath, [SCRIPT, "--update", "--platform", "linux-x64", "--toolchain", "rustc X", "--fmt", "551"], { encoding: "utf8" });
+  assert.equal(half.status, 2, half.stdout + half.stderr);
+  // 非整数
+  const nan = spawnSync(process.execPath, [SCRIPT, "--update", "--platform", "x", "--toolchain", "t", "--fmt", "abc", "--clippy", "1"], { encoding: "utf8" });
+  assert.equal(nan.status, 2, nan.stdout + nan.stderr);
+  assert.match(nan.stderr, /非负整数/);
+});

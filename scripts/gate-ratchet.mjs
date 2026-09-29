@@ -23,6 +23,9 @@
 //   node scripts/gate-ratchet.mjs                 # 两项都测、都比
 //   node scripts/gate-ratchet.mjs --only fmt      # 只测一项（CI 分步调用，Actions UI 里看得清）
 //   node scripts/gate-ratchet.mjs --update        # 测量并把新基线写回 gate-baseline.json
+//   node scripts/gate-ratchet.mjs --update --platform linux-x64 --toolchain "rustc 1.98.1 (…)" \
+//        --fmt 551 --clippy 49                    # 跨平台写入：CI 打印的读数直接记到那个平台键下
+//                                                  # （在 macOS 上跑 --update 只会写 darwin-arm64）
 //   node scripts/gate-ratchet.mjs --help
 // 退出码：0 通过（含「提示收紧」「未测量/工具链变了」的放行）　1 数值比基线差　2 用法错误
 //         3 测量本身失败（cargo 跑不起来、编译错误等 —— 这时没有可信读数，别装作通过）
@@ -71,7 +74,10 @@ export function evaluate({ metric, value, baseline, toolchain, recordedToolchain
   if (baseline === null || baseline === undefined) {
     return {
       verdict: "notice",
-      message: `该平台还没有基线读数（当前 ${value}${m.unit}）：跑 \`pnpm gate:ratchet --update\` 收进去，下次它才会拦`,
+      message:
+        `该平台还没有基线读数（当前 ${value}${m.unit}）：` +
+        `在这个平台上跑 \`pnpm gate:ratchet --update\`；或拿 CI 打印的读数回填 ——` +
+        ` \`--update --platform <键> --toolchain "<rustc --version>" --fmt N --clippy N\`（在别的机器上跑 --update 只会写本机的键）`,
     };
   }
   if (recordedToolchain !== toolchain) {
@@ -241,11 +247,38 @@ function main(argv, runner = defaultRunner) {
         return 2;
       }
     } else if (a === "--update") opts.update = true;
-    else if (a === "--help" || a === "-h") return usage(), 0;
+    else if (a === "--platform") opts.platform = argv[++i];
+    else if (a === "--toolchain") opts.toolchain = argv[++i];
+    else if (a === "--fmt" || a === "--clippy") {
+      const n = Number(argv[++i]);
+      if (!Number.isInteger(n) || n < 0) {
+        console.error(red(`✗ ${a} 要一个非负整数`));
+        return 2;
+      }
+      (opts.values ??= {})[a.slice(2)] = n;
+    } else if (a === "--help" || a === "-h") return usage(), 0;
     else {
       console.error(red(`✗ 未知选项：${a}（--help 看用法）`));
       return 2;
     }
+  }
+
+  // 跨平台回填：拿 CI 打印的读数直接写到那个平台键下（不跑 cargo，秒回）。
+  // 少一个前置参数就报用法错误 —— 静默写到错误的键下比不写更糟。
+  if (opts.values) {
+    const missing = ["update", "platform", "toolchain"].filter((k) => !opts[k]);
+    if (missing.length || Object.keys(opts.values).length !== Object.keys(METRICS).length) {
+      console.error(red(`✗ 用 \`--fmt N --clippy N\` 回填时必须同时给 --update --platform <键> --toolchain "<rustc --version>"（两项都要给）`));
+      return 2;
+    }
+    const baseline = loadBaseline();
+    const next = mergeBaseline(baseline, { platform: opts.platform, toolchain: opts.toolchain, values: opts.values });
+    fs.writeFileSync(BASELINE_PATH, JSON.stringify(next, null, 2) + "\n");
+    console.log(
+      `${green("✓")} 已回填 ${opts.platform}：${Object.entries(opts.values).map(([k, v]) => `${k}=${v}`).join(" ")}　toolchain=${opts.toolchain}`,
+    );
+    console.log(dim(`  写进了 ${path.relative(process.cwd(), BASELINE_PATH)}，记得随改动一起提交。`));
+    return 0;
   }
 
   const platform = platformKey();
@@ -256,7 +289,7 @@ function main(argv, runner = defaultRunner) {
 
   console.log(bold(`棘轮基线`) + dim(`　platform=${platform}　toolchain=${toolchain ?? "?"}`));
   if (!baseline.platforms?.[platform]) {
-    console.log(dim(`  ${platform} 还没记过基线，本次测量只打印不拦（--update 收进去）`));
+    console.log(dim(`  ${platform} 还没记过基线，本次测量只打印不拦（见上面 evaluate 的回填办法）`));
   }
 
   const values = {};
