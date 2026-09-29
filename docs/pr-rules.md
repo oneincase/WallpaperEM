@@ -402,13 +402,22 @@ pnpm test:scripts      # 门禁脚本的回归测试：拆分器（内容守恒 
 - 没开 PR 的改动，请自己在推送前跑一遍对应门禁（§6 那几条）。开 PR 的仍按上面的流程来。
 - 发布（§8）与 hotfix 照旧：tag 就是人工确认那一步。
 
-### 分支保护建议（GitHub 设置里配，不在版本控制内）
+### 分支保护（2026-09-29 已启用；配置在 GitHub 上，不在版本控制内）
 
-- 保护分支：`main`
-- 必需检查：**`PR 校验汇总`**（`pr-check.yml` 的汇总 job —— 分档逻辑变化时不用改设置）
-- 禁止 force push、要求分支为最新后再合并
-- **不要**勾「禁止直接 push」：维护者要能直推 `main`。当前未启用保护（2026-09-29 查
-  `repos/oneincase/WallpaperEM/branches/main/protection` 为 404）—— 启用保护时记住这条。
+- 保护分支：`main`。**必需检查 `PR 校验汇总`**（`pr-check.yml` 的汇总 job —— 分档逻辑
+  变化时不用改设置）、`strict: false`（不要求分支最新）、**禁止 force push 与删除分支**。
+- **不开「需要 PR」、不开「限制推送者」** —— 这两项才是挡直推的开关。GitHub 的必需检查
+  只管**合并路径**（官方 *About protected branches*：status checks 约束 merge；push 由
+  restrict / require-PR / 签名 / 锁定这几项管，我们一项都没开），所以
+  **直推 `main` 仍然可用** —— 这条文档本身就是开启保护之后直推进来的，能进历史即为实测。
+- **不开 `enforce_admins`**：维护者可以带着红检查合并自己的 PR。与 §0.1「直推不管」
+  同一哲学 —— **拦得住疏忽，拦不住有意为之**；真兜底是推送后的 push 校验（§6）。
+- 查 / 改 / 一键撤销：
+
+```bash
+gh api repos/oneincase/WallpaperEM/branches/main/protection
+gh api -X DELETE repos/oneincase/WallpaperEM/branches/main/protection
+```
 
 ## 8. 发布与 CHANGELOG
 
