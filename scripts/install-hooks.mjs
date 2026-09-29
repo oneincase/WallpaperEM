@@ -9,8 +9,9 @@
 //   3. 已经存在别人写的同名钩子时不能默默覆盖 —— 先备份再替换。
 //
 // 装的两个：
-//   commit-msg  → scripts/commit-msg-lint.mjs        提交信息形状（`type(scope): 主题`）
-//   pre-commit  → scripts/split-commits.mjs --hook   一批改动含多个功能时拦下（docs/pr-rules.md §2）
+//   commit-msg  → scripts/commit-msg-lint.mjs          提交信息形状（`type(scope): 主题`）
+//   pre-commit  → scripts/repo-hygiene.mjs --staged    §9 违禁物（先跑：纯 git、毫秒级）
+//               → scripts/split-commits.mjs --hook     §2 多功能改动拦截
 //
 // 用法：
 //   node scripts/install-hooks.mjs              # 安装（幂等，可重复跑）
@@ -30,23 +31,30 @@ import { execFileSync } from "node:child_process";
 
 const MARKER_PREFIX = "# WE-HOOK-MANAGED";
 
-/** 本脚本接管的钩子。lfs 的那四个（post-*、pre-push）不在这里，也不许加进来。 */
+/**
+ * 本脚本接管的钩子。lfs 的那四个（post-*、pre-push）不在这里，也不许加进来。
+ * 一个钩子可以串多条命令（`runs`，按序执行，任一失败即停）—— pre-commit 就串了两道
+ * 检查：先跑纯 git、毫秒级的违禁物检查，再跑提交粒度检查。
+ */
 const HOOKS = [
   {
     name: "commit-msg",
-    script: "scripts/commit-msg-lint.mjs",
-    args: '"$1"',
     what: "提交信息校验",
     hint: '试跑：node scripts/commit-msg-lint.mjs --message "fix(ui): 修按钮"',
+    runs: [{ script: "scripts/commit-msg-lint.mjs", args: '"$1"' }],
   },
   {
     name: "pre-commit",
-    script: "scripts/split-commits.mjs",
-    args: "--hook",
-    what: "多功能改动拦截",
-    hint: "试跑：node scripts/split-commits.mjs --hook　规则：docs/pr-rules.md §2 提交粒度",
+    what: "违禁物检查 + 多功能改动拦截",
+    hint: "试跑：node scripts/repo-hygiene.mjs --staged　·　node scripts/split-commits.mjs --hook　规则：docs/pr-rules.md §2 §9",
+    runs: [
+      { script: "scripts/repo-hygiene.mjs", args: "--staged" },
+      { script: "scripts/split-commits.mjs", args: "--hook" },
+    ],
   },
 ];
+
+const allScripts = (hook) => hook.runs.map((r) => r.script);
 
 const argv = process.argv.slice(2);
 const flag = (name) => argv.includes(name);
@@ -72,13 +80,20 @@ function locate() {
 }
 
 function hookBody(hook) {
+  // 每条检查单独 `[ -f ]` 判存在（部分检出时跳过而不是把提交卡死），最后一条用 exec
+  // 接管进程 —— 这样钩子的退出码就是检查的退出码，也省掉一层 shell。
+  const checks = hook.runs
+    .map((r, i) => {
+      const cmd = `"$node_bin" "$root/${r.script}" ${r.args}`;
+      const invoke = i === hook.runs.length - 1 ? `exec ${cmd}` : `${cmd} || exit $?`;
+      return `[ -f "$root/${r.script}" ] || exit 0\n${invoke}`;
+    })
+    .join("\n\n");
   return `#!/bin/sh
 ${MARKER_PREFIX}: ${hook.name}
 # 由 scripts/install-hooks.mjs 生成，请勿手工编辑（改动会被下次安装覆盖）。
 # 规则见 docs/pr-rules.md；绕过：git commit --no-verify
 root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
-script="$root/${hook.script}"
-[ -f "$script" ] || exit 0
 
 node_bin="\${WE_NODE:-$(command -v node 2>/dev/null)}"
 if [ -z "$node_bin" ] || [ ! -x "$node_bin" ]; then
@@ -86,7 +101,7 @@ if [ -z "$node_bin" ] || [ ! -x "$node_bin" ]; then
   exit 0
 fi
 
-exec "$node_bin" "$script" ${hook.args}
+${checks}
 `;
 }
 
@@ -106,9 +121,11 @@ function install() {
     return 1;
   }
   const { root, hooksDir } = loc;
-  const missing = HOOKS.filter((h) => !fs.existsSync(path.join(root, h.script)));
+  const missing = HOOKS.flatMap((h) => allScripts(h).map((s) => ({ hook: h.name, script: s }))).filter(
+    ({ script }) => !fs.existsSync(path.join(root, script)),
+  );
   if (missing.length) {
-    warn(`找不到 ${missing.map((h) => h.script).join("、")}，跳过安装（是不是只拷了部分文件？）`);
+    warn(`找不到 ${missing.map((m) => m.script).join("、")}，跳过安装（是不是只拷了部分文件？）`);
     return flag("--if-possible") ? 0 : 1;
   }
 
@@ -188,7 +205,7 @@ function status() {
     const target = path.join(loc.hooksDir, hook.name);
     const rel = path.relative(loc.root, target);
     if (!fs.existsSync(target)) say(`${c("33", "未安装")} ${hook.name} 钩子（${rel}）`);
-    else if (isManaged(target)) say(`${c("32", "已安装")} ${hook.name} 钩子 → ${hook.script}（${hook.what}）`);
+    else if (isManaged(target)) say(`${c("32", "已安装")} ${hook.name} 钩子 → ${allScripts(hook).join(" → ")}（${hook.what}）`);
     else say(`${c("33", "存在")} 非本脚本管理的 ${hook.name} 钩子`);
   }
 

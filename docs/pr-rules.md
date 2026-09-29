@@ -281,7 +281,7 @@ pnpm hooks:uninstall   # 卸载（有备份则还原）
 | 钩子 | 指向 | 管什么 | 绕过 |
 | --- | --- | --- | --- |
 | `commit-msg` | `scripts/commit-msg-lint.mjs` | §2 提交信息形状 | `git commit --no-verify`（**CI 仍会拦**） |
-| `pre-commit` | `scripts/split-commits.mjs --hook` | §2 提交粒度（一批改动含多个功能就拦） | `WE_ALLOW_MIXED=1`，或 `--no-verify`（**CI 拦不住**，见 §2） |
+| `pre-commit` | `repo-hygiene.mjs --staged` → `split-commits.mjs --hook` | §9 违禁物 + §2 提交粒度（一批改动含多个功能就拦） | 违禁物只有 `--no-verify`（**CI 会兜底**）；粒度还有 `WE_ALLOW_MIXED=1`（**CI 拦不住**，见 §2） |
 
 这两个之外不碰别的钩子：`post-checkout` / `post-commit` / `post-merge` / `pre-push`
 是 **git-lfs 的**，安装脚本不碰它们。钩子在运行时自己找 node，找不到就放行并提示 ——
@@ -323,6 +323,7 @@ pnpm test:scripts      # 门禁脚本的回归测试：拆分器（内容守恒 
 | clippy | `gate-ratchet.mjs --only clippy` | `src-tauri/` | **棘轮**³ | ⚠️ 50 条警告（去重后） |
 | 单元测试 | `cargo test --lib` | `src-tauri/` | 报告 | 本机 255 passed / 0 failed / 2 ignored² |
 | CHANGELOG 提醒 | 文件比对 | `src/`、`src-tauri/src/` | 提醒 | — |
+| §9 违禁物 | `repo-hygiene.mjs --all` + `--range` | 全部 | **阻断** | 通过（301 个追踪文件干净；大文件只查新增） |
 
 ¹ 三处权威版本（`package.json` / `tauri.conf.json` / `Cargo.toml`）不一致即失败；
 `bin-info.plist`（dev 版内嵌）不一致只警告。
@@ -457,11 +458,28 @@ git tag v2.0.0 && git push origin v2.0.0
 - **工具工作目录**：`.ui-shots/`、`.v2c/`、`.video_agent/`、`.zcode/`、`proto-video-loop/clips/`
 - **系统垃圾**：`.DS_Store`、`*.bak`、`*~`
 - **大二进制**（> 5 MB 的必要二进制）：必须走 **Git LFS** 并在 `.gitattributes` 里登记。
-  注：当前 `.gitattributes` 为空、也没有 LFS 追踪的文件（`git lfs ls-files` 无输出），
-  所以这条是预防性的 —— 真要加大文件时，先 `git lfs track` 再 `git add`。
+  闸门**只查新增** —— 因为仓库里已经有 4 个既成事实的 `promo/gifs/*.gif`（5.6 / 7.7 /
+  12.4 / 16.1 MB；§9 当初写"这条是预防性的"时没发现它们）：历史的不追究，**新来的必须拦**。
+
+### 这条有闸门了（2026-09-29 起）
+
+上面的规则此前**只是文字**：`git add -f dist/`、塞个 `.DS_Store`、丢个 10MB 二进制，
+没有任何东西会拦（`.gitignore` 只挡"不加 `-f` 的人"）。现在两处都拦，实现是同一份
+`scripts/repo-hygiene.mjs`：
+
+| 检查点 | 调用 | 查什么 |
+| --- | --- | --- |
+| 本地 `pre-commit`（两道检查里的第一道） | `repo-hygiene.mjs --staged` | 暂存区的路径 + 新增大文件 |
+| CI（PR / 直推 `main` / 手动） | `repo-hygiene.mjs --all` **+** `--range <范围>` | 全仓路径 + 本次新增的大文件 |
+
+- 路径**全仓扫**（实测基线：301 个追踪文件干净），所以 `--no-verify` 绕过钩子也躲不过 CI；
+- 大文件**只查新增**（理由见上），用 `git check-attr filter` 判 LFS —— 不要求装 lfs 客户端；
+- **删掉**违禁文件不算违禁（那是修复，不是新问题）；
+- 自查：`pnpm hygiene`（默认查暂存区）、`pnpm hygiene -- --all`。
 
 `.gitignore` 已经覆盖上面绝大多数；改动确实需要新忽略项时，**同时**更新
 `.gitignore` 与 `.zcodeignore`（后者供编码工具用，两者历来保持一致）。
+§9 的规则文本改了，实现表（`repo-hygiene.mjs` 的 `FORBIDDEN`）要同步改 —— 它有测试看着。
 
 ## 10. 常见的被打回原因
 
@@ -475,6 +493,8 @@ git tag v2.0.0 && git push origin v2.0.0
 7. 修了 bug 但没补能复现它的测试 —— 这类修复的失效方式是"不报错、过一会行为不对"，
    只能靠测试兜住。
 8. 版本号只改了一处。
+9. 仓库里混进 §9 的违禁物（`dist/`、`.DS_Store`、`*.db`、>5MB 且没走 LFS 的新文件）——
+   本地 `pre-commit` 与 CI 都会拦，见 §9。
 
 ## 附录：规则实现在哪
 
@@ -487,6 +507,7 @@ git tag v2.0.0 && git push origin v2.0.0
 | `scripts/gate-ratchet.mjs` | 门禁棘轮：fmt / clippy 的「不新增」闸门（读数比基线差才红） |
 | `scripts/gate-baseline.json` | 棘轮基线（按 `os-arch` 分平台 + 工具链版本）；**收紧 = 改这个文件** |
 | `scripts/release-preflight.mjs` | 发布前置检查（版本 / tag / CHANGELOG），三个 build `needs:` 它 |
+| `scripts/repo-hygiene.mjs` | §9 违禁物闸门（路径 + 新增大文件），`pre-commit` 与 CI 共用 |
 | `scripts/install-hooks.mjs` | 安装 / 卸载 / 查看 `commit-msg` + `pre-commit` 钩子（不碰 git-lfs 的钩子） |
 | `scripts/check-versions.mjs` | 四处版本号一致性 |
 | `scripts/pr-size-check.mjs` | 体积自查（**不再拦 PR**，2026-09-29 取消闸门） |
@@ -501,8 +522,10 @@ pnpm lint:commit --range origin/main..HEAD        # 校验整个分支
 pnpm commit:split                                 # 提交粒度：看当前暂存区会被怎么拆（不会提交）
 node scripts/split-commits.mjs --audit origin/main..HEAD    # 拿历史回看这条规则拦了谁（只读）
 node scripts/split-commits.mjs --explain <文件>   # 某个文件算哪个功能域
-pnpm test:scripts                                 # 拆分器 + 棘轮等门禁脚本的回归测试
+pnpm test:scripts                                 # 拆分器 + 棘轮 + 卫生 + 发布前置 的回归测试
 pnpm gate:ratchet                                 # fmt/clippy 棘轮（--update 收紧基线，--only 单测一项）
+pnpm hygiene                                      # §9 违禁物（默认查暂存区；-- --all 扫全仓）
+node scripts/release-preflight.mjs --tag v2.0.0   # 发布前置（不传 tag = 彩排模式，只提醒）
 node scripts/pr-size-check.mjs --range origin/main..HEAD    # 体积自查（可选，不拦）
 pnpm versions:check
 ```

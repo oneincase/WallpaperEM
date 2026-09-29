@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SPLIT = path.join(HERE, "split-commits.mjs");
 
-const SCRIPT_FILES = ["split-commits.mjs", "commit-msg-lint.mjs", "install-hooks.mjs"];
+const SCRIPT_FILES = ["split-commits.mjs", "commit-msg-lint.mjs", "install-hooks.mjs", "repo-hygiene.mjs"];
 
 /** 基线内容：路径刻意照着真仓库挑，好让域表（scripts/split-commits.mjs 的 RULES）真的被走到。 */
 const BASE = {

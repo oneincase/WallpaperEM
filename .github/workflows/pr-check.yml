@@ -207,6 +207,18 @@ jobs:
         # 用 shell 展开的 glob（`node --test scripts/` 在 Node 24 上会把目录当模块加载而报错）。
         run: node --test scripts/*.test.mjs
 
+      - name: §9 违禁物检查（全仓路径 + 本次范围内的新增大文件）
+        # 本地 pre-commit 会查暂存区，这里是**服务端兜底**：--no-verify 绕过钩子之后只有这里
+        # 能发现。--all 扫全部追踪文件（抓历史上混进来的路径）；--range 再查"这次新增的
+        # >5MB 文件有没有走 LFS"（--all 不查大小，因为 promo/gifs/ 里有 4 个既成事实的 GIF）。
+        run: |
+          node scripts/repo-hygiene.mjs --all
+          if [ "$RANGE" != "all" ]; then
+            node scripts/repo-hygiene.mjs --range "$RANGE"
+          else
+            echo "范围未知：--all 已覆盖路径；增量大文件检查跳过（范围拿不准时宁可不做判断）"
+          fi
+
       - name: 代码变更是否补了 CHANGELOG（建议项，不阻断）
         continue-on-error: true
         run: |
