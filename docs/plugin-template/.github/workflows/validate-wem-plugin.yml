@@ -1,0 +1,30 @@
+# 校验 wem-plugin.json 是否符合 WallpaperEM 第三方插件接入协议。
+#
+# 这是模板：把本文件复制到你的插件仓库 .github/workflows/ 下，
+# 同时把 scripts/validate-wem-plugin.mjs（与 protocol-cases.json）复制到仓库里。
+# 协议与规则见：
+# https://github.com/oneincase/WallpaperEM/blob/main/docs/plugin-protocol.md
+name: Validate wem-plugin.json
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # 清单必须在仓库根、且符合接入协议（零依赖脚本，不需要 npm install）
+      - name: Validate manifest
+        run: node scripts/validate-wem-plugin.mjs wem-plugin.json
+
+      # 可选：确认自查脚本本身没被改坏（跑协议共享用例）
+      - name: Validate the validator
+        run: node scripts/validate-wem-plugin.mjs --self-test

@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "name": "我的插件",
+  "summary": "一句话说明这个插件能给我什么（会显示在插件卡片上）",
+  "description": "展开后的完整说明：它打开什么、怎么用。",
+  "category": "创作工具",
+  "icon": "🧩",
+  "author": "your-github-name",
+  "version": "1.0.0",
+  "homepage": "https://github.com/you/wem-my-plugin",
+  "capabilities": ["open-url"],
+  "entry": {
+    "type": "url",
+    "url": "https://example.com/",
+    "open": "external"
+  }
+}

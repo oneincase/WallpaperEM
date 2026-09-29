@@ -9,6 +9,50 @@
 - **应用菜单再点停止**：「应用到桌面」的目标选择菜单里，正在播放本张壁纸的显示器会标
   「● 播放中」，再点该项即停止该屏播放（同一入口完成应用/停止切换）；停止不改写
   「上次目标」记录。
+- **插件页 + 第一个内置插件 DeepSeek Harness**：胶囊导航「收藏」之后新增「插件」一格，
+  插件分内置/第三方，支持关键词搜索与分类筛选，**每个插件点开都是一扇新窗口**（内置插件
+  开应用内窗口，第三方插件交系统浏览器）。第一个内置插件是 dsh：自动扫描本机是否装了
+  `dsh` 命令行（PATH + 常见全局目录），没有就把安装引导摊开（Node → `npm install -g
+  @deepseek-ai/dsh` → 重新检测，附官网下载页），装了则复用；随后在
+  `~/.dsh/profiles/wallpallperem` 建一个**干净 profile**（只列 dsh 自带的 base + web-app，
+  已存在文件一律不动，用户改过就退到独立 overlay 而非覆盖），把本应用的 MCP 服务写成它
+  的 patch 层条目（MCP 没开就顺手开），最后启动 `dsh --profile wallpallperem --no-open
+  --port <空闲端口>`，解析它打印的带令牌地址并开窗。窗口销毁 / 应用退出 / 界面「停止
+  后台进程」三处都会回收 dsh 子进程。详见 `docs/plugins.md`。
+- **插件市场 + 第三方插件热插拔**：插件页分「已安装 / 插件市场」两栏。第三方插件是
+  **声明式清单**（`<appData>/plugins/<id>/wem-plugin.json`，只描述名称/图标/分类与一个
+  http(s) 入口，**不是可执行代码**），因此装、卸、往目录里手放一份、重扫都只动一个目录、
+  立刻生效，不需要重启应用，也不给第三方代码任何权限。市场以 GitHub
+  `topic:wem-plugin` 仓库搜索为来源（安装即拉仓库根的 `wem-plugin.json`），已安装的插件
+  并入同一列表，支持关键词搜索与「相关度/最热/最近更新/名称」排序；匿名搜索限流
+  10 次/分钟，用 500ms 防抖 + 90s 结果缓存兜，撞限流/离线时只提示不报错；话题下还没有
+  仓库时给出明确空态提示。
+  发布一个第三方插件 = 仓库打 `wem-plugin` 话题 + 根目录放一份清单。
+- **第三方插件接入协议 v1**：把「插件能做什么、不能做什么、怎么算合规」写成可执行的规范
+  （[`docs/plugin-protocol.md`](docs/plugin-protocol.md) + 机器可读的
+  [`docs/wem-plugin.schema.json`](docs/wem-plugin.schema.json)）。协议要点：清单加
+  `schemaVersion`（比宿主新的**拒绝**而不是猜着解释）、`capabilities` 能力白名单
+  （今天只有 `open-url` / `open-window`；声明未实现的能力会被拒，不装「点了没反应」的
+  插件）、`minAppVersion`（不满足时**可安装、不可打开**并在卡片标注）；新增 id 冲突规则
+  （同一个 id 被另一个来源占用时拒绝覆盖，避免两个作者的同名插件互相盖掉）；错误码表与
+  作者发布自查表同文。宿主只解释声明、从不执行第三方代码，能力边界在文档里显式列出
+  （不做代码执行 / 界面注入 / IPC / 文件读写 / 后台常驻）。
+- **特权能力 `dsh-profile`：第三方插件可以直接往 DeepSeek Harness 里装插件包**。清单写
+  `"entry": {"type": "dsh", "packages": [...]}`，打开时应用会 `dsh plugin --profile
+  wallpallperem add <包…>` 把包装进本应用维护的干净 profile（装完重启 harness 再开窗，
+  装过的包跳过）；这是唯一会引入第三方代码的能力，因此卡片带「特权：会运行第三方代码」
+  标记、首次打开弹确认、包名只放行 npm 注册表规格（`-` 开头 / `file:` / `git+` / 路径一律
+  拒绝）：给它一份 `wem-plugin.json`（`entry.type = "dsh"`）即可被市场搜到并安装。
+- **一键安装 pnpm 引导**：`dsh-profile` 型插件要往 profile 装包，靠的是 `dsh plugin` 背后的
+  pnpm；本机没有 pnpm 时插件页不再只给一句命令 —— dsh 卡片会显示 pnpm 状态并给出「安装
+  pnpm」按钮，打开插件失败时也会弹确认（`npm install -g pnpm`，会写入 Node 全局 bin 目录），
+  装完自动重试刚才那次打开；没有 npm 则提示先装 Node.js 并打开下载页。
+- **插件作者模板与 CI 自查**：[`docs/plugin-template/`](docs/plugin-template/) 给出一份
+  可直接复制的起步模板 —— 零依赖校验脚本 `scripts/validate-wem-plugin.mjs`（本地
+  `node scripts/validate-wem-plugin.mjs` 即可跑）与 GitHub Actions 工作流
+  `.github/workflows/validate-wem-plugin.yml`，CI 里挡住不合规清单；脚本与宿主共用同一份
+  协议用例 [`protocol-cases.json`](docs/plugin-template/protocol-cases.json)（Rust 单测也跑
+  它），规则漂移会当场红。
 
 ### 🛠 改变 / Changed
 

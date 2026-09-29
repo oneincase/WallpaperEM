@@ -1,0 +1,130 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/oneincase/WallpaperEM/main/docs/wem-plugin.schema.json",
+  "title": "wem-plugin.json（WallpaperEM 第三方插件清单）",
+  "description": "第三方插件的接入清单。协议、规则、能力矩阵与错误码见 docs/plugin-protocol.md。宿主只解释这份清单，不执行任何第三方代码。",
+  "type": "object",
+  "required": ["name"],
+  "properties": {
+    "schemaVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1,
+      "default": 1,
+      "description": "清单协议版本。缺省 = 1。比宿主支持的版本新会被拒绝（plugin-schema）。"
+    },
+    "id": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "description": "插件标识，决定本地目录名。缺省 = 插件目录名 / 仓库名。会被规整成小写安全目录名（slug）；同一个 id 被另一个来源占用时安装会被拒绝（plugin-id-conflict）。"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 60,
+      "description": "显示名（必填）。"
+    },
+    "summary": {
+      "type": "string",
+      "maxLength": 200,
+      "description": "卡片上的一句话，建议 60 字以内。"
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 4000,
+      "description": "展开后的完整说明。"
+    },
+    "category": {
+      "enum": ["AI 助手", "壁纸资源", "创作工具", "其他"],
+      "default": "其他",
+      "description": "分类，决定市场/已安装里的分类筛选。未知值归入「其他」。"
+    },
+    "icon": {
+      "type": "string",
+      "maxLength": 8,
+      "default": "🧩",
+      "description": "列表图标，单个 emoji。"
+    },
+    "author": {
+      "type": "string",
+      "maxLength": 60,
+      "description": "作者 / 组织名。"
+    },
+    "version": {
+      "type": "string",
+      "maxLength": 32,
+      "description": "插件自己的版本号（仅展示；更新检查用得到）。"
+    },
+    "homepage": {
+      "type": "string",
+      "format": "uri",
+      "description": "项目主页 / 仓库页。同时是 id 冲突判定里的「来源指纹」。"
+    },
+    "minAppVersion": {
+      "type": "string",
+      "pattern": "^v?[0-9]+(\\.[0-9]+){0,2}([-+].*)?$",
+      "description": "要求的最低应用版本（三段数字，可带 v 前缀与 -rc.1 后缀）。不满足时：可安装但打不开（plugin-app-version）。格式错则拒绝安装。"
+    },
+    "capabilities": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "enum": ["open-url", "open-window", "dsh-profile"] },
+      "description": "声明需要宿主提供的能力。白名单之外的取值一律拒绝（plugin-capability）；必须包含入口隐含的那一项（url 型看 entry.open，dsh 型是 dsh-profile）。缺省 = 按入口推导。dsh-profile 是特权能力：会把 packages 装进 DeepSeek Harness，等于运行第三方代码，应用会先让用户确认。"
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "enum": ["url", "dsh"],
+          "default": "url",
+          "description": "url = 打开一个地址；dsh = 把 packages 装进本应用维护的 DeepSeek Harness profile 并打开 dsh 界面。其它取值会被拒绝（plugin-entry-type）。"
+        },
+        "url": {
+          "type": "string",
+          "pattern": "^https?://",
+          "description": "url 型的入口地址。只认 http/https：file:// 能读本机任意文件，javascript: 在 webview 里就是执行代码，一律拒绝（plugin-url）。"
+        },
+        "open": {
+          "enum": ["external", "window"],
+          "default": "external",
+          "description": "url 型：external = 系统浏览器新窗口；window = 应用内新窗口。"
+        },
+        "packages": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "maxLength": 214,
+            "pattern": "^(@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*(@[A-Za-z0-9._+^~*<>=|-]+)?$"
+          },
+          "description": "dsh 型要装进 profile 的 npm 包名（可带版本/标签），1–8 个。只放行注册表包名：file:/link:/git+/../x 与以 - 开头的参数一律拒绝（plugin-packages）。"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "type": { "const": "dsh" } },
+            "required": ["type"]
+          },
+          "then": { "required": ["packages"] },
+          "else": { "required": ["url"] }
+        }
+      ]
+    },
+    "url": {
+      "type": "string",
+      "pattern": "^https?://",
+      "description": "容错写法：等价于 entry.url。与 entry 二选一。"
+    },
+    "open": {
+      "enum": ["external", "window"],
+      "description": "容错写法：等价于 entry.open。"
+    }
+  },
+  "additionalProperties": true,
+  "anyOf": [{ "required": ["entry"] }, { "required": ["url"] }]
+}
