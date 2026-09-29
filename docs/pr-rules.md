@@ -290,7 +290,7 @@ pnpm hooks:uninstall   # 卸载（有备份则还原）
 回归测试（`node:test`，零依赖，全在临时仓库里做）：
 
 ```bash
-pnpm test:scripts      # 16 个用例：拆分内容守恒 / 部分暂存 / 计划文件 / 拒绝路径 / 钩子自动拆分
+pnpm test:scripts      # 门禁脚本的回归测试：拆分器（内容守恒 / 部分暂存 / 拒绝路径 / 钩子自动拆分）+ 棘轮（比较逻辑与测量）
 ```
 
 ### CI（PR 时）
@@ -307,30 +307,42 @@ pnpm test:scripts      # 16 个用例：拆分内容守恒 / 部分暂存 / 计�
 | 前端构建 | `pnpm build` | `src/` 等 | **阻断** | 通过 |
 | Cargo.lock 一致性 | `cargo metadata --locked` | `src-tauri/` | **阻断** | 通过 |
 | 编译全部目标 | `cargo check --all-targets` | `src-tauri/` | **阻断** | 通过 |
-| rustfmt | `cargo fmt --all --check` | `src-tauri/` | 报告 | ❌ 41 文件 / 604 处差异 |
-| clippy | `cargo clippy --all-targets` | `src-tauri/` | 报告 | ⚠️ 57 条警告 |
-| 单元测试 | `cargo test --lib` | `src-tauri/` | 报告 | 249 passed / 3 failed² |
+| rustfmt | `gate-ratchet.mjs --only fmt` | `src-tauri/` | **棘轮**³ | ⚠️ 551 处差异（`gate-baseline.json`） |
+| clippy | `gate-ratchet.mjs --only clippy` | `src-tauri/` | **棘轮**³ | ⚠️ 50 条警告（去重后） |
+| 单元测试 | `cargo test --lib` | `src-tauri/` | 报告 | 本机 255 passed / 0 failed / 2 ignored² |
 | CHANGELOG 提醒 | 文件比对 | `src/`、`src-tauri/src/` | 提醒 | — |
 
 ¹ 三处权威版本（`package.json` / `tauri.conf.json` / `Cargo.toml`）不一致即失败；
 `bin-info.plist`（dev 版内嵌）不一致只警告。
-² 这是**本机（macOS）**基线；Linux CI 上是 211 passed / 2 failed（平台专属断言没按平台 gate +
-   mock 服务器连不上），两个数都对，只是平台不同。报告档不挡人，清干净才能翻成阻断。
+² 本机（macOS）2026-09-29 实测：**255 passed / 0 failed / 2 ignored**，那 2 个 `#[ignore]`
+   是设备依赖（`audio_restart_resumes_frames_after_stop`）与网络依赖（`real_subs_page_probe`）
+   —— 依赖机器的测试不能当门禁，`#[ignore]` 是正确归宿。**Linux 侧基线待第一次 push 校验
+   量出来**（量完这条就翻成阻断，见下面的翻正式条件）。文档里的数字**以 `gate-baseline.json` 为准**，
+   这里手抄的会过期 —— 2026-09-29 改这条时就发现它还写着 249/3。
+³ **棘轮（ratchet）**：读数进 `scripts/gate-baseline.json`，**比基线差才阻断**，比基线好提示
+   收紧（`pnpm gate:ratchet --update`，基线只许收紧）。它是"报告"与"一把梭阻断"之间的第三档：
+   见下文。
 
-### 为什么有的是"报告"而不是"阻断"
+### 为什么有的是"报告"，有的是"棘轮"
 
 **因为它们的基线本来就不过。** 把 `cargo fmt --check` 设成阻断，只会让每个 PR 都红、
 然后所有人学会无视 CI —— 那比没有 CI 更糟。
 
-所以这几项按"**不新增**"来要求：
+**但纯"报告"也守不住**：日志没人看，数字只会悄悄往上涨（文档里那句"604 处差异"自己掉到
+551，不是因为有东西在守）。所以 fmt / clippy 用**棘轮**：
 
-- **rustfmt**：新增/改动的代码要合规（编辑器保存时格式化即可）。
-  全仓统一格式化是**独立一件事**，单独开 PR 做，别混进功能 PR。
-- **clippy**：本 PR 不新增警告。
-- **单元测试**：CI 上是参考，**证据在本地** —— PR 描述里贴本地 `cargo test --lib`
-  的通过/失败数与自己基线的对比（见第 2 节 `ef93848` 的写法）。
+- 读数进 `scripts/gate-baseline.json`（按 `os-arch` 分平台，工具链版本一起记）；
+- **比基线差 → 阻断**；比基线好 → 提示 `pnpm gate:ratchet --update` 收紧；
+- 工具链变了（CI 用 `@stable`，浮动）或该平台没测过 → **当次放行并打印读数**，不硬拦 ——
+  拿旧尺子量新工具的读数没有意义，别把漂移当成回归；
+- 清理存量（全仓格式化、逐条修 clippy）仍是**独立一件事**，单独提交，别混进功能改动（§5）。
 
-**翻正式的条件**：把基线清干净，然后在 `pr-check.yml` 里删掉对应的
+命令：`pnpm gate:ratchet`（全量）、`pnpm gate:ratchet --only fmt`、`pnpm gate:ratchet --update`。
+
+**单元测试**仍是报告档，**证据在本地** —— PR 描述里贴本地 `cargo test --lib`
+的通过/失败数与自己基线的对比（见第 2 节 `ef93848` 的写法）。
+
+**翻正式的条件**：把基线清干净（测试档：Linux 侧量出来也是 0 failed），再删掉对应的
 `continue-on-error: true`。一次一条，别一口气全开。
 
 ### 不在 PR 门禁里的事
@@ -448,6 +460,8 @@ git tag v2.0.0 && git push origin v2.0.0
 | `scripts/commit-msg-lint.mjs` | 提交信息 / PR 标题 / PR 正文校验（**零依赖**，本地与 CI 共用） |
 | `scripts/split-commits.mjs` | 提交粒度：多功能改动的判定、按功能域拆分、`pre-commit` 拦截（**零依赖**） |
 | `scripts/split-commits.test.mjs` | 上者的回归测试（`pnpm test:scripts`，全在临时仓库里跑） |
+| `scripts/gate-ratchet.mjs` | 门禁棘轮：fmt / clippy 的「不新增」闸门（读数比基线差才红） |
+| `scripts/gate-baseline.json` | 棘轮基线（按 `os-arch` 分平台 + 工具链版本）；**收紧 = 改这个文件** |
 | `scripts/install-hooks.mjs` | 安装 / 卸载 / 查看 `commit-msg` + `pre-commit` 钩子（不碰 git-lfs 的钩子） |
 | `scripts/check-versions.mjs` | 四处版本号一致性 |
 | `scripts/pr-size-check.mjs` | 体积自查（**不再拦 PR**，2026-09-29 取消闸门） |
@@ -462,7 +476,8 @@ pnpm lint:commit --range origin/main..HEAD        # 校验整个分支
 pnpm commit:split                                 # 提交粒度：看当前暂存区会被怎么拆（不会提交）
 node scripts/split-commits.mjs --audit origin/main..HEAD    # 拿历史回看这条规则拦了谁（只读）
 node scripts/split-commits.mjs --explain <文件>   # 某个文件算哪个功能域
-pnpm test:scripts                                 # 拆分器自身的回归测试
+pnpm test:scripts                                 # 拆分器 + 棘轮等门禁脚本的回归测试
+pnpm gate:ratchet                                 # fmt/clippy 棘轮（--update 收紧基线，--only 单测一项）
 node scripts/pr-size-check.mjs --range origin/main..HEAD    # 体积自查（可选，不拦）
 pnpm versions:check
 ```

@@ -9,11 +9,15 @@ name: PR 校验（规则 / 前端 / Rust）
 #     · `i18n-audit.mjs`        → 基线通过（退出码 1 才代表缺译）　→ 阻断
 #     · `cargo check`           → 基线通过　　　　　　　　　　　　→ 阻断
 #     · 版本号三处一致　　　　　→ 基线通过　　　　　　　　　　　　→ 阻断
-#     · `cargo fmt --check`     → 基线**不过**（41 个文件 604 处差异）→ 报告
-#     · `cargo clippy`          → 基线**57 条警告**　　　　　　　　→ 报告
-#     · `cargo test --lib`      → 基线本机 249 passed / 3 failed（PTY 与
-#                                 钥匙串被沙箱拒绝，非代码缺陷）；CI 上是
-#                                 211 passed / 2 failed（平台不同）　→ 报告
+#     · `cargo fmt --check`     → 基线**不过** → **棘轮**（2026-09-29 起）：读数进
+#                                 scripts/gate-baseline.json，**比基线差才红**、比基线好
+#                                 提示收紧。它替代了原来的 continue-on-error —— 纯"报告"
+#                                 的日志没人看，数字会悄悄往上涨；全仓格式化仍是独立一件事
+#                                 （§5），所以也不做一把梭阻断。
+#     · `cargo clippy`          → 同上（棘轮，去重后的 50 条）
+#     · `cargo test --lib`      → 基线本机 255 passed / 0 failed / 2 ignored（设备与网络类
+#                                 测试已 `#[ignore]`）→ 报告；Linux 侧基线待第一次 push 校验
+#                                 量出来后翻正（docs/pr-rules.md §6）
 #   把没过基线的检查设成阻断，只会让每个 PR 都红、然后所有人学会无视 CI。
 #   要"翻正式"：先把基线清干净，再把对应的 continue-on-error 删掉 —— 一次一条。
 #
@@ -273,22 +277,15 @@ jobs:
         working-directory: src-tauri
         run: cargo check --all-targets
 
-      # ---- 报告档（基线未清零，故不阻断；见文件头部说明）----
+      # ---- fmt / clippy：棘轮档（基线在 scripts/gate-baseline.json，只许收紧）----
+      # 比基线差才红（阻断），比基线好提示收紧；工具链/平台没测过时放行并打印读数。
+      # 拆成两步不是为了语义，是为了 Actions UI 里能看出是哪项涨了。
 
-      - name: rustfmt 差异（报告）
-        continue-on-error: true
-        working-directory: src-tauri
-        run: |
-          echo "基线：41 个文件 604 处差异 —— 全仓统一格式化是独立一件事，别混进功能 PR。"
-          echo "要求：**新增/改动的代码**请保持 rustfmt 合规（编辑器保存时格式化即可）。"
-          cargo fmt --all --check
+      - name: rustfmt 差异（棘轮：不新增）
+        run: node scripts/gate-ratchet.mjs --only fmt
 
-      - name: clippy 警告（报告）
-        continue-on-error: true
-        working-directory: src-tauri
-        run: |
-          echo "基线：57 条警告。要求：本 PR 不新增警告。"
-          cargo clippy --all-targets --message-format=short
+      - name: clippy 警告（棘轮：不新增）
+        run: node scripts/gate-ratchet.mjs --only clippy
 
       - name: 单元测试（报告）
         continue-on-error: true
