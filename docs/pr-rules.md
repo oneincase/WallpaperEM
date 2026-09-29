@@ -426,6 +426,8 @@ CI 检测到 `src/` 或 `src-tauri/src/` 有改动而 `CHANGELOG.md` 没动时�
 ### 发布流程
 
 ```bash
+# 0. 发布前置自查（可选但便宜：本地几秒，出错别等三平台构建白跑）
+node scripts/release-preflight.mjs --tag v2.0.0
 # 1. 版本号四处对齐（pnpm versions:check 应为全绿）
 # 2. CHANGELOG：把 [Unreleased] 归到 ## [x.y.z] - YYYY-MM-DD
 # 3. 发布提交（走 main，见第 7 节的例外）
@@ -434,7 +436,12 @@ git commit -m 'release: v2.0.0（本次要点的短清单）'
 git tag v2.0.0 && git push origin v2.0.0
 ```
 
-推 `v*` 标签会触发 `build-dmg` / `build-linux` / `build-windows` 出安装包。
+推 `v*` 标签会触发 `build-dmg` / `build-linux` / `build-windows` 出安装包，
+**且三者都先 `needs: release-preflight.yml`**：在最便宜的 runner 上几秒跑完
+「三处权威版本一致 + tag 形状 + `tag == 版本` + CHANGELOG 已归段」，不过就红，
+那三台（含按分钟计费的 `macos-14`）**根本不会启动**。手动触发（彩排）时同一检查
+**只提醒不阻断** —— 归段本来就是上面第 2 步的事，彩排时还没归是正常的。
+
 想在发布前先验三平台能否构建，手动跑 `build-test.yml`（只出 artifact，不建 Release）。
 
 ### hotfix
@@ -479,6 +486,7 @@ git tag v2.0.0 && git push origin v2.0.0
 | `scripts/split-commits.test.mjs` | 上者的回归测试（`pnpm test:scripts`，全在临时仓库里跑） |
 | `scripts/gate-ratchet.mjs` | 门禁棘轮：fmt / clippy 的「不新增」闸门（读数比基线差才红） |
 | `scripts/gate-baseline.json` | 棘轮基线（按 `os-arch` 分平台 + 工具链版本）；**收紧 = 改这个文件** |
+| `scripts/release-preflight.mjs` | 发布前置检查（版本 / tag / CHANGELOG），三个 build `needs:` 它 |
 | `scripts/install-hooks.mjs` | 安装 / 卸载 / 查看 `commit-msg` + `pre-commit` 钩子（不碰 git-lfs 的钩子） |
 | `scripts/check-versions.mjs` | 四处版本号一致性 |
 | `scripts/pr-size-check.mjs` | 体积自查（**不再拦 PR**，2026-09-29 取消闸门） |

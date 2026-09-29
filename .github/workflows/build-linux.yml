@@ -17,7 +17,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  preflight:
+    # 发布前置检查（三处版本一致 / tag 对得上 / CHANGELOG 已归段）：几秒钟拦在
+    # 最便宜的 runner 上 —— 不过，下面这个按分钟计费的构建根本不会启动。
+    # 规则见 docs/pr-rules.md §8。
+    uses: ./.github/workflows/release-preflight.yml
+
   build-linux:
+    needs: [preflight]
     # 两个架构都用**对应架构的原生 runner**，不做交叉编译（交叉到 arm64 需要整套
     # arm64 sysroot + webkit2gtk 库，成本远高于直接用 arm runner）。
     # 两行都用 22.04 底座（x64 → ubuntu-22.04、arm64 → ubuntu-22.04-arm，

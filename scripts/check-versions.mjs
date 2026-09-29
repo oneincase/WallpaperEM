@@ -15,12 +15,16 @@
 //                                     专门发过一条 chore 同步它，故仍纳入检查。
 //                                     两个键都要查 —— 只查一个会漏掉另一个的漂移。
 //
-// 用法：node scripts/check-versions.mjs   （全部一致退出 0，权威版本不一致退出 1）
+// 用法：node scripts/check-versions.mjs            （全部一致退出 0，权威版本不一致退出 1）
+//       node scripts/check-versions.mjs --root DIR  指定仓库根（测试夹具用；默认 = 本脚本所在仓库）
 
 import fs from "node:fs";
 import path from "node:path";
 
-const ROOT = path.resolve(import.meta.dirname, "..");
+// --root 先于任何读文件解析：下面的 readVersion 是模块顶层执行的
+const argv = process.argv.slice(2);
+const rootFlag = argv.indexOf("--root");
+const ROOT = rootFlag >= 0 && argv[rootFlag + 1] ? path.resolve(argv[rootFlag + 1]) : path.resolve(import.meta.dirname, "..");
 
 const useColor = process.stdout.isTTY && !process.env.NO_COLOR;
 const c = (code, s) => (useColor ? `\u001b[${code}m${s}\u001b[0m` : s);

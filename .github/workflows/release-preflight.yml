@@ -1,0 +1,26 @@
+name: 发布前置检查
+
+# 发布流程的第一道闸（规则见 docs/pr-rules.md §8）：在**最便宜的 runner** 上花几秒确认
+# "这次要发的东西是对的" —— 三处权威版本一致、tag 形状与 tag==版本、CHANGELOG 已归段。
+# 由 build-dmg / build-linux / build-windows 以 workflow_call 引用（needs: 它）：
+# 检查不过，那三台（含按分钟计费的 macos-14）根本不会启动。
+#
+# 不构建任何东西、不发布任何东西 —— 它只读仓库内容。
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: 发布前置检查
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 版本 / tag / CHANGELOG 检查
+        # GITHUB_REF_NAME 由触发方带过来：tag 推送时是标签名（严格模式），
+        # 手动触发时是分支名（彩排模式：只提醒不阻断）。
+        run: node scripts/release-preflight.mjs
