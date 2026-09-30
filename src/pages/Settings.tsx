@@ -5,6 +5,8 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   api,
   type CacheStats,
+  type DepotdlInstallProgress,
+  type DownloadBackend,
   type DownloadToolStatus,
   type FfmpegInstallProgress,
   type FfmpegStatus,
@@ -41,6 +43,12 @@ const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
   { id: "performance", label: "画质" },
   { id: "network", label: "网络与服务" },
   { id: "about", label: "关于" },
+];
+
+// 下载工具（账号页的选择器；值域与 Rust 的 BackendKind::as_str 一致）
+const DOWNLOAD_BACKENDS: { id: DownloadBackend; label: string }[] = [
+  { id: "steamcmd", label: "steamcmd" },
+  { id: "depotdownloader", label: "DepotDownloader" },
 ];
 
 // ---- 画质档位预设（与 Rust 的 PRESET_LOW/MEDIUM/HIGH 逐字段镜像）----
@@ -153,15 +161,21 @@ export function SettingsPage() {
   const [language, setLanguage] = useState<string>("english");
   // 界面语言（i18n）：这里只是订阅，取词走模块级 tr()；订阅是为了本页文案跟着变
   const locale = useLocale();
-  // 下载账号（steamcmd 只支持账号密码登录）
-  const [cred, setCred] = useState<{ configured: boolean; username?: string } | null>(null);
+  // 下载账号（steamcmd / DepotDownloader 均只支持账号密码登录）
+  const [cred, setCred] = useState<{
+    configured: boolean;
+    username?: string;
+    backend: DownloadBackend;
+    backendLoggedIn: boolean;
+  } | null>(null);
   const [editingCred, setEditingCred] = useState(false);
+  // 下载工具状态：当前选中的后端 + 两个工具各自的安装状态
   const [tool, setTool] = useState<DownloadToolStatus | null>(null);
-  // steamcmd 安装
-  const [installing, setInstalling] = useState(false);
+  // 下载工具安装/卸载中与它的一行反馈（两个工具共用）
+  const [toolBusy, setToolBusy] = useState(false);
+  const [toolMsg, setToolMsg] = useState("");
   const [confirmLogout, setConfirmLogout] = useState(false);
   const msg = useMessage();
-  const [installMsg, setInstallMsg] = useState("");
   const [dlUser, setDlUser] = useState("");
   const [dlPass, setDlPass] = useState("");
   const [credMsg, setCredMsg] = useState("");
@@ -179,6 +193,14 @@ export function SettingsPage() {
   // 平台判断：文案里平台分支很多（权限、抽帧、代理、自启），散着写 os === "..." 容易漏改
   const isMac = os === "macos";
   const isWin = os === "windows";
+  // ---- 下载工具（账号页）派生状态 ----
+  const dlBackend: DownloadBackend = tool?.backend ?? "steamcmd";
+  const isDD = dlBackend === "depotdownloader";
+  const sc = tool?.steamcmd;
+  const dd = tool?.depotdownloader;
+  const toolReady = isDD ? !!dd?.installed : !!sc?.installed;
+  // 不可安装：steamcmd 缺 Rosetta（Apple Silicon）/ 当前平台没有 DD 官方构建
+  const toolBlocked = isDD ? !dd?.supported : !!sc?.rosettaMissing;
   // 系统音频捕获平台支持性（Linux 暂未支持，开关给出明确提示而不是报权限错误）
   const [audioSupported, setAudioSupported] = useState(true);
   // 抽帧组件（ffmpeg）：Linux/Windows 上视频/GIF 抽首帧要用它，可应用内一键安装
@@ -394,7 +416,7 @@ export function SettingsPage() {
     }
   }, [loadCache]);
 
-  // 「保存凭据」时的双验证状态：steamcmd（后台任务）+ 网页会话
+  // 「保存凭据」时的双验证状态：当前下载工具（后台任务）+ 网页会话
   const [credSaving, setCredSaving] = useState(false);
   type WebVerify =
     | { state: "checking" }
@@ -433,10 +455,12 @@ export function SettingsPage() {
     setSteamVerifyQueued(false);
     try {
       await api.downloadCredentialsSet(dlUser, dlPass);
-      setCred({ configured: true, username: dlUser });
+      // 刚保存时两个后端的登录态都还没建立（换账号会清标记），先按「待验证」呈现；
+      // 验证任务结束时由 download:progress 监听刷新成真实状态
+      setCred({ configured: true, username: dlUser, backend: dlBackend, backendLoggedIn: false });
       setDlPass("");
       setCredMsg(tr("✅ 已保存，正在验证两条登录通道…"));
-      // 双验证：① steamcmd 登录验证任务（验证码/手机确认走全局弹窗，
+      // 双验证：① 下载工具登录验证任务（验证码/手机确认走全局弹窗，
       // 验证通过后下载免密免验证码）② 网页会话（订阅同步用）
       api.downloadVerifyLogin().catch(console.warn);
       setSteamVerifyQueued(true);
@@ -473,7 +497,7 @@ export function SettingsPage() {
   const logout = async () => {
     try {
       await api.downloadCredentialsClear();
-      setCred({ configured: false });
+      setCred({ configured: false, backend: dlBackend, backendLoggedIn: false });
       setDlUser("");
       setDlPass("");
       setCredMsg("");
@@ -483,20 +507,53 @@ export function SettingsPage() {
     }
   };
 
-  // 安装 / 修复 steamcmd
-  const installSteamcmd = async (force = false) => {
-    setInstalling(true);
-    setInstallMsg(tr("准备安装…"));
+  // 安装 / 修复当前下载工具（steamcmd 或 DepotDownloader）
+  const installActiveTool = async (force = false) => {
+    const isDD = tool?.backend === "depotdownloader";
+    setToolBusy(true);
+    setToolMsg(tr("准备安装…"));
     try {
-      await api.steamcmdInstall(force);
+      if (isDD) await api.depotdlInstall(force);
+      else await api.steamcmdInstall(force);
       setTool(await api.downloadToolStatus());
-      setInstallMsg(tr("✅ steamcmd 已就绪"));
+      setToolMsg(isDD ? tr("✅ DepotDownloader 已就绪") : tr("✅ steamcmd 已就绪"));
     } catch (e) {
       const raw = String(e);
       // 后端用 "CODE|中文说明" 传递可识别的失败原因
-      setInstallMsg(raw.includes("|") ? raw.slice(raw.indexOf("|") + 1) : raw);
+      setToolMsg(raw.includes("|") ? raw.slice(raw.indexOf("|") + 1) : raw);
     } finally {
-      setInstalling(false);
+      setToolBusy(false);
+    }
+  };
+
+  /** 卸载当前下载工具（删工具本体，登录态保留） */
+  const uninstallActiveTool = async () => {
+    const isDD = tool?.backend === "depotdownloader";
+    setToolBusy(true);
+    setToolMsg("");
+    try {
+      if (isDD) await api.depotdlUninstall();
+      else await api.steamcmdUninstall();
+      setTool(await api.downloadToolStatus());
+      setToolMsg(tr("已卸载（登录态保留，下次下载前重新安装即可）"));
+    } catch (e) {
+      setToolMsg(String(e));
+    } finally {
+      setToolBusy(false);
+    }
+  };
+
+  /** 切换下载工具。两个工具的登录态各自独立，切换后账号区会提示首次验证 */
+  const switchBackend = async (next: DownloadBackend) => {
+    if (next === tool?.backend) return;
+    setToolMsg("");
+    setCredMsg("");
+    try {
+      await api.downloadBackendSet(next);
+      setTool(await api.downloadToolStatus());
+      setCred(await api.downloadCredentialsStatus());
+    } catch (e) {
+      setToolMsg(String(e));
     }
   };
 
@@ -505,10 +562,28 @@ export function SettingsPage() {
       const { phase, message } = e.payload;
       const label =
         phase === "download" ? tr("下载中") : phase === "extract" ? tr("解压中") : tr("初始化中");
-      setInstallMsg(`${label}：${trMsg(message)}`);
+      setToolMsg(`${label}：${trMsg(message)}`);
+    });
+    const unDepot = listen<DepotdlInstallProgress>("depotdl:install-progress", (e) => {
+      const { phase, message } = e.payload;
+      const label =
+        phase === "download" ? tr("下载中") : phase === "extract" ? tr("解压中") : tr("校验中");
+      setToolMsg(`${label}：${trMsg(message)}`);
+    });
+    // 登录验证任务（保存凭据后自动入队）结束时刷新账号状态：
+    // 换工具/换账号后的首次验证成功，会在这里从「待验证」翻成「已登录」
+    const unVerify = listen<{ taskId: number; status: string }>("download:progress", (e) => {
+      const { status } = e.payload;
+      if (status !== "done" && status !== "failed") return;
+      api
+        .downloadCredentialsStatus()
+        .then(setCred)
+        .catch(() => { });
     });
     return () => {
       unInstall.then((f) => f());
+      unDepot.then((f) => f());
+      unVerify.then((f) => f());
     };
   }, []);
 
@@ -1090,61 +1165,132 @@ export function SettingsPage() {
       <div className="min-h-0 overflow-y-auto flex flex-col">
         <div className="w-full p-5  mx-auto my-auto space-y-5">
           {tab === "download" && (
-            <Group title={tr("下载账号")}>
-              <Row
-                label={tr("下载工具")}
-                desc={
-                  tool?.rosettaMissing
-                    ? tr(
-                        "缺少 Rosetta 2：steamcmd 的官方引导程序是 x86_64，首次启动需要它。请在终端执行 softwareupdate --install-rosetta --agree-to-license 后重试（首次自更新后 steamcmd 即以原生 arm64 运行）",
-                      )
-                    : tool?.installed
-                      ? `${tr("steamcmd 已就绪")}${tool.version ? ` · ${tr("版本")} ${tool.version}` : ""}${tool.path ? ` · ${tool.path}` : ""}`
-                      : tool?.downloaded
-                        ? tr("已下载但未完成初始化，请点击「修复」重试")
-                        : tr(
-                            "Valve 官方 steamcmd。尚未安装，点击「安装」从官方源下载（约 2.5 MB 引导包，初始化后约 85 MB）",
-                          )
-                }
-                control={
-                  <div className="flex items-center gap-2">
-                    <span
-                      className={`text-[12px] font-medium ${tool?.installed ? "text-green-500" : "text-red-500"}`}
-                    >
-                      {tool?.installed ? tr("就绪") : tr("未就绪")}
-                    </span>
-                    <button
-                      className="btn !py-1 text-[11.5px]"
-                      disabled={installing || tool?.rosettaMissing}
-                      onClick={() => installSteamcmd(!!tool?.installed)}
-                    >
-                      {installing ? tr("安装中…") : tool?.installed ? tr("修复") : tr("安装")}
-                    </button>
+            <>
+              <Group title={tr("下载")}>
+                <Row
+                  label={tr("下载工具")}
+                  desc={
+                    isDD
+                      ? tr(
+                          "第三方 DepotDownloader（GPL-2.0，从上游官方 Releases 下载）：用 Steam 令牌登录，不挤占本机已登录的 Steam 客户端。工具本体约 {size}",
+                          { size: formatBytes(dd?.expectedDownloadBytes ?? 0) },
+                        )
+                      : tr(
+                          "Valve 官方 steamcmd（默认）：登录会挤掉正在运行的 Steam 客户端（同账号同时只能登录一处）；首次安装需从官方源下载引导包并初始化（约 85 MB）",
+                        )
+                  }
+                  control={
+                    <div className="inline-flex shrink-0 gap-0.5 rounded-[9px] border border-[var(--separator)] bg-[var(--content)] p-0.5">
+                      {DOWNLOAD_BACKENDS.map((b) => (
+                        <button
+                          key={b.id}
+                          disabled={toolBusy}
+                          onClick={() => void switchBackend(b.id)}
+                          className={`rounded-[7px] px-2.5 py-[3px] text-[12px] font-medium transition-colors disabled:opacity-50 ${tool?.backend === b.id
+                            ? "bg-[var(--accent)] text-[var(--accent-fg)] shadow-sm"
+                            : "text-[var(--text-2)] hover:bg-[var(--glass-hover)]"
+                            }`}
+                        >
+                          {b.label}
+                        </button>
+                      ))}
+                    </div>
+                  }
+                />
+                {/* 当前工具的就绪状态 + 安装 / 修复 / 卸载 */}
+                <div className="mt-3 rounded-xl border border-[var(--separator)] p-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2 text-[13px] font-medium">
+                        {isDD ? "DepotDownloader" : "steamcmd"}
+                        <span
+                          className={`text-[12px] font-medium ${toolReady ? "text-green-500" : "text-red-500"}`}
+                        >
+                          {toolReady ? tr("就绪") : tr("未就绪")}
+                        </span>
+                      </div>
+                      <div className="mt-0.5 break-all text-[11.5px] text-[var(--text-2)]">
+                        {isDD
+                          ? dd?.installed
+                            ? `${tr("DepotDownloader 已就绪")}${dd.version ? ` · ${tr("版本")} ${dd.version}` : ""}${dd.path ? ` · ${dd.path}` : ""}`
+                            : dd?.supported
+                              ? tr(
+                                "尚未安装，点击「安装」从上游官方 Releases 下载（约 {size}，解压即用，无需另装 .NET）",
+                                { size: formatBytes(dd.expectedDownloadBytes) },
+                              )
+                              : tr("当前平台没有 DepotDownloader 官方构建，请改用 steamcmd")
+                          : toolBlocked
+                            ? tr(
+                              "缺少 Rosetta 2：steamcmd 的官方引导程序是 x86_64，首次启动需要它。请在终端执行 softwareupdate --install-rosetta --agree-to-license 后重试（首次自更新后 steamcmd 即以原生 arm64 运行）",
+                            )
+                            : sc?.installed
+                              ? `${tr("steamcmd 已就绪")}${sc.version ? ` · ${tr("版本")} ${sc.version}` : ""}${sc.path ? ` · ${sc.path}` : ""}`
+                              : sc?.downloaded
+                                ? tr("已下载但未完成初始化，请点击「修复」重试")
+                                : tr(
+                                  "Valve 官方 steamcmd。尚未安装，点击「安装」从官方源下载（约 2.5 MB 引导包，初始化后约 85 MB）",
+                                )}
+                      </div>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-2">
+                      {toolReady && (
+                        <button
+                          className="btn !py-1 text-[11.5px]"
+                          disabled={toolBusy}
+                          onClick={() => void uninstallActiveTool()}
+                        >
+                          {tr("卸载")}
+                        </button>
+                      )}
+                      {!toolBlocked && (
+                        <button
+                          className="btn btn-primary !py-1 text-[11.5px]"
+                          disabled={toolBusy}
+                          onClick={() => void installActiveTool(toolReady)}
+                        >
+                          {toolBusy ? tr("处理中…") : toolReady ? tr("修复") : tr("安装")}
+                        </button>
+                      )}
+                    </div>
                   </div>
-                }
-              />
-              {installMsg && (
-                <div className="mt-1.5 break-all text-[12px] text-[var(--text-2)]">{installMsg}</div>
-              )}
+                  {toolMsg && (
+                    <div className="mt-1.5 break-all text-[12px] text-[var(--text-2)]">{trMsg(toolMsg)}</div>
+                  )}
+                </div>
+              </Group>
 
-              <Row
-                label={tr("下载账号")}
-                desc={
-                  cred?.configured
-                    ? tr("已登录：{user}（需拥有 Wallpaper Engine，下载不再重复验证）", {
-                        user: cred.username ?? "",
-                      })
-                    : tr(
-                        "下载工坊内容需拥有 WE 的 Steam 账号。首次下载会要求输入 Steam Guard 验证码，之后记住登录态。注意：steamcmd 登录会挤掉你正在运行的 Steam 客户端（同账号同时只能登录一处）",
-                      )
-                }
-                control={
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <span
-                      className={`text-[12px] font-medium ${cred?.configured ? "text-green-500" : "text-[var(--text-2)]"}`}
-                    >
-                      {cred?.configured ? tr("已登录") : tr("未登录")}
-                    </span>
+              <Group title={tr("下载账号")}>
+                <Row
+                  label={tr("下载账号")}
+                  desc={
+                    cred?.configured
+                      ? cred.backendLoggedIn
+                        ? tr("已登录：{user}（需拥有 Wallpaper Engine，下载不再重复验证）", {
+                          user: cred.username ?? "",
+                        })
+                        : tr("已保存账号 {user}：当前下载工具会在首次下载时补一次登录验证", {
+                          user: cred.username ?? "",
+                        })
+                      : isDD
+                        ? tr(
+                          "下载工坊内容需拥有 WE 的 Steam 账号。首次下载会要求输入 Steam Guard 验证码（手机确认或验证器验证码），之后记住登录态；DepotDownloader 不影响本机其它 Steam 登录",
+                        )
+                        : tr(
+                          "下载工坊内容需拥有 WE 的 Steam 账号。首次下载会要求输入 Steam Guard 验证码，之后记住登录态。注意：steamcmd 登录会挤掉你正在运行的 Steam 客户端（同账号同时只能登录一处）",
+                        )
+                  }
+                  control={
+                    <div className="flex shrink-0 items-center justify-end gap-2">
+                      <span
+                        className={`text-[12px] font-medium ${cred?.configured
+                          ? cred.backendLoggedIn
+                            ? "text-green-500"
+                            : "text-amber-500"
+                          : "text-[var(--text-2)]"
+                          }`}
+                      >
+                        {cred?.configured ? (cred.backendLoggedIn ? tr("已登录") : tr("待验证")) : tr("未登录")}
+                      </span>
                     {cred?.configured && !editingCred && (
                       <button
                         className="btn !py-1 text-[11.5px]"
@@ -1209,7 +1355,7 @@ export function SettingsPage() {
                   </div>
                   <p className="text-[11.5px] text-[var(--text-2)]">
                     {tr(
-                      "密码本地加密存储。保存后会立即验证两条登录通道（steamcmd 下载 + 订阅同步网页会话），验证通过后续使用免密免验证码。",
+                      "密码本地加密存储。保存后会立即验证两条登录通道（当前下载工具 + 订阅同步网页会话），验证通过后续使用免密免验证码。",
                     )}
                   </p>
 
@@ -1218,7 +1364,7 @@ export function SettingsPage() {
                     <div className="space-y-1.5 rounded-lg bg-[var(--content)] p-2.5 text-[12px]">
                       <div className="flex items-center gap-2">
                         <span className="text-[var(--text-2)]">
-                          {tr("① steamcmd 下载通道：")}
+                          {tr("① 下载通道：")}
                         </span>
                         <span className="text-amber-500">{tr("验证任务已入队")}</span>
                       </div>
@@ -1296,7 +1442,8 @@ export function SettingsPage() {
                   )}
                 </div>
               )}
-            </Group>
+              </Group>
+            </>
           )}
 
           {tab === "network" && (
@@ -2194,7 +2341,7 @@ export function SettingsPage() {
         <ConfirmModal
           title={tr("登出下载账号")}
           message={tr(
-            "将清除本地保存的账号密码、steamcmd 登录态与订阅同步的网页登录会话。下次下载和订阅同步都需要重新登录并再过一次验证。",
+            "将清除本地保存的账号密码、两个下载工具的登录态与订阅同步的网页登录会话。下次下载和订阅同步都需要重新登录并再过一次验证。",
           )}
           confirmText={tr("登出")}
           danger

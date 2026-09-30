@@ -1,18 +1,22 @@
-//! steamcmd 后端：命令行拼装、输出解析、产物布局。
+//! 下载后端：命令行拼装、输出解析、产物布局。
 //!
 //! 队列、状态机、产物收编、依赖补拉由 `download/mod.rs` 承担，本模块只管
-//! 「怎么跟 steamcmd 这个子进程打交道」。三个非显然的约束（都是踩过的坑）：
+//! 「怎么跟下载工具这个子进程打交道」，并在两个实现之间分发：
 //!
-//! - **stdin 必须是 TTY**：管道会让 steamcmd 直接打印
-//!   "cannot read from the console" 退出 → 见 `pty.rs`
-//! - **下载成功后常不退出**：macOS 上 Steam API 拆卸有线程竞争，`+quit` 无响应，
-//!   必须靠 `match_success` 匹配到成功行后主动杀进程，不能等退出码
-//! - **下载期间零进度输出**：`workshop_download_item` 只在首尾各打一行，
-//!   中间完全静默 → 进度由 mod.rs 轮询产物目录体积估算
+//! - [`SteamCmd`]（`self`，Valve 官方，默认）：三个非显然的约束（都是踩过的坑）——
+//!   **stdin 必须是 TTY**（管道会让它直接打印 "cannot read from the console" 退出，
+//!   见 `pty.rs`）、**下载成功后常不退出**（macOS 上 Steam API 拆卸有线程竞争，
+//!   `+quit` 无响应，必须靠 `match_success` 匹配到成功行后主动杀进程，不能等退出码）、
+//!   **下载期间零进度输出**（`workshop_download_item` 只在首尾各打一行，进度由
+//!   mod.rs 轮询产物目录体积估算）
+//! - [`super::depotdl::DepotDl`]（第三方，可选）：细节见该模块头注释
+//!
+//! [`Backend`] 是二者的统一门面，`download_backend` 设置决定实例化哪一个。
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use crate::download::depotdl::DepotDl;
 use crate::download::APP_ID;
 
 /// 登录凭据。`has_token` 为真时表示 steamcmd 已缓存登录态，无需再传密码。
@@ -58,12 +62,12 @@ const MOBILE_RE: &str =
 /// - "Logging in using username/password."（密码登录才会打印；缓存登录是另一句）
 /// - "Logging in user 'x' [U:1:0] to Steam Public..."（密码登录时 steamid 恒为 U:1:0，
 ///   缓存登录会带上真实 steamid 如 [U:1:351868315]）
-const LOGIN_START_RE: &str =
-    r"(?i)logging in using username/password|logging in user .*\[u:1:0\]";
+const LOGIN_START_RE: &str = r"(?i)logging in using username/password|logging in user .*\[u:1:0\]";
 
 /// 工坊大件常见，且 steamcmd 下载期间完全静默，看门狗必须给足时间
 pub const WATCHDOG: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
+#[derive(Clone)]
 pub struct SteamCmd {
     /// `<app_data>/steamcmd/steamcmd.sh`
     pub script: PathBuf,
@@ -255,7 +259,8 @@ pub fn is_prompt(tail: &str) -> bool {
 }
 
 /// 编译并缓存正则。按模式缓存，避免每行输出现场编译。
-fn re(pattern: &'static str) -> &'static regex::Regex {
+/// 两个后端共用（各自的模式是各自的编译期常量）。
+pub(crate) fn cached_regex(pattern: &'static str) -> &'static regex::Regex {
     use std::collections::HashMap;
     use std::sync::{OnceLock, RwLock};
 
@@ -278,13 +283,28 @@ fn re(pattern: &'static str) -> &'static regex::Regex {
     compiled
 }
 
+fn re(pattern: &'static str) -> &'static regex::Regex {
+    cached_regex(pattern)
+}
+
 /// 递归统计目录内的字节数（steamcmd 无进度输出时用它估算下载进度）。
 pub fn dir_size(path: &Path) -> u64 {
+    dir_size_excluding(path, &[])
+}
+
+/// 同 [`dir_size`]，但跳过 `skip` 里的顶层目录名（后端自己的元数据目录）。
+/// DepotDownloader 的 `.DepotDownloader/` 就落在产物根下，不排除的话
+/// 「只下到元数据」也会被当成有产物。
+pub fn dir_size_excluding(path: &Path, skip: &[&str]) -> u64 {
     let Ok(entries) = std::fs::read_dir(path) else {
         return 0;
     };
     let mut total = 0u64;
     for e in entries.flatten() {
+        let name = e.file_name();
+        if skip.iter().any(|s| name == std::ffi::OsStr::new(s)) {
+            continue;
+        }
         match e.file_type() {
             Ok(t) if t.is_dir() => total += dir_size(&e.path()),
             Ok(t) if t.is_file() => total += e.metadata().map(|m| m.len()).unwrap_or(0),
@@ -292,6 +312,265 @@ pub fn dir_size(path: &Path) -> u64 {
         }
     }
     total
+}
+
+// ---------- 后端选择 ----------
+
+/// 下载工具种类（设置键 `download_backend` 的取值）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKind {
+    /// Valve 官方 steamcmd（默认）
+    SteamCmd,
+    /// 第三方 DepotDownloader（需另行下载，约 33 MB）
+    DepotDownloader,
+}
+
+impl BackendKind {
+    /// 缺省与非法值都回落到 steamcmd：默认工具不因历史残留设置而改变
+    pub fn from_setting(raw: Option<&str>) -> Self {
+        match raw.map(str::trim) {
+            Some("depotdownloader") | Some("depot_downloader") | Some("DepotDownloader") => {
+                Self::DepotDownloader
+            }
+            _ => Self::SteamCmd,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::SteamCmd => "steamcmd",
+            Self::DepotDownloader => "depotdownloader",
+        }
+    }
+
+    /// 面向用户/错误信息的名字
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::SteamCmd => "steamcmd",
+            Self::DepotDownloader => "DepotDownloader",
+        }
+    }
+
+    /// 该工具的登录态标记设置键。
+    ///
+    /// 必须按后端分开：两个工具各自缓存登录态（steamcmd 在重定向 HOME 的
+    /// config.vdf，DD 在 .NET IsolatedStorage），换工具后原来的令牌用不上，
+    /// 拿旧标记省略密码会让新工具卡在「请输入密码」上。
+    pub fn token_setting(&self) -> &'static str {
+        match self {
+            Self::SteamCmd => "download_has_token",
+            Self::DepotDownloader => "depotdl_has_token",
+        }
+    }
+
+    /// 登录验证成功标记（下载页/设置页展示用；与后端一一对应）
+    pub fn logged_in_setting(&self) -> &'static str {
+        match self {
+            Self::SteamCmd => crate::download::steamcmd_install::SETTING_LOGGED_IN,
+            Self::DepotDownloader => crate::download::depotdl_install::SETTING_LOGGED_IN,
+        }
+    }
+
+    /// 未安装时的失败错误码（前端用于区分「工具没装」这类可自愈失败）
+    pub fn missing_code(&self) -> &'static str {
+        match self {
+            Self::SteamCmd => "STEAMCMD_NOT_FOUND",
+            Self::DepotDownloader => "DEPOTDL_NOT_FOUND",
+        }
+    }
+}
+
+/// 当前选中的下载后端。所有「跟子进程打交道」的差异都在这里分发，
+/// `download/mod.rs` 对两个工具一视同仁。
+#[derive(Clone)]
+pub enum Backend {
+    SteamCmd(SteamCmd),
+    DepotDownloader(DepotDl),
+}
+
+impl Backend {
+    pub fn kind(&self) -> BackendKind {
+        match self {
+            Self::SteamCmd(_) => BackendKind::SteamCmd,
+            Self::DepotDownloader(_) => BackendKind::DepotDownloader,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        self.kind().label()
+    }
+
+    /// 登录态标记的设置键（见 [`BackendKind::token_setting`]）
+    pub fn token_setting(&self) -> &'static str {
+        self.kind().token_setting()
+    }
+
+    pub fn program(&self) -> &Path {
+        match self {
+            Self::SteamCmd(b) => &b.script,
+            Self::DepotDownloader(b) => &b.bin,
+        }
+    }
+
+    pub fn is_installed(&self) -> bool {
+        match self {
+            Self::SteamCmd(b) => b.is_installed(),
+            Self::DepotDownloader(b) => b.is_installed(),
+        }
+    }
+
+    /// 未安装时的失败提示（指向设置页的对应入口）
+    pub fn install_hint(&self) -> &'static str {
+        match self {
+            Self::SteamCmd(_) => "steamcmd 尚未安装，请到「设置 → 账号」点击安装",
+            Self::DepotDownloader(_) => {
+                "DepotDownloader 尚未安装，请到「设置 → 账号」切换下载工具后点击安装"
+            }
+        }
+    }
+
+    /// 需要注入的环境变量（两个工具都要重定向家目录隔离登录态）
+    pub fn extra_env(&self) -> Vec<(String, OsString)> {
+        match self {
+            Self::SteamCmd(b) => b.extra_env(),
+            Self::DepotDownloader(b) => b.extra_env(),
+        }
+    }
+
+    /// 子进程工作目录（DD 需要：account.config 是相对 CWD 读写的）
+    pub fn current_dir(&self) -> Option<PathBuf> {
+        match self {
+            Self::SteamCmd(_) => None,
+            Self::DepotDownloader(b) => b.current_dir(),
+        }
+    }
+
+    /// 单个条目的下载参数。`login_id` 只有 DD 用（并发实例要各自不同的 LogonID），
+    /// steamcmd 忽略。
+    pub fn build_args(
+        &self,
+        item_id: &str,
+        workdir: &Path,
+        cred: &Credentials,
+        login_id: i64,
+    ) -> Vec<OsString> {
+        match self {
+            Self::SteamCmd(b) => b.build_args(item_id, workdir, cred),
+            Self::DepotDownloader(b) => b.build_args(item_id, workdir, cred, login_id),
+        }
+    }
+
+    /// 登录验证任务的参数
+    pub fn build_login_args(
+        &self,
+        workdir: &Path,
+        cred: &Credentials,
+        login_id: i64,
+    ) -> Vec<OsString> {
+        match self {
+            Self::SteamCmd(b) => b.build_login_args(workdir, cred),
+            Self::DepotDownloader(b) => b.build_login_args(workdir, cred, login_id),
+        }
+    }
+
+    pub fn match_login_success(&self, s: &str) -> bool {
+        match self {
+            Self::SteamCmd(b) => b.match_login_success(s),
+            Self::DepotDownloader(b) => b.match_login_success(s),
+        }
+    }
+
+    /// 是否「密码登录已开始」（只有 steamcmd 需要靠它推测手机确认）
+    pub fn match_login_start(&self, s: &str) -> bool {
+        match self {
+            Self::SteamCmd(b) => b.match_login_start(s),
+            Self::DepotDownloader(_) => false,
+        }
+    }
+
+    pub fn match_success(&self, s: &str) -> bool {
+        match self {
+            Self::SteamCmd(b) => b.match_success(s),
+            Self::DepotDownloader(b) => b.match_success(s),
+        }
+    }
+
+    pub fn match_guard_prompt(&self, s: &str) -> Option<GuardKind> {
+        match self {
+            Self::SteamCmd(b) => b.match_guard_prompt(s),
+            Self::DepotDownloader(b) => b.match_guard_prompt(s),
+        }
+    }
+
+    pub fn parse_failure(&self, s: &str) -> Option<String> {
+        match self {
+            Self::SteamCmd(b) => b.parse_failure(s),
+            Self::DepotDownloader(b) => b.parse_failure(s),
+        }
+    }
+
+    /// 进度是否来自输出行（DD 逐文件打百分比）而不是轮询目录体积（steamcmd）
+    pub fn progress_from_output(&self) -> bool {
+        matches!(self, Self::DepotDownloader(_))
+    }
+
+    /// 从输出行解析百分比（仅 [`Self::progress_from_output`] 为真的后端）
+    pub fn parse_progress(&self, s: &str) -> Option<f64> {
+        match self {
+            Self::SteamCmd(_) => None,
+            Self::DepotDownloader(b) => b.parse_progress(s),
+        }
+    }
+
+    /// 收编前把输出行收拾成可展示的样子（DD 会混入 ANSI/OSC 控制序列）
+    pub fn sanitize_line(&self, line: String) -> String {
+        match self {
+            Self::SteamCmd(_) => line,
+            Self::DepotDownloader(_) => crate::download::depotdl::strip_ansi(&line),
+        }
+    }
+
+    pub fn artifact_dir(&self, workdir: &Path, item_id: &str) -> PathBuf {
+        match self {
+            Self::SteamCmd(b) => b.artifact_dir(workdir, item_id),
+            Self::DepotDownloader(b) => b.artifact_dir(workdir, item_id),
+        }
+    }
+
+    /// 产物是否真实落地（成功判定用；两个后端的判据不同）
+    pub fn artifact_ready(&self, workdir: &Path, item_id: &str) -> bool {
+        match self {
+            Self::SteamCmd(b) => {
+                let dir = b.artifact_dir(workdir, item_id);
+                dir.is_dir() && dir_size(&dir) > 0
+            }
+            Self::DepotDownloader(b) => b.artifact_ready(workdir),
+        }
+    }
+
+    /// 收编时要跳过的元数据目录名（各处布局的元数据目录不同）
+    pub fn is_metadata_entry(&self, name: &str) -> bool {
+        match self {
+            Self::SteamCmd(_) => name == "steamapps",
+            Self::DepotDownloader(b) => b.is_metadata_entry(name),
+        }
+    }
+
+    /// 退出码是否可信（steamcmd 下载成功后可能卡住不退出，见模块头注释）
+    pub fn trust_exit_code(&self) -> bool {
+        match self {
+            Self::SteamCmd(_) => false,
+            Self::DepotDownloader(b) => b.trust_exit_code(),
+        }
+    }
+
+    /// 子进程输出的「未换行尾部」是否是需要用户输入的提示
+    pub fn prompt_detector(&self) -> fn(&str) -> bool {
+        match self {
+            Self::SteamCmd(_) => is_prompt,
+            Self::DepotDownloader(_) => crate::download::depotdl::is_prompt,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -379,13 +658,12 @@ mod tests {
         let b = sc();
         // console_log.txt 实测：密码登录的两个信号
         assert!(b.match_login_start("Logging in using username/password."));
-        assert!(
-            b.match_login_start("Logging in user 'xiaojian520520' [U:1:0] to Steam Public...")
-        );
+        assert!(b.match_login_start("Logging in user 'xiaojian520520' [U:1:0] to Steam Public..."));
         // 缓存登录不触发：否则每次秒登录都会误弹「等待手机确认」
         assert!(!b.match_login_start("Logging in using cached credentials."));
-        assert!(!b
-            .match_login_start("Logging in user 'xiaojian520520' [U:1:351868315] to Steam Public..."));
+        assert!(!b.match_login_start(
+            "Logging in user 'xiaojian520520' [U:1:351868315] to Steam Public..."
+        ));
         assert!(!b.match_login_start("Loading Steam API...OK"));
     }
 
@@ -426,5 +704,60 @@ mod tests {
             .unwrap()
             .contains("不存在"));
         assert_eq!(b.parse_failure("Loading Steam API...OK"), None);
+    }
+
+    #[test]
+    fn backend_setting_defaults_to_steamcmd() {
+        // 缺省 / 历史残留 / 非法值一律 steamcmd：默认工具不能被脏设置改掉
+        for raw in [
+            None,
+            Some(""),
+            Some("steamcmd"),
+            Some("DepotDownloader-old"),
+        ] {
+            assert_eq!(
+                BackendKind::from_setting(raw),
+                BackendKind::SteamCmd,
+                "raw={raw:?}"
+            );
+        }
+        assert_eq!(
+            BackendKind::from_setting(Some("depotdownloader")),
+            BackendKind::DepotDownloader
+        );
+        assert_eq!(BackendKind::SteamCmd.as_str(), "steamcmd");
+        assert_eq!(BackendKind::DepotDownloader.as_str(), "depotdownloader");
+        // 两个工具各自一套登录态标记
+        assert_ne!(
+            BackendKind::SteamCmd.token_setting(),
+            BackendKind::DepotDownloader.token_setting()
+        );
+    }
+
+    #[test]
+    fn prompt_detector_switches_per_backend() {
+        let steam = Backend::SteamCmd(sc());
+        let dd = Backend::DepotDownloader(DepotDl {
+            bin: PathBuf::from("/tmp/depotdownloader/DepotDownloader"),
+            home: PathBuf::from("/tmp/depotdl-home"),
+        });
+        // steamcmd 的提示检测器认不出 DD 的提示，反之亦然（错配会让输入框弹不出来）
+        assert!((steam.prompt_detector())("Steam Guard code:"));
+        assert!(!(steam.prompt_detector())(
+            "STEAM GUARD! Please enter your 2-factor auth code from your authenticator app: "
+        ));
+        assert!((dd.prompt_detector())(
+            "STEAM GUARD! Please enter your 2-factor auth code from your authenticator app: "
+        ));
+        assert!(!(dd.prompt_detector())("Steam Guard code:"));
+        // DD 不需要「密码登录已开始」的推测（提示是明文的）
+        assert!(!dd.match_login_start("Logging in using username/password."));
+        assert!(steam.match_login_start("Logging in using username/password."));
+        // 退出码可信度与进度来源按后端区分
+        assert!(!steam.trust_exit_code());
+        assert!(dd.trust_exit_code());
+        assert!(!steam.progress_from_output());
+        assert!(dd.progress_from_output());
+        assert_eq!(dd.sanitize_line("\u{1b}]9;4;1;5\u{7}hi".into()), "hi");
     }
 }

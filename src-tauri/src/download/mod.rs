@@ -2,10 +2,16 @@
 //!
 //! 状态机：queued → authenticating → downloading → installing → done | failed
 //!
-//! 下载工具是 Valve 官方 steamcmd（运行时安装到 app data，见 `steamcmd_install.rs`）。
-//! 与它打交道的细节（命令行、输出正则、PTY、产物布局、收尾方式）收敛在 `backend.rs`。
+//! 下载工具二选一（设置 `download_backend`，默认 valve 官方 steamcmd）：
+//! - `steamcmd`（默认）：运行时安装到 app data，见 `steamcmd_install.rs`
+//! - `depotdownloader`（可选）：第三方工具，运行时从官方 Release 下载，见 `depotdl_install.rs`
+//!
+//! 两者的差异（命令行、输出正则、PTY/管道、进度来源、产物布局、收尾方式）全部收敛在
+//! `backend.rs` 的 [`backend::Backend`] 门面之后，本模块只按门面编程。
 
 pub mod backend;
+pub mod depotdl;
+pub mod depotdl_install;
 pub mod pty;
 pub mod steamcmd_install;
 
@@ -27,12 +33,15 @@ use tokio::sync::oneshot;
 use crate::db;
 use crate::keychain::get_password;
 use crate::secure_store;
-use backend::{Credentials, GuardKind, SteamCmd};
+use backend::{Backend, BackendKind, Credentials, GuardKind};
 
 pub const APP_ID: &str = "431960";
 const GUARD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// steamcmd 无进度输出，用产物目录大小估算进度的轮询间隔
 const SIZE_POLL_INTERVAL: Duration = Duration::from_millis(1000);
+/// 输出行进度（DepotDownloader 逐文件百分比）的节流间隔：
+/// 大件会连续刷几十行，按行发事件会把前端淹没
+const PROGRESS_THROTTLE: Duration = Duration::from_millis(1000);
 /// 密码登录开始后，超过该时长仍未成功就推测在等待手机 App 确认。
 ///
 /// 新版 steamcmd 等待手机确认时不打印任何提示（console_log.txt 实测：
@@ -90,12 +99,28 @@ impl DownloadService {
 
     // ---------- 后端选择 ----------
 
-    /// 当前配置的下载后端（默认 steamcmd）
-    /// 构造 steamcmd 句柄。
-    fn downloader(&self) -> Result<SteamCmd, String> {
-        Ok(SteamCmd {
-            script: steamcmd_install::script_path(&self.app)?,
-            home: steamcmd_install::home_dir(&self.app)?,
+    /// 当前配置的下载后端（设置 `download_backend`，缺失/非法值 = steamcmd）。
+    /// 热读：下一次任务调度即生效，跑着的任务继续用它开始时的那个后端。
+    fn backend_kind(&self) -> BackendKind {
+        let raw = self
+            .db
+            .lock()
+            .ok()
+            .and_then(|c| db::get_setting(&c, "download_backend"));
+        BackendKind::from_setting(raw.as_deref())
+    }
+
+    /// 按当前设置构造后端句柄（路径即用即取，工具重新安装后无需重启）。
+    fn downloader(&self) -> Result<Backend, String> {
+        Ok(match self.backend_kind() {
+            BackendKind::SteamCmd => Backend::SteamCmd(backend::SteamCmd {
+                script: steamcmd_install::script_path(&self.app)?,
+                home: steamcmd_install::home_dir(&self.app)?,
+            }),
+            BackendKind::DepotDownloader => Backend::DepotDownloader(depotdl::DepotDl {
+                bin: depotdl_install::bin_path(&self.app)?,
+                home: depotdl_install::home_dir(&self.app)?,
+            }),
         })
     }
 
@@ -213,18 +238,15 @@ impl DownloadService {
             }
         };
         if !dl.is_installed() {
-            self.fail(
-                task_id,
-                "STEAMCMD_NOT_FOUND",
-                "steamcmd 尚未安装，请到「设置 → 账号」点击安装",
-            );
+            self.fail(task_id, dl.kind().missing_code(), dl.install_hint());
             return;
         }
-        let bin = dl.script.clone();
+        let bin = dl.program().to_path_buf();
 
-        // 凭据：有持久化登录态时只需账号名；否则需完整账号密码
-        // （首次登录后 steamcmd 会把登录态缓存到被重定向的 HOME 下）。
-        let cred = match self.resolve_credentials() {
+        // 凭据：有该后端自己的持久化登录态时只需账号名；否则需完整账号密码
+        // （登录态标记按后端分开，换工具后的首次下载会重新用账号密码登录，
+        //   见 BackendKind::token_setting）。
+        let cred = match self.resolve_credentials(dl.kind()) {
             Ok((username, password, has_token)) => Credentials {
                 username,
                 password,
@@ -251,10 +273,12 @@ impl DownloadService {
             self.fail(task_id, "IO_ERROR", &format!("创建工作目录失败: {e}"));
             return;
         }
-        // steamcmd 要求 force_install_dir 是绝对路径，否则内容会静默落到 $HOME/Steam
+        // steamcmd 要求 force_install_dir 是绝对路径，否则内容会静默落到 $HOME/Steam；
+        // DD 同理（-dir 相对路径会落在子进程 CWD，即它的隔离 HOME 下）
         let workdir = std::fs::canonicalize(&workdir).unwrap_or(workdir);
-        if let Ok(h) = steamcmd_install::home_dir(&self.app) {
-            let _ = std::fs::create_dir_all(h);
+        // 登录态隔离目录先建好（两个后端都把家目录重定向到这里）
+        for (_, v) in dl.extra_env() {
+            let _ = std::fs::create_dir_all(PathBuf::from(&v));
         }
 
         let proxy = {
@@ -264,17 +288,24 @@ impl DownloadService {
             })
         };
 
-        // 登录验证任务：只 +login +quit，不下载任何内容
+        // 登录验证任务：只验证登录，不下载内容（steamcmd: +login +quit；
+        // DD: -app 431960 -manifest-only）
         let is_verify = item_id == backend::VERIFY_ITEM_ID;
         let mut cmd = Command::new(&bin);
         if is_verify {
-            cmd.args(dl.build_login_args(&workdir, &cred));
+            cmd.args(dl.build_login_args(&workdir, &cred, task_id));
         } else {
-            cmd.args(dl.build_args(&item_id, &workdir, &cred));
+            cmd.args(dl.build_args(&item_id, &workdir, &cred, task_id));
         }
         for (k, v) in dl.extra_env() {
             cmd.env(k, v);
         }
+        // DD 的 account.config 走相对 CWD，令牌目录也由其中介 → 固定到隔离目录
+        if let Some(dir) = dl.current_dir() {
+            cmd.current_dir(dir);
+        }
+        // Windows 上隐藏子进程控制台窗口（*nix 无操作）
+        crate::util::hide_console_tokio(&mut cmd);
         if let Some(p) = &proxy {
             cmd.env("http_proxy", p)
                 .env("https_proxy", p)
@@ -284,6 +315,7 @@ impl DownloadService {
 
         // 交互通道：*nix 上 steamcmd 的 stdin 必须是 TTY（管道会让它直接
         // "cannot read from the console" 退出）；Windows 走匿名管道（详见 pty.rs）。
+        // 提示探测函数按后端切换（两家的提示文案完全不同）。
         let (mut writer, mut out_rx, slot) = {
             let mut pty = match pty::Pty::open() {
                 Ok(p) => p,
@@ -301,7 +333,7 @@ impl DownloadService {
                 }
             };
             // 交互通道必须在 spawn 之后取：Windows 上管道句柄来自 Child 本身
-            let (writer, rx) = match pty.channel(&mut child, backend::is_prompt).await {
+            let (writer, rx) = match pty.channel(&mut child, dl.prompt_detector()).await {
                 Ok(c) => c,
                 Err(e) => {
                     let _ = child.start_kill();
@@ -314,12 +346,16 @@ impl DownloadService {
             (writer, rx, slot)
         };
 
-        // steamcmd 下载期间零进度输出：轮询产物目录大小估算进度。
-        // 登录验证任务没有产物，用 -1 的不确定态进度即可。
+        // 进度来源按后端分两路：
+        // - steamcmd 下载期间零输出 → 轮询产物目录大小估算（见 spawn_size_poller）
+        // - DepotDownloader 逐文件打百分比 → 由 handle_event 解析输出行
+        // 登录验证任务没有产物也不看进度，用 -1 的不确定态进度即可。
         // 注意状态必须保持 authenticating：误报 downloading 会让前端把验证任务
         // 显示成「下载中」，还会触发「登录已推进」逻辑提前收起手机确认弹窗。
         let progress_poll = if is_verify {
             self.emit_progress(task_id, "authenticating", -1.0);
+            tauri::async_runtime::spawn(std::future::pending::<()>())
+        } else if dl.progress_from_output() {
             tauri::async_runtime::spawn(std::future::pending::<()>())
         } else {
             self.spawn_size_poller(
@@ -338,6 +374,7 @@ impl DownloadService {
             mobile_confirm_notified: Arc::new(AtomicBool::new(false)),
             mobile_hint_armed: false,
             mobile_hint_cancel: Arc::new(AtomicBool::new(false)),
+            last_progress_at: std::time::Instant::now() - PROGRESS_THROTTLE,
         };
         let watchdog = backend::WATCHDOG;
         let task_deadline = tokio::time::sleep(watchdog);
@@ -397,7 +434,10 @@ impl DownloadService {
             // steamcmd 在 macOS 上下载完成后常卡在 Steam API 拆卸而不退出，
             // 匹配到成功行就主动收尾，不能等退出码。
             if st.success {
-                tracing::info!("task {task_id}: 成功标志已出现，主动结束 steamcmd");
+                tracing::debug!(
+                    "task {task_id}: 成功标志已出现，主动收尾（{tool}）",
+                    tool = dl.label()
+                );
                 self.kill_task(task_id).await;
                 st.exit_code = Some(0);
                 break;
@@ -411,14 +451,18 @@ impl DownloadService {
         st.mobile_hint_cancel.store(true, Ordering::SeqCst);
         self.children.lock().await.remove(&task_id);
 
-        // 成功判定：以「成功行 + 产物真实存在」为准（登录验证任务无产物，只看成功行）。
-        // 退出码不可信 —— macOS 上 steamcmd 下载成功后常卡在拆卸阶段被我们主动杀掉。
+        // 成功判定：产物真实存在 + （成功行 或 可信的退出码）。
+        // - steamcmd：退出码不可信（macOS 上下载成功后常卡在拆卸阶段被我们主动杀掉），
+        //   必须匹配到成功行
+        // - DepotDownloader：失败必 return 1、成功正常退出，退出码可信；
+        //   网页文件那条路径没有专门的完成行，只看成功行会误判失败
+        // 登录验证任务无产物，只看成功行。
         let real_success = if is_verify {
             st.success && st.error_msg.is_none()
         } else {
-            let artifact = dl.artifact_dir(&workdir, &item_id);
-            let files_ok = artifact.is_dir() && backend::dir_size(&artifact) > 0;
-            st.success && files_ok && st.error_msg.is_none()
+            let files_ok = dl.artifact_ready(&workdir, &item_id);
+            let finished = st.success || (dl.trust_exit_code() && st.exit_code == Some(0));
+            finished && files_ok && st.error_msg.is_none()
         };
 
         if st.error_msg.is_none() && !real_success {
@@ -450,20 +494,25 @@ impl DownloadService {
             self.fail(
                 task_id,
                 "DOWNLOAD_FAILED",
-                if is_verify { "登录验证未完成" } else { "下载未完成" },
+                if is_verify {
+                    "登录验证未完成"
+                } else {
+                    "下载未完成"
+                },
             );
             return;
         }
 
-        // 登录验证任务：登录成功即完成，无需安装
+        // 登录验证任务：登录成功即完成，无需安装。
+        // 登录态标记按后端分开记：换工具后要重新登录一次（令牌不通用）。
         if is_verify {
             if let Ok(conn) = self.db.lock() {
-                let _ = db::set_setting(&conn, "download_has_token", "true");
-                let _ = db::set_setting(&conn, steamcmd_install::SETTING_LOGGED_IN, "true");
+                let _ = db::set_setting(&conn, dl.token_setting(), "true");
+                let _ = db::set_setting(&conn, dl.kind().logged_in_setting(), "true");
             }
             self.update(task_id, "done", 100.0, None, None, false);
             self.emit_progress(task_id, "done", 100.0);
-            tracing::info!("login verify done (task {task_id})");
+            tracing::info!("login verify done (task {task_id}, {})", dl.label());
             return;
         }
 
@@ -474,8 +523,9 @@ impl DownloadService {
         let svc = self.clone();
         let item = item_id.clone();
         let install_wd = workdir.clone();
+        let install_dl = dl.clone();
         let install_res =
-            tokio::task::spawn_blocking(move || svc.install(item, &install_wd)).await;
+            tokio::task::spawn_blocking(move || svc.install(item, &install_wd, &install_dl)).await;
         match install_res {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
@@ -487,15 +537,15 @@ impl DownloadService {
                 return;
             }
         }
-        // 下载成功：登录令牌已持久化，置位标记，后续下载省略密码走令牌登录。
-        // 注意 backend_kind() 内部也会 lock db，必须在取锁前先算好，否则自锁死。
+        // 下载成功：登录令牌已持久化，置位该后端的标记，后续下载省略密码走令牌登录。
+        // 注意这里在锁内只做纯写入（token_setting/logged_in_setting 都是纯函数，不再取锁）。
         if let Ok(conn) = self.db.lock() {
-            let _ = db::set_setting(&conn, "download_has_token", "true");
-            let _ = db::set_setting(&conn, steamcmd_install::SETTING_LOGGED_IN, "true");
+            let _ = db::set_setting(&conn, dl.token_setting(), "true");
+            let _ = db::set_setting(&conn, dl.kind().logged_in_setting(), "true");
         }
         self.update(task_id, "done", 100.0, None, None, false);
         self.emit_progress(task_id, "done", 100.0);
-        tracing::info!("download done: item {item_id}");
+        tracing::info!("download done: item {item_id} ({})", dl.label());
     }
 
     /// 记录任务开始时间（原实现从未写入该列，前端拿到的 startedAt 恒为 null）
@@ -593,7 +643,7 @@ impl DownloadService {
         &self,
         ev: pty::OutEvent,
         task_id: i64,
-        dl: &SteamCmd,
+        dl: &Backend,
         st: &mut TaskState,
         is_verify: bool,
     ) {
@@ -601,9 +651,29 @@ impl DownloadService {
             pty::OutEvent::Line(l) => l.clone(),
             pty::OutEvent::Prompt(p) => p.clone(),
         };
+        // DepotDownloader 会把 ANSI/OSC 控制序列混进输出（终端进度条指令），
+        // 先收拾干净再匹配/展示，避免控制字节进日志与错误信息
+        let text = dl.sanitize_line(text);
         let line = text.trim();
         if line.is_empty() {
             return;
+        }
+
+        // 输出行进度（目前只有 DepotDownloader 有）：节流后直接推前端，
+        // 这类行不进日志缓冲，否则几秒就把最近输出刷满。
+        // 验证任务跳过：它要一直停在 authenticating，误报 downloading 会让前端
+        // 把「账号登录验证」显示成「下载中」，也会提前收起手机确认提示。
+        if dl.progress_from_output() && !is_verify {
+            if let Some(pct) = dl.parse_progress(line) {
+                if st.last_progress_at.elapsed() >= PROGRESS_THROTTLE {
+                    st.last_progress_at = std::time::Instant::now();
+                    let cur = self.current_progress(task_id);
+                    let pct = pct.min(99.0).max(cur.max(0.0));
+                    self.update(task_id, "downloading", pct, None, None, false);
+                    self.emit_progress(task_id, "downloading", pct);
+                }
+                return;
+            }
         }
 
         // 密码登录开始：启动「静默等待手机确认」推测定时器。
@@ -645,10 +715,10 @@ impl DownloadService {
 
     /// 识别到需要用户输入验证码时，建立一次性通道并通知前端。
     /// 手机确认类提示只做日志，不弹输入框。
-    fn request_guard(&self, task_id: i64, dl: &SteamCmd, line: &str, st: &mut TaskState) {
+    fn request_guard(&self, task_id: i64, dl: &Backend, line: &str, st: &mut TaskState) {
         let Some(kind) = dl.match_guard_prompt(line) else {
-            // 诊断：含有 confirm 字样却没匹配上的行打出来，方便发现 steamcmd
-            // 又改了提示文案（之前已经改过一次：新版干脆不打印了）
+            // 诊断：含有 confirm 字样却没匹配上的行打出来，方便发现下载工具
+            // 又改了提示文案（steamcmd 之前已经改过一次：新版干脆不打印了）
             if line.to_ascii_lowercase().contains("confirm") {
                 tracing::warn!("task {task_id}: 疑似确认提示但未匹配: {line}");
             }
@@ -659,7 +729,7 @@ impl DownloadService {
             GuardKind::MobileConfirm => {
                 // 只提示一次：steamcmd 在等待期间会反复刷这句提示。
                 // 与静默推测定时器抢同一个标志，谁先谁发。
-                self.notify_mobile_confirm(task_id, st, "steamcmd 输出了确认提示");
+                self.notify_mobile_confirm(task_id, st, "下载工具输出了确认提示");
             }
             GuardKind::Password => {
                 // 令牌失效时后端会重新索要密码。这里不弹框，直接标记失败让用户重新登录，
@@ -730,16 +800,19 @@ impl DownloadService {
     }
 
     /// 解析下载凭据。返回 (username, password, has_token)：
-    /// - 有持久化登录态：password 为空字符串，steamcmd 直接用缓存凭据登录
-    /// - 无令牌：返回完整账号密码（首次登录用）
-    fn resolve_credentials(&self) -> Result<(String, String, bool), String> {
+    /// - 该后端已有持久化登录态：password 为空字符串，工具直接用缓存凭据/令牌登录
+    /// - 无登录态：返回完整账号密码（首次登录用）
+    ///
+    /// `kind` 决定读哪一份登录态标记：两个工具的令牌不通用（steamcmd 在重定向
+    /// HOME 的 config.vdf，DD 在 .NET IsolatedStorage），换工具后必须重新登录一次。
+    fn resolve_credentials(&self, kind: BackendKind) -> Result<(String, String, bool), String> {
         let conn = self.db.lock().map_err(|e| e.to_string())?;
         let username = db::get_setting(&conn, "download_username")
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
                 "请先到「设置 → 账号」登录 Steam 账号（需拥有 Wallpaper Engine）".to_string()
             })?;
-        let has_token = db::get_setting(&conn, "download_has_token")
+        let has_token = db::get_setting(&conn, kind.token_setting())
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
         if has_token {
@@ -808,7 +881,7 @@ impl DownloadService {
     }
 
     /// 收编：把下载产物移入壁纸库，解析 project.json 登记类型
-    fn install(&self, item_id: String, workdir: &Path) -> Result<(), String> {
+    fn install(&self, item_id: String, workdir: &Path, backend: &Backend) -> Result<(), String> {
         // 该 item 若是某壁纸的依赖（target_dir 记录合并目标，`|` 分隔多个，依赖链会传递），
         // 下载完成后需把产物合并回主壁纸目录
         let dependency_targets: Vec<PathBuf> = {
@@ -835,16 +908,15 @@ impl DownloadService {
             v
         };
 
-        // 产物就在本任务的独立工作目录里（并行下载各用各的，见 run_task）
-        let steamcmd_path = workdir
-            .join("steamapps/workshop/content")
-            .join(APP_ID)
-            .join(&item_id);
+        // 产物就在本任务的独立工作目录里（并行下载各用各的，见 run_task）。
+        // 具体位置按后端取：steamcmd 在 steamapps/workshop/content/<app>/<id>，
+        // DepotDownloader 的 -dir 就是工作目录本体。
+        let backend_path = backend.artifact_dir(workdir, &item_id);
         let mut src: Option<PathBuf> = None;
-        if steamcmd_path.is_dir() {
-            src = Some(steamcmd_path);
+        if backend_path.is_dir() {
+            src = Some(backend_path);
         } else if workdir.is_dir() {
-            let entries = std::fs::read_dir(&workdir).map_err(|e| e.to_string())?;
+            let entries = std::fs::read_dir(workdir).map_err(|e| e.to_string())?;
             let has_content = entries.into_iter().next().is_some();
             if has_content {
                 src = Some(workdir.to_path_buf());
@@ -862,8 +934,9 @@ impl DownloadService {
         for entry in std::fs::read_dir(&src).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
             let name = entry.file_name();
-            // 根布局时跳过遗留 steamapps 目录
-            if src == workdir && name == "steamapps" {
+            // 根布局时跳过下载工具的元数据目录（steamcmd: steamapps；
+            // DD: .DepotDownloader）—— 它们不是壁纸内容
+            if src == workdir && backend.is_metadata_entry(&name.to_string_lossy()) {
                 continue;
             }
             let from = entry.path();
@@ -1171,6 +1244,8 @@ struct TaskState {
     mobile_hint_armed: bool,
     /// 置位后推测定时器放弃发提示（登录已成功/失败/改要验证码/任务结束）
     mobile_hint_cancel: Arc<AtomicBool>,
+    /// 上次上报输出行进度的时间（节流用；初值退到节流窗口之前，首行即上报）
+    last_progress_at: std::time::Instant,
 }
 
 fn copy_recursive(
@@ -1262,7 +1337,22 @@ pub fn init(app: &AppHandle) -> Result<(), String> {
     let svc = Arc::new(DownloadService::new(db.inner().clone(), app.clone()));
     app.manage(svc.clone());
 
-    // 老版本用 DepotDownloader 时的登录令牌目录；该后端已移除，清掉释放空间
+    // 登录态隔离目录先建好：两个后端都靠重定向 HOME 把凭据关进应用目录
+    // （steamcmd 的 config.vdf / DepotDownloader 的 .NET IsolatedStorage）
+    for d in [
+        steamcmd_install::home_dir(app),
+        depotdl_install::home_dir(app),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Err(e) = std::fs::create_dir_all(&d) {
+            tracing::warn!("创建登录态目录失败（{}）: {e}", d.display());
+        }
+    }
+
+    // 老版本 DepotDownloader（侧车时代，用 -configdir 参数）留下的令牌目录：
+    // 现在的隔离方式是重定向 HOME，这个目录不会再被读写，清掉释放空间
     if let Ok(dir) = app.path().app_data_dir() {
         let legacy = dir.join("dd-config");
         if legacy.exists() {
@@ -1372,10 +1462,36 @@ pub(crate) fn read_proxy(app: &AppHandle) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
-/// 下载工具（steamcmd）安装状态，供设置页展示。
+/// 下载工具安装状态，供设置页展示：当前选中的后端 + 两个工具各自的状态。
+///
+/// 两个都返回（而不是只返回当前工具）：设置页的工具选择器要知道另一个工具
+/// 装没装，好在切换后立刻给出「未就绪 / 去安装」的正确状态，不用二次请求。
 #[tauri::command]
 pub fn download_tool_status(app: AppHandle) -> serde_json::Value {
-    steamcmd_install::status(&app)
+    let backend = app
+        .try_state::<Arc<DownloadService>>()
+        .map(|s| s.backend_kind())
+        .unwrap_or(BackendKind::SteamCmd);
+    json!({
+        "backend": backend.as_str(),
+        "steamcmd": steamcmd_install::status(&app),
+        "depotdownloader": depotdl_install::status(&app),
+    })
+}
+
+/// 切换下载工具（`steamcmd` / `depotdownloader`）。非法值一律回落到默认（steamcmd）。
+/// 热生效：已在队列里的任务下一次调度就用新工具，跑着的任务不受影响。
+#[tauri::command]
+pub fn download_backend_set(app: AppHandle, backend: String) -> Result<String, String> {
+    let kind = BackendKind::from_setting(Some(backend.as_str()));
+    {
+        let db = app.state::<Arc<Mutex<Connection>>>();
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        db::set_setting(&conn, "download_backend", kind.as_str())?;
+    }
+    crate::notify_setting_changed(&app, "download_backend", kind.as_str());
+    tracing::info!("下载工具已切换为 {}", kind.label());
+    Ok(kind.as_str().to_string())
 }
 
 /// 安装（或修复）steamcmd。异步执行，进度经 `steamcmd:install-progress` 事件推送。
@@ -1393,6 +1509,21 @@ pub fn steamcmd_uninstall_tool(app: AppHandle) -> Result<(), String> {
     steamcmd_install::uninstall(&app)
 }
 
+/// 安装（或修复）DepotDownloader。异步执行，进度经 `depotdl:install-progress` 事件推送。
+#[tauri::command]
+pub async fn depotdl_install_tool(
+    app: AppHandle,
+    force: Option<bool>,
+) -> Result<serde_json::Value, String> {
+    depotdl_install::install(app, force.unwrap_or(false)).await
+}
+
+/// 卸载 DepotDownloader（删除安装目录，保留登录态目录）
+#[tauri::command]
+pub fn depotdl_uninstall_tool(app: AppHandle) -> Result<(), String> {
+    depotdl_install::uninstall(&app)
+}
+
 #[tauri::command]
 pub fn download_credentials_set(
     app: AppHandle,
@@ -1408,9 +1539,9 @@ pub fn download_credentials_set(
     {
         let conn = db.lock().map_err(|e| e.to_string())?;
         db::set_setting(&conn, "download_username", &username)?;
-        // 换账号/改密码：清除旧的登录态标记，下次下载重新用账号密码登录
+        // 换账号/改密码：清除**两个后端**的登录态标记，下次下载重新用账号密码登录
         let _ = conn.execute(
-            "DELETE FROM settings WHERE key IN ('download_has_token','steamcmd_logged_in')",
+            "DELETE FROM settings WHERE key IN ('download_has_token','depotdl_has_token','steamcmd_logged_in','depotdl_logged_in')",
             [],
         );
     }
@@ -1422,21 +1553,29 @@ pub fn download_credentials_set(
 #[tauri::command]
 pub fn download_credentials_status(app: AppHandle) -> Result<serde_json::Value, String> {
     let db = app.state::<Arc<Mutex<Connection>>>();
+    // backend_kind() 内部会取同一把 db 锁，必须先算好再进临界区
+    let kind = app
+        .try_state::<Arc<DownloadService>>()
+        .map(|s| s.backend_kind())
+        .unwrap_or(BackendKind::SteamCmd);
     let conn = db.lock().map_err(|e| e.to_string())?;
     let username = db::get_setting(&conn, "download_username");
-    let has_token = db::get_setting(&conn, "download_has_token")
+    let backend_logged_in = db::get_setting(&conn, kind.token_setting())
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
     let dir = app.path().app_data_dir().ok();
-    let has_pw = match (&username, &dir) {
+    let has_stored_pw = match (&username, &dir) {
         (Some(u), Some(d)) => secure_store::has(u, d),
         _ => false,
     };
-    // 密码或登录态任一可用即视为已配置（首次登录成功后 steamcmd 会缓存凭据，
-    // 此时本地密码可能已被清掉，但仍能免密下载）
+    // 密码或当前后端的登录态任一可用即视为已配置（首次登录成功后工具会缓存
+    // 凭据，此时本地密码可能已被清掉，但仍能免密下载）
     Ok(json!({
-        "configured": username.is_some() && (has_pw || has_token),
+        "configured": username.is_some() && (has_stored_pw || backend_logged_in),
         "username": username,
+        // 当前工具 + 它自己的登录态：UI 用它显示「已登录」还是「换工具后需首次验证」
+        "backend": kind.as_str(),
+        "backendLoggedIn": backend_logged_in,
     }))
 }
 
@@ -1563,9 +1702,15 @@ pub fn download_credentials_clear(app: AppHandle) -> Result<(), String> {
     if let Ok(home) = steamcmd_install::home_dir(&app) {
         let _ = std::fs::remove_dir_all(home);
     }
+    // 清 DepotDownloader 登录态：令牌在重定向 HOME 下的 .NET IsolatedStorage 里，
+    // 整目录删掉即可（两个工具都退干净，换工具后不会拿半套态）
+    if let Ok(home) = depotdl_install::home_dir(&app) {
+        let _ = std::fs::remove_dir_all(home);
+    }
     let conn = db.lock().map_err(|e| e.to_string())?;
     let _ = conn.execute(
-        "DELETE FROM settings WHERE key IN ('download_username','download_has_token','steamcmd_logged_in')",
+        "DELETE FROM settings WHERE key IN
+         ('download_username','download_has_token','steamcmd_logged_in','depotdl_has_token','depotdl_logged_in')",
         [],
     );
     Ok(())

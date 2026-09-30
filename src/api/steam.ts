@@ -143,8 +143,11 @@ export interface DownloadTask {
   finishedAt?: number;
 }
 
-/** 下载工具（Valve 官方 steamcmd）安装状态 */
-export interface DownloadToolStatus {
+/** 下载工具种类（设置键 download_backend；默认 steamcmd） */
+export type DownloadBackend = "steamcmd" | "depotdownloader";
+
+/** steamcmd（Valve 官方，默认下载工具）状态 */
+export interface SteamcmdStatus {
   /** 已下载且已完成首次自更新，可用于下载 */
   installed: boolean;
   /** 已下载解压（可能尚未完成自更新） */
@@ -157,9 +160,37 @@ export interface DownloadToolStatus {
   rosettaMissing: boolean;
 }
 
+/** DepotDownloader（第三方，可选下载工具）状态 */
+export interface DepotdlStatus {
+  /** 当前平台是否有上游官方构建（没有时设置页隐藏安装入口） */
+  supported: boolean;
+  installed: boolean;
+  path?: string;
+  version?: string | null;
+  /** 上游许可（GPL-2.0）：设置页如实标注来源与许可 */
+  license: string;
+  source: string;
+  /** 预计下载体积（仅用于文案） */
+  expectedDownloadBytes: number;
+}
+
+/** 下载工具安装状态：当前选中的后端 + 两个工具各自的状态 */
+export interface DownloadToolStatus {
+  backend: DownloadBackend;
+  steamcmd: SteamcmdStatus;
+  depotdownloader: DepotdlStatus;
+}
+
 /** steamcmd 安装进度事件 `steamcmd:install-progress` 的载荷 */
 export interface SteamcmdInstallProgress {
   phase: "download" | "extract" | "warmup";
+  progress: number;
+  message: string;
+}
+
+/** DepotDownloader 安装进度事件 `depotdl:install-progress` 的载荷 */
+export interface DepotdlInstallProgress {
+  phase: "download" | "extract" | "check";
   progress: number;
   message: string;
 }
@@ -281,12 +312,21 @@ export const api = {
     invoke<AuthorSummary | null>("library_item_author", { itemId }),
   // 下载
   downloadToolStatus: () => invoke<DownloadToolStatus>("download_tool_status"),
+  /** 切换下载工具（"steamcmd" / "depotdownloader"），返回归一化后的取值 */
+  downloadBackendSet: (backend: DownloadBackend) =>
+    invoke<DownloadBackend>("download_backend_set", { backend }),
   steamcmdInstall: (force?: boolean) =>
     invoke<{ installed: boolean; skipped?: boolean; path?: string; version?: string }>(
       "steamcmd_install_tool",
       { force }
     ),
   steamcmdUninstall: () => invoke<void>("steamcmd_uninstall_tool"),
+  depotdlInstall: (force?: boolean) =>
+    invoke<{ installed: boolean; skipped?: boolean; path?: string; version?: string }>(
+      "depotdl_install_tool",
+      { force }
+    ),
+  depotdlUninstall: () => invoke<void>("depotdl_uninstall_tool"),
   // 抽帧组件（ffmpeg）：Linux/Windows 上「视频/GIF → 静态壁纸」与本地库视频封面要用
   ffmpegStatus: () => invoke<FfmpegStatus>("ffmpeg_status"),
   ffmpegInstall: (force?: boolean) =>
@@ -301,9 +341,16 @@ export const api = {
       password,
     }),
   downloadCredentialsStatus: () =>
-    invoke<{ configured: boolean; username?: string }>("download_credentials_status"),
+    invoke<{
+      configured: boolean;
+      username?: string;
+      /** 当前下载工具 */
+      backend: DownloadBackend;
+      /** 当前工具自己的登录态（换工具后为 false，需首次下载时重新验证） */
+      backendLoggedIn: boolean;
+    }>("download_credentials_status"),
   downloadCredentialsClear: () => invoke<void>("download_credentials_clear"),
-  /** 入队「登录验证」任务（steamcmd +login +quit），交互走全局 Guard 弹窗 */
+  /** 入队「登录验证」任务（按当前后端：steamcmd +login +quit / DD -manifest-only），交互走全局 Guard 弹窗 */
   downloadVerifyLogin: () => invoke<number>("download_verify_login"),
   /** 只建立网页会话（保存凭据时的双验证用），不拉订阅列表 */
   accountWebLoginStart: () => invoke<AccountWebLoginResponse>("account_web_login_start"),

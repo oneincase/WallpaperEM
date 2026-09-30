@@ -114,7 +114,7 @@ Its highlights: **tiny installer size · decoupled third-party dependencies · e
 ### 中文
 
 **是什么。** 一个把「Wallpaper Engine 生态」接到你自己桌面上的开源引擎。它复用你的 Steam 账号，
-用 Valve 官方的 `steamcmd` 从创意工坊把壁纸**下载**到本地，再用自己的渲染器把
+用 Valve 官方的 `steamcmd`（也可切换第三方 DepotDownloader，见下）从创意工坊把壁纸**下载**到本地，再用自己的渲染器把
 **视频 / GIF / 网页 / 场景（WebGL）/ 图片** 画到桌面最底层 —— 于是你不必常年挂着一个 Steam
 客户端，也不被单一平台绑住：Windows / macOS / Linux 上共用同一套本地库。
 
@@ -126,7 +126,8 @@ raised-desktop 与 Win10 的经典结构都做了适配）；Linux 上走 X11 �
 **一张壁纸的一生。**
 
 1. **找到它** —— 「工坊」页搜索 / 排序 / 按类型与题材筛选；本地文件也可以直接导入本地库。
-2. **拿回来** —— `steamcmd` 串行下载，支持 Steam Guard 验证码与失败重试；账号密码**本地加密
+2. **拿回来** —— 下载工具默认 Valve 官方 `steamcmd`，也可在设置里换成第三方
+   `DepotDownloader`；并行下载，支持 Steam Guard 验证码与失败重试；账号密码**本地加密
    存储**，不弹系统钥匙串授权。工坊条目失效后会在本地库中被识别并清理。
 3. **渲染它** —— 应用时为每块屏启动一个渲染器页（与媒体同源的内容服务器，消除跨源限制）：
    视频 / GIF 走媒体管线；网页壁纸直接跑它自己的 HTML/JS 并注入 WE 的 shim API；场景壁纸用
@@ -141,8 +142,9 @@ raised-desktop 与 Win10 的经典结构都做了适配）；Linux 上走 X11 �
 
 **定位与边界。** 这是一个**独立的开源项目**，与 Wallpaper Engine 及其开发者、Valve 均无隶属关系；
 它不修改也不绕过 WE，创意工坊内容仍来自你自己的 Steam 账号，因此**需要账号拥有《Wallpaper
-Engine》**。下载走 Valve 官方工具，同一账号登录 steamcmd 会挤掉正在运行的 Steam 客户端
-（steamcmd 固有行为，无法规避）。
+Engine》**。下载默认走 Valve 官方工具：同一账号登录 steamcmd 会挤掉正在运行的 Steam 客户端
+（steamcmd 固有行为）；不想被打断可在「设置 → 账号」把下载工具切到第三方 DepotDownloader
+（它用 Steam 令牌登录，不影响本机已登录的客户端）。
 
 **适合谁。** 想在 Windows / macOS / Linux 上用同一套引擎管理壁纸库的人；不想为了动态壁纸常年多开
 一个 Steam 客户端的人；以及想用 AI 批量生成、调整场景壁纸的人。想先从源码跑起来，见
@@ -166,7 +168,8 @@ sit on top, and what you see as the "desktop background" is a live, interactive 
 
 1. **Find it** — search, sort and filter by type and genre on the Workshop page; local files can be
    imported straight into the library.
-2. **Fetch it** — serial downloads through `steamcmd`, with Steam Guard codes and retries;
+2. **Fetch it** — parallel downloads through `steamcmd` (default) or, if you switch tools,
+   third-party `DepotDownloader`; with Steam Guard codes and retries;
    credentials are **encrypted locally**, with no Keychain prompt. Entries that disappear from the
    Workshop are detected and cleaned up in the library.
 3. **Render it** — applying a wallpaper starts one renderer page per display (served by the same
@@ -187,9 +190,11 @@ sit on top, and what you see as the "desktop background" is a live, interactive 
 
 **Positioning and boundaries.** This is an **independent open-source project**, not affiliated with
 Wallpaper Engine, its developers, or Valve. It neither modifies nor bypasses WE: Workshop content still
-comes from your own Steam account, so **the account must own *Wallpaper Engine***. Downloads use
-Valve's official tool, and signing steamcmd in with the same account disconnects your running Steam
-client (inherent to steamcmd, no way around it).
+comes from your own Steam account, so **the account must own *Wallpaper Engine***. Downloads default
+to Valve's official tool: signing steamcmd in with the same account disconnects your running Steam
+client (inherent to steamcmd). If you'd rather not be disconnected, switch the download tool to the
+third-party DepotDownloader under Settings → Account — it signs in with a Steam token and leaves your
+signed-in client alone.
 
 **Who it's for.** People who want a single engine to manage their wallpaper library across
 Windows / macOS / Linux; people who'd rather not keep an extra Steam client running just for live
@@ -204,7 +209,7 @@ see [Build from Source](#从源码构建--build-from-source).
 
 - 🖼️ **五类壁纸**：视频（mp4/webm/mov）、GIF、网页（HTML/JS）、场景（WE 原生 `scene.pkg`，由 [`webwallgl`](https://github.com/oneincase/webwallgl) WebGL 渲染）、静态图片。
 - 🌐 **Steam 创意工坊**：搜索、排序（趋势 / 最多订阅 / 最多收藏 / 最新）、类型与题材筛选、分页浏览。
-- ⬇️ **下载**：使用 Valve 官方 **steamcmd**（应用内一键安装），支持 Steam Guard 验证码、串行队列与失败重试；账号密码**本地加密存储**，不弹系统钥匙串授权。
+- ⬇️ **下载**：下载工具可选 —— 默认 Valve 官方 **steamcmd**（应用内一键安装），也可切换第三方 **DepotDownloader**（不挤占已登录的 Steam 客户端），都支持 Steam Guard 验证码、并行队列与失败重试；账号密码**本地加密存储**，不弹系统钥匙串授权。
 - 🗂️ **本地库与收藏**：预览、应用、打开目录、删除；属性可自定义的壁纸带可视化属性面板（滑块/开关/配色/下拉/文件）。
 - 🖥️ **多显示器**：每屏一个桌面级窗口，默认置于桌面图标之下（图标仍可点击）；可开启「交互模式」把壁纸提到图标之上以接收鼠标。
 - 🎞️ **轮播播放列表**：按间隔在本地库壁纸间自动切换。
@@ -226,7 +231,7 @@ see [Build from Source](#从源码构建--build-from-source).
 
 - 🖼️ **Five wallpaper types**: video (mp4/webm/mov), GIF, web (HTML/JS), scene (native WE `scene.pkg`, rendered in WebGL by [`webwallgl`](https://github.com/oneincase/webwallgl)), and static images.
 - 🌐 **Steam Workshop**: search, sort (Trend / Most Subscribed / Most Favorited / Newest), type & genre filters, paginated browsing.
-- ⬇️ **Downloads**: Valve's official **steamcmd** (installed from inside the app), with Steam Guard codes, a serial queue and retries; credentials are **encrypted locally** — no Keychain auth prompt.
+- ⬇️ **Downloads**: pick your download tool — Valve's official **steamcmd** (installed from inside the app, the default) or third-party **DepotDownloader** (which leaves your signed-in Steam client alone); both support Steam Guard codes, a parallel queue and retries, and credentials are **encrypted locally** — no Keychain auth prompt.
 - 🗂️ **Local library & favorites**: preview, apply, open folder, delete; wallpapers with customizable properties get a visual property panel (slider / toggle / color / combo / file).
 - 🖥️ **Multi-display**: one desktop-level window per screen, sitting below the desktop icons by default (icons stay clickable); an optional "interactive" mode raises it above the icons to receive mouse input.
 - 🎞️ **Playlist rotation**: automatically cycle through local-library wallpapers on a timer.

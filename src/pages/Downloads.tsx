@@ -15,9 +15,11 @@ import { tr, trMsg } from "../lib/i18n";
 export function DownloadsPage() {
   const [tasks, setTasks] = useState<DownloadTask[]>([]);
   const [loading, setLoading] = useState(true);
+  // 当前下载工具（steamcmd / DepotDownloader）：头部提示用，便于排障时确认走的是哪个
+  const [toolName, setToolName] = useState("");
 
   const [confirmClear, setConfirmClear] = useState(false);
-  // 壁纸 ID 直下载：内联输入（不弹框）。元数据零依赖入队，steamcmd 按 ID 直取，
+  // 壁纸 ID 直下载：内联输入（不弹框）。元数据零依赖入队，下载工具按 ID 直取，
   // 国内免代理也能下（详情接口被墙不影响）
   const [idOpen, setIdOpen] = useState(false);
   const [idInput, setIdInput] = useState("");
@@ -62,6 +64,10 @@ export function DownloadsPage() {
 
   useEffect(() => {
     refresh();
+    api
+      .downloadToolStatus()
+      .then((s) => setToolName(s.backend === "depotdownloader" ? "DepotDownloader" : "steamcmd"))
+      .catch(() => { });
     const un = listen<{ taskId: number; status: string; progress: number }>(
       "download:progress",
       (e) => {
@@ -117,6 +123,12 @@ export function DownloadsPage() {
           <h1 className="text-[22px] font-bold tracking-tight">{tr("下载")}</h1>
           <p className="text-[13px] text-[var(--text-2)] mt-1">
             {tr("下载需在「设置 → 账号」登录 Steam 账号（需拥有 Wallpaper Engine）")}
+            {toolName && (
+              <>
+                {" · "}
+                {tr("下载工具：{tool}", { tool: toolName })}
+              </>
+            )}
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -210,7 +222,7 @@ export function DownloadsPage() {
                 </div>
                 <div className="w-40">
                   <div className="h-1.5 rounded-full bg-[var(--glass-subtle)] overflow-hidden">
-                    {/* progress < 0：后端（steamcmd）不输出进度且拿不到总大小，显示不确定态 */}
+                    {/* progress < 0：后端拿不到总大小（steamcmd 无进度输出且元数据缺 file_size），显示不确定态 */}
                     {t.status !== "done" && t.progress < 0 ? (
                       <div className="h-full w-1/3 rounded-full bg-[var(--accent-fill)] animate-indeterminate" />
                     ) : (

@@ -95,6 +95,7 @@ export const EN_US: Record<string, string> = {
   // ---------------- 下载页 ----------------
   "下载需在「设置 → 账号」登录 Steam 账号（需拥有 Wallpaper Engine）":
     "Downloading requires signing in with a Steam account (Settings → Account); the account must own Wallpaper Engine",
+  "下载工具：{tool}": "Download tool: {tool}",
   "清空已完成": "Clear finished",
   "暂无下载任务": "No download tasks",
   "在工坊或详情页点击「下载」，任务会出现在这里":
@@ -504,9 +505,24 @@ export const EN_US: Record<string, string> = {
   "正在启动…": "Starting…",
   "下载账号": "Download account",
   "下载工具": "Download tool",
+  "第三方 DepotDownloader（GPL-2.0，从上游官方 Releases 下载）：用 Steam 令牌登录，不挤占本机已登录的 Steam 客户端。工具本体约 {size}":
+    "Third-party DepotDownloader (GPL-2.0, downloaded from the upstream official Releases): signs in with a Steam token and does not kick out the Steam client you already have signed in. The tool itself is about {size}",
+  "Valve 官方 steamcmd（默认）：登录会挤掉正在运行的 Steam 客户端（同账号同时只能登录一处）；首次安装需从官方源下载引导包并初始化（约 85 MB）":
+    "Valve's official steamcmd (default): signing in kicks the running Steam client offline (one session per account); first-time setup downloads the bootstrap package from Valve and initializes it (about 85 MB)",
   "缺少 Rosetta 2：steamcmd 的官方引导程序是 x86_64，首次启动需要它。请在终端执行 softwareupdate --install-rosetta --agree-to-license 后重试（首次自更新后 steamcmd 即以原生 arm64 运行）":
     "Rosetta 2 is missing: Valve's steamcmd bootstrap is x86_64 and needs it on first launch. Run softwareupdate --install-rosetta --agree-to-license in Terminal and retry (after its first self-update steamcmd runs natively on arm64).",
   "steamcmd 已就绪": "steamcmd is ready",
+  "DepotDownloader 已就绪": "DepotDownloader is ready",
+  "尚未安装，点击「安装」从上游官方 Releases 下载（约 {size}，解压即用，无需另装 .NET）":
+    "Not installed yet. Click Install to download it from the upstream official Releases (about {size}; unzip and run, no separate .NET install needed)",
+  "当前平台没有 DepotDownloader 官方构建，请改用 steamcmd":
+    "There is no official DepotDownloader build for this platform — use steamcmd instead",
+  "✅ DepotDownloader 已就绪": "✅ DepotDownloader is ready",
+  "已卸载（登录态保留，下次下载前重新安装即可）":
+    "Uninstalled (session state kept; reinstall before your next download)",
+  "校验中": "Verifying",
+  "卸载": "Uninstall",
+  "处理中…": "Working…",
   "版本": "version",
   "已下载但未完成初始化，请点击「修复」重试": "Downloaded but not initialized — click Repair to retry",
   "Valve 官方 steamcmd。尚未安装，点击「安装」从官方源下载（约 2.5 MB 引导包，初始化后约 85 MB）":
@@ -518,18 +534,23 @@ export const EN_US: Record<string, string> = {
   "安装": "Install",
   "已登录：{user}（需拥有 Wallpaper Engine，下载不再重复验证）":
     "Signed in as {user} (must own Wallpaper Engine; downloads skip verification from now on)",
+  "已保存账号 {user}：当前下载工具会在首次下载时补一次登录验证":
+    "Account {user} saved — the current download tool will verify the sign-in on your next download",
   "下载工坊内容需拥有 WE 的 Steam 账号。首次下载会要求输入 Steam Guard 验证码，之后记住登录态。注意：steamcmd 登录会挤掉你正在运行的 Steam 客户端（同账号同时只能登录一处）":
     "Downloading workshop content requires a Steam account that owns WE. The first download asks for a Steam Guard code, then the session is remembered. Note: signing in with steamcmd kicks out your running Steam client (one session per account).",
+  "下载工坊内容需拥有 WE 的 Steam 账号。首次下载会要求输入 Steam Guard 验证码（手机确认或验证器验证码），之后记住登录态；DepotDownloader 不影响本机其它 Steam 登录":
+    "Downloading workshop content requires a Steam account that owns WE. The first download asks for a Steam Guard code (mobile confirmation or authenticator code), then the session is remembered; DepotDownloader does not disturb other Steam sign-ins on this machine.",
   "已登录": "Signed in",
+  "待验证": "Pending verification",
   "未登录": "Not signed in",
   "重新配置": "Reconfigure",
   "登出": "Sign out",
   "Steam 账号（登录名或邮箱）": "Steam account (login name or email)",
   "保存并验证中…": "Saving and verifying…",
   "保存凭据并验证": "Save credentials and verify",
-  "密码本地加密存储。保存后会立即验证两条登录通道（steamcmd 下载 + 订阅同步网页会话），验证通过后续使用免密免验证码。":
-    "The password is stored encrypted locally. Saving verifies both sign-in paths right away (steamcmd downloads + the web session used by subscription sync); once verified, later use needs no password or code.",
-  "① steamcmd 下载通道：": "① steamcmd download path:",
+  "密码本地加密存储。保存后会立即验证两条登录通道（当前下载工具 + 订阅同步网页会话），验证通过后续使用免密免验证码。":
+    "The password is stored encrypted locally. Saving verifies both sign-in paths right away (the current download tool + the web session used by subscription sync); once verified, later use needs no password or code.",
+  "① 下载通道：": "① Download path:",
   "验证任务已入队": "verification task queued",
   "若需要 Steam Guard 验证码或手机确认，会弹出全局窗口提示（也可到「下载」页查看进度）":
     "If a Steam Guard code or mobile confirmation is needed, a global dialog appears (you can also follow progress on the Downloads page)",
@@ -615,7 +636,6 @@ export const EN_US: Record<string, string> = {
   "已就绪": "Ready",
   "系统已装": "System install",
   "未安装": "Not installed",
-  "卸载": "Uninstall",
   "自动暂停": "Auto pause",
   "切到非桌面应用时自动暂停壁纸，切回桌面时自动播放（手动暂停不受影响）":
     "Pause the wallpaper while a non-desktop app is focused and resume when the desktop comes back (manual pauses are unaffected)",
@@ -665,8 +685,8 @@ export const EN_US: Record<string, string> = {
   "跨平台动态壁纸引擎（macOS / Windows / Linux）· 浏览/下载并应用 Steam 创意工坊壁纸（视频 / 场景 / 网页 / 图片）":
     "Cross-platform dynamic wallpaper engine (macOS / Windows / Linux) · browse, download and apply Steam Workshop wallpapers (video / scene / web / image)",
   "登出下载账号": "Sign out of the download account",
-  "将清除本地保存的账号密码、steamcmd 登录态与订阅同步的网页登录会话。下次下载和订阅同步都需要重新登录并再过一次验证。":
-    "Clears the locally saved credentials, the steamcmd session and the web session used by subscription sync. The next download and sync will ask you to sign in and verify again.",
+  "将清除本地保存的账号密码、两个下载工具的登录态与订阅同步的网页登录会话。下次下载和订阅同步都需要重新登录并再过一次验证。":
+    "Clears the locally saved credentials, both download tools' session state and the web session used by subscription sync. The next download and sync will ask you to sign in and verify again.",
   "将删除 {size} 的预览图/网页缓存与壁纸首帧封面，并清空工坊页的列表快照。已下载的壁纸与各项设置不受影响。":
     "Deletes {size} of preview/web cache and wallpaper first-frame covers, and clears the workshop list snapshot. Downloaded wallpapers and settings are unaffected.",
   "将删除预览图/网页缓存与壁纸首帧封面，并清空工坊页的列表快照。":
@@ -1082,7 +1102,6 @@ export const EN_US: Record<string, string> = {
     "Remove the selected wallpapers from the library without deleting files on disk",
   "从本地库删除选中的壁纸，并删除磁盘文件":
     "Delete the selected wallpapers from the library and delete their files on disk",
-  "处理中…": "Working…",
   // 壁纸信息面板
   "文件已丢失": "File missing",
   "库内正常": "In library",
@@ -1355,6 +1374,33 @@ export const EN_US_BACKEND: Record<string, string> = {
   "该账号未拥有 Wallpaper Engine": "This account does not own Wallpaper Engine",
   "该账号在其他设备登录，请稍后再试": "This account signed in on another device — try again later",
   "无法连接 Steam 服务器：{}": "Cannot reach the Steam servers: {}",
+
+  // 下载：DepotDownloader（第三方可选后端）
+  "该账号无法获取 Wallpaper Engine（未拥有，或所在区服不可用）":
+    "This account cannot access Wallpaper Engine (it does not own it, or it is unavailable in this region)",
+  "Steam 登录失败：{}": "Steam sign-in failed: {}",
+  "登录未通过（未取到 Steam 凭据），请检查账号密码或稍后重试":
+    "Sign-in did not go through (no Steam credentials were obtained). Check the account and password, or try again later",
+  "该工坊条目类型不受支持": "This Workshop item type is not supported",
+  "下载失败（Steam CDN 取清单/分片失败），请重试或检查网络/代理":
+    "Download failed (the Steam CDN could not fetch the manifest or chunks) — retry, or check your network/proxy",
+  "无法连接 Steam 服务器，请检查网络/代理": "Cannot reach the Steam servers — check your network/proxy",
+  "无权访问该内容（需登录拥有 Wallpaper Engine 的账号）":
+    "No access to this content (sign in with an account that owns Wallpaper Engine)",
+  "DepotDownloader 尚未安装，请到「设置 → 账号」切换下载工具后点击安装":
+    "DepotDownloader is not installed yet — select it as the download tool in Settings → Account and click Install",
+  "当前平台（{}-{}）没有 DepotDownloader 官方构建，请改用 steamcmd":
+    "There is no official DepotDownloader build for this platform ({}-{}) — use steamcmd instead",
+  "下载 DepotDownloader 失败：{e}。若网络受限，可在「设置 → 网络与服务」配置代理后重试":
+    "Failed to download DepotDownloader: {}. If your network is restricted, configure a proxy under Settings → Network & Services and retry",
+  "安装包里没找到 DepotDownloader 可执行文件（上游包结构可能变了）":
+    "No DepotDownloader executable in the package (the upstream layout may have changed)",
+  "写入 DepotDownloader 失败: {e}": "Failed to write DepotDownloader: {}",
+  "DepotDownloader 已下载但无法执行（安装包不完整，或被安全软件/隔离属性拦截）":
+    "DepotDownloader was downloaded but cannot run (incomplete package, blocked by security software, or still quarantined)",
+  "创建文件失败: {e}": "Failed to create the file: {}",
+  "下载内容异常（仅 {written} 字节，可能是错误页）":
+    "The download looks wrong (only {} bytes — possibly an error page)",
 
   // 下载：任务编排
   "steamcmd 尚未安装，请到「设置 → 账号」点击安装": "steamcmd is not installed yet — install it in Settings → Account",
