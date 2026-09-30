@@ -15,6 +15,7 @@
  *   __wePushMedia(event)  — {op, payload} 见下
  *   __wePushDirectoryFiles(prop, files) / __weRemoveDirectoryFiles(prop, files)
  *   __weRewriteFileUrl(s) — file:/// → 同源相对（HTTP 页）；空 file:/// → ""
+ *                            ＋ 相对 URL 逃出站点根时把 `..` 夹回根（官方语义）
  *   __wePushPointer(x, y, buttons, mods) / __wePointerLeave() — 外部指针注入（见文末）
  *   __wePushWheel(x, y, dx, dy, mode, mods) — 外部滚轮注入（含触摸板捏合，见文末）
  */
@@ -238,6 +239,117 @@
   var origRaf = w.requestAnimationFrame.bind(w);
   var origCaf = w.cancelAnimationFrame.bind(w);
 
+  /**
+   * 站点根夹住（对齐官方 WE 的 URL 解析语义）。
+   *
+   * 官方把**壁纸目录本身当站点根**（一壁纸一站点，`..` 解析到根就被丢弃）：
+   * 根目录下的 `../assets/x.skel` 等于 `assets/x.skel`。本仓（及 WallpaperEM 的
+   * content_server）站点形态是 `/web/<token>/<itemId>/…` —— 条目目录比根**深一层**，
+   * 于是作者写的 `../assets/…` 会逃出条目目录，落到 `/web/<token>/assets/…` → 404。
+   *
+   * 3650874083 / 3650880224（Blue Archive spine 网页壁纸）就是这样整页黑屏的：
+   * `js/main.js` 里 skel/atlas 走 XHR、贴图走 Image.src，路径全是 `../assets/8k/…`，
+   * AssetManager 一个文件都拿不到 → `load()` 打着 `Model assets not found` 死循环 → 一帧不画。
+   *
+   * 只改「解析结果**逃出站点根**」的**相对** URL：逃出去的路径在宿主侧永远不在条目
+   * 目录里（今天必然 404），夹回来只会把必失败的请求救活；没逃逸的一律**原样返回**
+   * （连绝对化都不做）—— 对现有语料零行为变化。`data:` / `blob:` / `http(s):` /
+   * `//` / `/` 这些不经过本站点解析的形态一律不碰（file: 仍归 `rewriteBareFileUrl` 管）。
+   */
+  function siteRootPath() {
+    var base = "";
+    try {
+      base = (w.document && w.document.baseURI) || "";
+    } catch (_) {
+      /* 不透明源读 baseURI 可能抛，退回 location */
+    }
+    if (!base) {
+      try {
+        base = (w.location && w.location.href) || "";
+      } catch (_) {
+        return null;
+      }
+    }
+    if (!base) return null;
+    var path = base;
+    try {
+      path = new URL(base).pathname;
+    } catch (_) {
+      var cut = path.search(/[?#]/);
+      if (cut >= 0) path = path.slice(0, cut);
+      var scheme = /^[a-z][a-z0-9+.-]*:\/\/[^/?#]*/i.exec(path);
+      if (scheme) path = path.slice(scheme[0].length) || "/";
+      if (path.charAt(0) !== "/") return null;
+    }
+    var seg = path.split("/");
+    // ['', 'web', '<token>', '<itemId>', …] —— 宿主与 WallpaperEM 同一形态
+    if (seg[1] !== "web" || !seg[2] || !seg[3]) return null;
+    return "/" + seg[1] + "/" + seg[2] + "/" + seg[3] + "/";
+  }
+
+  /** 相对 URL 解析后逃出站点根时，按官方语义把 `..` 夹在根上；否则原样返回入参。 */
+  function clampUrlToSiteRoot(url) {
+    if (typeof url !== "string") return url;
+    if (!url || /^(?:[a-z][a-z0-9+.\-]*:|\/\/|\/)/i.test(url)) return url;
+    var root = siteRootPath();
+    if (!root) return url;
+    var base;
+    try {
+      base = (w.document && w.document.baseURI) || (w.location && w.location.href);
+    } catch (_) {
+      return url;
+    }
+    if (!base) return url;
+    var abs;
+    var rootAbs;
+    try {
+      abs = new URL(url, base);
+      rootAbs = new URL(root, base);
+    } catch (_) {
+      return url;
+    }
+    if (abs.origin !== rootAbs.origin) return url;
+    if (abs.pathname.indexOf(root) === 0) return url; // 没逃逸：一个字节都不改
+
+    // 逃逸了：按段重放，`..` 越过根时丢弃（= 官方在根处的夹住）
+    var tail = "";
+    var rel = url;
+    var q = url.search(/[?#]/);
+    if (q >= 0) {
+      tail = url.slice(q);
+      rel = url.slice(0, q);
+    }
+    var basePath;
+    try {
+      basePath = new URL(base).pathname;
+    } catch (_) {
+      return url;
+    }
+    var cut = basePath.lastIndexOf("/");
+    basePath = cut < 0 ? "/" : basePath.slice(0, cut + 1);
+    var rootSeg = root.slice(1, -1).split("/");
+    var out = basePath.split("/").filter(function (x) {
+      return x !== "";
+    });
+    // 文档（或作者 <base>）必须落在站点根之内，否则这套夹住不适用
+    if (out.slice(0, rootSeg.length).join("/") !== rootSeg.join("/")) return url;
+    var parts = rel.split("/");
+    for (var i = 0; i < parts.length; i++) {
+      var p = parts[i];
+      if (p === "" || p === ".") continue;
+      if (p === "..") {
+        if (out.length > rootSeg.length) out.pop();
+        continue; // 已到根：丢弃这个 ..
+      }
+      out.push(p);
+    }
+    try {
+      return new URL("/" + out.join("/") + tail, rootAbs.origin).href;
+    } catch (_) {
+      return url;
+    }
+  }
+
   // 官方 CEF 以文件系统为源，作者普遍 `'file:///' + value`。HTTP 同源页里
   // file:///files/x.webm 加载失败；空 value 变成 file:///（1748506393）。
   // file: 协议页保持原样（真本地嵌入）。
@@ -268,16 +380,63 @@
     if (typeof input !== "string") return input;
     if (/url\(/i.test(input)) {
       return input.replace(/url\(\s*(['"]?)([^)'"]*?)\1\s*\)/gi, function (_m, q, inner) {
-        var next = rewriteBareFileUrl(inner);
+        var next = rewriteBareFileUrl(clampUrlToSiteRoot(inner));
         if (!next) return "none";
         var quote = q || '"';
         return "url(" + quote + next + quote + ")";
       });
     }
-    return rewriteBareFileUrl(input);
+    // 先做站点根夹住（相对 URL 逃逸），再做 file:/// 改写（两者输入形态互不重叠）
+    return rewriteBareFileUrl(clampUrlToSiteRoot(input));
   }
 
   w.__weRewriteFileUrl = rewriteWeFileUrl;
+
+  /**
+   * XHR / fetch 的站点根夹住。
+   *
+   * `rewriteWeFileUrl` 只挂在元素 src/href 与 style 上，而 spine 这类库的
+   * **二进制/文本**（.skel / .atlas）是走 XHR 下的 —— 只挂元素钩子修不到
+   * 3650874083 的黑屏。这里补上两个网络入口。
+   */
+  function installEscapedUrlHooks() {
+    try {
+      var X = w.XMLHttpRequest;
+      if (X && X.prototype && typeof X.prototype.open === "function" && !X.prototype.__weClamp) {
+        var origOpen = X.prototype.open;
+        X.prototype.open = function (method, url) {
+          var args = Array.prototype.slice.call(arguments);
+          if (typeof url === "string") args[1] = clampUrlToSiteRoot(url);
+          return origOpen.apply(this, args);
+        };
+        X.prototype.__weClamp = true;
+      }
+    } catch (_) {
+      /* verifier 无 XHR 时跳过 */
+    }
+    try {
+      if (typeof w.fetch === "function" && !w.fetch.__weClamp) {
+        var origFetch = w.fetch;
+        var fetchClamped = function (input, init) {
+          try {
+            if (typeof input === "string") {
+              input = clampUrlToSiteRoot(input);
+            } else if (input && typeof input === "object" && typeof input.url === "string" && w.Request) {
+              var c = clampUrlToSiteRoot(input.url);
+              if (c !== input.url) input = new w.Request(c, input);
+            }
+          } catch (_) {
+            /* 改写失败就按原样发 */
+          }
+          return origFetch.call(this, input, init);
+        };
+        fetchClamped.__weClamp = true;
+        w.fetch = fetchClamped;
+      }
+    } catch (_) {
+      /* verifier 无 fetch 时跳过 */
+    }
+  }
 
   function installFileUrlHooks() {
     try {
@@ -362,6 +521,7 @@
     }
   }
   installFileUrlHooks();
+  installEscapedUrlHooks();
 
   // propertyName → string[]（绝对/相对路径；随机文件从此抽）
   var directoryFiles = Object.create(null);
