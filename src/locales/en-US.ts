@@ -1151,6 +1151,7 @@ export const EN_US: Record<string, string> = {
   "未检测到 dsh 命令行，请先按引导安装":
     "No dsh CLI detected — follow the install guide first",
   "DeepSeek Harness 正在启动，请稍候": "DeepSeek Harness is starting, please wait",
+  "启动已取消（插件窗口已关闭）": "Startup cancelled (the plugin window was closed)",
   "本机没有可用的空闲端口": "No free local port available",
   "启动 dsh 进程失败": "Failed to start the dsh process",
   "dsh 启动后立即退出": "dsh exited right after starting",

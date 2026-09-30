@@ -28,7 +28,7 @@ use std::ffi::OsString;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -57,6 +57,11 @@ const DOWNLOAD_URL: &str = "https://harness.deepseek.com";
 const INSTALL_COMMAND: &str = "npm install -g @deepseek-ai/dsh";
 /// 首次启动要建 profile、挂载插件树，90s 是给冷启动留的余量
 const START_TIMEOUT: Duration = Duration::from_secs(90);
+/// `dsh --version` 探测超时：超了就当拿不到版本号，但进程必须先收掉
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// SIGTERM 到 SIGKILL 之间给多久。node 侧的收尾（放掉 profile 写锁、带走子进程）
+/// 通常是毫秒级，半秒足够；等不到就上手 SIGKILL
+const KILL_GRACE: Duration = Duration::from_millis(500);
 /// 往 profile 装插件包（pnpm + 联网）：dsh 自己就会等最多 2 分钟的写锁/查找，
 /// 这里给到 5 分钟
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(300);
@@ -69,12 +74,31 @@ const PNPM_INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
 
 // ---------------------------------------------------------------- 状态
 
-/// 插件宿主状态：当前只有 dsh 子进程需要持有。
+/// 插件宿主状态：dsh 子进程在**三种状态**之间走一圈。
+///
+/// 收尾（关窗 / 停止 / 退出）必须能同时收掉「已就绪」与「启动中」两个阶段 —— 冷启动
+/// 要建 profile、挂插件树，几十秒里进程已经在跑；漏掉这段窗口就等于在用户桌面上
+/// 留一个看不见的 node。启动中的句柄在启动流程手里（它要读 stdout 拿带令牌的地址），
+/// 状态里只登记 pid，收尾按 pid 收掉整组。
 #[derive(Default)]
 pub struct DshHost {
-    proc: Mutex<Option<Running>>,
-    /// 正在启动：防连点造成两个 dsh 进程（后一个会覆盖句柄，前一个变孤儿）
-    starting: AtomicBool,
+    slot: Mutex<Slot>,
+    /// 正在打开：防连点造成两个 dsh 进程（后一个会覆盖句柄，前一个变孤儿）
+    opening: AtomicBool,
+    /// 收尾请求计数：每次 [`DshHost::kill`] 自增，进行中的启动据此发现自己已作废
+    /// （见 [`prepare_and_launch`]）—— 比「先复位标志再等」少一个竞态窗口
+    epoch: AtomicU64,
+}
+
+#[derive(Default)]
+enum Slot {
+    #[default]
+    Idle,
+    /// 进程已起、就绪地址未到。只有 pid：句柄在启动流程手里
+    Starting {
+        pid: u32,
+    },
+    Ready(Running),
 }
 
 struct Running {
@@ -82,10 +106,59 @@ struct Running {
     url: String,
 }
 
-/// 起启动互斥：无论成功失败都要把 starting 放回去（`?` 提前返回时靠 Drop）。
-struct StartGuard<'a>(&'a AtomicBool);
+/// 「现在是什么状况」——命令层只读这一眼，拿不到锁时按 Idle 处理
+enum Snapshot {
+    Idle,
+    Starting,
+    Ready(String),
+}
 
-impl Drop for StartGuard<'_> {
+impl DshHost {
+    /// 收尾：就绪的收整组，启动中的按 pid 收。幂等，可重复调用。
+    ///
+    /// 先涨 epoch 再收进程：反过来的话，启动流程可能刚把新进程登记进去就被这一步
+    /// 漏掉。涨完 epoch，进行中的启动即使晚一步登记，也会在 [`wait_for_url`] 里
+    /// 发现自己已作废并自收。
+    fn kill(&self) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        let Ok(mut slot) = self.slot.lock() else {
+            return;
+        };
+        match std::mem::replace(&mut *slot, Slot::Idle) {
+            Slot::Ready(mut r) => kill_tree(&mut r.child),
+            // 句柄在启动流程手里：按 pid 收整组，那边看到进程没了会自己清登记
+            Slot::Starting { pid } => kill_tree_pid(pid),
+            Slot::Idle => {}
+        }
+    }
+
+    /// 现在的状况（顺带把「进程已经退出」的就绪句柄清掉并 reap）
+    fn snapshot(&self) -> Snapshot {
+        let Ok(mut slot) = self.slot.lock() else {
+            return Snapshot::Idle;
+        };
+        // 先看就绪的那个还活着没；这一段借用 slot 内部，清了才能再动 slot
+        let dead = match &mut *slot {
+            Slot::Ready(r) => !matches!(r.child.try_wait(), Ok(None)),
+            _ => false,
+        };
+        if dead {
+            if let Slot::Ready(mut r) = std::mem::replace(&mut *slot, Slot::Idle) {
+                let _ = r.child.wait();
+            }
+        }
+        match &*slot {
+            Slot::Idle => Snapshot::Idle,
+            Slot::Starting { .. } => Snapshot::Starting,
+            Slot::Ready(r) => Snapshot::Ready(r.url.clone()),
+        }
+    }
+}
+
+/// 起启动互斥：无论成功失败都要把 opening 放回去（`?` 提前返回时靠 Drop）。
+struct OpenGuard<'a>(&'a AtomicBool);
+
+impl Drop for OpenGuard<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::SeqCst);
     }
@@ -93,20 +166,179 @@ impl Drop for StartGuard<'_> {
 
 pub fn init(app: &AppHandle) {
     app.manage(DshHost::default());
+    // 上次没走完收尾留下的 dsh（崩溃 / 强杀 / 开发时重建）：后台清一次。
+    // 起进程 + 等它退，别堵住 setup
+    let _ = std::thread::Builder::new()
+        .name("dsh-reap".into())
+        .spawn(reap_orphans);
 }
 
 /// 窗口销毁 / 应用退出：把子进程收掉，别在用户桌面上留看不见的 node。
 pub fn shutdown(app: &AppHandle) {
     if let Some(host) = app.try_state::<DshHost>() {
-        kill(&host);
+        host.kill();
     }
 }
 
-fn kill(host: &DshHost) {
-    if let Ok(mut slot) = host.proc.lock() {
-        if let Some(mut r) = slot.take() {
-            let _ = r.child.kill();
-            let _ = r.child.wait();
+// ---------------------------------------------------------------- 收进程
+
+/// 子进程一律放进它自己的进程组。
+///
+/// 收尾时按组杀，dsh 自己 spawn 出来的 node / pnpm / 工具子进程才会跟着一起走 ——
+/// 只杀直接子进程会留下一串看不见的孤儿（跑一条命令、装一个插件包都会起子进程）。
+/// 放在 [`cli_command`] 里：`dsh web`、`dsh plugin add`、`dsh --version` 都受益。
+#[cfg(unix)]
+fn in_own_group(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    cmd.process_group(0);
+}
+
+/// 非 Unix 不设组：Windows 靠 `taskkill /T` 按父子关系清树（见 [`kill_tree_pid`]）
+#[cfg(not(unix))]
+fn in_own_group(_cmd: &mut Command) {}
+
+/// 收掉 `pid` 对应的整棵进程树（进程是组长：spawn 时进了自己的组）。
+///
+/// 先 SIGTERM 给 dsh 收尾的机会（放掉 profile 写锁、带走自己的子进程），宽限期
+/// 内没退出再 SIGKILL 兜底。**按组发**而不是只杀直接子进程，否则子进程全成孤儿。
+/// SIGTERM →（宽限期内等到「没了」就收手）→ SIGKILL。
+///
+/// `target` 是信号对象：负 pid = 整个进程组，正 pid = 单个进程。`still_there` 问
+/// 「还在不在」—— 组的问法与单个进程一样（`kill(target, 0)`），差别只在 target。
+#[cfg(unix)]
+fn terminate(target: i32, mut still_there: impl FnMut() -> bool) {
+    unsafe { libc::kill(target, libc::SIGTERM) };
+    let deadline = Instant::now() + KILL_GRACE;
+    while Instant::now() < deadline {
+        if !still_there() {
+            return; // 已经收干净，不必再上 SIGKILL
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    unsafe { libc::kill(target, libc::SIGKILL) };
+}
+
+/// 收掉 `pid` 对应的整棵进程树**并 reap**（句柄在手时用这个：能顺手把僵尸收掉，
+/// 否则僵尸会让「组里还有人」的探测一直为真，白等满宽限期）
+fn kill_tree(child: &mut Child) {
+    let pid = child.id();
+    #[cfg(unix)]
+    {
+        let group = -(pid as i32); // 负 pid = 进程组
+        terminate(group, || {
+            let _ = child.try_wait();
+            unsafe { libc::kill(group, 0) == 0 }
+        });
+    }
+    #[cfg(windows)]
+    win_kill_tree(pid);
+    // 兜底：组信号没送达时至少杀掉直接子进程
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// 只有 pid、没有句柄时（启动中就被收尾）：按 pid 收整组
+fn kill_tree_pid(pid: u32) {
+    #[cfg(unix)]
+    {
+        let group = -(pid as i32);
+        terminate(group, || unsafe { libc::kill(group, 0) == 0 });
+    }
+    #[cfg(windows)]
+    win_kill_tree(pid);
+}
+
+/// Windows 上按父子关系清整棵树（没有进程组的概念）
+#[cfg(windows)]
+fn win_kill_tree(pid: u32) {
+    // /T 清整棵树，/F 不给它拖延的机会；GUI 应用里别闪一个控制台
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    use std::os::windows::process::CommandExt;
+    let _ = Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+}
+
+// ---------------------------------------------------------------- 遗留回收
+
+/// ps 里认出来的一条「上次遗留的 dsh」
+struct Leftover {
+    pid: i32,
+    /// 它自己就是组长（pgid == pid）：整组一起收；否则只杀这一个 —— 别去动
+    /// 它可能继承来的别的进程组（可能是用户终端的前台组）
+    own_group: bool,
+}
+
+/// 这条命令行是不是本应用的 dsh 实例：`dsh` 与 `--profile wallpallperem` 都要看到。
+///
+/// 只认一个都会误伤：`dsh` 是用户自己也可能在跑的命令，而 profile 名只是一个普通
+/// 目录名（`dsh plugin --profile wallpallperem add …` 这类辅助命令同样命中 —— 它们
+/// 也是本应用起的，一并回收）。
+fn is_our_dsh(cmd: &str) -> bool {
+    if !cmd.contains("dsh") {
+        return false;
+    }
+    cmd.split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|w| w[0] == "--profile" && w[1] == PROFILE)
+}
+
+/// `ps -A -o pid=,ppid=,pgid=,uid=,command=` 的输出 → 要回收的遗留实例。
+///
+/// 只认**孤儿**（ppid=1）：命令行带这个 profile 的进程如果是用户自己在终端里开的
+/// （ppid 是 shell），不归我们管，绝不能碰。抽成纯函数便于测试。
+fn orphan_instances(ps_out: &str, euid: u32) -> Vec<Leftover> {
+    ps_out
+        .lines()
+        .filter_map(|line| {
+            let mut f = line.split_whitespace();
+            let pid = f.next()?.parse::<i32>().ok()?;
+            let ppid = f.next()?.parse::<i32>().ok()?;
+            let pgid = f.next()?.parse::<i32>().ok()?;
+            let uid = f.next()?.parse::<u32>().ok()?;
+            if uid != euid || ppid != 1 || pid <= 0 {
+                return None;
+            }
+            if !is_our_dsh(&f.collect::<Vec<_>>().join(" ")) {
+                return None;
+            }
+            Some(Leftover {
+                pid,
+                own_group: pgid == pid,
+            })
+        })
+        .collect()
+}
+
+/// 上次运行没走完收尾（崩溃 / 强杀 / 开发重建）会留下失联的 dsh：它不归任何窗口
+/// 管，不主动捞就永远留在用户的进程表里（每失败一次留一个）。
+///
+/// 非 Unix 不做：Windows 上拿「命令行 + 父进程」只有 WMI/PowerShell 一路，代价和
+/// 风险都高；那边正常退出的每条路径照样收进程，只有强杀会漏。
+fn reap_orphans() {
+    #[cfg(unix)]
+    {
+        let euid = unsafe { libc::geteuid() };
+        // -ww：不加宽度限制。不带它 ps 会按终端宽度截断命令行，长路径的 node
+        // 命令行被截掉尾巴就认不出来了
+        let Ok(out) = Command::new("ps")
+            .args(["-A", "-ww", "-o", "pid=,ppid=,pgid=,uid=,command="])
+            .stdin(Stdio::null())
+            .output()
+        else {
+            return;
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        for l in orphan_instances(&text, euid) {
+            // 自己是组长的按整组收（把它的子进程一起带走），否则只杀这一个
+            let target = if l.own_group { -l.pid } else { l.pid };
+            let scope = if l.own_group { "（整组）" } else { "" };
+            tracing::info!("回收上次遗留的 dsh 进程（pid {}{scope}）", l.pid);
+            terminate(target, || unsafe { libc::kill(target, 0) == 0 });
         }
     }
 }
@@ -452,29 +684,62 @@ fn cli_command(cli: &Path, node: Option<&Path>) -> Command {
     };
     cmd.env("PATH", child_path(cli, node));
     cmd.stdin(Stdio::null());
+    // 自己的进程组：收尾时按组杀，dsh 起的子进程跟着一起走（见 kill_tree_pid）
+    in_own_group(&mut cmd);
     cmd
 }
 
 /// `dsh --version`。探测超时（10s）就放弃版本号，不阻塞扫描。
+///
+/// 超时必须把进程收掉再走：读输出是阻塞的，进程不退出的话探测线程会永远挂着
+/// （每次扫描漏一个线程 + 一个 node），所以超时后杀组并 join 回来。
 fn probe_version(cli: &Path, node: Option<&Path>) -> Option<String> {
-    let cli = cli.to_path_buf();
-    let node = node.map(|n| n.to_path_buf());
+    probe_version_within(cli, node, PROBE_TIMEOUT)
+}
+
+/// [`probe_version`] 的可注入超时版本（测试用）；返回前保证线程与进程都已收场
+fn probe_version_within(cli: &Path, node: Option<&Path>, timeout: Duration) -> Option<String> {
+    let mut cmd = cli_command(cli, node);
+    cmd.arg("--version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = cmd.spawn().ok()?;
+    let pid = child.id();
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let out = cli_command(&cli, node.as_deref()).arg("--version").output();
-        let _ = tx.send(out);
-    });
-    match rx.recv_timeout(Duration::from_secs(10)) {
-        Ok(Ok(o)) if o.status.success() => {
-            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if s.is_empty() {
-                None
-            } else {
-                // 多行输出只取第一行（版本号那行）
-                Some(s.lines().next().unwrap_or("").trim().to_string())
-            }
+    let reader = match std::thread::Builder::new()
+        .name("dsh-probe".into())
+        .spawn(move || {
+            // 退出后读干净管道（进程已死时这里立刻返回）
+            let _ = tx.send(child.wait_with_output());
+        }) {
+        Ok(h) => h,
+        Err(_) => {
+            // 线程起不来就没有读者：按 pid 把进程收掉（句柄随闭包一起没了）
+            kill_tree_pid(pid);
+            return None;
         }
-        _ => None,
+    };
+    let out = match rx.recv_timeout(timeout) {
+        Ok(out) => out,
+        Err(_) => {
+            // 超时：先收进程，读线程自然结束 —— 不是简单地把它扔下不管
+            kill_tree_pid(pid);
+            let _ = reader.join();
+            tracing::warn!("dsh --version 超时（已收回进程），本次扫描不给版本号");
+            return None;
+        }
+    };
+    let _ = reader.join();
+    let o = out.ok()?;
+    if !o.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        // 多行输出只取第一行（版本号那行）
+        Some(s.lines().next().unwrap_or("").trim().to_string())
     }
 }
 
@@ -639,21 +904,6 @@ fn free_port() -> Result<u16, PluginError> {
     Ok(port)
 }
 
-/// 在跑的实例还活着吗？活着返回它的 URL；进程已退出则清掉句柄。
-fn live_url(host: &DshHost) -> Option<String> {
-    let mut slot = host.proc.lock().ok()?;
-    if let Some(r) = slot.as_mut() {
-        match r.child.try_wait() {
-            Ok(None) => return Some(r.url.clone()),
-            _ => {
-                let mut dead = slot.take().unwrap();
-                let _ = dead.child.wait();
-            }
-        }
-    }
-    None
-}
-
 fn spawn_dsh(
     cli: &Path,
     node: Option<&Path>,
@@ -681,7 +931,16 @@ fn spawn_dsh(
 ///
 /// 必须用它的地址而不是自己拼 `http://127.0.0.1:<port>/`：那行的 URL 带本次进程
 /// 的令牌，浏览器先拿签名 cookie 再跳转；不带令牌访问根路径拿不到会话。
-fn wait_for_url(child: &mut Child, port: u16) -> Result<String, PluginError> {
+///
+/// `epoch` 是启动开始时的收尾计数：期间窗口关 / 点停止 / 应用退出都会让它变，
+/// 这时立刻收掉进程并按 `dsh-cancelled` 返回 —— 不能继续等满 90s，更不能把
+/// 一个已经死掉的进程当成「就绪」登记回去。**返回前保证子进程已收场**。
+fn wait_for_url(
+    child: &mut Child,
+    port: u16,
+    host: &DshHost,
+    epoch: u64,
+) -> Result<String, PluginError> {
     let stdout = child
         .stdout
         .take()
@@ -689,33 +948,37 @@ fn wait_for_url(child: &mut Child, port: u16) -> Result<String, PluginError> {
     let stderr = child.stderr.take();
     let (tx, rx): (_, Receiver<String>) = mpsc::channel();
 
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            tracing::info!("dsh: {line}");
-            if let Some(rest) = line.strip_prefix("dsh web: ") {
-                let url = rest.split_whitespace().next().unwrap_or("");
-                if url.starts_with("http") {
-                    let _ = tx.send(url.to_string());
+    let _ = std::thread::Builder::new()
+        .name("dsh-stdout".into())
+        .spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                tracing::info!("dsh: {line}");
+                if let Some(rest) = line.strip_prefix("dsh web: ") {
+                    let url = rest.split_whitespace().next().unwrap_or("");
+                    if url.starts_with("http") {
+                        let _ = tx.send(url.to_string());
+                    }
                 }
             }
-        }
-    });
+        });
 
     // stderr 只留最后 40 行：报错时够定位，又不至于把日志灌进窗口
     let tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
     if let Some(err) = stderr {
         let buf = tail.clone();
-        std::thread::spawn(move || {
-            for line in BufReader::new(err).lines().map_while(Result::ok) {
-                tracing::warn!("dsh: {line}");
-                if let Ok(mut b) = buf.lock() {
-                    if b.len() >= 40 {
-                        b.pop_front();
+        let _ = std::thread::Builder::new()
+            .name("dsh-stderr".into())
+            .spawn(move || {
+                for line in BufReader::new(err).lines().map_while(Result::ok) {
+                    tracing::warn!("dsh: {line}");
+                    if let Ok(mut b) = buf.lock() {
+                        if b.len() >= 40 {
+                            b.pop_front();
+                        }
+                        b.push_back(line);
                     }
-                    b.push_back(line);
                 }
-            }
-        });
+            });
     }
     let collect = |buf: &Arc<Mutex<VecDeque<String>>>| {
         buf.lock()
@@ -725,6 +988,11 @@ fn wait_for_url(child: &mut Child, port: u16) -> Result<String, PluginError> {
 
     let deadline = Instant::now() + START_TIMEOUT;
     loop {
+        // 收尾请求（关窗 / 停止 / 退出）：本次启动作废，收掉进程立刻返回
+        if host.epoch.load(Ordering::SeqCst) != epoch {
+            kill_tree(child);
+            return Err(PluginError::code("dsh-cancelled"));
+        }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             break;
@@ -744,8 +1012,11 @@ fn wait_for_url(child: &mut Child, port: u16) -> Result<String, PluginError> {
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    let cancelled = host.epoch.load(Ordering::SeqCst) != epoch;
+    kill_tree(child);
+    if cancelled {
+        return Err(PluginError::code("dsh-cancelled"));
+    }
     // 端口写进诊断：超时最常见的原因就是端口这块出问题（被别的进程抢了/防火墙）
     Err(PluginError::new(
         "dsh-timeout",
@@ -761,29 +1032,65 @@ fn prepare_and_launch(app: &AppHandle, mcp_url: &str) -> Result<Started, PluginE
     let dir = profile_dir();
     let plan = ensure_profile(&dir, mcp_url)?;
 
-    if let Some(host) = app.try_state::<DshHost>() {
-        if let Some(url) = live_url(&host) {
-            return Ok(Started { url, port: 0 });
-        }
+    let host = app.state::<DshHost>();
+    match host.snapshot() {
+        // 已经有一个跑着的：复用它（重启会丢掉用户正在进行的会话）
+        Snapshot::Ready(url) => return Ok(Started { url, port: 0 }),
+        // 上一个还在启动：等它的结果，别再起一个
+        Snapshot::Starting => return Err(PluginError::code("dsh-starting")),
+        Snapshot::Idle => {}
     }
+    // 启动开始时的收尾计数：期间任何一次 kill（关窗 / 停止 / 退出）都会让它变
+    let epoch = host.epoch.load(Ordering::SeqCst);
 
     let port = free_port()?;
     let mut child = spawn_dsh(&cli, node.as_deref(), plan.overlay.as_deref(), port, &dir)?;
-    match wait_for_url(&mut child, port) {
+    let pid = child.id();
+    // 先登记 pid 再等就绪：冷启动要建 profile、挂插件树，几十秒里进程已经在跑，
+    // 这段窗口里关窗 / 退出也必须能把它收掉
+    match host.slot.lock() {
+        Ok(mut slot) => *slot = Slot::Starting { pid },
+        Err(_) => {
+            kill_tree(&mut child);
+            return Err(PluginError::code("dsh-store"));
+        }
+    }
+
+    match wait_for_url(&mut child, port, &host, epoch) {
         Ok(url) => {
-            if let Some(host) = app.try_state::<DshHost>() {
-                // 放进状态前先清掉可能残留的旧句柄，否则又漏一个进程
-                kill(&host);
-                if let Ok(mut slot) = host.proc.lock() {
-                    *slot = Some(Running {
-                        child,
-                        url: url.clone(),
-                    });
+            let mut slot = match host.slot.lock() {
+                Ok(slot) => slot,
+                Err(_) => {
+                    kill_tree(&mut child);
+                    return Err(PluginError::code("dsh-store"));
                 }
+            };
+            // 启动期间被收尾过：这次启动已经作废（进程也已经被收掉了），
+            // 别把一个死进程登记成「就绪」
+            if host.epoch.load(Ordering::SeqCst) != epoch {
+                drop(slot);
+                kill_tree(&mut child);
+                return Err(PluginError::code("dsh-cancelled"));
             }
+            *slot = Slot::Ready(Running {
+                child,
+                url: url.clone(),
+            });
             Ok(Started { url, port })
         }
-        Err(e) => Err(e),
+        Err(e) => {
+            // 清登记（还写着我这一个 pid 时才清）；进程由 wait_for_url 收场
+            if let Ok(mut slot) = host.slot.lock() {
+                if matches!(&*slot, Slot::Starting { pid: p } if *p == pid) {
+                    *slot = Slot::Idle;
+                }
+            }
+            // 被收尾打断的启动不算「起不来」：报专用码，界面能说清原因
+            if host.epoch.load(Ordering::SeqCst) != epoch {
+                return Err(PluginError::code("dsh-cancelled"));
+            }
+            Err(e)
+        }
     }
 }
 
@@ -813,7 +1120,13 @@ pub async fn dsh_scan(app: AppHandle) -> Value {
         .to_string();
     let running = app
         .try_state::<DshHost>()
-        .and_then(|h| live_url(&h))
+        .map(|h| h.snapshot())
+        .and_then(|s| match s {
+            Snapshot::Ready(url) => Some(url),
+            // 启动中不算「运行中」：界面上那个「打开」按钮会带着
+            // dsh-starting 提示自己等一下
+            Snapshot::Starting | Snapshot::Idle => None,
+        })
         .unwrap_or_default();
 
     json!({
@@ -861,10 +1174,10 @@ pub async fn dsh_install_pnpm() -> Result<Value, PluginError> {
 #[tauri::command]
 pub async fn dsh_open(app: AppHandle) -> Result<Value, PluginError> {
     let host = app.state::<DshHost>();
-    if host.starting.swap(true, Ordering::SeqCst) {
+    if host.opening.swap(true, Ordering::SeqCst) {
         return Err(PluginError::code("dsh-starting"));
     }
-    let _guard = StartGuard(&host.starting);
+    let _guard = OpenGuard(&host.opening);
     ensure_running(&app).await
 }
 
@@ -874,7 +1187,12 @@ pub async fn dsh_open(app: AppHandle) -> Result<Value, PluginError> {
 /// 第三方 `dsh-profile` 插件（往 profile 装包的那种）也走这条路径。
 pub(crate) async fn ensure_running(app: &AppHandle) -> Result<Value, PluginError> {
     let host = app.state::<DshHost>();
-    let alive = live_url(&host);
+    let alive = match host.snapshot() {
+        Snapshot::Ready(url) => Some(url),
+        // 正在启动：让界面等上一次的结果，别再点一次（会起来两个）
+        Snapshot::Starting => return Err(PluginError::code("dsh-starting")),
+        Snapshot::Idle => None,
+    };
     if let Some(w) = app.get_webview_window(PLUGIN_WINDOW_LABEL) {
         match &alive {
             Some(url) => {
@@ -1025,10 +1343,10 @@ fn run_capped(mut cmd: Command, timeout: Duration) -> Result<RunOutput, PluginEr
     let err_buf: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
     let mut handles = Vec::new();
     if let Some(pipe) = child.stdout.take() {
-        handles.push(drain(pipe, "dsh", out_buf.clone()));
+        handles.push(drain(pipe, "dsh-out", out_buf.clone()));
     }
     if let Some(pipe) = child.stderr.take() {
-        handles.push(drain(pipe, "dsh", err_buf.clone()));
+        handles.push(drain(pipe, "dsh-err", err_buf.clone()));
     }
 
     let deadline = Instant::now() + timeout;
@@ -1041,7 +1359,9 @@ fn run_capped(mut cmd: Command, timeout: Duration) -> Result<RunOutput, PluginEr
         }
         if Instant::now() >= deadline {
             timed_out = true;
-            let _ = child.kill();
+            // 按整棵树收：`dsh plugin add` 底下挂着 pnpm，只杀 dsh 会留下它 ——
+            // 而它还攥着 stdout/stderr 管道，下面两个读线程就永远 join 不回来
+            kill_tree(&mut child);
             let _ = child.wait();
             break None;
         }
@@ -1070,30 +1390,36 @@ struct RunOutput {
     timed_out: bool,
 }
 
-/// 把一条管道读到 EOF，只留最后 [`MAX_TAIL_LINES`] 行。
+/// 把一条管道读到 EOF，只留最后 [`MAX_TAIL_LINES`] 行。线程带名字：万一哪天它
+/// 没退出（子进程攥着管道不放就是这种症状），看线程列表就能认出是谁。
 fn drain<R: std::io::Read + Send + 'static>(
     pipe: R,
     tag: &'static str,
     buf: Arc<Mutex<VecDeque<String>>>,
 ) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        for line in BufReader::new(pipe).lines().map_while(Result::ok) {
-            tracing::info!("{tag}: {line}");
-            if let Ok(mut b) = buf.lock() {
-                if b.len() >= MAX_TAIL_LINES {
-                    b.pop_front();
+    std::thread::Builder::new()
+        .name(tag.into())
+        .spawn(move || {
+            for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                tracing::info!("{tag}: {line}");
+                if let Ok(mut b) = buf.lock() {
+                    if b.len() >= MAX_TAIL_LINES {
+                        b.pop_front();
+                    }
+                    b.push_back(line);
                 }
-                b.push_back(line);
             }
-        }
-    })
+        })
+        .expect("spawn pipe reader")
 }
 
 /// 停掉后台的 dsh 进程（窗口由用户自己关；这里给「停止」按钮用）。
+///
+/// 启动中的实例同样收：点了停止还让它在后台继续把 profile 建完，就是漏一个进程。
 #[tauri::command]
 pub fn dsh_stop(app: AppHandle) -> Value {
     if let Some(host) = app.try_state::<DshHost>() {
-        kill(&host);
+        host.kill();
     }
     json!({ "ok": true })
 }
@@ -1163,6 +1489,265 @@ mod tests {
         assert!(dirs
             .iter()
             .any(|d| d.to_string_lossy().ends_with(".local/share/pnpm")));
+    }
+
+    // ---- 孤儿回收：只认「我们的 profile + 已经是孤儿（ppid=1）+ 本用户」 ----
+
+    #[test]
+    fn orphan_instances_only_takes_our_own_orphans() {
+        let ps = "\
+           1       0     1     0 /sbin/launchd\n\
+         501       1   501   501 node /usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js --profile wallpallperem --no-open --port 53233\n\
+         502       1   502   501 node /usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js --profile web --no-open\n\
+         503    4242   503   501 node /usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js --profile wallpallperem --no-open\n\
+         504       1   504   502 node /usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js --profile wallpallperem --no-open\n\
+         505       1   999   501 node /usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js plugin --profile wallpallperem add foo\n\
+         506       1   506   501 node /usr/local/lib/node_modules/other-tool/lib/bin.js --profile wallpallperem\n";
+        let got = orphan_instances(ps, 501);
+        // 501：我们的 + 孤儿 + 本用户 + 自己是组长 → 整组收
+        // 505：装插件那次（`dsh plugin`）同样是本应用起的，也回收；但它不是组长，
+        //      只杀进程本身（别去动它继承来的、可能是用户前台组的那个组）
+        let ids: Vec<i32> = got.iter().map(|l| l.pid).collect();
+        assert_eq!(ids, vec![501, 505]);
+        assert!(got[0].own_group);
+        assert!(!got[1].own_group);
+    }
+
+    #[test]
+    fn is_our_dsh_needs_both_marks() {
+        assert!(is_our_dsh(
+            "node /x/@deepseek-ai/dsh/lib/bin.js --profile wallpallperem --no-open --port 1"
+        ));
+        assert!(is_our_dsh("dsh plugin --profile wallpallperem add pkg"));
+        // 别人 profilename 前缀撞车不算（整 token 比对）
+        assert!(!is_our_dsh("node /x/dsh/bin.js --profile wallpallperemX"));
+        // 用户自己的 dsh（别的 profile）不关我们的事
+        assert!(!is_our_dsh("dsh web --no-open"));
+        assert!(!is_our_dsh("node /x/other-tool --profile wallpallperem"));
+    }
+
+    // ---- 收尾：直接子进程与它生的子进程一起走 ----
+
+    #[cfg(unix)]
+    fn alive(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// 等进程真的从进程表消失（被杀的进程可能有极短的僵尸期）
+    #[cfg(unix)]
+    fn wait_dead(pid: i32) -> bool {
+        for _ in 0..50 {
+            if !alive(pid) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// 有界等待自己的子进程退出并 reap（僵尸状态 kill(pid, 0) 仍然是成功，
+    /// 必须靠 reap 确认它真的走完了收尾）
+    #[cfg(unix)]
+    fn wait_child_dead(child: &mut Child) -> bool {
+        for _ in 0..50 {
+            match child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(_) => return false,
+            }
+        }
+        false
+    }
+
+    /// 写一个「假 dsh」脚本：先起一个子进程（模拟 dsh 跑命令 / 装包时生的 node），
+    /// 把两个 pid 写进目录，然后自己挂住不走。返回脚本路径。
+    #[cfg(unix)]
+    fn fake_dsh(dir: &Path, name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).unwrap();
+        let script = dir.join(format!("{name}.sh"));
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nsleep 300 &\necho $! > '{g}'\necho $$ > '{c}'\nsleep 300\n",
+                g = dir.join(format!("{name}-child.pid")).display(),
+                c = dir.join(format!("{name}.pid")).display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    #[cfg(unix)]
+    fn read_pid(path: &Path) -> Option<i32> {
+        std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    }
+
+    /// 等「假 dsh」把两个 pid 都写出来：返回 (自己的 pid, 子进程的 pid)
+    #[cfg(unix)]
+    fn wait_pids(dir: &Path, name: &str) -> (i32, i32) {
+        for _ in 0..200 {
+            match (
+                read_pid(&dir.join(format!("{name}.pid"))),
+                read_pid(&dir.join(format!("{name}-child.pid"))),
+            ) {
+                (Some(a), Some(b)) => return (a, b),
+                _ => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        panic!("假 dsh 没起来");
+    }
+
+    #[cfg(unix)]
+    fn spawn_fake(script: &Path) -> Child {
+        let mut cmd = Command::new(script);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        in_own_group(&mut cmd);
+        cmd.spawn().unwrap()
+    }
+
+    /// 关窗 / 停止 / 退出的收尾：dsh 自己 spawn 出来的子进程也要一起走 ——
+    /// 只杀直接子进程会在用户桌面上留一串看不见的 node
+    #[cfg(unix)]
+    #[test]
+    fn kill_tree_takes_grandchildren_too() {
+        let dir = std::env::temp_dir().join(format!("we-dsh-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let script = fake_dsh(&dir, "tree");
+        let mut child = spawn_fake(&script);
+        let (me, kid) = wait_pids(&dir, "tree");
+        assert_eq!(me as u32, child.id());
+        assert!(alive(me) && alive(kid));
+
+        kill_tree(&mut child);
+        assert!(wait_dead(me), "直接子进程");
+        assert!(wait_dead(kid), "子进程（只杀直接子进程的话就是它活下来）");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 启动中（还没等到就绪地址）就被收尾：进程已经在跑，这一段最容易漏
+    #[cfg(unix)]
+    #[test]
+    fn kill_host_reaps_a_starting_child_and_cancels_the_start() {
+        let dir = std::env::temp_dir().join(format!("we-dsh-start-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let script = fake_dsh(&dir, "start");
+        let mut child = spawn_fake(&script);
+        let (me, kid) = wait_pids(&dir, "start");
+
+        // 模拟「启动流程已登记 pid、正在等就绪地址」
+        let host = DshHost::default();
+        *host.slot.lock().unwrap() = Slot::Starting { pid: me as u32 };
+        assert!(matches!(host.snapshot(), Snapshot::Starting));
+        let epoch = host.epoch.load(Ordering::SeqCst);
+
+        host.kill(); // 关窗 / 退出
+        assert!(
+            host.epoch.load(Ordering::SeqCst) != epoch,
+            "收尾必须让进行中的启动作废（epoch 要变）"
+        );
+        assert!(matches!(host.snapshot(), Snapshot::Idle));
+        assert!(wait_child_dead(&mut child), "启动中的直接子进程");
+        assert!(wait_dead(kid), "启动中的子进程");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 探测超时不能留下「永远挂在读管道上的线程 + 一个 node」
+    #[cfg(unix)]
+    #[test]
+    fn probe_timeout_reaps_process_and_thread() {
+        let dir = std::env::temp_dir().join(format!("we-dsh-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let script = fake_dsh(&dir, "probe");
+
+        let started = Instant::now();
+        // 脚本由探测自己拉起来（就是被测的那条路）：它会写出两个 pid，然后挂住
+        let v = probe_version_within(&script, None, Duration::from_millis(800));
+        assert!(v.is_none(), "一个不回答 --version 的 dsh：拿不到版本号");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "超时后应当立刻收场，而不是继续等（实测 {:?}）",
+            started.elapsed()
+        );
+        let (me, kid) = wait_pids(&dir, "probe");
+        assert!(wait_dead(me), "被探测的进程");
+        assert!(wait_dead(kid), "它生的子进程");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 强杀 / 崩溃 / 开发重建留下的实例：启动时按「ppid=1 + 我们的 profile + 本用户」
+    /// 捞出来收掉 —— 但**不能碰**还挂在父进程下的实例（那是用户自己在终端里开的）。
+    #[cfg(unix)]
+    #[test]
+    fn reap_orphans_takes_the_leftover_but_not_a_parented_one() {
+        let dir = std::env::temp_dir().join(format!("we-dsh-orphan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // 忽略 SIGTERM：顺带把「宽限期内不退就 SIGKILL」那段也走到
+        let script = dir.join("dsh");
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(
+                &script,
+                "#!/bin/sh\ntrap '' TERM\necho $$ > \"$(dirname \"$0\")/orphan.pid\"\nsleep 300\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // 拉到 ppid=1：起一个 sh 把脚本放后台，然后 sh 自己退出 → 脚本被 launchd 收养
+        let launched = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "'{}' web --profile {PROFILE} >/dev/null 2>&1 &",
+                script.display()
+            ))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut launched = launched;
+        let _ = launched.wait();
+        let orphan = loop {
+            if let Some(pid) = read_pid(&dir.join("orphan.pid")) {
+                break pid;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        // 对照组：同一个脚本，但还挂在测试进程下（ppid 不是 1）—— 绝不能碰
+        let mut parented = spawn_fake(&script);
+        let parented_pid = parented.id() as i32;
+        assert!(
+            ppid_of(orphan) == Some(1),
+            "假 dsh 应当已成孤儿（ppid=1），实际 {:?}",
+            ppid_of(orphan)
+        );
+
+        reap_orphans();
+
+        assert!(
+            wait_dead(orphan),
+            "强杀遗留的实例应当被回收（它忽略 SIGTERM，靠宽限期后的 SIGKILL）"
+        );
+        assert!(
+            alive(parented_pid),
+            "还挂在父进程下的实例不归我们管，不能误杀"
+        );
+        kill_tree(&mut parented);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 真实 `ps` 读取：拿一个 ppid=1 的假 dsh 验证整条探测链（口径 + 命令行匹配）
+    #[cfg(unix)]
+    fn ppid_of(pid: i32) -> Option<i32> {
+        let out = Command::new("ps")
+            .args(["-o", "ppid=", "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
     }
 
     #[test]

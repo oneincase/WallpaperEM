@@ -47,6 +47,8 @@ function failureText(code: string): string {
       return tr("未检测到 dsh 命令行，请先按引导安装");
     case "dsh-starting":
       return tr("DeepSeek Harness 正在启动，请稍候");
+    case "dsh-cancelled":
+      return tr("启动已取消（插件窗口已关闭）");
     case "dsh-port":
       return tr("本机没有可用的空闲端口");
     case "dsh-spawn":
