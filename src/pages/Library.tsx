@@ -755,7 +755,8 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
           const running = Boolean(plStatus?.switchable ?? (plStatus?.active || boundNames.size > 0));
           return (
           <span className="ml-auto flex items-center gap-2 rounded-full bg-[var(--accent)]/10 px-3 py-0.5 text-[12px] text-[var(--text-2)]">
-            <span className="text-[var(--accent-strong)]">▶</span>
+            {/* 这里原本还有个装饰用的 ▶，与右侧「启用轮播」/暂停的真实按钮同形先撞脸、
+                点了又没反应（它只是个 span），2026-10-01 按用户要求摘掉 */}
             <span className="font-medium text-[var(--text-1)]">
               {!running && activeList
                 ? tr("「{name}」未在轮播", { name: activeList.name })
