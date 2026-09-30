@@ -1656,6 +1656,13 @@ fn create_desktop_window(
         .maximizable(false)
         .closable(false)
         .skip_taskbar(true)
+        // 壁纸窗永不接受焦点：macOS 上 `show()` 是 makeKeyAndOrderFront，一个**可成为
+        // key** 的窗口被 show 出来就会把 key 从主窗口抢走。同 App 内换 key 用户看不到
+        // 前台变化，但主窗口里的页面会收到 blur：WebKit 从此不再给这个页面投递悬停/
+        // 指针事件 ——「点了应用换壁纸 → 回到卡片上抽屉不滑出来」就是这么来的（2026-10-01
+        // 实测复现：换纸后连 CSS 的卡片抬起都失效，重新激活窗口才恢复）。
+        // 壁纸窗本来也不需要键鼠焦点：交互走桌面指针注入与滚轮转发，都不依赖 key。
+        .focusable(false)
         .focused(false);
     #[cfg(target_os = "macos")]
     {

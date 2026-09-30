@@ -100,9 +100,14 @@ export function WallpaperCard({
         <div className="absolute right-1.5 top-1.5 z-10">{coverBadgeRight}</div>
       )}
 
-      {/* 向上抽屉：默认沉在底边外，悬停/键盘聚焦时滑出覆盖在图上 */}
+      {/* 向上抽屉：默认沉在底边外，悬停/键盘聚焦时滑出覆盖在图上。
+          键盘那一路要 `:focus-visible` 而不是 `:focus-within` —— 后者对**鼠标点击**
+          也成立，于是「点了抽屉里的按钮 → 焦点留在按钮上 → 鼠标移开抽屉也不收」。
+          悬停这一路纯 CSS（每张卡片都要有，JS 逐卡记状态在几百张的列表里是白搭开销）；
+          「点应用换壁纸后 hover 失效」那个坑的根因在 Rust 侧（壁纸窗抢 key，见
+          wallpaper/mod.rs 的 .focusable(false)），不在卡片这里。 */}
       <div
-        className="absolute inset-x-0 bottom-0 z-20 translate-y-full opacity-0 transition-all duration-300 ease-out group-focus-within:translate-y-0 group-focus-within:opacity-100 group-hover:translate-y-0 group-hover:opacity-100"
+        className="absolute inset-x-0 bottom-0 z-20 translate-y-full opacity-0 transition-all duration-300 ease-out group-has-[:focus-visible]:translate-y-0 group-has-[:focus-visible]:opacity-100 group-hover:translate-y-0 group-hover:opacity-100"
         onClick={stop}
         onKeyDown={stop}
       >
