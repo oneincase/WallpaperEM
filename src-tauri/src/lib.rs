@@ -124,6 +124,8 @@ pub fn run() {
             app.manage(NativeMenuState { tray });
             // 轮播状态文案（当前项 / 暂停·恢复）按启动时状态刷新一次
             update_tray_rotation(app.handle());
+            // 托盘「显示器」子菜单按当前屏 + 会话填充（之后随插拔/绑定变化重建）
+            update_tray_displays(app.handle());
             // 抽帧组件（ffmpeg）的托管路径：抽帧入口拿不到 AppHandle，启动时缓存一份
             ffmpeg::init(app.handle());
             // 音频捕获状态须先于内容服务器（SSE 端点读取其共享频谱帧）
@@ -491,6 +493,7 @@ pub struct TrayMenu {
     show: MenuItem<tauri::Wry>,
     item_props: MenuItem<tauri::Wry>,
     auto_pause: CheckMenuItem<tauri::Wry>,
+    displays_menu: Submenu<tauri::Wry>,
     rot_menu: Submenu<tauri::Wry>,
     rot_status: MenuItem<tauri::Wry>,
     rot_prev: MenuItem<tauri::Wry>,
@@ -528,6 +531,131 @@ impl TrayMenu {
         }
         // 轮播状态文案是动态的（当前项 / 暂停·恢复），按当前状态重写
         self.refresh_rotation(app)?;
+        // 「显示器」子菜单整棵都是动态的（每屏一项、含列表名）：按当前语言重建
+        self.refresh_displays(app)?;
+        Ok(())
+    }
+
+    /// 重建「显示器」子菜单：每块屏一个子菜单 —— 当前壁纸（只读）/ 壁纸设置… /
+    /// 轮播列表（含「不轮播」，单选）/ 清除壁纸。显示器插拔、每屏绑定或清除、
+    /// 语言切换后调用（见 [`update_tray_displays`]）；轮播定时步进不调用 ——
+    /// 每步都重建原生菜单没有意义，菜单打开时还会闪。
+    ///
+    /// 菜单事件只带回字符串 id，目标（哪块屏、哪个列表）靠前缀编码还原，
+    /// 见 [`DISP_ROT_PREFIX`] 等常量。
+    fn refresh_displays(&self, app: &AppHandle) -> tauri::Result<()> {
+        self.displays_menu.set_text(i18n::tr("显示器"))?;
+        // 先清空：项数、文案、勾选都随显示器与列表变，整体重建最省心
+        if let Ok(items) = self.displays_menu.items() {
+            for _ in 0..items.len() {
+                let _ = self.displays_menu.remove_at(0);
+            }
+        }
+        let list = wallpaper::displays_list(app.clone()).unwrap_or(serde_json::Value::Null);
+        let displays = list
+            .get("displays")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if displays.is_empty() {
+            let none = MenuItem::with_id(
+                app,
+                "disp_none",
+                i18n::tr("未检测到显示器"),
+                false,
+                None::<&str>,
+            )?;
+            return self.displays_menu.append(&none);
+        }
+        let playlists = wallpaper::playlists_brief(app);
+        for d in &displays {
+            let Some(id) = d.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let name = d.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let primary = d.get("isPrimary").and_then(|v| v.as_bool()).unwrap_or(false);
+            let item_id = d.get("itemId").and_then(|v| v.as_str()).map(str::to_string);
+            let bound = d
+                .get("binding")
+                .and_then(|v| v.get("playlistId"))
+                .and_then(|v| v.as_i64());
+            // 钉住（手动设过单张/选过「不轮播」）才勾「不轮播」——没绑定 ≠ 不轮播，
+            // 没单独设置过的屏正跟着统一列表走（会换纸），勾上就是反的
+            let pinned = d.get("pinned").and_then(|v| v.as_bool()).unwrap_or(false);
+            let head = format!(
+                "{}{}",
+                name,
+                if primary {
+                    format!("（{}）", i18n::tr("主屏"))
+                } else {
+                    String::new()
+                }
+            );
+
+            // 第一行只读：这块屏现在挂的壁纸（没有就不给「壁纸设置…」入口 ——
+            // 没有可配置对象，点了只会唤起主窗口）
+            let cur = MenuItem::with_id(
+                app,
+                format!("disp_cur:{id}"),
+                match d.get("title").and_then(|v| v.as_str()) {
+                    Some(t) if !t.is_empty() => format!("{}：{}", i18n::tr("当前"), t),
+                    _ => i18n::tr("未设置壁纸").to_string(),
+                },
+                false,
+                None::<&str>,
+            )?;
+            let props = MenuItem::with_id(
+                app,
+                format!("{}{id}", DISP_PROPS_PREFIX),
+                i18n::tr("壁纸设置…"),
+                item_id.is_some(),
+                None::<&str>,
+            )?;
+            let stop = MenuItem::with_id(
+                app,
+                format!("{}{id}", DISP_STOP_PREFIX),
+                i18n::tr("清除壁纸"),
+                item_id.is_some(),
+                None::<&str>,
+            )?;
+
+            // 轮播列表：单选组（不轮播 / 各列表），勾选反映该屏当前的绑定/钉住。
+            // 跟随统一列表的屏（无绑定、未钉住）不勾任何一项 —— 它在轮播，
+            // 「不轮播」勾上就是反的；三个状态各有各的落点
+            let off = CheckMenuItemBuilder::with_id(
+                format!("{}{id}", DISP_ROT_OFF_PREFIX),
+                i18n::tr("不轮播（固定当前壁纸）"),
+            )
+            .checked(pinned)
+            .build(app)?;
+            let mut rot_items: Vec<CheckMenuItem<tauri::Wry>> = vec![off];
+            rot_items.extend(
+                playlists
+                    .iter()
+                    .map(|(pid, pname)| {
+                        CheckMenuItemBuilder::with_id(
+                            format!("{}{id}:{pid}", DISP_ROT_PREFIX),
+                            pname,
+                        )
+                        .checked(bound == Some(*pid))
+                        .build(app)
+                    })
+                    .collect::<tauri::Result<Vec<_>>>()?,
+            );
+            let rot = Submenu::with_items(app, i18n::tr("轮播列表"), true, &as_refs(&rot_items))?;
+            let sub = Submenu::with_items(
+                app,
+                head,
+                true,
+                &[
+                    &cur as &dyn tauri::menu::IsMenuItem<tauri::Wry>,
+                    &props,
+                    &rot,
+                    &stop,
+                ],
+            )?;
+            self.displays_menu.append(&sub)?;
+        }
         Ok(())
     }
 
@@ -629,6 +757,20 @@ pub(crate) fn update_tray_rotation(app: &AppHandle) {
     }
 }
 
+/// 显示器集合 / 每屏会话 / 每屏绑定变化后重建托盘「显示器」子菜单。
+/// 只在**结构性变化**时调用（插拔、绑定、清除、语言切换）——轮播定时步进不调，
+/// 重建原生菜单在菜单打开时会引起重绘。**调用方须在 DB 锁外调用**
+/// （内部走 displays_list，会自己拿锁）。
+pub(crate) fn update_tray_displays(app: &AppHandle) {
+    if let Some(state) = app.try_state::<NativeMenuState>() {
+        if let Some(tray) = &state.tray {
+            if let Err(e) = tray.refresh_displays(app) {
+                tracing::warn!("refresh tray displays failed: {e}");
+            }
+        }
+    }
+}
+
 /// 会被语言影响的原生菜单/标题。语言切换时由 retranslate_native_ui 整份重写
 pub struct NativeMenuState {
     /// 托盘不可用的环境（Linux 无 AppIndicator 等）为 None，见 build_tray 的降级说明
@@ -664,6 +806,18 @@ fn as_refs(items: &[CheckMenuItem<tauri::Wry>]) -> Vec<&dyn tauri::menu::IsMenuI
         .collect()
 }
 
+/// 托盘「显示器」子菜单里每屏条目的 id 前缀。原生菜单事件只带回字符串 id，
+/// 这里用前缀 + 目标还原点击意图（显示器 id 是纯数字哈希，列表 id 是整数，
+/// 都不含分隔符）：
+///   disp_props:<displayId>            打开该屏当前壁纸的「壁纸设置」窗口
+///   disp_stop:<displayId>             清除该屏的壁纸
+///   disp_rot_off:<displayId>          该屏不轮播（固定当前壁纸）
+///   disp_rot:<displayId>:<playlistId> 该屏轮播指定列表
+const DISP_PROPS_PREFIX: &str = "disp_props:";
+const DISP_STOP_PREFIX: &str = "disp_stop:";
+const DISP_ROT_OFF_PREFIX: &str = "disp_rot_off:";
+const DISP_ROT_PREFIX: &str = "disp_rot:";
+
 /// 托盘：显示主窗口 / 壁纸设置 / 暂停播放 / 全局快速设置（显示模式·清晰度·帧率上限）/ 退出
 fn build_tray(app: &AppHandle) -> tauri::Result<TrayMenu> {
     let show = MenuItem::with_id(app, "show", i18n::tr("显示主窗口"), true, None::<&str>)?;
@@ -696,6 +850,11 @@ fn build_tray(app: &AppHandle) -> tauri::Result<TrayMenu> {
             &rot_pause,
         ],
     )?;
+
+    // 显示器（每屏）：内容全是动态的（每屏一项、随插拔与会话变化），先建空壳，
+    // 由 refresh_displays 填（init 后立即调一次；见 update_tray_displays）。
+    // 每屏：当前壁纸（只读）/ 壁纸设置… / 轮播列表（单选）/ 清除壁纸。
+    let displays_menu = Submenu::with_id(app, "displays", i18n::tr("显示器"), true)?;
 
     let mk_check = |id: &str, text: &str, checked: bool| {
         CheckMenuItemBuilder::with_id(id, text)
@@ -742,6 +901,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<TrayMenu> {
             &item_props,
             &auto_pause_item,
             &rot_menu,
+            &displays_menu,
             &sep1,
             &quality_menu,
             &filter_menu,
@@ -756,6 +916,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<TrayMenu> {
         show: show.clone(),
         item_props: item_props.clone(),
         auto_pause: auto_pause_item.clone(),
+        displays_menu: displays_menu.clone(),
         rot_menu: rot_menu.clone(),
         rot_status: rot_status.clone(),
         rot_prev: rot_prev.clone(),
@@ -804,19 +965,87 @@ fn build_tray(app: &AppHandle) -> tauri::Result<TrayMenu> {
                 }
                 "item_props" => {
                     // 独立设置窗口：只带配置面板，不唤起主界面。
-                    // 多显示器时取第一个已应用项（active_items 已过滤文件丢失）。
-                    match wallpaper::active_items(app.clone()) {
-                        Ok(ids) if !ids.is_empty() => {
-                            if let Err(e) = props_window::open(app, &ids[0]) {
-                                tracing::warn!("open props window for {} failed: {e}", ids[0]);
+                    // 目标 = **当前屏幕**（光标所在那块屏，见 wallpaper::current_screen）
+                    // 当前挂的壁纸 —— 不能拿 active_items()[0]：那是「第一块有壁纸的
+                    // 屏」，多屏时经常是另一块屏的（用户报的正是这个）。
+                    match wallpaper::current_screen(app) {
+                        Some(cs) => match &cs.item_id {
+                            Some(item) => {
+                                // 打一行「当前屏幕 → 哪张壁纸」：配错屏时这是第一手线索
+                                tracing::info!(
+                                    "tray item_props: 当前屏幕「{}」（{}）→ 壁纸 {item}",
+                                    cs.name,
+                                    cs.id
+                                );
+                                if let Err(e) = props_window::open_at(app, item, Some(cs.frame)) {
+                                    tracing::warn!("open props window for {item} failed: {e}");
+                                }
+                            }
+                            // 当前屏没有壁纸：没有可配置对象，唤起主窗口让用户先应用。
+                            // 刻意不退回别的屏的壁纸 —— 那正是「配错对象」的来源；
+                            // 想配别的屏用「显示器 ▸ <屏> ▸ 壁纸设置…」。
+                            None => {
+                                tracing::info!(
+                                    "tray item_props: 当前屏幕「{}」（{}）没有壁纸，唤起主窗口",
+                                    cs.name,
+                                    cs.id
+                                );
+                                main_window::ensure_main_window(app);
+                            }
+                        },
+                        None => main_window::ensure_main_window(app),
+                    }
+                }
+                // 每屏：壁纸设置…（打开该屏当前壁纸的属性窗口，面板就摆在那块屏上）
+                id if id.starts_with(DISP_PROPS_PREFIX) => {
+                    let did = &id[DISP_PROPS_PREFIX.len()..];
+                    match wallpaper::display_item_id(app, did) {
+                        Some(item) => {
+                            let screen = wallpaper::screen_frame(did);
+                            if let Err(e) = props_window::open_at(app, &item, screen) {
+                                tracing::warn!("tray disp_props[{did}]: {e}");
                             }
                         }
-                        Ok(_) => {
-                            // 没有已应用壁纸：没有可配置对象，唤出主窗口让用户先选一张
-                            main_window::ensure_main_window(app);
-                        }
-                        Err(e) => tracing::warn!("tray item_props: {e}"),
+                        // 该屏没挂壁纸（或刚好被清掉）：没有可配置对象，唤起主窗口
+                        None => main_window::ensure_main_window(app),
                     }
+                }
+                // 每屏：清除壁纸（同时清掉该屏的轮播绑定/钉住，见 wallpaper::stop）
+                id if id.starts_with(DISP_STOP_PREFIX) => {
+                    let did = &id[DISP_STOP_PREFIX.len()..];
+                    if let Err(e) = wallpaper::stop(app.clone(), Some(did.to_string())) {
+                        tracing::warn!("tray disp_stop[{did}]: {e}");
+                    }
+                    update_tray_displays(app);
+                }
+                // 每屏：不轮播（固定当前壁纸）
+                id if id.starts_with(DISP_ROT_OFF_PREFIX) => {
+                    let did = &id[DISP_ROT_OFF_PREFIX.len()..];
+                    if let Err(e) =
+                        wallpaper::display_binding_set(app.clone(), did.to_string(), None)
+                    {
+                        tracing::warn!("tray disp_rot_off[{did}]: {e}");
+                    }
+                    update_tray_displays(app);
+                }
+                // 每屏：轮播指定列表
+                id if id.starts_with(DISP_ROT_PREFIX) => {
+                    let rest = &id[DISP_ROT_PREFIX.len()..];
+                    match rest.split_once(':').and_then(|(d, p)| {
+                        p.parse::<i64>().ok().map(|pid| (d.to_string(), pid))
+                    }) {
+                        Some((did, pid)) => {
+                            if let Err(e) = wallpaper::display_binding_set(
+                                app.clone(),
+                                did.clone(),
+                                Some(pid),
+                            ) {
+                                tracing::warn!("tray disp_rot[{did}:{pid}]: {e}");
+                            }
+                        }
+                        None => tracing::warn!("tray disp_rot: 无法解析的菜单 id {id}"),
+                    }
+                    update_tray_displays(app);
                 }
                 "auto_pause" => {
                     let was = tray_read_setting(app, "wallpaper_auto_pause", "false");

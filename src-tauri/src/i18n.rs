@@ -100,6 +100,18 @@ fn en(zh: &str) -> Option<&'static str> {
         "暂停轮播" => "Pause Slideshow",
         "恢复轮播" => "Resume Slideshow",
         "轮播：未启用" => "Slideshow: off",
+        // ---- 托盘 · 显示器子菜单（每屏一项：当前壁纸 / 壁纸设置… / 轮播列表 / 清除）----
+        // 措辞与前端表（src/locales/en-US.ts）的同名字符串保持一致：同一条文案在
+        // 托盘与界面两处译文不同，中英切换看起来就像两个产品
+        "显示器" => "Displays",
+        "主屏" => "Primary",
+        "当前" => "Current",
+        "未设置壁纸" => "No wallpaper set",
+        "壁纸设置…" => "Wallpaper Settings…",
+        "轮播列表" => "Slideshow playlist",
+        "不轮播（固定当前壁纸）" => "No rotation (pin the current wallpaper)",
+        "清除壁纸" => "Clear Wallpaper",
+        "未检测到显示器" => "No displays detected",
         // ---- macOS 应用菜单 / 快捷键动作（见 hotkeys.rs）----
         "最小化主窗口" => "Minimize Main Window",
         "隐藏主窗口" => "Hide Main Window",

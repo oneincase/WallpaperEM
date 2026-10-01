@@ -66,8 +66,11 @@ extern "C" {
 /// `CGEventCreate(NULL)` 造一个「当前状态」事件再取位置，是不需要任何权限的
 /// 只读查询；不要换成 NSEvent.mouseLocation —— 那个只能在主线程调用，
 /// 而这里跑在轮询线程上。
+///
+/// `pub(crate)`：macos.rs 的「当前屏幕」判定（cursor_display_id）要复用同一份
+/// 光标查询与坐标约定，别在那边再声明一次 CGEvent 符号。
 #[cfg(target_os = "macos")]
-fn cursor_state() -> Option<(f64, f64, u32)> {
+pub(crate) fn cursor_state() -> Option<(f64, f64, u32)> {
     unsafe {
         let ev = CGEventCreate(std::ptr::null_mut());
         if ev.is_null() {

@@ -117,6 +117,13 @@ pub fn active_screens() -> Vec<ScreenInfo> {
     out.into_iter().map(|(s, _)| s).collect()
 }
 
+/// 光标所在的显示器 id（「当前屏幕」）：[`cursor_state`] 已是逻辑坐标（GTK 的
+/// 物理坐标按命中屏 scale 换算），与 [`hit_screen_id`] 吃的 ScreenInfo 逻辑矩形同系。
+pub fn cursor_display_id() -> Option<u32> {
+    let (x, y, _) = cursor_state()?;
+    hit_screen_id(x, y)
+}
+
 /// 全局逻辑坐标点落在哪台显示器（滚轮派发用；Linux 暂无系统滚轮源，备平台接口一致）。
 #[allow(dead_code)]
 pub fn hit_screen_id(x: f64, y: f64) -> Option<u32> {
@@ -124,6 +131,18 @@ pub fn hit_screen_id(x: f64, y: f64) -> Option<u32> {
         .into_iter()
         .find(|s| x >= s.x && x < s.x + s.w && y >= s.y && y < s.y + s.h)
         .map(|s| s.id)
+}
+
+/// 主窗口中心点（逻辑坐标、左上原点），供 [`hit_screen_id`]（ScreenInfo 逻辑矩形）。
+#[allow(dead_code)]
+pub fn window_hit_point<R: Runtime>(window: &WebviewWindow<R>) -> Option<(f64, f64)> {
+    let pos = window.outer_position().ok()?;
+    let size = window.outer_size().ok()?;
+    let scale = window.scale_factor().ok().unwrap_or(1.0);
+    Some((
+        (pos.x as f64 + size.width as f64 / 2.0) / scale,
+        (pos.y as f64 + size.height as f64 / 2.0) / scale,
+    ))
 }
 
 /// 经 Tauri/GTK 枚举显示器，返回（逻辑坐标屏幕信息, scale_factor）

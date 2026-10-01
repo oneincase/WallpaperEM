@@ -1,9 +1,7 @@
-// 应用目标（哪块屏）的两项跨组件状态：
-// ① armed  —— 显示器坞「更换壁纸」锁定的目标屏，下一次应用动作只落它（然后自动解除）；
-// ② last   —— 目标菜单的「上次选择」（"" = 统一应用，即全部显示器），供下次标记 ✓。
+// 应用目标（哪块屏）的跨组件状态：
+// armed —— 显示器坞点卡片锁定的目标屏：下一次「应用到桌面」只落它，然后自动解除；
+// 没锁定就是全部显示器（2026-10-01 起目标选择只走显示器坞，不再有弹层菜单）。
 import { useSyncExternalStore } from "react";
-
-const LAST_TARGET_KEY = "we.applyTarget.last";
 
 export type ApplyTarget = { id: string; name: string };
 
@@ -47,21 +45,4 @@ export function consumeApplyTarget(): ApplyTarget | null {
 
 export function useArmedApplyTarget(): ApplyTarget | null {
   return useSyncExternalStore(subscribe, getArmed, getArmed);
-}
-
-/** 上次目标：null=从没选过，""=统一应用（全部显示器），其余=displayId */
-export function readLastTarget(): string | null {
-  try {
-    return localStorage.getItem(LAST_TARGET_KEY);
-  } catch {
-    return null;
-  }
-}
-
-export function writeLastTarget(target: string) {
-  try {
-    localStorage.setItem(LAST_TARGET_KEY, target);
-  } catch {
-    /* ignore */
-  }
 }

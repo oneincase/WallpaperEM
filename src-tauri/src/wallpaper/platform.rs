@@ -2,6 +2,8 @@
 //!
 //! 各后端（macos.rs / linux.rs）对外提供完全一致的函数集：
 //! - `ScreenInfo` / `active_screens` / `display_asleep`：屏幕枚举与睡眠检测
+//! - `cursor_display_id`：光标所在显示器（「当前屏幕」——托盘/快捷键的壁纸设置用）
+//! - `window_hit_point`：主窗口中心点（喂 `hit_screen_id`，单位随各后端约定）
 //! - `legacy_display_ids` / `refresh_display_meta`：显示器稳定 id 迁移映射与名称缓存刷新
 //! - `set_frame` / `apply_desktop_window`：窗口几何与桌面层级
 //! - `set_movable_by_background`：背景拖动（仅 macOS 有效，其余平台空实现）
@@ -56,6 +58,22 @@ mod fallback {
     }
 
     pub fn hit_screen_id(_x: f64, _y: f64) -> Option<u32> {
+        None
+    }
+
+    pub fn window_hit_point<R: Runtime>(window: &WebviewWindow<R>) -> Option<(f64, f64)> {
+        let pos = window.outer_position().ok()?;
+        let size = window.outer_size().ok()?;
+        let scale = window.scale_factor().ok().unwrap_or(1.0);
+        Some((
+            (pos.x as f64 + size.width as f64 / 2.0) / scale,
+            (pos.y as f64 + size.height as f64 / 2.0) / scale,
+        ))
+    }
+
+    /// 「当前屏幕」判定（托盘/快捷键的「壁纸设置」靠它挑该配哪块屏的壁纸）。
+    /// 未实现的平台回 None，调用方回退主屏。
+    pub fn cursor_display_id() -> Option<u32> {
         None
     }
 

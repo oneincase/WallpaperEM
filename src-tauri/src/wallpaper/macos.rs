@@ -54,6 +54,7 @@ extern "C" {
     fn CGWindowLevelForKey(key: i32) -> i32;
     fn CGDisplayCreateUUIDFromDisplayID(display: u32) -> *mut c_void;
     fn CGDisplayPixelsWide(display: u32) -> usize;
+    fn CGDisplayPixelsHigh(display: u32) -> usize;
     fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32) -> *mut c_void;
     fn CGRectMakeWithDictionaryRepresentation(dict: *mut c_void, rect: *mut CRect) -> bool;
 }
@@ -272,6 +273,13 @@ pub fn legacy_display_ids() -> Vec<(String, String)> {
         .collect()
 }
 
+/// 光标所在的显示器 id（「当前屏幕」）。坐标配对与滚轮派发一致：CGEvent 的全局位置
+/// 是左上原点 CG 点，直接喂 [`hit_screen_id`]（同吃 CGDisplayBounds 坐标，公式见其注释）。
+pub fn cursor_display_id() -> Option<u32> {
+    let (x, y, _) = super::pointer::cursor_state()?;
+    hit_screen_id(x, y)
+}
+
 /// 活动显示器列表（points 坐标）
 pub fn active_screens() -> Vec<ScreenInfo> {
     let mut ids = [0u32; 16];
@@ -324,17 +332,56 @@ pub fn hit_screen_id(x: f64, y: f64) -> Option<u32> {
         .map(|s| s.id)
 }
 
+/// 主窗口中心点（CG 全局：points、左上原点），供 [`hit_screen_id`] 命中测试。
+///
+/// 取 tao 的 `outer_position`/`outer_size`（物理像素）除 scale 换回逻辑点后，
+/// y 还要减掉 tao 的已知偏差：它的 y 翻转基准是 `CGDisplay::main().pixels_high()`
+/// （**像素**），而 NSWindow.frame 是 points —— 换回逻辑点后仍比真实 CG y 多出
+/// 「主屏像素高 − 主屏点高」（Retina 上非零：主屏 982pt/1964px 时恒偏 +982pt，
+/// 命中几乎必失，静默退化成「最近一次应用的会话」）。x 无此问题；窗口自身
+/// scale 在换算中约掉，与它在哪块屏无关。
+pub fn window_hit_point<R: Runtime>(window: &WebviewWindow<R>) -> Option<(f64, f64)> {
+    let pos = window.outer_position().ok()?;
+    let size = window.outer_size().ok()?;
+    let scale = window.scale_factor().ok().unwrap_or(1.0);
+    let cx = (pos.x as f64 + size.width as f64 / 2.0) / scale;
+    let cy = (pos.y as f64 + size.height as f64 / 2.0) / scale;
+    let tao_y_bias = unsafe {
+        CGDisplayPixelsHigh(CGMainDisplayID()) as f64
+            - CGDisplayBounds(CGMainDisplayID()).size.height
+    };
+    Some((cx, cy - tao_y_bias))
+}
+
 /// 主显示器是否睡眠
 pub fn display_asleep() -> bool {
     unsafe { CGDisplayIsAsleep(CGMainDisplayID()) }
 }
 
-/// 设置窗口 frame（points）
+/// 主显示器高度（points）。CG 与 AppKit 两套全局坐标系的换算基准。
+fn primary_height() -> f64 {
+    unsafe { CGDisplayBounds(CGMainDisplayID()).size.height }
+}
+
+/// CG 全局坐标（左上原点、y 向下，`CGDisplayBounds` / 鼠标事件的坐标系）→
+/// AppKit 全局坐标（主屏左下原点、y 向上，`NSWindow.setFrame` 的坐标系）。
+///
+/// x 两套一致，只翻 y：`appkit_y = primary_h - cg_y - h`。
+/// 主屏自身恒得 0（`primary_h - 0 - primary_h`），所以只有**与主屏高度不同的屏**
+/// 会暴露这条换算 —— 少这一步时窗口整体上移 `primary_h - h` 个点：实测主屏 982、
+/// 副屏 1024 时副屏窗口落在 CG y=-42，副屏底部 42pt 露出系统壁纸（2026-10-01）。
+fn flip_frame_y(cg_y: f64, h: f64, primary_h: f64) -> f64 {
+    primary_h - cg_y - h
+}
+
+/// 设置窗口 frame。入参是 [`super::platform::ScreenInfo`] 的 CG 坐标系
+/// （x, y, w, h），内部翻成 AppKit 坐标系再交给 NSWindow。
 pub fn set_frame(window: &WebviewWindow, x: f64, y: f64, w: f64, h: f64) {
     let ptr = match window.ns_window() {
         Ok(p) if !p.is_null() => p,
         _ => return,
     };
+    let y = flip_frame_y(y, h, primary_height());
     unsafe {
         if let Some(win) = retain_window(ptr) {
             win.setFrame_display(
@@ -376,6 +423,13 @@ pub fn apply_desktop_window<R: Runtime>(
         }
     };
     let level = target_window_level(interactive);
+    // frame 是 CG 坐标系（见 set_frame 注释），NSWindow 要 AppKit 坐标系
+    let frame = (
+        frame.0,
+        flip_frame_y(frame.1, frame.3, primary_height()),
+        frame.2,
+        frame.3,
+    );
     unsafe {
         if let Some(win) = retain_window(ptr) {
             win.setLevel(level as isize);
@@ -1031,4 +1085,30 @@ fn on_frontmost_changed(app: &tauri::AppHandle, bundle_id: &str, own_bundle: &st
     };
     super::pointer::set_desktop_active(is_desktop);
     recheck_with(app, Mode::Hint, kind);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CG（左上原点）→ AppKit（主屏左下原点）的 y 翻转换算。
+    /// 主屏自身恒 0；副屏与主屏等高时也与旧行为一致（0）；高度不同才是这条的
+    /// 用武之地 —— 2026-10-01 实测：主屏 982 / 副屏 1024 时窗口落在 CG y=-42。
+    #[test]
+    fn flip_frame_y_maps_cg_top_left_to_appkit_bottom_left() {
+        // 主屏：cg_y=0，h=主屏高 → 0（换算前后都不动）
+        assert_eq!(flip_frame_y(0.0, 982.0, 982.0), 0.0);
+        // 与主屏等高的副屏（左右排布）：cg_y=0 → 0，与旧行为一致
+        assert_eq!(flip_frame_y(0.0, 982.0, 982.0), 0.0);
+        // 更高的副屏：CG y=0，h=1024，主屏 982 → -42（窗口底边落到主屏底边之下）
+        assert_eq!(flip_frame_y(0.0, 1024.0, 982.0), -42.0);
+        // 更矮的副屏：CG y=0，h=900 → +82
+        assert_eq!(flip_frame_y(0.0, 900.0, 982.0), 82.0);
+        // 位于主屏上方（CG y<0）的副屏：1024 高、cg_y=-1024 → 982
+        assert_eq!(flip_frame_y(-1024.0, 1024.0, 982.0), 982.0);
+        // 换算不变量：窗口在 CG 空间的上下边与 AppKit 空间一一对应
+        let (cg_y, h, ph) = (120.0, 1080.0, 982.0);
+        let ay = flip_frame_y(cg_y, h, ph);
+        assert_eq!(ph - (ay + h), cg_y, "反算回 CG y 应还原");
+    }
 }

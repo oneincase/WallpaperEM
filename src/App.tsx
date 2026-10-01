@@ -9,6 +9,7 @@ import { SharesPage } from "./pages/Shares";
 import { HotkeysPage } from "./pages/Hotkeys";
 import { SettingsPage } from "./pages/Settings";
 import { TopBar, type PageId } from "./components/TopBar";
+import { ApplyTargetBanner } from "./components/ApplyTargetBanner";
 import { GuardDialogs } from "./components/GuardDialogs";
 import { ResizeHandles } from "./components/ResizeHandles";
 import { useWallpaperBackdrop } from "./hooks/useWallpaperBackdrop";
@@ -148,6 +149,10 @@ function Shell() {
       />
 
       <TopBar activeId={detailId ? null : page} onNavigate={navigate} />
+
+      {/* 应用目标锁定提示：armed 是全局状态，横幅跟着全局走（工坊/详情页点
+          「应用」也只落锁定的那块屏，不能只有库页看得见） */}
+      <ApplyTargetBanner />
 
       <div className="relative z-10 flex-1 flex flex-col min-h-0">
         {page === "workshop" ? (

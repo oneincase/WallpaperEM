@@ -1,9 +1,10 @@
 // 库页底部的显示器坞：鼠标扫到屏幕底边即从下方滑出，列出当前连接的显示器。
 //
-// 它承接了原「显示器」页的全部日常操作，所以那一页已移除：
+// 它承接了原「显示器」页的全部日常操作，所以那一页已移除；也是「应用到哪块屏」的
+// **唯一**入口（2026-10-01 取消应用时的目标弹层菜单）：
 //   - 选屏应用：点卡片 = 锁定应用目标（复用 lib/apply-target 的 armed 机制），
 //     之后在网格里点任意壁纸「应用」就只落这一屏；再点一次卡片取消。
-//   - 统一 / 独立模式切换（settings_set display_mode）
+//   - 统一 / 独立模式切换（settings_set display_mode；默认统一）
 //   - 每屏的轮播绑定（displayBindingSet）/ 清除该屏壁纸（wallpaperStop）
 // 原页面里的布局缩略图舞台没有搬过来 —— 卡片列表已经表达了「哪块屏、什么壁纸」，
 // 舞台只是同一信息的可视化重排。
@@ -141,7 +142,10 @@ export function DisplayDock({
               </span>
 
               {!single && (
-                <div className="flex items-center gap-0.5 rounded-lg border border-[var(--separator)] p-0.5">
+                // 分段控件样式与设置页「画质档位」同一套（选中 = 玻璃白填充 + 白字，
+                // 未选 = 内容底 + 次级文字）：此前选中态用的是 --accent-strong（近白实色）
+                // 配白字，白底白字几乎读不出来（2026-10-01 用户截图反馈）。
+                <div className="flex overflow-hidden rounded-lg border border-[var(--separator)]">
                   {(
                     [
                       ["unified", tr("统一模式")],
@@ -150,16 +154,18 @@ export function DisplayDock({
                   ).map(([m, label]) => (
                     <button
                       key={m}
+                      type="button"
+                      aria-pressed={mode === m}
                       title={
                         m === "unified"
-                          ? tr("应用壁纸时同步替换所有显示器的壁纸")
-                          : tr("每块屏可以各自设置壁纸与轮播")
+                          ? tr("统一模式（默认）：轮播列表驱动所有屏；单独设过壁纸的屏除外")
+                          : tr("独立模式：只有各屏自己绑定的列表会轮播，全局列表不驱动任何屏")
                       }
                       onClick={() => void setMode(m)}
-                      className={`rounded-md px-2 py-0.5 text-[11.5px] transition-colors ${
+                      className={`px-3 py-1 text-[12px] transition-colors ${
                         mode === m
-                          ? "bg-[var(--accent-strong)] text-white"
-                          : "text-[var(--text-2)] hover:bg-[var(--glass-hover)]"
+                          ? "bg-[var(--accent-fill)] text-white"
+                          : "bg-[var(--content)] text-[var(--text-2)] hover:text-[var(--text)]"
                       }`}
                     >
                       {label}
@@ -171,7 +177,9 @@ export function DisplayDock({
               <span className="text-[11.5px] text-[var(--text-2)]">
                 {single
                   ? tr("仅检测到一块显示器")
-                  : tr("选中一块屏后，在库里点「应用」就只设置该屏")}
+                  : armed
+                    ? tr("已锁定「{name}」：在库里点「应用」只设置该屏", { name: armed.name })
+                    : tr("点卡片锁定一块屏；不锁定则在库里点「应用」= 全部屏")}
               </span>
 
               {armed && (
@@ -274,10 +282,16 @@ export function DisplayDock({
                       </div>
                       <div className="truncate text-[11px] text-[var(--text-2)]">
                         {d.title ?? tr("未设置壁纸")}
-                        {d.binding && (
+                        {d.binding ? (
                           <span className="ml-1 text-[var(--accent-strong)]">
                             · {tr("轮播")} {d.binding.index + 1}/{d.binding.total}
                           </span>
+                        ) : (
+                          d.pinned && (
+                            <span className="ml-1" title={tr("已单独设置：统一列表不会再换这块屏")}>
+                              · {tr("固定")}
+                            </span>
+                          )
                         )}
                       </div>
                     </div>
@@ -310,7 +324,9 @@ export function DisplayDock({
             onClick={() => void bind(bindAt.d, null)}
           >
             <span>{tr("不轮播（固定当前壁纸）")}</span>
-            {bindAt.d.binding == null && (
+            {/* 勾选看 pinned 而非 binding == null：没绑定 ≠ 不轮播，没单独设置过的
+                屏正跟着统一列表走（会换纸），勾上「不轮播」就是睁眼说瞎话 */}
+            {bindAt.d.pinned && (
               <span className="text-[11px] text-[var(--accent-strong)]">✓</span>
             )}
           </button>

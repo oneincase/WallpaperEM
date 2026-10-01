@@ -559,9 +559,10 @@ fn stop_sessions_for(app: &AppHandle, item_id: &str) -> Result<(), String> {
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?
     };
-    // 释放锁后再停止（stop 内部要跑主线程，避免持锁等待）
+    // 释放锁后再停止（stop 内部要跑主线程，避免持锁等待）。条目已删 = 不走
+    // 「用户清除」语义：该屏若在轮播里，下一个间隔自然换到别的条目
     for d in applied_displays {
-        let _ = wallpaper::stop(app.clone(), Some(d));
+        let _ = wallpaper::stop_after_item_gone(app.clone(), Some(d));
     }
     Ok(())
 }
@@ -660,7 +661,7 @@ pub fn library_prune(app: AppHandle) -> Result<Vec<String>, String> {
         out
     };
     for d in stale_displays {
-        let _ = wallpaper::stop(app.clone(), Some(d));
+        let _ = wallpaper::stop_after_item_gone(app.clone(), Some(d));
     }
 
     let conn = db.lock().map_err(|e| e.to_string())?;

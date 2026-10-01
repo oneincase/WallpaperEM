@@ -24,7 +24,7 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
   const [showProps, setShowProps] = useState(false);
   const [showShare, setShowShare] = useState(false);
   const { appliedItems, downloadedItems, refreshApplied } = useWallpaperMeta();
-  const { apply: applyWithTarget, menuNode: applyMenu } = useApplyWallpaper();
+  const { apply: applyWithTarget } = useApplyWallpaper();
   // 作者名片（Steam 资料页解析）；解析失败回退显示裸 SteamID64
   const [authorName, setAuthorName] = useState<string | null>(null);
 
@@ -169,13 +169,12 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
               {applied ? (
                 <button
                   className="btn !bg-green-500/15 !text-green-400 !border-green-500/30 hover:opacity-80"
-                  title={tr("已应用到桌面（可点击重新应用或指定屏）")}
-                  onClick={async (e) => {
+                  title={tr("已应用到桌面（可点击重新应用）")}
+                  onClick={async () => {
                     setApplying(true);
                     try {
-                      const r = await applyWithTarget(item.id, e.currentTarget);
-                      // 停止某屏播放同样要刷新（条目可能退出已应用集合）
-                      if (r !== "cancelled") await refreshApplied();
+                      await applyWithTarget(item.id);
+                      await refreshApplied();
                     } catch (err) {
                       msg.error(String(err));
                     } finally {
@@ -190,11 +189,11 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
                   className="btn"
                   disabled={applying}
                   title={tr("需先下载到本地库")}
-                  onClick={async (e) => {
+                  onClick={async () => {
                     setApplying(true);
                     try {
-                      const r = await applyWithTarget(item.id, e.currentTarget);
-                      if (r !== "cancelled") await refreshApplied();
+                      await applyWithTarget(item.id);
+                      await refreshApplied();
                     } catch (err) {
                       msg.error(String(err));
                     } finally {
@@ -272,7 +271,6 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
         />
       )}
 
-      {applyMenu}
     </div>
   );
 }

@@ -935,6 +935,21 @@ fn monitor_scale_at(px: i32, py: i32) -> Option<f64> {
         .map(|m| m.scale)
 }
 
+/// 光标所在的显示器 id（「当前屏幕」）。
+///
+/// 用 `GetCursorPos` 的**物理像素**再喂 [`hit_screen_id`]（它按物理矩形命中）——
+/// 不要图省事用 [`cursor_state`]：那个已按 scale 化成逻辑坐标，在缩放 ≠100% 的
+/// 屏上会和物理矩形错配。
+pub fn cursor_display_id() -> Option<u32> {
+    let mut p = POINT { x: 0, y: 0 };
+    unsafe {
+        GetCursorPos(&mut p).ok()?;
+    }
+    // 缓存可能还没被监控 tick 填过（首次查询早于壁纸窗口出现）：先补一次
+    let _ = active_screens();
+    hit_screen_id(p.x as f64, p.y as f64)
+}
+
 /// 全局物理像素点（GetCursorPos / 低级钩子坐标）落在哪台显示器，返回其 id。
 /// 滚轮派发用；不在任何屏内返回 None（这次事件丢弃）。
 pub fn hit_screen_id(x: f64, y: f64) -> Option<u32> {
@@ -946,6 +961,19 @@ pub fn hit_screen_id(x: f64, y: f64) -> Option<u32> {
     mons.iter()
         .find(|m| xi >= m.px.0 && xi < m.px.0 + m.px.2 && yi >= m.px.1 && yi < m.px.1 + m.px.3)
         .map(|m| m.info.id)
+}
+
+/// 主窗口中心点（**物理**像素、虚拟桌面坐标系），供 [`hit_screen_id`] 命中测试
+/// （它按物理矩形命中）。tao 的 `outer_position`/`outer_size` 在 Win32 就是
+/// GetWindowRect 的物理坐标 —— 不能除 scale：那是逻辑坐标，缩放 ≠100% 的屏上
+/// 会和物理矩形错配、认错屏或命不中。
+pub fn window_hit_point<R: Runtime>(window: &WebviewWindow<R>) -> Option<(f64, f64)> {
+    let pos = window.outer_position().ok()?;
+    let size = window.outer_size().ok()?;
+    Some((
+        pos.x as f64 + size.width as f64 / 2.0,
+        pos.y as f64 + size.height as f64 / 2.0,
+    ))
 }
 
 /// 未被 Windows 后端使用的占位：`GetForegroundWindow` 供排障日志用

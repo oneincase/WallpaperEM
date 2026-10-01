@@ -687,6 +687,8 @@ export interface DisplayInfo {
   previewUrl: string | null;
   /** 该屏的轮播绑定（未绑定为 null） */
   binding: DisplayBinding | null;
+  /** 手动固定：该屏被单独设过壁纸/选过「不轮播」，统一列表不刷它 */
+  pinned?: boolean;
 }
 
 export interface DisplaysListResult {

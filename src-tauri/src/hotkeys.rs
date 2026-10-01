@@ -583,13 +583,31 @@ pub fn dispatch(app: &AppHandle, action: &str) {
                 }
                 return;
             }
-            match crate::wallpaper::active_items(app.clone()) {
-                Ok(ids) if !ids.is_empty() => {
-                    if let Err(e) = crate::props_window::open(app, &ids[0]) {
-                        tracing::warn!("hotkey open props: {e}");
+            // 与托盘「壁纸设置」同一条目标解析：**当前屏幕**（光标所在屏）当前挂的
+            // 壁纸 —— 不是 active_items()[0]（多屏时经常是另一块屏的），面板也摆在
+            // 那块屏上（见 wallpaper::current_screen / props_window::open_at）。
+            match crate::wallpaper::current_screen(app) {
+                Some(cs) => match cs.item_id {
+                    Some(item) => {
+                        tracing::info!(
+                            "hotkey open props: 当前屏幕「{}」（{}）→ 壁纸 {item}",
+                            cs.name,
+                            cs.id
+                        );
+                        if let Err(e) = crate::props_window::open_at(app, &item, Some(cs.frame)) {
+                            tracing::warn!("hotkey open props: {e}");
+                        }
                     }
-                }
-                _ => crate::main_window::ensure_main_window(app),
+                    None => {
+                        tracing::info!(
+                            "hotkey open props: 当前屏幕「{}」（{}）没有壁纸，唤起主窗口",
+                            cs.name,
+                            cs.id
+                        );
+                        crate::main_window::ensure_main_window(app);
+                    }
+                },
+                None => crate::main_window::ensure_main_window(app),
             }
         }
         "toggle_pause" => {

@@ -142,17 +142,14 @@ export function WorkshopPage({ onOpenDetail }: { onOpenDetail: (id: string) => v
   );
 
   /** 卡片上的快捷应用（已下载条目） */
-  const { apply: applyWithTarget, menuNode: applyMenu } = useApplyWallpaper();
+  const { apply: applyWithTarget } = useApplyWallpaper();
   const quickApply = useCallback(
-    async (id: string, anchor?: HTMLElement) => {
+    async (id: string) => {
       try {
-        const r = await applyWithTarget(id, anchor);
-        // 应用后重取权威集合（与本地库页同一纪律）；目标菜单被点掉时不报成功，
-        // 「stopped」= 停了某屏播放（桌面变化本身就是反馈，不弹「已应用」）
-        if (r !== "cancelled") {
-          await refreshApplied();
-          if (r === "done") msg.success(tr("已应用到桌面"));
-        }
+        await applyWithTarget(id);
+        // 应用后重取权威集合（与本地库页同一纪律）
+        await refreshApplied();
+        msg.success(tr("已应用到桌面"));
       } catch (e) {
         msg.error(String(e));
       }
@@ -516,7 +513,7 @@ export function WorkshopPage({ onOpenDetail }: { onOpenDetail: (id: string) => v
                         className="rounded-md p-0.5 text-[var(--accent-strong)] transition-colors hover:bg-[var(--glass-hover)]"
                         title={tr("应用到桌面")}
                         aria-label={tr("应用到桌面")}
-                        onClick={(e) => void quickApply(item.id, e.currentTarget)}
+                        onClick={() => void quickApply(item.id)}
                       >
                         <CardActionIcon kind="apply" />
                       </button>
@@ -538,7 +535,6 @@ export function WorkshopPage({ onOpenDetail }: { onOpenDetail: (id: string) => v
           />
         )}
       </div>
-      {applyMenu}
     </div>
   );
 }

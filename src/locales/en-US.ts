@@ -755,46 +755,42 @@ export const EN_US: Record<string, string> = {
     "Manage each display's wallpaper individually; “Change wallpaper” targets only that screen",
   "统一模式": "Unified mode",
   "独立模式": "Independent mode",
-  "统一模式：应用壁纸时同步替换所有显示器的壁纸":
-    "Unified: applying a wallpaper replaces it on all displays",
-  "独立模式：每块屏可各自指定壁纸（与后续各自的切换列表）；点「应用」时选择目标屏":
-    "Independent: each display gets its own wallpaper (and playlist later); pick a target display when applying",
+  "统一模式（默认）：轮播列表驱动所有屏；单独设过壁纸的屏除外":
+    "Unified (default): a playlist drives every display, except the ones you set individually",
+  "独立模式：只有各屏自己绑定的列表会轮播，全局列表不驱动任何屏":
+    "Independent: only playlists bound to a screen rotate; the global playlist drives nothing",
   "已切换到统一模式": "Switched to unified mode",
   "已切换到独立模式": "Switched to independent mode",
   "全部停止": "Stop all",
   "已停止全部壁纸": "All wallpapers stopped",
   "未检测到显示器": "No displays detected",
   "仅检测到一块显示器": "Only one display detected",
-  "选中一块屏后，在库里点「应用」就只设置该屏":
-    "Pick a display, then hit Apply on any wallpaper to set that screen only",
+  "已锁定「{name}」：在库里点「应用」只设置该屏":
+    "“{name}” locked — hitting Apply in the library sets that screen only",
+  "点卡片锁定一块屏；不锁定则在库里点「应用」= 全部屏":
+    "Click a card to lock one screen; with none locked, Apply in the library targets every screen",
   "取消选择「{name}」": "Clear selection “{name}”",
   "已选中": "Selected",
   "清除该屏壁纸": "Clear this screen's wallpaper",
   "为该屏选择轮播列表": "Pick a playlist to rotate on this screen",
-  "应用壁纸时同步替换所有显示器的壁纸":
-    "Applying a wallpaper replaces it on every display at once",
-  "每块屏可以各自设置壁纸与轮播": "Each screen can have its own wallpaper and playlist",
   "「{name}」的轮播": "Playlist for “{name}”",
   "不轮播（固定当前壁纸）": "No rotation (pin the current wallpaper)",
   "还没有切换列表 —— 先在本地库顶部新建一个":
     "No playlists yet — create one at the top of the library first",
   "显示器布局": "Display layout",
   "主屏": "Primary",
+  "当前": "Current",
   "当前：{title}": "Current: {title}",
   "未设置壁纸": "No wallpaper set",
+  "固定": "Pinned",
+  "已单独设置：统一列表不会再换这块屏":
+    "Set individually — the global playlist will not change this screen",
   "更换壁纸": "Change wallpaper",
   "同步到所有屏": "Sync to all displays",
   "已同步到所有显示器": "Synced to all displays",
-  "应用到哪块屏？": "Apply to which display?",
-  "统一应用": "Apply to all",
-  "全部显示器": "All displays",
-  "上次": "Last used",
-  "播放中": "Playing",
-  "点击停止该屏的壁纸播放": "Click to stop playback on this display",
   "正在为「{name}」选择壁纸 —— 点「应用」只设置该屏":
     "Choosing a wallpaper for “{name}” — clicking apply sets only that screen",
-  "已应用到桌面（可点击重新应用或指定屏）":
-    "Applied to desktop (click to re-apply or target a display)",
+  "已应用到桌面（可点击重新应用）": "Applied to desktop (click to re-apply)",
   "切换列表": "Playlists",
   "新建": "New",
   "轮播": "Slideshow",
@@ -1652,6 +1648,8 @@ export const EN_US_BACKEND: Record<string, string> = {
   "播放列表不存在": "The playlist does not exist",
   "播放列表为空": "The playlist is empty",
   "未激活播放列表": "No playlist is active",
+  "统一列表没有目标屏：所有屏都已被单独设置":
+    "The global playlist has no target: every display is set individually",
 
   // MCP 服务（设置页展示的状态/错误；HTTP 面的响应体是给 AI 客户端看的，不在此列）
   "端口 {port} 绑定失败: {last}": "Failed to bind port {}: {}",
@@ -2000,6 +1998,16 @@ export const EN_US_BACKEND: Record<string, string> = {
   "滤镜效果": "Filter",
   "退出": "Quit",
   "轮播：未启用": "Slideshow: off",
+  // 托盘「显示器」子菜单（每屏一项；与界面表同名的几条这里也要镜像）
+  "显示器": "Displays",
+  "主屏": "Primary",
+  "当前": "Current",
+  "未设置壁纸": "No wallpaper set",
+  "壁纸设置…": "Wallpaper Settings…",
+  "轮播列表": "Slideshow playlist",
+  "不轮播（固定当前壁纸）": "No rotation (pin the current wallpaper)",
+  "清除壁纸": "Clear Wallpaper",
+  "未检测到显示器": "No displays detected",
   "壁纸": "Wallpapers",
   "文件": "Files",
 

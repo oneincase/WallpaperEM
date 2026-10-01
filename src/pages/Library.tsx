@@ -59,7 +59,6 @@ import { WorkshopWebUploadModal } from "../components/WorkshopWebUploadModal";
 import { VirtualGrid } from "../components/VirtualGrid";
 import { DisplayDock } from "../components/DisplayDock";
 import { useApplyWallpaper } from "../hooks/useApplyWallpaper";
-import { cancelApplyTarget, useArmedApplyTarget } from "../lib/apply-target";
 import { tr, trMsg } from "../lib/i18n";
 
 /** 筛选条件持久化：窗口会在内存压力下被回收重建（全新 JS 上下文），不落盘的话
@@ -350,8 +349,7 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
     loadApplied();
   }, [loadApplied]);
 
-  const { apply: applyWithTarget, menuNode: applyMenu } = useApplyWallpaper();
-  const armedTarget = useArmedApplyTarget();
+  const { apply: applyWithTarget } = useApplyWallpaper();
 
   // ---- 切换列表（并入本地库：chips 筛选 + 卡片选中批量加入，全程无弹框）----
   const [playlists, setPlaylists] = useState<Playlist[]>([]);
@@ -536,12 +534,12 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
     );
     setPicked(new Set());
   };
-  const apply = async (itemId: string, anchor?: HTMLElement) => {
+  const apply = async (itemId: string) => {
     try {
-      const r = await applyWithTarget(itemId, anchor);
-      // 应用/停止后须重取权威的已应用集合（多屏时可同时有多条「已应用」，
-      // 停掉一屏也会让条目退出集合），否则旧状态残留（前端只 add 不删除旧 id）。
-      if (r !== "cancelled") await loadApplied();
+      await applyWithTarget(itemId);
+      // 应用后须重取权威的已应用集合（多屏时可同时有多条「已应用」），
+      // 否则旧状态残留（前端只 add 不删除旧 id）。
+      await loadApplied();
     } catch (e) {
       msg.error(String(e));
     }
@@ -609,17 +607,6 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
           <span className="rounded-lg bg-[var(--content)] px-4 py-2 text-[13px] font-medium shadow-lg">
             {tr("松开导入壁纸（支持文件与文件夹，可多个）")}
           </span>
-        </div>
-      )}
-      {/* 显示器坞「更换壁纸」锁定的目标屏提示（应用后或点取消自动解除） */}
-      {armedTarget && (
-        <div className="mb-3 flex shrink-0 items-center gap-2 rounded-lg border border-[var(--accent-strong)]/40 bg-[var(--accent)]/10 px-3 py-1.5 text-[12.5px]">
-          <span className="flex-1 truncate">
-            {tr("正在为「{name}」选择壁纸 —— 点「应用」只设置该屏", { name: armedTarget.name })}
-          </span>
-          <button className="btn !py-0.5 text-[11.5px]" onClick={cancelApplyTarget}>
-            {tr("取消")}
-          </button>
         </div>
       )}
       {/* 工具栏 */}
@@ -1099,15 +1086,15 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
                   ) : appliedItems.has(item.itemId) ? (
                     <button
                       className="flex items-center justify-center rounded-lg border border-green-500/30 px-0.5 py-1 !text-green-400 bg-green-500/10 hover:opacity-80"
-                      onClick={(e) => void apply(item.itemId, e.currentTarget)}
-                      data-tip={tr("已应用到桌面（可点击重新应用或指定屏）")}
+                      onClick={() => void apply(item.itemId)}
+                      data-tip={tr("已应用到桌面（可点击重新应用）")}
                     >
                       <IconApply />
                     </button>
                   ) : (
                     <button
                       className="flex items-center justify-center rounded-lg border border-[var(--accent-strong)] px-0.5 py-1 text-[var(--accent-fg)] bg-[var(--accent)] hover:opacity-90"
-                      onClick={(e) => void apply(item.itemId, e.currentTarget)}
+                      onClick={() => void apply(item.itemId)}
                       data-tip={tr("应用到桌面")}
                     >
                       <IconApply />
@@ -1429,7 +1416,6 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
         />
       )}
 
-      {applyMenu}
 
       {/* 底部显示器坞：鼠标扫到屏幕底边滑出。它已承接原「显示器」页的日常操作
           （选屏应用 / 统一独立模式 / 每屏轮播绑定），所以那一页已移除 */}

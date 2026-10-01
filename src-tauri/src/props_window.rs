@@ -10,8 +10,21 @@
 
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 
-/// 打开（或聚焦）某壁纸的独立设置窗口。
-pub fn open(app: &AppHandle, item_id: &str) -> tauri::Result<()> {
+/// 打开（或聚焦）某壁纸的独立设置窗口并摆到指定显示器上（`screen` = 该屏的逻辑帧 `(x, y, w, h)`，
+/// 坐标系同 [`crate::wallpaper::platform::ScreenInfo`]）。
+///
+/// 为什么要指定屏：托盘/快捷键的「壁纸设置」取的是**光标所在屏**的壁纸（见
+/// wallpaper::current_screen），面板就该出现在那块屏上 —— 否则多屏用户点了
+/// 副屏的菜单，面板却跑到主屏，还得回头找。
+///
+/// 匹配方式：按帧原点比对 Tauri 的显示器表（`position()/scale` 与 ScreenInfo
+/// 同为「逻辑坐标、左上原点」，各平台后端都按这个口径换算）；找不到目标屏
+/// （拔了/坐标系对不上）退回主屏，不报错。
+pub fn open_at(
+    app: &AppHandle,
+    item_id: &str,
+    screen: Option<(f64, f64, f64, f64)>,
+) -> tauri::Result<()> {
     let label = format!("props-{item_id}");
 
     // 已存在：取消最小化、显示、聚焦，不重复开窗
@@ -19,6 +32,10 @@ pub fn open(app: &AppHandle, item_id: &str) -> tauri::Result<()> {
         let _ = w.unminimize();
         let _ = w.show();
         let _ = w.set_focus();
+        // 已经开着时也把窗口挪到目标屏（从托盘另一块屏的入口进来时会走到这）
+        if let Some((x, y)) = side_pos_on(app, screen) {
+            let _ = w.set_position(tauri::LogicalPosition::new(x, y));
+        }
         return Ok(());
     }
 
@@ -26,15 +43,7 @@ pub fn open(app: &AppHandle, item_id: &str) -> tauri::Result<()> {
     let url = format!("props.html?item={}", urlencode(item_id));
     // 位置：贴屏幕右侧、垂直居中 —— 页面带 props-slide 从右缘滑入的动画
     // （index.css），两者配合 = 「从右侧向左划出」的设置面板。
-    // builder.position 吃逻辑坐标：监视器几何是物理像素，除以 scale 换算
-    let side_pos: Option<(f64, f64)> = app.primary_monitor().ok().flatten().map(|m| {
-        let scale = m.scale_factor();
-        let (mp, ms) = (m.position().clone(), m.size().clone());
-        let lw = ms.width as f64 / scale;
-        let lh = ms.height as f64 / scale;
-        let (ox, oy) = (mp.x as f64 / scale, mp.y as f64 / scale);
-        (ox + lw - (620.0 + 24.0), oy + (lh - 640.0) / 2.0)
-    });
+    let side_pos: Option<(f64, f64)> = side_pos_on(app, screen);
     let mut builder = WebviewWindowBuilder::new(app, &label, WebviewUrl::App(url.into()))
         // 原生标题栏文案（页面里的 document.title 由 props-main.tsx 自己设）
         .title(crate::i18n::tr("壁纸设置"))
@@ -96,6 +105,44 @@ pub fn open(app: &AppHandle, item_id: &str) -> tauri::Result<()> {
         });
     }
     Ok(())
+}
+
+/// 面板落点：目标屏（`screen` = 逻辑帧，见 [`open_at`]）的右侧、垂直居中；
+/// 目标屏缺失/匹配不上时退回主屏。返回逻辑坐标（builder.position 的口径）。
+fn side_pos_on(app: &AppHandle, screen: Option<(f64, f64, f64, f64)>) -> Option<(f64, f64)> {
+    /// 屏幕右缘留 24pt，面板宽 620；垂直居中（面板高 640）
+    const PANEL_W: f64 = 620.0;
+    const PANEL_H: f64 = 640.0;
+    const MARGIN: f64 = 24.0;
+
+    // 监视器几何是物理像素：除以 scale 换回逻辑坐标（与 ScreenInfo 同口径）
+    let logical = |m: &tauri::Monitor| {
+        let scale = m.scale_factor();
+        let (p, s) = (m.position(), m.size());
+        (
+            p.x as f64 / scale,
+            p.y as f64 / scale,
+            s.width as f64 / scale,
+            s.height as f64 / scale,
+        )
+    };
+    let monitors = app.available_monitors().unwrap_or_default();
+    let target = screen.and_then(|(tx, ty, _, _)| {
+        monitors
+            .iter()
+            .map(|m| (m, logical(m)))
+            // 原点比对即可（同一时刻同一位置不会有两块屏）；1pt 容差吃掉取整差
+            .find(|(_, (x, y, _, _))| (x - tx).abs() < 1.0 && (y - ty).abs() < 1.0)
+            .map(|(_, l)| l)
+    });
+    let (ox, oy, lw, lh) = match target {
+        Some(l) => l,
+        None => {
+            let m = app.primary_monitor().ok().flatten()?;
+            logical(&m)
+        }
+    };
+    Some((ox + lw - (PANEL_W + MARGIN), oy + (lh - PANEL_H) / 2.0))
 }
 
 /// 最小 URL 编码：itemId 是工坊 ID（数字或本地导入目录名），只需要防少数
