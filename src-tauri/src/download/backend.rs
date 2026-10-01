@@ -564,6 +564,19 @@ impl Backend {
         }
     }
 
+    /// 登录态是否**真的**还在（不只是我们写下的乐观标记）。
+    ///
+    /// - steamcmd：令牌写在被重定向 HOME 的 `config.vdf`（Steam 自己维护的格式），
+    ///   检查成本高、历史上也没出过「标记与实况不符」→ 直接信标记
+    /// - DepotDownloader：令牌是隔离目录里的一枚 `account.config`，一眼可查；
+    ///   查不到就带上密码走密码登录，别让任务卡在「请输入密码」上
+    pub fn has_stored_session(&self) -> bool {
+        match self {
+            Self::SteamCmd(_) => true,
+            Self::DepotDownloader(b) => b.has_stored_session(),
+        }
+    }
+
     /// 子进程输出的「未换行尾部」是否是需要用户输入的提示
     pub fn prompt_detector(&self) -> fn(&str) -> bool {
         match self {

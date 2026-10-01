@@ -3,10 +3,11 @@
 //! 与 `backend.rs`（steamcmd）并列，可被设置页切换。与 steamcmd 的差异，
 //! 全部来自读上游源码 + 本机实测（DepotDownloader 3.4.0，.NET 9 单文件）：
 //!
-//! - **没有 `-configdir`**：登录令牌落在 .NET 的 IsolatedStorage（按程序集隔离，
-//!   根目录由 HOME / XDG_DATA_HOME 推导），`account.config` 则按**相对 CWD** 读写。
-//!   所以隔离方式是「重定向 HOME + 把子进程 CWD 设到应用目录」，见 `extra_env`
-//!   与 `current_dir`。
+//! - **没有 `-configdir`**：登录令牌落在 .NET 的 IsolatedStorage（按程序集隔离），
+//!   `account.config` 则按**相对 CWD** 读写。隔离它要按平台各给一个环境变量
+//!   （macOS 得用 `CFFIXED_USER_HOME` —— `HOME` 对 CoreFoundation 路径解析无效，
+//!   实测令牌会漏进真实用户库），外加把子进程 CWD 设到应用目录：
+//!   见 `extra_env` 与 `current_dir`。
 //! - **有进度输出**：逐文件 ` 99.66% /path/file`（宽度 6 的百分比 + 路径），
 //!   不像 steamcmd 那样全程静默，故进度直接来自输出而不是轮询目录体积。
 //! - **退出码可信**：失败路径 `return 1`，成功正常退出（steamcmd 在 macOS 上
@@ -65,8 +66,18 @@ impl DepotDl {
         self.bin.is_file()
     }
 
-    /// 隔离登录态：`HOME`（macOS/Linux）/ `USERPROFILE`（Windows）+ `XDG_DATA_HOME`。
-    /// 令牌在 .NET IsolatedStorage 里，根目录由这两者推导，双保险。
+    /// 隔离登录态用的环境变量。
+    ///
+    /// DD 的令牌存在 .NET 的 **IsolatedStorage** 里，根目录 = `LocalApplicationData/IsolatedStorage`，
+    /// 而这一步各平台的解析方式完全不同（2026-10-01 实测 + 读 dotnet/runtime 源码）：
+    ///
+    /// - **macOS**：走 CoreFoundation 的 `NSApplicationSupportDirectory`（`Interop.Sys.SearchPath`），
+    ///   **`HOME` 对它无效** —— 实测把 HOME 重定向到隔离目录后，令牌照样写进真实的
+    ///   `~/Library/Application Support/IsolatedStorage/…`（多级混淆目录，路径算不出来）。
+    ///   能覆盖它的是 `CFFIXED_USER_HOME`（CF 的官方家目录覆盖点，实测生效）。
+    /// - **Linux**：`$XDG_DATA_HOME` 或 `$HOME/.local/share`（源码明写），给 XDG 即可。
+    /// - **Windows**：`SHGetKnownFolderPath` 读注册表，改 `USERPROFILE` 无效 —— 这里隔离不了，
+    ///   只能靠登出时按时间窗清扫（见 [`sweep_token_dirs`]）。
     pub fn extra_env(&self) -> Vec<(String, OsString)> {
         let mut env = vec![(
             crate::download::steamcmd_install::home_env_key().to_string(),
@@ -76,6 +87,12 @@ impl DepotDl {
             "XDG_DATA_HOME".to_string(),
             self.home.join(".local").join("share").into_os_string(),
         ));
+        if cfg!(target_os = "macos") {
+            env.push((
+                "CFFIXED_USER_HOME".to_string(),
+                self.home.as_os_str().into(),
+            ));
+        }
         env
     }
 
@@ -259,11 +276,128 @@ impl DepotDl {
     pub fn trust_exit_code(&self) -> bool {
         true
     }
+
+    /// 隔离目录里是否真有登录令牌。
+    ///
+    /// 用来给「登录态标记」做体检：DB 里的 `depotdl_has_token` 只是我们上一次成功后写下的
+    /// 乐观标记，而令牌可能已经不在（用户删了目录、从没在这个位置登录过、Windows 上压根
+    /// 不落这儿）。令牌不在就把密码带上，让 DD 走一次密码登录（它自己会在拿到令牌后
+    /// 优先用令牌，不会多要一次验证码）。
+    pub fn has_stored_session(&self) -> bool {
+        token_store_present(&self.home)
+    }
+}
+
+/// `home` 下是否存在 DD 写的 `account.config`（IsolatedStorage 的叶子文件）。
+/// 深度封顶：`…/IsolatedStorage/<混淆>/<混淆>/Url.<hash>/AssemFiles/account.config`。
+pub fn token_store_present(home: &Path) -> bool {
+    fn walk(dir: &Path, depth: usize) -> bool {
+        if depth > 6 {
+            return false;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if walk(&p, depth + 1) {
+                    return true;
+                }
+            } else if p
+                .file_name()
+                .map(|n| n == "account.config")
+                .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+        false
+    }
+    walk(home, 0)
 }
 
 /// 无需构造实例的提示判定，供字节级读取器的 'static 闭包使用。
 pub fn is_prompt(tail: &str) -> bool {
     re(CODE_RE).is_match(tail) || re(MOBILE_RE).is_match(tail) || re(PASSWORD_RE).is_match(tail)
+}
+
+/// 平台上的 **真实** .NET IsolatedStorage 根（不是我们重定向后的那份）。
+///
+/// 只给登出清扫用：macOS/Linux 上令牌已经被环境变量关进应用目录（整目录随登出删除），
+/// Windows 上 `SHGetKnownFolderPath` 不听环境变量的，令牌就留在真实用户库 —— 这一份要单独扫。
+pub fn real_isolated_storage_root() -> Option<PathBuf> {
+    let home = if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)?
+    } else {
+        // .NET 在 Darwin 用 NSApplicationSupportDirectory，在 Linux 用 XDG/HOME
+        let xdg = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute());
+        match (cfg!(target_os = "macos"), xdg) {
+            (true, _) => dirs::home_dir()?
+                .join("Library")
+                .join("Application Support"),
+            (false, Some(p)) => p,
+            (false, None) => dirs::home_dir()?.join(".local").join("share"),
+        }
+    };
+    Some(home.join("IsolatedStorage"))
+}
+
+/// 扫描 IsolatedStorage 里**本次登录之后**被写过的 DD 令牌目录，返回其所属身份目录
+/// （`<…>/Url.<hash>`，即 `AssemFiles/account.config` 的父目录）。
+///
+/// 只认「目录结构 + 文件名 + 时间窗」三件事，不做任何路径猜测 —— IsolatedStorage 的
+/// 目录名是按机器密钥混淆过的，算不出来，所以按「我们自己刚写出来的那份」定位：
+/// 时间窗取我们记录的成功登录时刻（见 `depotdl_token_at`），别的 .NET 应用不会在这几秒里
+/// 恰好写一个同名文件。深度也封顶（`Url.*/AssemFiles/account.config` 是固定三层）。
+pub fn sweep_token_dirs(root: &Path, since: std::time::SystemTime) -> Vec<PathBuf> {
+    const TOKEN_FILE: &str = "account.config";
+    fn walk(dir: &Path, depth: usize, since: std::time::SystemTime, out: &mut Vec<PathBuf>) {
+        if depth > 4 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, depth + 1, since, out);
+            } else if p.file_name().map(|n| n == TOKEN_FILE).unwrap_or(false) {
+                let fresh = e
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .map(|t| t >= since)
+                    .unwrap_or(false);
+                if fresh {
+                    if let Some(owner) = p.parent().and_then(|f| f.parent()) {
+                        if !out.contains(&owner.to_path_buf()) {
+                            out.push(owner.to_path_buf());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, 0, since, &mut out);
+    out
+}
+
+/// 删掉这些身份目录里的令牌文件（`account.config` 及其所在的 `AssemFiles/`）。
+/// 返回删掉的目录数；失败只记日志，不打断登出。
+pub fn remove_token_dirs(dirs: &[PathBuf]) -> usize {
+    let mut n = 0;
+    for d in dirs {
+        if std::fs::remove_file(d.join("AssemFiles").join("account.config")).is_ok() {
+            let _ = std::fs::remove_dir(d.join("AssemFiles"));
+            let _ = std::fs::remove_dir(d);
+            n += 1;
+        }
+    }
+    n
 }
 
 /// 去掉 ANSI / OSC 控制序列（DD 在支持的终端上会写 `ESC]9;4;…BEL` 进度条指令，
@@ -506,6 +640,92 @@ mod tests {
     }
 
     #[test]
+    fn token_store_probe_finds_account_config_only() {
+        let d = std::env::temp_dir().join("wpem-depotdl-token-probe");
+        let _ = std::fs::remove_dir_all(&d);
+        // IsolatedStorage 的形态：<混淆>/<混淆>/Url.<hash>/AssemFiles/account.config
+        let leaf = d
+            .join("5gaj3azb.qtq")
+            .join("jep5swvl.5pu")
+            .join("Url.02eo5hacpemcgklat33fbjrszovmtsh3")
+            .join("AssemFiles");
+        std::fs::create_dir_all(&leaf).unwrap();
+        assert!(!token_store_present(&d), "没有令牌文件时应为 false");
+        std::fs::write(leaf.join("account.config"), b"x").unwrap();
+        assert!(token_store_present(&d));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn sweep_picks_fresh_token_dirs_and_removes_them() {
+        let root = std::env::temp_dir().join("wpem-depotdl-token-sweep");
+        let _ = std::fs::remove_dir_all(&root);
+        let mk = |name: &str| {
+            let leaf = root.join("obf1").join("obf2").join(name).join("AssemFiles");
+            std::fs::create_dir_all(&leaf).unwrap();
+            std::fs::write(leaf.join("account.config"), b"token").unwrap();
+            leaf.parent().unwrap().to_path_buf()
+        };
+        let mine = mk("Url.aaaa");
+        // 别的目录（结构不同）与别的文件名都不该被认领
+        std::fs::create_dir_all(
+            root.join("obf1")
+                .join("obf2")
+                .join("Other")
+                .join("AssemFiles"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("obf1")
+                .join("obf2")
+                .join("Other")
+                .join("AssemFiles")
+                .join("depot.config"),
+            b"x",
+        )
+        .unwrap();
+
+        // 时间窗在未来 → 全都不算「刚写出来的」
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(600);
+        assert!(sweep_token_dirs(&root, future).is_empty());
+        // 时间窗在过去（带 5 分钟余量，与登出路径同款算法）→ 认领并删除
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(300);
+        assert_eq!(sweep_token_dirs(&root, past), vec![mine.clone()]);
+        assert_eq!(remove_token_dirs(&[mine.clone()]), 1);
+        assert!(!mine.exists());
+        // 无关目录原样保留
+        assert!(root
+            .join("obf1")
+            .join("obf2")
+            .join("Other")
+            .join("AssemFiles")
+            .join("depot.config")
+            .is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn env_redirects_home_and_native_store() {
+        // 只断言「我们给了哪些键」：值故意取隔离目录本身，不碰真实家目录
+        let d = DepotDl {
+            bin: PathBuf::from("/tmp/depotdownloader/DepotDownloader"),
+            home: PathBuf::from("/tmp/depotdl-home"),
+        };
+        let env = d.extra_env();
+        let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(keys.contains(&crate::download::steamcmd_install::home_env_key()));
+        assert!(keys.contains(&"XDG_DATA_HOME"));
+        if cfg!(target_os = "macos") {
+            // macOS 上 .NET 走 CoreFoundation，HOME 无效，必须给 CFFIXED_USER_HOME
+            assert!(keys.contains(&"CFFIXED_USER_HOME"), "{keys:?}");
+        }
+        assert!(
+            !keys.contains(&"LOCALAPPDATA"),
+            "Windows 侧隔离不了，别给假的保证"
+        );
+    }
+
+    #[test]
     fn ansi_sequences_stripped() {
         assert_eq!(
             strip_ansi("\u{1b}]9;4;1;42\u{7}Downloading a.pkg"),
@@ -516,11 +736,7 @@ mod tests {
     }
 
     #[test]
-    fn env_redirects_home_and_xdg() {
-        let env = dd().extra_env();
-        let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
-        assert!(keys.contains(&crate::download::steamcmd_install::home_env_key()));
-        assert!(keys.contains(&"XDG_DATA_HOME"));
+    fn workdir_is_the_isolated_home() {
         assert_eq!(dd().current_dir(), Some(PathBuf::from("/tmp/depotdl-home")));
     }
 }

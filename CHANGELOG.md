@@ -93,6 +93,29 @@
 
 ### 🐛 修复 / Fixed
 
+- **DepotDownloader 的登录态现在真落在应用目录里，登出也真能清掉**（上一批刚上线的可切换
+  下载工具的收尾）。真机跑通后复盘的三个问题，一并修掉：
+  ① **macOS 上隔离失效**：DD 的令牌存在 .NET IsolatedStorage，根目录取
+  `LocalApplicationData/IsolatedStorage`，而 macOS 上这一步走 CoreFoundation 的
+  `NSApplicationSupportDirectory` —— **`HOME` 重定向对它无效**（实测：重定向后令牌照样写进真实的
+  `~/Library/Application Support/IsolatedStorage/…`）。补上 `CFFIXED_USER_HOME`（CF 的官方家目录
+  覆盖点）后实测令牌落进应用目录、真家目录零新增；Linux 侧 `XDG_DATA_HOME` 本来就有效。
+  Windows 侧 `SHGetKnownFolderPath` 读注册表、同样不认环境变量，隔离不了 —— 改为「登出时按
+  上次登录时刻当时间窗」精确清扫（只认 `account.config` 这一固定文件名与
+  `…/AssemFiles/` 结构，深度封顶，不会误伤别的 .NET 应用）。
+  ② **登录态标记会撒谎**：`depotdl_has_token` 只是上次成功后写下的乐观标记，令牌不在时会让任务
+  卡在「请输入密码」并谎报「登录态已失效」。现在取密码前会先体检隔离目录里是否真有
+  `account.config`（steamcmd 侧格式复杂、历史上没出过错，仍按标记走），查不到就带密码走一次
+  密码登录（DD 拿到令牌后自己会优先用令牌，不会多要验证码）。这条也顺带让这次改动**平滑升级**：
+  老位置留下的令牌用不上时，下次下载会自己用密码重新登录，无需用户手动重配。
+  ③ 记录「最近一次成功登录时刻」（`download_token_at`），登出时清掉它。
+  真机证据：用户账号实测连续 17 单全部成功（03:48 首单命中手机确认 → 我们新增的
+  `MobileConfirm` 提示生效 → 之后 16 单零交互，令牌复用正常）；改后用应用同款环境变量组合再跑，
+  隔离目录出现 `IsolatedStorage/…/Url.<hash>`、真家目录无新增。
+  注意：这次修复**之前**已经写在真实家目录里的那份旧令牌（以及 8 月 sidecar 时代留下的几份）
+  不会再被 DD 读取，但也不会被登出清掉 —— 想彻底清可以手动删
+  `~/Library/Application Support/IsolatedStorage`（Windows：
+  `%LOCALAPPDATA%\IsolatedStorage`）。
 - **关掉 dsh 插件后不再留下看不见的 node**：内置插件的子进程现在收尾一律**按进程组**
   走（SIGTERM → 半秒宽限 → SIGKILL，Windows 用 `taskkill /T`），dsh 自己起的
   node/pnpm/工具子进程跟着一起走；宿主状态多了「启动中」一态（冷启动几十秒里进程已经

@@ -42,6 +42,15 @@ const SIZE_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 /// 输出行进度（DepotDownloader 逐文件百分比）的节流间隔：
 /// 大件会连续刷几十行，按行发事件会把前端淹没
 const PROGRESS_THROTTLE: Duration = Duration::from_millis(1000);
+/// 最近一次成功建立下载工具登录态的时刻（unix 秒）。登出时用它当时间窗，
+/// 从 .NET 的 IsolatedStorage 里精确扫出「我们自己刚写出来的」那份令牌
+/// （Windows 上隔离不了，令牌会落在真实用户库 —— 见 `depotdl::sweep_token_dirs`）。
+const TOKEN_AT_SETTING: &str = "download_token_at";
+
+/// 当前 unix 秒
+fn now_secs() -> String {
+    chrono::Utc::now().timestamp().to_string()
+}
 /// 密码登录开始后，超过该时长仍未成功就推测在等待手机 App 确认。
 ///
 /// 新版 steamcmd 等待手机确认时不打印任何提示（console_log.txt 实测：
@@ -246,7 +255,7 @@ impl DownloadService {
         // 凭据：有该后端自己的持久化登录态时只需账号名；否则需完整账号密码
         // （登录态标记按后端分开，换工具后的首次下载会重新用账号密码登录，
         //   见 BackendKind::token_setting）。
-        let cred = match self.resolve_credentials(dl.kind()) {
+        let cred = match self.resolve_credentials(&dl) {
             Ok((username, password, has_token)) => Credentials {
                 username,
                 password,
@@ -509,6 +518,7 @@ impl DownloadService {
             if let Ok(conn) = self.db.lock() {
                 let _ = db::set_setting(&conn, dl.token_setting(), "true");
                 let _ = db::set_setting(&conn, dl.kind().logged_in_setting(), "true");
+                let _ = db::set_setting(&conn, TOKEN_AT_SETTING, &now_secs());
             }
             self.update(task_id, "done", 100.0, None, None, false);
             self.emit_progress(task_id, "done", 100.0);
@@ -542,6 +552,7 @@ impl DownloadService {
         if let Ok(conn) = self.db.lock() {
             let _ = db::set_setting(&conn, dl.token_setting(), "true");
             let _ = db::set_setting(&conn, dl.kind().logged_in_setting(), "true");
+            let _ = db::set_setting(&conn, TOKEN_AT_SETTING, &now_secs());
         }
         self.update(task_id, "done", 100.0, None, None, false);
         self.emit_progress(task_id, "done", 100.0);
@@ -803,20 +814,28 @@ impl DownloadService {
     /// - 该后端已有持久化登录态：password 为空字符串，工具直接用缓存凭据/令牌登录
     /// - 无登录态：返回完整账号密码（首次登录用）
     ///
-    /// `kind` 决定读哪一份登录态标记：两个工具的令牌不通用（steamcmd 在重定向
-    /// HOME 的 config.vdf，DD 在 .NET IsolatedStorage），换工具后必须重新登录一次。
-    fn resolve_credentials(&self, kind: BackendKind) -> Result<(String, String, bool), String> {
+    /// 读哪一份登录态标记由 `dl` 决定：两个工具的令牌不通用（steamcmd 在重定向 HOME 的
+    /// config.vdf，DD 在 .NET IsolatedStorage），换工具后必须重新登录一次。
+    /// 标记还要过一遍 [`Backend::has_stored_session`] 体检 —— 令牌可能已经不在
+    /// （换机器、手删了隔离目录、这次改动把 macOS 的令牌位置挪进了应用目录）。
+    fn resolve_credentials(&self, dl: &Backend) -> Result<(String, String, bool), String> {
         let conn = self.db.lock().map_err(|e| e.to_string())?;
         let username = db::get_setting(&conn, "download_username")
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
                 "请先到「设置 → 账号」登录 Steam 账号（需拥有 Wallpaper Engine）".to_string()
             })?;
-        let has_token = db::get_setting(&conn, kind.token_setting())
+        let flagged = db::get_setting(&conn, dl.token_setting())
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
-        if has_token {
+        if flagged && dl.has_stored_session() {
             return Ok((username, String::new(), true));
+        }
+        if flagged {
+            tracing::info!(
+                "{} 的登录态标记还在，但隔离目录里找不到令牌 → 本次用账号密码登录",
+                dl.label()
+            );
         }
         let password = self.read_password(&username)?;
         Ok((username, password, false))
@@ -1337,8 +1356,9 @@ pub fn init(app: &AppHandle) -> Result<(), String> {
     let svc = Arc::new(DownloadService::new(db.inner().clone(), app.clone()));
     app.manage(svc.clone());
 
-    // 登录态隔离目录先建好：两个后端都靠重定向 HOME 把凭据关进应用目录
-    // （steamcmd 的 config.vdf / DepotDownloader 的 .NET IsolatedStorage）
+    // 登录态隔离目录先建好：两个后端都把凭据关进应用目录
+    // （steamcmd 的 config.vdf 靠 HOME 重定向；DD 的 .NET IsolatedStorage 在 macOS 上
+    //   还要 CFFIXED_USER_HOME、Linux 靠 XDG_DATA_HOME —— 见 depotdl::extra_env）
     for d in [
         steamcmd_install::home_dir(app),
         depotdl_install::home_dir(app),
@@ -1352,7 +1372,7 @@ pub fn init(app: &AppHandle) -> Result<(), String> {
     }
 
     // 老版本 DepotDownloader（侧车时代，用 -configdir 参数）留下的令牌目录：
-    // 现在的隔离方式是重定向 HOME，这个目录不会再被读写，清掉释放空间
+    // 现在的隔离方式是按平台重定向 .NET 的存储根，这个目录不会再被读写，清掉释放空间
     if let Ok(dir) = app.path().app_data_dir() {
         let legacy = dir.join("dd-config");
         if legacy.exists() {
@@ -1702,15 +1722,39 @@ pub fn download_credentials_clear(app: AppHandle) -> Result<(), String> {
     if let Ok(home) = steamcmd_install::home_dir(&app) {
         let _ = std::fs::remove_dir_all(home);
     }
-    // 清 DepotDownloader 登录态：令牌在重定向 HOME 下的 .NET IsolatedStorage 里，
-    // 整目录删掉即可（两个工具都退干净，换工具后不会拿半套态）
+    // 清 DepotDownloader 登录态：令牌在隔离目录下的 .NET IsolatedStorage 里，整目录删掉即可
     if let Ok(home) = depotdl_install::home_dir(&app) {
         let _ = std::fs::remove_dir_all(home);
+    }
+    // Windows 上 .NET 的 IsolatedStorage 根由注册表决定（改 USERPROFILE 无效），令牌留在
+    // 真实用户库 —— 按「上次成功登录的时刻」当时间窗，把它精确扫出来删掉。
+    // macOS 补了 CFFIXED_USER_HOME、Linux 有 XDG_DATA_HOME，令牌本来就在上面那个目录里。
+    {
+        let since = {
+            let conn = db.lock().map_err(|e| e.to_string())?;
+            db::get_setting(&conn, TOKEN_AT_SETTING).and_then(|v| v.trim().parse::<i64>().ok())
+        };
+        if let (Some(at), Some(root)) = (since, depotdl::real_isolated_storage_root()) {
+            if let Some(at) =
+                std::time::SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(at as u64))
+            {
+                // 留 5 分钟余量：登录成功到写令牌之间有登录/取清单的耗时
+                let since = at - Duration::from_secs(300);
+                let dirs = depotdl::sweep_token_dirs(&root, since);
+                let n = depotdl::remove_token_dirs(&dirs);
+                if n > 0 {
+                    tracing::info!(
+                        "登出：清掉 {n} 处 DepotDownloader 令牌（{}）",
+                        root.display()
+                    );
+                }
+            }
+        }
     }
     let conn = db.lock().map_err(|e| e.to_string())?;
     let _ = conn.execute(
         "DELETE FROM settings WHERE key IN
-         ('download_username','download_has_token','steamcmd_logged_in','depotdl_has_token','depotdl_logged_in')",
+         ('download_username','download_has_token','steamcmd_logged_in','depotdl_has_token','depotdl_logged_in','download_token_at')",
         [],
     );
     Ok(())
