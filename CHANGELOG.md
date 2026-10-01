@@ -4,6 +4,18 @@
 
 ## [Unreleased]
 
+### 🐛 修复 / Fixed
+
+- **macOS 打包版读不到「系统正在播放」（封面 / 歌名 / 艺人 / 进度全空）**：macOS 15.4 起
+  MediaRemote 只对「被授权」的进程返回数据，media-bridge 必须靠内嵌 helper + `/usr/bin/perl`
+  借权代读；而带 `--target` 的构建（Tauri universal 必然带）下，build-dependency 产出的
+  cdylib 落在宿主布局 `target/<profile>/deps/`、build.rs 只查 `target/<triple>/<profile>/`，
+  找不到就**静默不嵌** —— 运行时退回进程内直连，在 15.4+ 上只会拿到空字典（status 仍报
+  Running，所以从 App 侧看不出异常），v2.1.0 的 macOS 包即此状态。现在
+  `build-dmg.yml` / `build-test.yml` 的 macOS 行在构建前按两个架构各建一份 helper、
+  `lipo` 合成 universal 并经 `MB_MAC_HELPER_DYLIB` 指给构建，构建后**逐架构切片断言**
+  helper 已内嵌（缺了直接让 job 失败，坏包不再进 Release）。
+
 ## [v2.1.0] - 2026-10-01
 
 ### ✨ 新增 / Added

@@ -201,6 +201,42 @@ jobs:
           "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER=$link" |
             Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+      # macOS 15.4+ 起 MediaRemote 只对「被授权」的进程返回数据：media-bridge 必须把
+      # helper 动态库嵌进主二进制、运行时落盘、再由 /usr/bin/perl 加载代读（详见
+      # media-bridge README「macOS 15.4+ 权限通道」）。
+      #
+      # **不能指望 build-dependency 自动嵌**：带 `--target`（universal 构建必然带）时，
+      # build-dependency 的 cdylib 落在宿主布局 target/<profile>/deps/，而 media-bridge
+      # 的 build.rs 只查 target/<triple>/<profile>/，找不到就**静默不嵌** —— 运行时退回
+      # 进程内直连，在 15.4+ 上只会拿到空字典：封面/歌名/艺人/进度全空，status 却照报
+      # Running（v2.1.0 的 macOS 包就是这么发出去的）。所以这里显式按两个架构各建一份、
+      # lipo 合成 universal，用 build.rs 认的 MB_MAC_HELPER_DYLIB 指给构建。
+      #
+      # 输出路径每次都相同、且按内容替换文件：这个路径会进 MB_MAC_HELPER_DYLIB，值或
+      # 文件 mtime 一变，build.rs 的 rerun-if-env-changed / rerun-if-changed 就判定失效，
+      # media-bridge 连同所有下游 crate（含主 crate）整条重编，Rust 缓存等于没有。
+      - name: 构建 macOS helper 动态库（供主二进制内嵌）
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          for triple in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release -p media-bridge-mac-helper \
+              --manifest-path ../media-bridge/Cargo.toml --target "$triple"
+          done
+          helper="$GITHUB_WORKSPACE/../media-bridge/target/libmedia_bridge_mac_helper.dylib"
+          lipo -create \
+            ../media-bridge/target/aarch64-apple-darwin/release/libmedia_bridge_mac_helper.dylib \
+            ../media-bridge/target/x86_64-apple-darwin/release/libmedia_bridge_mac_helper.dylib \
+            -o "$helper.new"
+          if [ -f "$helper" ] && cmp -s "$helper.new" "$helper"; then
+            rm "$helper.new"
+          else
+            mv "$helper.new" "$helper"
+          fi
+          echo "MB_MAC_HELPER_DYLIB=$helper" >> "$GITHUB_ENV"
+          # 变量后紧跟全角字符时必须用 ${} 包起来：bash 会把「（」的字节当成变量名的一部分
+          echo "helper 已就绪：${helper}（架构 $(lipo -archs "$helper")）"
+
       - name: 构建（不签名、不发 Release）
         # tauri.conf.json 里 bundle.macOS.signingIdentity 写的是本机证书名
         # （"WallpaperEM Dev Signer"），CI 上并不存在，直接构建会失败。
@@ -221,6 +257,39 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm tauri build ${{ matrix.build_args }}
+
+      # 防静默回归：主二进制里必须真的嵌着 helper —— 这是 macOS 15.4+ 唯一能读到
+      # 「系统正在播放」的通道，而嵌不上时应用不报错、只是永远拿不到数据（见上面
+      # helper 步骤的说明）。判据是 helper 独有的字符串（它内部 dispatch queue 的
+      # label，宿主代码里没有）。逐架构切片检查：交叉构建时若只嵌了宿主架构那一份，
+      # Intel 切片会坏，而整包 grep 只会看到一个 arm64 命中。
+      - name: 断言 helper 已嵌入主二进制（逐架构切片）
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          app=$(find src-tauri/target/universal-apple-darwin/release/bundle/macos \
+            -maxdepth 1 -name '*.app' -print -quit)
+          [ -n "$app" ] || { echo "::error::没找到 .app（产物路径变了？）"; exit 1; }
+          bin="$app/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
+          [ -f "$bin" ] || { echo "::error::没找到主二进制 $bin"; exit 1; }
+          for arch in $(lipo -archs "$bin"); do
+            slice="$RUNNER_TEMP/slice-$arch"
+            # 单架构产物（没走 universal 的本地/单人构建）不用抽切片，直接查原文件
+            if [ "$(lipo -archs "$bin" | wc -w | tr -d ' ')" -gt 1 ]; then
+              lipo -thin "$arch" -o "$slice" "$bin"
+            else
+              cp "$bin" "$slice"
+            fi
+            # 直接 grep 二进制（-a 当文本扫）：**不要**写成 `strings | grep -q` ——
+            # 脚本开了 pipefail，grep -q 命中即退出会让 strings 吃 SIGPIPE，管道状态
+            # 变成 141，明明命中也判成失败。
+            if grep -aq 'media-bridge.helper' "$slice"; then
+              echo "$arch 切片：helper 已内嵌 ✅"
+            else
+              echo "::error::$arch 切片没有内嵌 media-bridge helper —— 该平台上 macOS 15.4+ 的「正在播放」（封面/歌名/进度）会是空的。查上面的 helper 构建步骤与 MB_MAC_HELPER_DYLIB 是否生效。"
+              exit 1
+            fi
+          done
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
