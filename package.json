@@ -18,6 +18,7 @@
     "commit:split": "node scripts/split-commits.mjs",
     "gate:ratchet": "node scripts/gate-ratchet.mjs",
     "hygiene": "node scripts/repo-hygiene.mjs",
+    "release:finish": "node scripts/release-finish.mjs",
     "test:scripts": "node --test scripts/*.test.mjs",
     "size:check": "node scripts/pr-size-check.mjs",
     "versions:check": "node scripts/check-versions.mjs"

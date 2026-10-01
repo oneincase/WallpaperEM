@@ -457,6 +457,8 @@ node scripts/release-preflight.mjs --tag v2.0.0
 git commit -m 'release: v2.0.0（本次要点的短清单）'
 # 4. 推 tag —— 这一步就是人工确认
 git tag v2.0.0 && git push origin v2.0.0
+# 5. 构建把 Release 建出来之后：写版本说明（见下一节）
+pnpm release:finish --tag v2.0.0
 ```
 
 推 `v*` 标签会触发 `build-dmg` / `build-linux` / `build-windows` 出安装包，
@@ -466,6 +468,33 @@ git tag v2.0.0 && git push origin v2.0.0
 **只提醒不阻断** —— 归段本来就是上面第 2 步的事，彩排时还没归是正常的。
 
 想在发布前先验三平台能否构建，手动跑 `build-test.yml`（只出 artifact，不建 Release）。
+
+### 发布后收尾（版本说明）
+
+构建把 Release 建出来之后（先 `--dry-run` 看一眼要写什么，再真跑）：
+
+```bash
+pnpm release:finish --tag v2.0.0 --dry-run
+pnpm release:finish --tag v2.0.0          # 说明文件默认取 docs/release-notes/v2.0.0.md
+```
+
+它写的是用户真正看得到的两处，**一处不写就等于没写**：
+
+| 写哪 | 谁在看 | 内容来源 |
+| --- | --- | --- |
+| GitHub Release 正文 | 下载页 | 说明文件全文（**去掉** app-notes 区块） |
+| 各平台清单的 `notes` | 应用内「设置 → 关于 → 软件更新 → 更新内容」 | `<!-- app-notes:start -->…end` 区块内的纯文本 |
+
+**为什么必须单有这一步**：三个 build workflow 生成清单时是「先读 Release 正文、再写进
+notes」，而 Release 是构建过程中由 `softprops/action-gh-release` 建的、正文本来就没人写 ——
+不补这一步，应用内更新弹窗永远是空的（v1.1.0 / v2.0.0 实测如此，v2.1.0 的那份是人工补的）。
+
+说明文件约定 `docs/release-notes/<tag>.md`：正文照 v1.0.0 / v2.1.0 的形状写（开头一句本次
+重点 + 按「主要新功能 / 主要改变 / 主要修复 / 下载」分组 + 完整 CHANGELOG 链接）；应用内那份
+要短，且必须是**纯文本** —— 应用内是 `<pre>` 渲染，Markdown 标记会原样露出来（没写区块时
+脚本会退化成「去掉标记的全文」并提醒）。脚本幂等、随便重跑；写完先按 API 的资产体积硬核对，
+再对公开地址重试核对内容（Release 资产走 CDN，刷新可能晚一分钟，那一步只提醒不阻断）。
+缺说明文件时它会打印骨架，照着填即可。
 
 ### hotfix
 
@@ -529,6 +558,7 @@ git tag v2.0.0 && git push origin v2.0.0
 | `scripts/gate-ratchet.mjs` | 门禁棘轮：fmt / clippy 的「不新增」闸门（读数比基线差才红） |
 | `scripts/gate-baseline.json` | 棘轮基线（按 `os-arch` 分平台 + 工具链版本）；**收紧 = 改这个文件** |
 | `scripts/release-preflight.mjs` | 发布前置检查（版本 / tag / CHANGELOG），三个 build `needs:` 它 |
+| `scripts/release-finish.mjs` | 发布后收尾：写 Release 正文 + 重传清单 notes（版本说明），幂等可重跑 |
 | `scripts/repo-hygiene.mjs` | §9 违禁物闸门（路径 + 新增大文件），`pre-commit` 与 CI 共用 |
 | `scripts/install-hooks.mjs` | 安装 / 卸载 / 查看 `commit-msg` + `pre-commit` 钩子（不碰 git-lfs 的钩子） |
 | `scripts/check-versions.mjs` | 四处版本号一致性 |
@@ -544,10 +574,11 @@ pnpm lint:commit --range origin/main..HEAD        # 校验整个分支
 pnpm commit:split                                 # 提交粒度：看当前暂存区会被怎么拆（不会提交）
 node scripts/split-commits.mjs --audit origin/main..HEAD    # 拿历史回看这条规则拦了谁（只读）
 node scripts/split-commits.mjs --explain <文件>   # 某个文件算哪个功能域
-pnpm test:scripts                                 # 拆分器 + 棘轮 + 卫生 + 发布前置 的回归测试
+pnpm test:scripts                                 # 拆分器 + 棘轮 + 卫生 + 发布前置 / 收尾 的回归测试
 pnpm gate:ratchet                                 # fmt/clippy 棘轮（--update 收紧基线，--only 单测一项）
 pnpm hygiene                                      # §9 违禁物（默认查暂存区；-- --all 扫全仓）
 node scripts/release-preflight.mjs --tag v2.0.0   # 发布前置（不传 tag = 彩排模式，只提醒）
+node scripts/release-finish.mjs --tag v2.1.0 --dry-run      # 发布收尾（先看要写什么）
 node scripts/pr-size-check.mjs --range origin/main..HEAD    # 体积自查（可选，不拦）
 pnpm versions:check
 ```
