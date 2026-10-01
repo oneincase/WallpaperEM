@@ -573,7 +573,10 @@ impl TrayMenu {
                 continue;
             };
             let name = d.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let primary = d.get("isPrimary").and_then(|v| v.as_bool()).unwrap_or(false);
+            let primary = d
+                .get("isPrimary")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let item_id = d.get("itemId").and_then(|v| v.as_str()).map(str::to_string);
             let bound = d
                 .get("binding")
@@ -1031,15 +1034,14 @@ fn build_tray(app: &AppHandle) -> tauri::Result<TrayMenu> {
                 // 每屏：轮播指定列表
                 id if id.starts_with(DISP_ROT_PREFIX) => {
                     let rest = &id[DISP_ROT_PREFIX.len()..];
-                    match rest.split_once(':').and_then(|(d, p)| {
-                        p.parse::<i64>().ok().map(|pid| (d.to_string(), pid))
-                    }) {
+                    match rest
+                        .split_once(':')
+                        .and_then(|(d, p)| p.parse::<i64>().ok().map(|pid| (d.to_string(), pid)))
+                    {
                         Some((did, pid)) => {
-                            if let Err(e) = wallpaper::display_binding_set(
-                                app.clone(),
-                                did.clone(),
-                                Some(pid),
-                            ) {
+                            if let Err(e) =
+                                wallpaper::display_binding_set(app.clone(), did.clone(), Some(pid))
+                            {
                                 tracing::warn!("tray disp_rot[{did}:{pid}]: {e}");
                             }
                         }

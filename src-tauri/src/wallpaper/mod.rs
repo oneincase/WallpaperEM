@@ -1348,7 +1348,11 @@ fn ensure_windows_inner(app: &AppHandle, display_asleep: bool) {
         let ids: std::collections::HashSet<u32> = screens.iter().map(|s| s.id).collect();
         let mut last = LAST_SEEN_SCREENS.lock().unwrap();
         if matches!(&*last, Some(prev) if prev != &ids) {
-            tracing::info!("displays changed: {} -> {} screens", last.as_ref().map(|s| s.len()).unwrap_or(0), ids.len());
+            tracing::info!(
+                "displays changed: {} -> {} screens",
+                last.as_ref().map(|s| s.len()).unwrap_or(0),
+                ids.len()
+            );
             let _ = app.emit("displays-changed", ());
             // 托盘「显示器」子菜单按新的屏幕集合重建（拔掉的屏收掉、插回的补上）
             crate::update_tray_displays(app);
@@ -3272,7 +3276,6 @@ pub fn current_screen(app: &AppHandle) -> Option<CurrentScreen> {
     })
 }
 
-
 /// 当前已应用的本地库条目 id 集（供「本地库」页把已应用壁纸的应用按钮置为已应用/禁用）。
 /// 读取 wallpaper_sessions 中非空 item_id；wallpaper_stop 会删除会话行，故已停止的不在此列，
 /// 且重启后仍能反映「上次应用」的壁纸。
@@ -4516,8 +4519,7 @@ pub fn display_binding_set(
         // 显式绑定列表 = 「开始轮播」：清掉钉住（该屏回到轮播），并顺带清掉轮播暂停
         // —— 否则绑定后倒计时是停着的，用户在显示器坞选完列表看着像没生效
         set_screen_pin(&conn, &display_id, false);
-        db::set_setting(&conn, "playlist_rotation_paused", "false")
-            .map_err(|e| e.to_string())?;
+        db::set_setting(&conn, "playlist_rotation_paused", "false").map_err(|e| e.to_string())?;
     }
     // 托盘 / 本地库轮播条 / 显示器页都监听这个键，广播让状态一起翻到「轮播中」
     crate::notify_setting_changed(&app, "playlist_rotation_paused", "false");
@@ -4680,7 +4682,8 @@ fn clear_all_display_ctx(conn: &Connection) {
 /// 不校验列表实体还在不在）。
 fn clear_ctxs_of_playlist(conn: &Connection, id: i64) -> bool {
     let mut gone: Vec<String> = Vec::new();
-    if let Ok(mut stmt) = conn.prepare("SELECT key, value FROM settings WHERE key LIKE 'rot:%:playlist'")
+    if let Ok(mut stmt) =
+        conn.prepare("SELECT key, value FROM settings WHERE key LIKE 'rot:%:playlist'")
     {
         let rows = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
@@ -4729,7 +4732,11 @@ fn screen_pinned(conn: &Connection, display_id: &str) -> bool {
 }
 
 fn set_screen_pin(conn: &Connection, display_id: &str, pinned: bool) {
-    let _ = db::set_setting(conn, &pin_key(display_id), if pinned { "true" } else { "false" });
+    let _ = db::set_setting(
+        conn,
+        &pin_key(display_id),
+        if pinned { "true" } else { "false" },
+    );
 }
 
 fn clear_screen_pins(conn: &Connection) {
@@ -5017,8 +5024,7 @@ pub fn playlist_apply(app: AppHandle, id: i64) -> Result<serde_json::Value, Stri
         db::set_setting(&conn, "playlist_index", "0")?;
         save_ctx(&conn, &fresh_ctx(CTX_UNIFIED, playlist.clone(), 0))?;
         // 启用 = 要它跑起来：清掉轮播暂停（暂停过的状态下启用会「看着没生效」）
-        db::set_setting(&conn, "playlist_rotation_paused", "false")
-            .map_err(|e| e.to_string())?;
+        db::set_setting(&conn, "playlist_rotation_paused", "false").map_err(|e| e.to_string())?;
         // 显式的全局启用 = 重置「手动钉住」（那些屏回到跟全局列表走）；各屏自己的
         // 绑定是用户显式挑的列表，保留为覆盖项（统一列表本来就不刷它们）。
         clear_screen_pins(&conn);
@@ -5341,9 +5347,9 @@ fn rotation_paused(conn: &Connection) -> bool {
 /// 暂停只是停掉定时自动切换，手动切换照旧能走；真正没得切是上下文被移除之后
 /// （停止轮播、删列表、手动设了单张壁纸 → [`end_rotation_on_manual_apply`]）。
 fn has_rotation_ctx(conn: &Connection, screens: &[String]) -> bool {
-    active_ctx_keys(conn, screens).iter().any(|k| {
-        read_ctx(conn, k).is_some() && ctx_has_targets(conn, k, screens)
-    })
+    active_ctx_keys(conn, screens)
+        .iter()
+        .any(|k| read_ctx(conn, k).is_some() && ctx_has_targets(conn, k, screens))
 }
 
 /// 剪掉失效条目（本地文件已丢失等，配置解析失败）。返回剪掉数量。
@@ -5654,7 +5660,10 @@ mod tests {
             read_ctx(&c, CTX_UNIFIED).is_some(),
             "统一上下文由调用方另清，不在这条收口里"
         );
-        assert!(screen_pinned(&c, "111"), "钉住标记（rotpin:）不受 rot:% 波及");
+        assert!(
+            screen_pinned(&c, "111"),
+            "钉住标记（rotpin:）不受 rot:% 波及"
+        );
     }
 
     /// 删列表要清掉**所有**绑在它上面的每屏上下文，包括拔着/无窗口的屏 ——
@@ -5781,7 +5790,10 @@ mod tests {
 
         // 但只要有一块屏绑着自己的列表，就仍有可切换的上下文（那块屏的）
         save_ctx(&c, &fresh_ctx("222", p_clone_for_test(), 0)).unwrap();
-        assert!(ctx_has_targets(&c, "222", &screens), "每屏绑定恒有自己的落点");
+        assert!(
+            ctx_has_targets(&c, "222", &screens),
+            "每屏绑定恒有自己的落点"
+        );
         assert!(has_rotation_ctx(&c, &screens));
         clear_ctx(&c, "222");
         assert!(!has_rotation_ctx(&c, &screens));
