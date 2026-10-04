@@ -4,6 +4,37 @@
 
 ## [Unreleased]
 
+## [v2.2.0] - 2026-10-04
+
+### 🚀 新增 / Added
+
+- **松散目录形态：WE 编辑器源码工程免打包直接渲染（webwallgl 2.1.0）**：官方示例工程
+  （`defaultprojects` / `myprojects` 这类散装目录——`project.json` 的 `file` 指向
+  `*.json`、资源散在 `materials/` `shaders/` `models/` 等子目录）现在可以直接导入并渲染，
+  不再要求先打成 `scene.pkg`。渲染器新增 `Source.sceneDir` 按相对路径按名取资源，
+  入口取不到自动回退 `scene.pkg`（工坊里大量声明 `file: "scene.json"` 但盘上只有 pkg
+  的条目因此照常工作）；`resolve_item_config` 对缺 pkg 的散装工程放行，不再报
+  「未找到 scene.pkg」。
+- **视频渲染路径可切换**：设置页新增「视频渲染方式」——硬解直通（默认，零拷贝最流畅省电）
+  / 画布（逐帧绘入 canvas 再合成，兼容备用）；切换后正在播放的视频壁纸自动重挂。
+  实测滤镜对直通路径零 CPU 成本，「滤镜与直通互斥」的旧文案已删除。
+
+### 🛠 修复 / Fixed
+
+- **路径导入识别**：WE 编辑器工程常省略 `project.json` 的 `type` 字段（如 techno、
+  audiophile），路径导入时会被「无可识别文件 → 图片」的兜底误判成图片类型。
+  现在按 `file` 声明（`.json` 结尾且入口文件真实存在）识别为场景。
+- **类型标签兜底**：前端类型表补全 `image`，类型标签渲染加 `?? "未知"` 兜底——
+  未知类型不再让首页白屏（React 首屏崩溃）。
+
+### ⚙️ 引擎（webwallgl 2.1.0）随快照生效
+
+源码工程装载链（F1–F50 判据体系）、场景级相机路径与 `usershadervalues` 绑定、
+混合 pass 不写深度（neon_sunset 太阳外围黑方块）、真 3D 模型帧内共享深度与透明像素
+不写深度（城市盖住猫 / 树黑方块）、`applyUserProperties` 官方字母序（corsair_collection
+白屏）、`anchor:none` 文字按对齐贴 origin（文字时钟被剪贴蒙版抹掉）、GPU 资源确定性
+归零与上下文丢失可见事件、畸形 `.tex` 解析闸门、重粒子场景稳态帧率 +15.2%。
+
 ## [v2.1.1] - 2026-10-01
 
 ### 🐛 修复 / Fixed
