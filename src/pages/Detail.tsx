@@ -102,7 +102,7 @@ export function DetailPage({ id, onBack }: { id: string; onBack: () => void }) {
                 <h1 className="text-[17px] font-bold leading-snug tracking-tight">{item.title}</h1>
                 <div className="mt-1.5 flex items-center gap-1.5 flex-wrap">
                   <span className="rounded-full border border-[var(--separator)] bg-[var(--accent)] px-2 py-0.5 text-[11px] font-medium text-[var(--accent-strong)]">
-                    {tr(TYPE_LABELS[item.type])}
+                    {tr(TYPE_LABELS[item.type] ?? "未知")}
                   </span>
                   {item.tags.slice(0, 4).map((t) => (
                     <span

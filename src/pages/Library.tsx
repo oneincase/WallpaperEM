@@ -1061,7 +1061,7 @@ export function LibraryPage({ onOpenDetail }: { onOpenDetail: (id: string) => vo
                   ) : undefined}
                 </div>
               }
-              metaLeft={<TypeChip label={tr(TYPE_LABELS[item.type])} />}
+              metaLeft={<TypeChip label={tr(TYPE_LABELS[item.type] ?? "未知")} />}
               actions={
                 selectMode ? undefined : (
                 /* 8 个按钮排 2×4。顺序 = 「看/配这张壁纸」在前、「文件/分享/移出库」

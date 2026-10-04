@@ -6,6 +6,7 @@ export type WallpaperType =
   | "scene"
   | "web"
   | "gif"
+  | "image"
   | "application"
   | "unknown";
 
@@ -14,6 +15,7 @@ export const TYPE_LABELS: Record<WallpaperType, string> = {
   scene: "场景",
   web: "网页",
   gif: "GIF",
+  image: "图片",
   application: "程序",
   unknown: "未知",
 };

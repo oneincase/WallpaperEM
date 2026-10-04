@@ -113,7 +113,7 @@ export function WallpaperInfoModal({
             </div>
             <div className="mt-0.5 flex items-center gap-1.5">
               <span className="rounded-full border border-[var(--separator)] bg-[var(--accent)] px-2 py-0.5 text-[10.5px] font-medium text-[var(--accent-strong)]">
-                {tr(TYPE_LABELS[item.type])}
+                {tr(TYPE_LABELS[item.type] ?? "未知")}
               </span>
               {/* 状态优先级：文件丢了 > 正在应用 > 库内正常 */}
               {item.missing ? (

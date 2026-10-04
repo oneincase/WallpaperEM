@@ -499,7 +499,7 @@ export function WorkshopPage({ onOpenDetail }: { onOpenDetail: (id: string) => v
                     )}
                   </>
                 }
-                metaLeft={<TypeChip label={tr(TYPE_LABELS[item.type])} />}
+                metaLeft={<TypeChip label={tr(TYPE_LABELS[item.type] ?? "未知")} />}
                 coverBadgeRight={
                   item.subscriptions ? (
                     <CoverCountBadge count={item.subscriptions} />

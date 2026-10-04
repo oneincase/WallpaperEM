@@ -56,7 +56,7 @@ export function FavoritesPage({ onOpenDetail }: { onOpenDetail: (id: string) => 
               coverBadgeRight={
                 item.subscriptions > 0 ? <CoverCountBadge count={item.subscriptions} /> : undefined
               }
-              metaLeft={<TypeChip label={tr(TYPE_LABELS[item.type])} />}
+              metaLeft={<TypeChip label={tr(TYPE_LABELS[item.type] ?? "未知")} />}
               metaRight={
                 <button
                   className="text-[11px] text-[var(--text-2)] hover:text-red-500"
