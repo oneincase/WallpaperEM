@@ -258,6 +258,7 @@ pub fn run() {
             wallpaper::set_language,
             wallpaper::set_scene_fps,
             wallpaper::set_video_tex_scale,
+            wallpaper::set_video_render,
             wallpaper::set_filter,
             wallpaper::set_reveal,
             wallpaper::set_aa,

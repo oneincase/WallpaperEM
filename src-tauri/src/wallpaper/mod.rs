@@ -391,6 +391,22 @@ fn global_video_tex_scale(conn: Option<&Connection>) -> f32 {
     parse_video_tex_scale(raw.as_deref())
 }
 
+/// 视频壁纸渲染路径（渲染器 `?vidrender=`）：direct = 硬解直通（IOSurface 零拷贝，
+/// 4K/高帧率最流畅，默认），canvas = 画布 + 原生 loop（帧落 canvas 后再合成）。
+/// 两条路径都支持全局滤镜。独立开关，不参与画质档位。
+pub const VIDEO_RENDER_CHOICES: [&str; 2] = ["canvas", "direct"];
+
+fn default_video_render() -> String {
+    "direct".to_string()
+}
+
+/// 全局视频渲染路径（读设置 `wallpaper_video_render`），缺省/非法回落 direct。
+fn global_video_render(conn: Option<&Connection>) -> String {
+    conn.and_then(|c| db::get_setting(c, "wallpaper_video_render"))
+        .filter(|v| VIDEO_RENDER_CHOICES.contains(&v.as_str()))
+        .unwrap_or_else(default_video_render)
+}
+
 fn global_resources_normal(conn: Option<&Connection>) -> f32 {
     conn.and_then(|c| db::get_setting(c, "wallpaper_resources_normal"))
         .and_then(|s| s.trim().parse::<f32>().ok())
@@ -515,6 +531,7 @@ fn apply_play_config(app: &AppHandle, cfg: &mut WallpaperConfig, item_id: Option
         cfg.resources = None;
         cfg.resources_normal = DEFAULT_RESOURCES_NORMAL;
         cfg.video_tex_scale = 0.0;
+        cfg.video_render = default_video_render();
         cfg.local_assets = true;
         return;
     };
@@ -530,6 +547,7 @@ fn apply_play_config(app: &AppHandle, cfg: &mut WallpaperConfig, item_id: Option
         cfg.resources = None;
         cfg.resources_normal = DEFAULT_RESOURCES_NORMAL;
         cfg.video_tex_scale = 0.0;
+        cfg.video_render = default_video_render();
         cfg.local_assets = true;
         return;
     };
@@ -545,6 +563,7 @@ fn apply_play_config(app: &AppHandle, cfg: &mut WallpaperConfig, item_id: Option
     cfg.resources = global_resources(Some(&conn));
     cfg.resources_normal = global_resources_normal(Some(&conn));
     cfg.video_tex_scale = global_video_tex_scale(Some(&conn));
+    cfg.video_render = global_video_render(Some(&conn));
     cfg.local_assets = global_local_assets(Some(&conn));
     // 再叠本壁纸覆盖
     if let Some(id) = item_id {
@@ -816,6 +835,9 @@ pub struct WallpaperConfig {
     /// 视频纹理上传倍率（0 = 自动/交给库内帧率守门，正数 = 固定）。URL 的 `?vidscale=`
     #[serde(default = "default_video_tex_scale")]
     pub video_tex_scale: f32,
+    /// 视频壁纸渲染路径（direct=硬解直通，默认 / canvas=画布兼容备用）。URL 的 `?vidrender=`
+    #[serde(default = "default_video_render")]
+    pub video_render: String,
     #[serde(default = "default_muted")]
     pub muted: bool,
     /// 音量 0..1 的精确值（0 即静音）。挂载时一律先静音，渲染器在壁纸完全
@@ -854,6 +876,7 @@ impl Default for WallpaperConfig {
             resources: None,
             resources_normal: default_resources_normal(),
             video_tex_scale: default_video_tex_scale(),
+            video_render: default_video_render(),
             muted: default_muted(),
             volume: None,
             r#loop: default_loop(),
@@ -2908,6 +2931,8 @@ fn config_query_with_audio(cfg: &WallpaperConfig, audio_token: Option<&str>, win
     // 视频纹理上传倍率（库 2.0.0+）：0 = 库内自动（帧率守门），正数 = 固定。
     // 显式下发 0 也更清楚：渲染器一眼能看出「这个参数在自动档」。
     parts.push(format!("vidscale={}", cfg.video_tex_scale));
+    // 视频渲染路径（direct=硬解直通，默认 / canvas=画布兼容备用）
+    parts.push(format!("vidrender={}", url_encode(&cfg.video_render)));
     parts.push(format!("muted={}", cfg.muted));
     // 精确音量（0..1）：有壁纸专属音量记录时下发；渲染器加载完成后按它起音量
     if let Some(v) = cfg.volume {
@@ -3626,6 +3651,34 @@ pub fn set_video_tex_scale(app: AppHandle, scale: f32) -> Result<(), String> {
     eval_all(
         &app,
         &format!("window.__wp && window.__wp.setVideoTexScale({v})"),
+    );
+    Ok(())
+}
+
+/// 视频壁纸渲染路径（direct=硬解直通，零拷贝，默认；canvas=画布 + 原生 loop，
+/// 兼容备用）。两条路径都支持全局滤镜。挂载结构不同、无法热切：正在播的视频壁纸
+/// 由渲染器整张重挂生效，其他壁纸只记配置、下次应用时随 query 下发。
+#[tauri::command(rename = "wallpaper_set_video_render")]
+pub fn set_video_render(app: AppHandle, mode: String) -> Result<(), String> {
+    if !VIDEO_RENDER_CHOICES.contains(&mode.as_str()) {
+        return Err(format!(
+            "未知的视频渲染路径: {mode}（可选 {}）",
+            VIDEO_RENDER_CHOICES.join("/")
+        ));
+    }
+    if let Some(db) = app.try_state::<Arc<Mutex<Connection>>>() {
+        if let Ok(conn) = db.lock() {
+            let _ = db::set_setting(&conn, "wallpaper_video_render", &mode);
+        }
+    }
+    crate::notify_setting_changed(&app, "wallpaper_video_render", &mode);
+    tracing::info!("video render path set: {mode}");
+    eval_all(
+        &app,
+        &format!(
+            "window.__wp && window.__wp.setVideoRender({})",
+            serde_json::json!(mode)
+        ),
     );
     Ok(())
 }
@@ -5957,6 +6010,7 @@ mod tests {
             local_assets: true,
             media_base: Some("http://127.0.0.1:1/media/tok".into()),
             video_tex_scale: 0.0,
+            video_render: "canvas".into(),
         };
         let url =
             renderer_url_on("http://127.0.0.1:57810", &cfg, Some("audiotok"), "wallpaper-1")
@@ -5992,6 +6046,8 @@ mod tests {
             "localAssets=1",
             // project.json 声明的场景 pkg 入口（非默认命名时给渲染器指路）
             "scenePkg=scenes%2Fmy.pkg",
+            // 视频渲染路径（direct/canvas，缺省 direct）
+            "vidrender=canvas",
             "mediaBase=http%3A%2F%2F127.0.0.1%3A1%2Fmedia%2Ftok",
             "audioToken=audiotok",
         ] {

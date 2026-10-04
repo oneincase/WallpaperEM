@@ -459,6 +459,9 @@ export const api = {
   wallpaperSetRenderDpr: (dpr: number) => invoke<void>("wallpaper_set_render_dpr", { dpr }),
   // 视频纹理上传倍率：0 = 自动（库内帧率守门按实测帧率压），>0 固定（1 = 不压）
   wallpaperSetVideoTexScale: (scale: number) => invoke<void>("wallpaper_set_video_tex_scale", { scale }),
+  // 视频壁纸渲染路径：direct = 硬解直通（零拷贝，默认）/ canvas = 画布（兼容备用）
+  wallpaperSetVideoRender: (mode: "canvas" | "direct") =>
+    invoke<void>("wallpaper_set_video_render", { mode }),
   wallpaperSetLanguage: (language: string) =>
     invoke<void>("wallpaper_set_language", { language }),
   wallpaperSetSceneFps: (fps: number) => invoke<void>("wallpaper_set_scene_fps", { fps }),

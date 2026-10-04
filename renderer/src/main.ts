@@ -42,6 +42,12 @@ type WallpaperConfig = {
    * WKWebView 下逐帧 texImage2D(视频帧) 要同步跨进程取像素，代价随像素数线性。
    */
   videoTexScale?: number;
+  /**
+   * 视频壁纸渲染路径（仅 video 类型）：direct = 硬解直通（零拷贝最流畅，默认，
+   * 滤镜挂在 videoLayer 上照常生效），canvas = 画布 + 原生 loop（视频帧落在 wrap
+   * 下的 canvas 上）。缺省（undefined）= direct。两种路径挂载结构不同，切换需重挂。
+   */
+  videoRender?: "canvas" | "direct";
   /** 全局滤镜 id（见 WALLPAPER_FILTERS 白名单），未知 id 按无滤镜处理 */
   filter?: string;
   /**
@@ -120,28 +126,36 @@ const WALLPAPER_FILTERS: Record<string, string> = {
   contrast: "contrast(1.35)",
 };
 
+/** 本壁纸是否走直通路径（video 类型且未显式指定 canvas；缺省 = 直通） */
+function videoIsDirect(cfg: WallpaperConfig): boolean {
+  return cfg.type === "video" && cfg.videoRender !== "canvas";
+}
+
 function applyWallpaperFilter(filter?: string) {
-  // 视频直通与全局滤镜在物理上互斥：滤镜挂在祖先上会强制整棵子树离屏渲染，
-  // video 的 IOSurface 就再也交不到窗口合成器手里，直通白做。
-  // 产品上已确认「视频壁纸不参与滤镜」，这里再兜一层，避免别处遗漏这个前提。
-  if (state.cfg.type === "video") {
+  const css = WALLPAPER_FILTERS[filter ?? "none"] ?? "";
+  // 直通 + 滤镜：滤镜挂 videoLayer（直通视频所在的容器），wrap 不挂；画布路径挂 wrap。
+  // 滤镜强制的离屏是 GPU 合成 pass，实测直通挂滤镜与无滤镜 CPU 相同（零成本），
+  // 两条路径都正常吃滤镜 —— 不要再按「滤镜与直通互斥」处理。
+  if (videoIsDirect(state.cfg)) {
     wrap.style.filter = "";
+    videoLayer.style.filter = css;
     return;
   }
-  wrap.style.filter = WALLPAPER_FILTERS[filter ?? "none"] ?? "";
+  videoLayer.style.filter = "";
+  wrap.style.filter = css;
 }
 
 const state: {
   cfg: WallpaperConfig;
-  /** 库实例：scene / web / gif / image 由它承载（video 走直通，见 mountVideoDirect） */
+  /** 库实例：scene / web / gif / image 由它承载（video 走直通或画布，见 mount 分支） */
   inst?: SceneInstance;
-  /** 视频直通路径的播放元素（仅 video 类型；与 inst 互斥） */
+  /** 视频路径的播放元素（直通与画布共用；与 inst 互斥）。直通时可见，画布时是隐藏的供帧源 */
   video?: HTMLVideoElement;
   /** 直通视频当前使用的 blob URL（预取产物，换纸时必须 revoke，否则内存泄漏） */
   videoBlobUrl?: string;
   /** 装载序号：异步 mount 期间若又切了壁纸，靠它丢弃过期结果 */
   seq: number;
-  /** canvas 演示动画（非工坊类型，本文件自绘） */
+  /** canvas 演示动画与画布视频路径的画布（二者的承载字段，按类型互斥使用） */
   canvas?: HTMLCanvasElement;
   ctx?: CanvasRenderingContext2D;
   raf?: number;
@@ -175,14 +189,18 @@ const wrap: HTMLDivElement = (() => {
 })();
 
 /**
- * 视频直通的独立挂载点。
+ * 视频直通的独立挂载点（画布路径的 canvas 挂在 wrap 下，不用这里）。
  *
- * 为什么 video 不能挂在 wrap 下：wrap 上常年挂着全局滤镜（applyWallpaperFilter），
+ * 为什么直通的 video 不能挂在 wrap 下：wrap 上常年挂着全局滤镜（applyWallpaperFilter），
  * 而**祖先元素上的 filter 会让整棵子树强制离屏渲染** —— VideoToolbox 解出的
  * IOSurface 必须先被拉进离屏缓冲走一遍，直通合成就没了。reveal 的显形动画同理。
- * 所以 video 必须住在一个「什么都不加」的容器里，把像素搬运压回零拷贝路径。
+ * 所以直通 video 住在一个与 wrap 分离的容器里。
  *
- * 该容器只在 video 类型挂载期间显示，其余类型保持 display:none，不参与合成。
+ * 滤镜直接挂**本容器自己**：滤镜强制的离屏是 GPU 合成 pass，实测直通挂滤镜与
+ * 无滤镜 CPU 相同（零成本），所以滤镜在直通下照常生效（见 applyWallpaperFilter）。
+ * 除 filter 外仍不写 opacity/transform/will-change —— 那些是显形动画的领地，归 video 元素。
+ *
+ * 该容器只在直通视频挂载期间显示，其余时间保持 display:none，不参与合成。
  */
 const videoLayer: HTMLDivElement = (() => {
   const el = document.createElement("div");
@@ -214,7 +232,8 @@ function reveal() {
   // 层级的 alpha 混合由合成器在 GPU 上完成，不会触发离屏 —— 直通得以保住。
   // 不能走 runRevealFx：那是一整套给 wrap 加 transform/filter 关键帧的动画，
   // 适合 WebGL 画布，对直通视频则是灾难（filter 一上，直通立刻失效）。
-  if (state.video) {
+  // 画布路径没有这个约束：canvas 挂在 wrap 下，照常走显形动画。
+  if (state.video && videoIsDirect(state.cfg)) {
     state.video.style.opacity = "1";
     return;
   }
@@ -1713,9 +1732,10 @@ function clear() {
     state.iframe.remove();
     state.iframe = undefined;
   }
-  // 视频直通：光 remove() 不释放硬件解码会话 —— 必须显式停播并清空 src
-  // 再 load()，VideoToolbox 的会话才会当场归还。否则连续换几个 4K 视频壁纸，
-  // 解码会话只增不减（切回 web 壁纸后仍在后台占着）。
+  // 视频路径（直通/画布）：光 remove() 不释放硬件解码会话 —— 必须显式停播并
+  // 清空 src 再 load()，VideoToolbox 的会话才会当场归还。否则连续换几个 4K 视频
+  // 壁纸，解码会话只增不减（切回 web 壁纸后仍在后台占着）。
+  stopVideoCanvas();
   if (state.video) {
     const v = state.video;
     state.video = undefined;
@@ -1856,15 +1876,54 @@ async function fetchWallpaperProps(cfg: WallpaperConfig): Promise<
 const MOUNT_SLOW_MS = 10_000;
 const MOUNT_HARD_MS = 90_000;
 
+/** 视频元素公共属性（直通/画布共用）：一律静音起播，加载完成后再由 applyVideoVolume 起音量 */
+function createVideoElement(): HTMLVideoElement {
+  const v = document.createElement("video");
+  v.muted = true;
+  v.defaultMuted = true;
+  v.playsInline = true;
+  v.preload = "auto";
+  v.loop = true;
+  v.disablePictureInPicture = true;
+  v.setAttribute("disableremoteplayback", "");
+  v.setAttribute("x-webkit-airplay", "deny");
+  return v;
+}
+
+/** 视频元素错误 → 人类可读细节（直通/画布共用） */
+function videoErrorDetail(v: HTMLVideoElement): string {
+  const code = v.error?.code;
+  return v.error?.message || (code === 4 ? "格式不支持或资源不可读" : `code ${code ?? "?"}`);
+}
+
 /**
- * 视频壁纸直通挂载（不走 webwallgl）。
+ * 播放状态探针（直通/画布共用）：两种视频路径都没有库的渲染循环兜底，「播放到底
+ * 有没有在推进」必须能看见 —— 否则一旦卡住，日志里只有 mount/ready，完全无从判断
+ * 卡在哪一环。分几个时间点采样，覆盖「首帧后 / 缓冲中 / 稳定播放」三段。
+ */
+function probeVideoState(cfg: WallpaperConfig, seq: number, v: HTMLVideoElement, tag: string) {
+  if (seq !== state.seq) return;
+  const buf = v.buffered;
+  const ranges: string[] = [];
+  for (let i = 0; i < buf.length; i++) {
+    ranges.push(`${buf.start(i).toFixed(1)}-${buf.end(i).toFixed(1)}`);
+  }
+  const dur = Number.isFinite(v.duration) ? v.duration.toFixed(2) : "?";
+  reportDiag(
+    cfg,
+    `video[${tag}] ready=${v.readyState} net=${v.networkState} paused=${v.paused} ` +
+      `t=${v.currentTime.toFixed(2)}/${dur} buf=[${ranges.join(",") || "-"}] ` +
+      `err=${v.error?.code ?? "-"} ${v.videoWidth}x${v.videoHeight}`,
+  );
+}
+
+/**
+ * 视频壁纸直通挂载（不走 webwallgl；缺省路径，显式 `videoRender: "canvas"` 时改走
+ * mountVideoCanvas）。
  *
- * 为什么换掉库路径：库把每一帧 texImage2D 上传成 WebGL 纹理。4K 一帧就是
- * 3840×2160×4 ≈ 33MB，60fps ≈ 2GB/s；WKWebView 下 texImage2D(视频帧) 还要
- * 同步跨进程取像素 —— 这是壁纸里 4K 视频掉帧的根因，且代价随像素数线性。
- * 直通让 VideoToolbox 解出的 IOSurface 零拷贝交给窗口合成器，搬运量归零。
- *
- * 代价（产品上已确认）：视频壁纸不参与全局滤镜，原因见 applyWallpaperFilter。
+ * 为什么它是默认：让 VideoToolbox 解出的 IOSurface 零拷贝交给窗口合成器，搬运量
+ * 归零 —— 4K/高帧率素材上比画布路径省（proto-video-loop 原型）。滤镜不受影响：
+ * 全局滤镜挂在 videoLayer 上（见 applyWallpaperFilter），实测与无滤镜 CPU 相同。
  *
  * 循环策略：原生 loop，单解码会话。回绕时解码器要 flush + seek 回 0，这段
  * 没有新帧可上屏，是可见的接缝。要抹掉它得上双实例乒乓或交叉淡化（2 个解码
@@ -1880,15 +1939,7 @@ function mountVideoDirect(cfg: WallpaperConfig) {
   const seq = state.seq;
   reportDiag(cfg, "mount start (video direct)");
 
-  const v = document.createElement("video");
-  v.muted = true; // 一律静音起播，加载完成后再由 applyVideoVolume 起音量
-  v.defaultMuted = true;
-  v.playsInline = true;
-  v.preload = "auto";
-  v.loop = true;
-  v.disablePictureInPicture = true;
-  v.setAttribute("disableremoteplayback", "");
-  v.setAttribute("x-webkit-airplay", "deny");
+  const v = createVideoElement();
   // 样式只做三件事：铺满、提升合成层、给显形留一个 opacity 过渡。
   // translateZ(0) 是关键 —— video 被提升为独立合成层，IOSurface 才直通合成器。
   // opacity 过渡挂在 video **自己**身上是安全的（层属性，合成器直接混合）；
@@ -1918,35 +1969,7 @@ function mountVideoDirect(cfg: WallpaperConfig) {
   };
 
   v.addEventListener("loadeddata", done, { once: true });
-  v.addEventListener(
-    "error",
-    () => {
-      const code = v.error?.code;
-      const detail =
-        v.error?.message || (code === 4 ? "格式不支持或资源不可读" : `code ${code ?? "?"}`);
-      fail(`视频无法播放（${detail}）`);
-    },
-    { once: true },
-  );
-
-  // 直通路径没有库的渲染循环兜底，「播放到底有没有在推进」必须能看见 ——
-  // 否则一旦卡住，日志里只有 mount/ready，完全无从判断卡在哪一环。
-  // 分几个时间点采样，覆盖「首帧后 / 缓冲中 / 稳定播放」三段。
-  const probe = (tag: string) => {
-    if (seq !== state.seq) return;
-    const buf = v.buffered;
-    const ranges: string[] = [];
-    for (let i = 0; i < buf.length; i++) {
-      ranges.push(`${buf.start(i).toFixed(1)}-${buf.end(i).toFixed(1)}`);
-    }
-    const dur = Number.isFinite(v.duration) ? v.duration.toFixed(2) : "?";
-    reportDiag(
-      cfg,
-      `video[${tag}] ready=${v.readyState} net=${v.networkState} paused=${v.paused} ` +
-        `t=${v.currentTime.toFixed(2)}/${dur} buf=[${ranges.join(",") || "-"}] ` +
-        `err=${v.error?.code ?? "-"} ${v.videoWidth}x${v.videoHeight}`,
-    );
-  };
+  v.addEventListener("error", () => fail(`视频无法播放（${videoErrorDetail(v)}）`), { once: true });
 
   const start = (src: string) => {
     if (seq !== state.seq) return;
@@ -1955,7 +1978,7 @@ function mountVideoDirect(cfg: WallpaperConfig) {
     state.video = v;
     v.src = src;
     for (const ms of [600, 2000, 5000, 9000]) {
-      window.setTimeout(() => probe(`${ms}ms`), ms);
+      window.setTimeout(() => probeVideoState(cfg, seq, v, `${ms}ms`), ms);
     }
     // 全局暂停态（显示器睡眠 / 用户暂停）下挂载：只预载不起播，避免静默出声
     if (!state.paused) {
@@ -1993,7 +2016,181 @@ function mountVideoDirect(cfg: WallpaperConfig) {
   })();
 }
 
-/** 整段取回一个媒体文件。视频直通要先落地再挂，理由见 mountVideoDirect。 */
+// ---- 视频画布路径的绘制驱动 ----
+//
+// rAF 心跳 + 时间戳门：视频 currentTime 没推进就不重画（暂停/遮挡时零绘制开销），
+// 推进了才 drawImage —— 24fps 的素材每秒只画 24 次，60fps 的顶到 vsync 为止。
+// 不用 requestVideoFrameCallback：它绑定「帧被合成器呈现」，遮挡/后台窗口/部分
+// WKWebView 配置下注册了也不回调（实测后台窗口完全不触发），画布会定格而音频
+// 照走 —— 壁纸场景宁可按心跳对时间戳，也不能画着画着静默停摆。
+let videoCanvasRaf = 0;
+let videoCanvasForceDraw = false;
+
+/** 把视频当前帧画上画布。画布尺寸惰性对齐：清晰度热更/窗口变化下一拍自动生效 */
+function drawVideoCanvasFrame(
+  c: HTMLCanvasElement,
+  ctx: CanvasRenderingContext2D,
+  v: HTMLVideoElement,
+) {
+  const vw = v.videoWidth;
+  const vh = v.videoHeight;
+  if (!vw || !vh) return;
+  // 视口瞬间为 0（最小化/容器折叠）时别动画布：Math.max(1, 0) 会把画布砸成 1×1，
+  // 留一帧旧画面，等 resize/下一次有效尺寸再对齐，比黑一格强
+  if (!innerWidth || !innerHeight) return;
+  const dpr = toAbsoluteDpr(state.cfg.renderDpr ?? 0) || 1;
+  const w = Math.max(1, Math.round(innerWidth * dpr));
+  const h = Math.max(1, Math.round(innerHeight * dpr));
+  if (c.width !== w || c.height !== h) {
+    c.width = w;
+    c.height = h;
+  }
+  // 不透明上下文没有透明像素可言，留边黑底自己画（与 wrap 的 #000 同语义）
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, w, h);
+  const f = normalizeFit(state.cfg.fit);
+  if (f === "stretch") {
+    ctx.drawImage(v, 0, 0, w, h);
+    return;
+  }
+  const s = f === "contain" ? Math.min(w / vw, h / vh) : Math.max(w / vw, h / vh);
+  const dw = vw * s;
+  const dh = vh * s;
+  ctx.drawImage(v, (w - dw) / 2, (h - dh) / 2, dw, dh);
+}
+
+/** 起绘制心跳：从首帧就绪跑到卸载为止，暂停/遮挡由时间戳门自行归零开销 */
+function startVideoCanvasLoop() {
+  if (videoCanvasRaf) cancelAnimationFrame(videoCanvasRaf);
+  let lastT = -1;
+  const step = () => {
+    videoCanvasRaf = requestAnimationFrame(step);
+    const c = state.canvas;
+    const v = state.video;
+    if (!c || !v) return;
+    const t = v.currentTime;
+    if (t === lastT && !videoCanvasForceDraw) return;
+    videoCanvasForceDraw = false;
+    lastT = t;
+    const ctx = c.getContext("2d");
+    if (ctx) drawVideoCanvasFrame(c, ctx, v);
+  };
+  videoCanvasRaf = requestAnimationFrame(step);
+}
+
+/** 停掉绘制心跳（卸载用；暂停不停心跳 —— 时间戳门已把开销归零） */
+function stopVideoCanvas() {
+  if (videoCanvasRaf) {
+    cancelAnimationFrame(videoCanvasRaf);
+    videoCanvasRaf = 0;
+  }
+}
+
+// 视口尺寸变化：暂停/遮挡时时间戳门不会重画，尺寸变化要强制画一帧对齐新画幅
+window.addEventListener("resize", () => {
+  if (state.cfg.type === "video" && state.canvas) videoCanvasForceDraw = true;
+});
+
+/**
+ * 视频壁纸画布挂载（canvas + loop；显式 `videoRender: "canvas"` 时启用，缺省是
+ * 直通 mountVideoDirect）。
+ *
+ * 结构：一颗 `<video>` 负责解码与出声，绘制心跳把推进的帧 drawImage 进挂在
+ * wrap 下的 2D canvas —— 帧先落 canvas 再参与合成，全局滤镜照常生效（直通路径
+ * 同样吃滤镜，见 applyWallpaperFilter），代价是每帧一遍全幅像素搬运（量级中等，
+ * 原型实测）。循环用原生 loop，单解码会话，接缝特性与直通一致。
+ *
+ * 供帧源为什么**可见**（被不透明画布盖住）而不是 opacity:0 / display:none：
+ * 隐藏的媒体元素在 WKWebView 下会被引擎判定「无需呈现」—— 轻则后台窗口被暂停
+ * （实测），重则 rVFC/帧推进整个怠速。可见 + 被盖住只多一层被离屏子树吸收的
+ * 合成层，解码与呈现语义都和直通路径一致。
+ */
+function mountVideoCanvas(cfg: WallpaperConfig) {
+  const url = cfg.src;
+  if (!url) {
+    mountDefaultWallpaper();
+    return;
+  }
+  clear();
+  const seq = state.seq;
+  reportDiag(cfg, "mount start (video canvas)");
+
+  const v = createVideoElement();
+  // 供帧源可见：铺满但被不透明画布完全盖住（可被离屏子树吸收）。不用 opacity:0
+  // —— 隐藏的媒体元素在 WKWebView 下会被引擎怠速/暂停（实测），见函数注释
+  v.style.cssText =
+    "position:absolute;inset:0;width:100%;height:100%;display:block;background:#000;";
+
+  // 承接滤镜的画布：不透明上下文可被合成器当不透明层优化，留边黑底自己画。
+  // 画布在 DOM 里排在 video 之后（z 序更高），完全盖住供帧源
+  const c = document.createElement("canvas");
+  c.style.cssText = "position:absolute;inset:0;width:100%;height:100%;display:block;";
+  const ctx = c.getContext("2d", { alpha: false });
+  if (!ctx) {
+    // 2D 上下文都拿不到的极端环境：退回直通，至少有画面
+    reportDiag(cfg, "canvas 2d context 不可用，退回直通");
+    mountVideoDirect(cfg);
+    return;
+  }
+
+  let settled = false;
+  const fail = (msg: string) => {
+    if (settled || seq !== state.seq) return;
+    settled = true;
+    reportDiag(cfg, `failed: ${msg}`);
+    mountDefaultWallpaper();
+  };
+  const done = () => {
+    if (settled || seq !== state.seq) return;
+    settled = true;
+    applyVideoVolume();
+    startVideoCanvasLoop(); // 绘制心跳从首帧起跑（暂停态也画一帧，reveal 才有东西可显）
+    reportDiag(cfg, "ready");
+    reveal();
+  };
+
+  v.addEventListener("loadeddata", done, { once: true });
+  v.addEventListener("error", () => fail(`视频无法播放（${videoErrorDetail(v)}）`), { once: true });
+
+  const start = (src: string) => {
+    if (seq !== state.seq) return;
+    wrap.appendChild(v);
+    wrap.appendChild(c); // canvas 在上：先画首帧前它就是一块黑，恰好是「还没就绪」该有的样子
+    state.video = v;
+    state.canvas = c;
+    state.ctx = ctx;
+    v.src = src;
+    for (const ms of [600, 2000, 5000, 9000]) {
+      window.setTimeout(() => probeVideoState(cfg, seq, v, `${ms}ms`), ms);
+    }
+    // 全局暂停态（显示器睡眠 / 用户暂停）下挂载：只预载不起播，避免静默出声
+    if (!state.paused) {
+      void v.play().catch((e: unknown) => {
+        // 自动播放被拒不算致命：元素已就绪，宿主后续 resume() 仍能起播
+        reportDiag(cfg, `视频自动起播被拒：${(e as Error)?.message ?? e}`);
+      });
+    }
+  };
+
+  // 预取 blob 与直通同一理由：HTTP 直连时 WKWebView 缓冲区不含开头 0~0.2s，
+  // loop 回绕每圈都要停在 0 等数据（详见 mountVideoDirect 内的实测记录）。
+  // 预取失败不阻断：退回 HTTP 直连，至少有画面。
+  void (async () => {
+    try {
+      const blob = await prefetchMediaBlob(url);
+      if (seq !== state.seq) return; // 预取途中又换纸了，丢弃
+      state.videoBlobUrl = URL.createObjectURL(blob);
+      reportDiag(cfg, `video prefetch 完成 ${(blob.size / 1048576).toFixed(1)}MB → blob`);
+      start(state.videoBlobUrl);
+    } catch (e) {
+      if (seq !== state.seq) return;
+      reportDiag(cfg, `video prefetch 失败，退回 HTTP 直连：${(e as Error)?.message ?? e}`);
+      start(url);
+    }
+  })();
+}
+
+/** 整段取回一个媒体文件。视频路径（直通/画布）都要先落地再挂，理由见 mountVideoDirect。 */
 async function prefetchMediaBlob(url: string): Promise<Blob> {
   const res = await fetch(url, { cache: "force-cache" });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -2010,7 +2207,7 @@ async function prefetchMediaBlob(url: string): Promise<Blob> {
   return new Blob(chunks as BlobPart[], { type });
 }
 
-/** 视频直通路径的音量：不走库的 setVolume，直接落元素属性 */
+/** 视频路径（直通/画布共用）的音量：不走库的 setVolume，直接落元素属性 */
 function applyVideoVolume() {
   const v = state.video;
   if (!v) return;
@@ -2261,9 +2458,18 @@ function mount(cfg: WallpaperConfig) {
   // 滤镜挂在 wrap 上（不是壁纸内容上），所以每次挂载都重设一次即可：
   // clear() 只清子节点、不动 wrap 自身的 style
   applyWallpaperFilter(cfg.filter);
+  // 挂载摘要进诊断：「滤镜没生效 / 走的哪条视频路径」这类问题在这里一眼可判
+  reportDiag(
+    cfg,
+    `mount cfg: filter=${cfg.filter ?? "none"}${cfg.type === "video" ? ` videoRender=${videoIsDirect(cfg) ? "direct" : "canvas"}` : ""}`,
+  );
   if (cfg.type === "canvas") mountCanvas();
-  // 视频走直通（不经库）：4K 下库的逐帧纹理上传是掉帧主因，见 mountVideoDirect
-  else if (cfg.type === "video" && cfg.src) mountVideoDirect(cfg);
+  // 视频：缺省直通（零拷贝，滤镜挂 videoLayer 照常生效）；显式 canvas 走画布路径，
+  // 其 2D 上下文不可用时也回退直通
+  else if (cfg.type === "video" && cfg.src) {
+    if (videoIsDirect(cfg)) mountVideoDirect(cfg);
+    else mountVideoCanvas(cfg);
+  }
   else if (cfg.src) mountViaLib(cfg);
   else mountDefaultWallpaper(); // 无壁纸/未知类型 → 内联 SVG + 文案提示
 }
@@ -2283,6 +2489,8 @@ declare global {
       setSceneFps(fps: number): void;
       /** 视频纹理上传倍率热更（0 = 自动交给守门，>0 固定；就地生效不重挂载） */
       setVideoTexScale(scale: number): void;
+      /** 切换视频渲染路径（canvas/direct）：视频壁纸整张重挂生效 */
+      setVideoRender(mode: string): void;
       /** 渲染质量档位热更（库 1.3.23+）：部分更新、就地生效不重挂载 */
       setQuality(patch: QualityOptions): void;
       /** 当前生效的质量档位（三项齐全；未挂载库实例时为 null） */
@@ -2319,7 +2527,8 @@ window.__wp = {
   pause() {
     state.paused = true;
     state.inst?.pause();
-    state.video?.pause(); // 直通路径：库实例不存在，暂停要自己落
+    state.video?.pause(); // 视频路径（直通/画布）：库实例不存在，暂停要自己落
+    stopVideoCanvas(); // 画布路径：暂停连 rAF 心跳一起停，resume 再起
     if (state.raf !== undefined) {
       cancelAnimationFrame(state.raf);
       state.raf = undefined;
@@ -2342,14 +2551,22 @@ window.__wp = {
         (e: unknown) =>
           reportDiag(state.cfg, `video[resume] 恢复播放失败：${(e as Error)?.message ?? e}`),
       );
+      // 画布路径：绘制心跳随暂停一起停了，恢复播放时重新起（直通无画布，不进这支）
+      if (state.canvas && !videoIsDirect(state.cfg)) startVideoCanvasLoop();
     }
     if (state.cfg.type === "canvas") startCanvasLoop();
   },
   setFit(fit: string) {
     state.cfg.fit = fit as WallpaperFit;
     state.inst?.setFit(normalizeFit(fit as WallpaperFit));
-    // 直通路径下 fit 就是 video 的 object-fit，就地生效、不必重挂
-    if (state.video) state.video.style.objectFit = videoObjectFit(fit as WallpaperFit);
+    // 直通路径下 fit 就是 video 的 object-fit，就地生效、不必重挂；
+    // 画布路径由绘制时的铺画算法定（drawVideoCanvasFrame）—— 时间戳门可能挡着重画，
+    // 标记强制一帧对齐新 fit
+    if (state.video && videoIsDirect(state.cfg)) {
+      state.video.style.objectFit = videoObjectFit(fit as WallpaperFit);
+    } else if (state.canvas) {
+      videoCanvasForceDraw = true;
+    }
   },
   setVolume(volume: number) {
     const v = Math.max(0, Math.min(1, volume));
@@ -2384,9 +2601,13 @@ window.__wp = {
   // 动态调整渲染分辨率（入参是相对倍率：0 自动 / 0.75 / 0.85 / 1 高清）
   setRenderDpr(dpr: number) {
     state.cfg.renderDpr = dpr;
-    // 直通视频不经过 canvas，这个档位对它没有任何可生效的东西 ——
-    // 落到下面的 mount() 只会白断一次播放（重新 buffer），所以只记配置不动作。
-    if (state.video) return;
+    // 视频路径不经过库：直通完全不消费这个档位；画布路径的绘制每拍惰性对齐画布
+    // 尺寸，但时间戳门（不推进不重画）会挡住它 —— 标记强制重画一帧对齐新倍率。
+    // 都不必落到下面的 mount()：那会白断一次播放（重新 buffer）
+    if (state.video) {
+      videoCanvasForceDraw = true;
+      return;
+    }
     // 换算成库的绝对 DPR；库内部重挂载，不重新下载解析（source.key 命中缓存）
     const absolute = toAbsoluteDpr(dpr);
     if (state.inst) {
@@ -2402,6 +2623,15 @@ window.__wp = {
   setVideoTexScale(scale: number) {
     state.cfg.videoTexScale = scale;
     state.inst?.setVideoTexScale?.(scale);
+  },
+  // 切换视频渲染路径（canvas/direct）：两种路径的挂载结构不同（画布挂 wrap 下、
+  // 直通挂独立层），正在播的视频壁纸整张重挂生效；非视频壁纸只记配置，
+  // 下次应用时随 query 下发。blob 预取有 force-cache，重挂的取文件代价很小
+  setVideoRender(mode: string) {
+    if (mode !== "canvas" && mode !== "direct") return;
+    if ((state.cfg.videoRender ?? "direct") === mode) return;
+    state.cfg.videoRender = mode;
+    if (state.cfg.type === "video") mount(state.cfg);
   },
   setSceneFps(fps: number) {
     state.cfg.sceneFps = fps;
@@ -2475,6 +2705,9 @@ const initialCfg: WallpaperConfig = {
   sceneFps: Number(params.get("sceneFps")) || 24,
   // 0/缺省 = 自动（守门接管）；正数 = 固定倍率
   videoTexScale: Number(params.get("vidscale")) || 0,
+  // 视频渲染路径（仅 video 类型消费）：缺省/任意非 canvas 值 = 硬解直通（默认），
+  // 显式 canvas 才走画布路径
+  videoRender: params.get("vidrender") === "canvas" ? "canvas" : "direct",
   filter: params.get("filter") ?? undefined,
   // 渲染质量档位（query 键 aa/pq/pp → cfg 字段 aa/particles/postProcessing）
   aa: params.get("aa") ?? undefined,

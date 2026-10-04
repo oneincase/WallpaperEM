@@ -125,6 +125,10 @@ export function SettingsPage() {
   // **不参与画质档位反推**（预设一律给自动档），所以不并进 QUALITY_PRESETS。
   const [videoTexScale, setVideoTexScale] = useState<number>(0);
   const [videoTexScaleMsg, setVideoTexScaleMsg] = useState("");
+  // 视频壁纸渲染路径：direct = 硬解直通（零拷贝，默认）/ canvas = 画布（每帧绘入
+  // 画布再合成）。切档对正在播的视频壁纸整张重挂生效。同样不参与画质档位反推
+  const [videoRender, setVideoRender] = useState<"canvas" | "direct">("direct");
+  const [videoRenderMsg, setVideoRenderMsg] = useState("");
   // 全局场景帧率上限（15–60 任意整数，越低 GPU 占用越低），默认 24
   const [sceneFps, setSceneFps] = useState<number>(24);
   const [sceneFpsMsg, setSceneFpsMsg] = useState("");
@@ -264,6 +268,9 @@ export function SettingsPage() {
     invoke<string | null>("settings_get", { key: "wallpaper_video_tex_scale" })
       .then((v) => setVideoTexScale(parseVideoTexScaleSetting(v)))
       .catch(() => { });
+    invoke<string | null>("settings_get", { key: "wallpaper_video_render" })
+      .then((v) => setVideoRender(v === "canvas" ? "canvas" : "direct"))
+      .catch(() => { });
     // 画质参数整组载入（清晰度/帧率/粒子/后处理/贴图倍率/法线倍率）：
     // 档位要按整组值反推，逐个 setState 会在半路闪出错误档位，等全部到齐再落
     void Promise.all([
@@ -355,6 +362,9 @@ export function SettingsPage() {
           break;
         case "wallpaper_video_tex_scale":
           setVideoTexScale(parseVideoTexScaleSetting(value));
+          break;
+        case "wallpaper_video_render":
+          setVideoRender(value === "canvas" ? "canvas" : "direct");
           break;
         case "wallpaper_particles":
           setParticles(value || "high");
@@ -866,6 +876,17 @@ export function SettingsPage() {
         setVideoTexScaleMsg(String(e));
       }
     });
+  };
+
+  // 视频渲染路径切换：两种路径挂载结构不同，正在播的视频壁纸由渲染器整张重挂生效
+  const changeVideoRender = async (next: "canvas" | "direct") => {
+    setVideoRenderMsg("");
+    try {
+      await api.wallpaperSetVideoRender(next);
+      setVideoRender(next);
+    } catch (e) {
+      setVideoRenderMsg(String(e));
+    }
   };
 
   const changeSceneFps = (next: number) => {
@@ -2027,6 +2048,29 @@ export function SettingsPage() {
                 }
               />
               <Row
+                label={tr("视频渲染方式")}
+                desc={tr(
+                  "视频壁纸画面的产出方式。硬解直通（默认）：解码帧零拷贝直接上屏，最流畅省电；画布：每帧绘入画布再合成，作为兼容备用。切换后正在播放的视频壁纸自动重挂",
+                )}
+                control={
+                  <div className="flex items-center gap-2">
+                    <select
+                      value={videoRender}
+                      onChange={(e) =>
+                        void changeVideoRender(e.target.value as "canvas" | "direct")
+                      }
+                      className="rounded-lg border border-[var(--separator)] bg-[var(--content)] px-2 py-1 text-[12.5px] outline-none focus:border-[var(--accent-strong)]"
+                    >
+                      <option value="direct">{tr("硬解直通（默认）")}</option>
+                      <option value="canvas">{tr("画布（兼容备用）")}</option>
+                    </select>
+                    {videoRenderMsg && (
+                      <span className="text-[12px] text-red-500">{videoRenderMsg}</span>
+                    )}
+                  </div>
+                }
+              />
+              <Row
                 label={tr("贴图倍率")}
                 desc={tr("贴图解码/上传的分辨率倍率（0.50–1.00，1=原生）：去掉看不出来的过采样，画面逐像素不变但省显存。改动后壁纸重载一次")}
                 control={
@@ -2178,7 +2222,7 @@ export function SettingsPage() {
               <Row
                 label={tr("滤镜")}
                 desc={tr(
-                  "整个画面的色彩效果，实时热切、不重载壁纸；与托盘菜单「滤镜效果」是同一设置。视频壁纸不参与滤镜：它走硬解直通，而滤镜要求的离屏渲染与直通互斥，挂上滤镜就会让 4K 视频退回逐帧像素搬运。",
+                  "整个画面的色彩效果，实时热切、不重载壁纸；与托盘菜单「滤镜效果」是同一设置",
                 )}
                 control={
                   <div className="flex items-center gap-2">

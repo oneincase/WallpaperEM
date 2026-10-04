@@ -993,8 +993,11 @@ export const EN_US: Record<string, string> = {
   "滤镜": "Filter",
   "整个画面的色彩效果，实时热切、不重载壁纸；与托盘菜单「滤镜效果」是同一设置":
     "Full-screen colour effect, switched live without reloading the wallpaper; the same setting as “Filter” in the tray menu",
-  "整个画面的色彩效果，实时热切、不重载壁纸；与托盘菜单「滤镜效果」是同一设置。视频壁纸不参与滤镜：它走硬解直通，而滤镜要求的离屏渲染与直通互斥，挂上滤镜就会让 4K 视频退回逐帧像素搬运。":
-    "Full-screen colour effect, switched live without reloading the wallpaper; the same setting as “Filter” in the tray menu. Video wallpapers are exempt: they use hardware-decoded direct compositing, which is mutually exclusive with the offscreen rendering a filter requires — applying one would push 4K video back to copying pixels frame by frame.",
+  "视频渲染方式": "Video rendering",
+  "视频壁纸画面的产出方式。硬解直通（默认）：解码帧零拷贝直接上屏，最流畅省电；画布：每帧绘入画布再合成，作为兼容备用。切换后正在播放的视频壁纸自动重挂":
+    "How video wallpapers produce their picture. Direct decoding (default): decoded frames go straight to the screen with zero copies — the smoothest and most power-efficient. Canvas: frames are drawn into a canvas before compositing, kept as a compatibility fallback. Switching remounts the playing video wallpaper automatically.",
+  "硬解直通（默认）": "Direct decoding (default)",
+  "画布（兼容备用）": "Canvas (compatibility fallback)",
   "切换效果": "Transition effect",
   "叠化（默认）：新壁纸淡入盖过旧壁纸。换到另一张壁纸时生效":
     "Cross-fade (default): the new wallpaper fades in over the old one. Applies when switching to another wallpaper.",
@@ -1942,6 +1945,8 @@ export const EN_US_BACKEND: Record<string, string> = {
     "Scene frame rate out of range: {fps} ({SCENE_FPS_MIN}–{SCENE_FPS_MAX})",
   "未知的粒子质量档: {quality}（可选 {}）":
     "Unknown particle quality step: {quality} (available: {})",
+  "未知的视频渲染路径: {mode}（可选 {}）":
+    "Unknown video render path: {mode} (available: {})",
   "未知的后处理质量档: {quality}（可选 {}）":
     "Unknown post-processing quality step: {quality} (available: {})",
   "资源倍率超出范围: {v}（{RESOURCES_MIN}–{RESOURCES_MAX}）":
