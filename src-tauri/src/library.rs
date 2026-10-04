@@ -2102,6 +2102,18 @@ fn parse_project(dir: &Path) -> (String, String) {
                 .and_then(|t| t.as_str())
                 .map(|s| crate::steam::details::infer_type_from_tags(&[s.to_string()]))
                 .unwrap_or_else(|| "unknown".into());
+            // WE 编辑器散装工程常省略 type（defaultprojects 的 techno/audiophile），
+            // 只有 file 声明入口。file 以 .json 结尾且文件真实存在（project_json_entry
+            // 顺带做防穿越校验）= 松散场景工程——别让 infer_type 落到
+            // 「目录里无可识别文件 → image」的兜底上，把它们判成图片
+            let t = if t == "unknown"
+                && crate::wallpaper::project_json_entry(dir)
+                    .is_some_and(|rel| rel.to_ascii_lowercase().ends_with(".json"))
+            {
+                "scene".to_string()
+            } else {
+                t
+            };
             let title = v
                 .get("title")
                 .and_then(|t| t.as_str())
@@ -3075,6 +3087,33 @@ mod tests {
             .unwrap();
         merge_item_tags_in(&conn, "custom-1", &["Mature".into()]).unwrap();
         assert_eq!(tags_of("custom-1"), r#"["Mature"]"#);
+    }
+
+    #[test]
+    fn parse_project_loose_scene_without_type_field() {
+        // WE 编辑器散装工程（techno/audiophile 这类）：project.json 无 type 字段，
+        // 只有 file 声明入口 json —— 应判 scene，而不是落到 infer_type 的
+        // 「无可识别文件 → image」兜底
+        let d = tmpdir("loosescene");
+        std::fs::write(
+            d.join("project.json"),
+            r#"{"file":"techno.json","title":"Techno"}"#,
+        )
+        .unwrap();
+        std::fs::write(d.join("techno.json"), b"{}").unwrap();
+        std::fs::write(d.join("preview.jpg"), b"p").unwrap();
+        let (t, title) = parse_project(&d);
+        assert_eq!(t, "scene");
+        assert_eq!(title, "Techno");
+        let _ = std::fs::remove_dir_all(&d);
+
+        // file 声明的入口文件不存在 → 不算松散，保持 unknown（写错名/未拷全）
+        let d = tmpdir("loosescene-miss");
+        std::fs::write(d.join("project.json"), r#"{"file":"missing.json"}"#).unwrap();
+        std::fs::write(d.join("preview.jpg"), b"p").unwrap();
+        let (t, _) = parse_project(&d);
+        assert_eq!(t, "unknown");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
