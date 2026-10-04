@@ -1612,6 +1612,14 @@ function buildSource(cfg: WallpaperConfig): Source | null {
     // scene 的 src 是 itemId，资源目录为 {mediaBase}/{itemId}
     if (!cfg.mediaBase || !cfg.src) return null;
     const base = `${cfg.mediaBase.replace(/\/+$/, "")}/${cfg.src}`;
+    // project.json 拉取单飞：project() 与 sceneDir() 共用一份结果，同挂载只发一次请求
+    let projectOnce: Promise<Record<string, unknown> | null> | null = null;
+    const fetchProject = () => {
+      projectOnce ??= fetch(`${base}/project.json`)
+        .then(async (r) => (r.ok ? ((await r.json()) as Record<string, unknown>) : null))
+        .catch(() => null);
+      return projectOnce;
+    };
     return {
       key: base,
       // scene.pkg 逐个回退，project.json 声明的入口最优先（主 pkg 命名/布局
@@ -1638,13 +1646,72 @@ function buildSource(cfg: WallpaperConfig): Source | null {
           lastStatus != null ? `scene.pkg 加载失败（HTTP ${lastStatus}）` : "scene.pkg 加载失败",
         );
       },
-      async project(signal) {
-        try {
-          const r = await fetch(`${base}/project.json`, { signal });
-          return r.ok ? await r.json() : null;
-        } catch {
-          return null;
-        }
+      async project() {
+        return fetchProject();
+      },
+      // 松散目录形态（webwallgl 2.1.0）：project.json 的 file 以 .json 结尾 =
+      // 未打包源码工程（WE 编辑器 myprojects/defaultprojects 这类散装目录，
+      // 文件夹导入进来的就是这种），资源按相对路径按名取——/media 路由本就
+      // 支持任意子路径，Rust 侧零改动。file 不是 .json 结尾、或入口 json 取不到，
+      // 返回 null 回退 scene.pkg：大量工坊条目声明 file: "scene.json" 而盘上
+      // 只有 pkg，没有这条回退它们会整场挂掉。
+      async sceneDir(signal) {
+        const project = await fetchProject();
+        const declared =
+          typeof project?.file === "string" ? project.file.trim().replace(/^\/+/, "") : "";
+        if (!declared || /^preview\./i.test(declared) || !/\.json$/i.test(declared)) return null;
+        const cache = new Map<string, Uint8Array>();
+        const miss = new Map<string, number>();
+        const inflight = new Map<string, Promise<Uint8Array | null>>();
+        let bytes = 0;
+        const read = async (name: string, sig?: AbortSignal): Promise<Uint8Array | null> => {
+          const rel = name.replace(/\\/g, "/").replace(/^\/+/, "").trim();
+          if (!rel || rel.includes("\0") || rel.split("/").some((s) => s === ".." || s === ".")) {
+            return null;
+          }
+          const hit = cache.get(rel);
+          if (hit) return hit;
+          const missAt = miss.get(rel);
+          if (missAt !== undefined) {
+            if (Date.now() - missAt < 5000) return null;
+            miss.delete(rel);
+          }
+          const flying = inflight.get(rel);
+          if (flying) return flying;
+          const p = (async (): Promise<Uint8Array | null> => {
+            let r: Response;
+            try {
+              r = await fetch(`${base}/${rel.split("/").map(encodeURIComponent).join("/")}`, {
+                signal: sig,
+              });
+            } catch (e) {
+              if (sig?.aborted) throw e;
+              return null;
+            }
+            if (!r.ok) {
+              miss.set(rel, Date.now());
+              return null;
+            }
+            try {
+              const data = new Uint8Array(await r.arrayBuffer());
+              cache.set(rel, data);
+              bytes += data.byteLength;
+              return data;
+            } catch (e) {
+              if (sig?.aborted) throw e;
+              return null;
+            }
+          })();
+          inflight.set(rel, p);
+          try {
+            return await p;
+          } finally {
+            inflight.delete(rel);
+          }
+        };
+        const first = await read(declared, signal);
+        if (!first) return null;
+        return { entry: declared, read, bytes: () => bytes };
       },
     };
   }

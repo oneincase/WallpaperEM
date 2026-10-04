@@ -4321,32 +4321,42 @@ pub(crate) fn resolve_item_config(
             // 只认 scene.pkg 会误报缺失（843532366 的 gifscene.pkg 就是这类）
             let mut pkg_entry = scene_pkg_entry(&dir);
             if pkg_entry.is_none() {
-                // 缺 pkg：先用本地已有的依赖内容补齐；仍缺的自动加入下载队列
-                let dep_ids = crate::download::read_project_json(&dir.join("project.json"))
-                    .map(|v| crate::download::parse_dependency_ids(&v, item_id))
-                    .unwrap_or_default();
-                if dep_ids.is_empty() {
-                    return Err("未找到 scene.pkg".into());
-                }
-                let Some(svc) = app.try_state::<Arc<crate::download::DownloadService>>() else {
-                    return Err(format!(
-                        "未找到 scene.pkg（该壁纸依赖工坊内容 {}）",
-                        dep_ids.join("、")
-                    ));
-                };
-                let missing = svc.settle_dependencies(&dir, &dep_ids);
-                if !missing.is_empty() {
-                    let queued = svc.enqueue_dependency_tasks(&missing, std::slice::from_ref(&dir));
-                    if !queued.is_empty() {
-                        return Err(format!(
-                            "该壁纸依赖工坊内容 {}，已自动加入下载队列，下载完成后重新应用即可",
-                            queued.join("、")
-                        ));
+                // 松散目录形态（webwallgl 2.1.0）：project.json 的 file 以 .json 结尾
+                // 且入口文件真实存在 = 未打包源码工程（WE 编辑器 defaultprojects /
+                // myprojects、引用模式导入的散装目录），资源按相对路径散在盘上，
+                // 渲染器走 Source.sceneDir 按名取，不需要 scene.pkg 也不走依赖补齐
+                let loose = project_json_entry(&dir)
+                    .map(|rel| rel.to_ascii_lowercase().ends_with(".json"))
+                    .unwrap_or(false);
+                if !loose {
+                    // 缺 pkg：先用本地已有的依赖内容补齐；仍缺的自动加入下载队列
+                    let dep_ids = crate::download::read_project_json(&dir.join("project.json"))
+                        .map(|v| crate::download::parse_dependency_ids(&v, item_id))
+                        .unwrap_or_default();
+                    if dep_ids.is_empty() {
+                        return Err("未找到 scene.pkg".into());
                     }
-                }
-                pkg_entry = scene_pkg_entry(&dir);
-                if pkg_entry.is_none() {
-                    return Err("未找到 scene.pkg（依赖内容已合并但仍缺入口文件）".into());
+                    let Some(svc) = app.try_state::<Arc<crate::download::DownloadService>>() else {
+                        return Err(format!(
+                            "未找到 scene.pkg（该壁纸依赖工坊内容 {}）",
+                            dep_ids.join("、")
+                        ));
+                    };
+                    let missing = svc.settle_dependencies(&dir, &dep_ids);
+                    if !missing.is_empty() {
+                        let queued =
+                            svc.enqueue_dependency_tasks(&missing, std::slice::from_ref(&dir));
+                        if !queued.is_empty() {
+                            return Err(format!(
+                                "该壁纸依赖工坊内容 {}，已自动加入下载队列，下载完成后重新应用即可",
+                                queued.join("、")
+                            ));
+                        }
+                    }
+                    pkg_entry = scene_pkg_entry(&dir);
+                    if pkg_entry.is_none() {
+                        return Err("未找到 scene.pkg（依赖内容已合并但仍缺入口文件）".into());
+                    }
                 }
             }
             WallpaperConfig {

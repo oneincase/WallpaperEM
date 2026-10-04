@@ -9,6 +9,10 @@
  * 官方 CEF 在任何壁纸脚本前就把这些做成原生函数；工坊顶层直接注册。
  * 本文件作为 <head> 首个 classic script 插入。
  *
+ * 宿主可**先于本 shim** 声明站点根（可选，官方语义的 `..` 夹住按它行事）：
+ *   window.__weSiteRoot = "/<前缀…>/<条目>/"   — 站点形态非 /web/<token>/<itemId>/
+ *                                              的宿主（dsh-wallpaper-engine）用
+ *
  * 父页控制面 __we*（main.ts weShimCall / web.ts 泵）：
  *   __weSetPaused / __weSetFps / __weSetVolume / __weApplyProps / __weSeedProps
  *   __wePushAudio(arr128)
@@ -255,6 +259,10 @@
    * 目录里（今天必然 404），夹回来只会把必失败的请求救活；没逃逸的一律**原样返回**
    * （连绝对化都不做）—— 对现有语料零行为变化。`data:` / `blob:` / `http(s):` /
    * `//` / `/` 这些不经过本站点解析的形态一律不碰（file: 仍归 `rewriteBareFileUrl` 管）。
+   *
+   * 站点形态各家不同 ⇒ 宿主可**显式声明**根：注入本 shim 之前设
+   * `window.__weSiteRoot = "/<前缀…>/<条目>/"`（路径；相对形态按 baseURI 解析）。
+   * 声明缺省/非法时才按段位识别（`/web/<token>/<itemId>/`）。
    */
   function siteRootPath() {
     var base = "";
@@ -271,6 +279,33 @@
       }
     }
     if (!base) return null;
+    // 宿主显式声明的站点根优先（dsh-wallpaper-engine 形态：
+    // /wallpaper-engine/scene-files/<token>/ —— 段位识别认不出它）。
+    var declared = null;
+    try {
+      declared = w.__weSiteRoot;
+    } catch (_) {
+      /* 宿主用不透明源对象做 getter：忽略 */
+    }
+    if (typeof declared === "string" && declared) {
+      var declaredPath = declared;
+      if (declaredPath.charAt(0) === "/") {
+        // 已是绝对路径：直接用（只去掉 ?/#）—— 不解析，跨源 blob 文档里
+        // base 不可靠时这条也必须成立。
+        var hashCut = declaredPath.search(/[?#]/);
+        if (hashCut >= 0) declaredPath = declaredPath.slice(0, hashCut);
+      } else {
+        try {
+          declaredPath = new URL(declaredPath, base).pathname;
+        } catch (_) {
+          /* 解析不了就按原样交给下面的首字符判定（非 / 开头即不生效） */
+        }
+      }
+      if (declaredPath.charAt(0) === "/") {
+        if (declaredPath.charAt(declaredPath.length - 1) !== "/") declaredPath += "/";
+        return declaredPath;
+      }
+    }
     var path = base;
     try {
       path = new URL(base).pathname;
@@ -542,10 +577,27 @@
     status: null,
   };
 
+  /**
+   * 官方语义：applyUserProperties 的对象键序 = 官方 CEF 的遍历序。
+   * 官方 C++ 侧属性存于有序容器，键按字母序下发（非 project.json 声明序）。
+   * 证据：corsair_collection（官方内置 web 壁纸）的主组件 activateWallpaper 在收到
+   * "scene" 时直接 `effectProvider.currentEffect.reset()`，而 currentEffect 只由
+   * "effect" 键的发射创建 —— 按 project.json 序（scene 第 1、effect 第 6）下发必然
+   * TypeError → 路由导航被掐死 → 白屏。它在官方能跑 ⇒ 官方序必是 effect 先于 scene，
+   * 字母序（effect < logo < scene）自洽。作者脚本都是逐键取值（if (properties.x)），
+   * 键序对它们不可见，重排对既有语料恒等。
+   */
+  function weOrderUserProperties(props) {
+    var keys = Object.keys(props).sort();
+    var out = {};
+    for (var i = 0; i < keys.length; i++) out[keys[i]] = props[keys[i]];
+    return out;
+  }
+
   function callApplyUserProperties(props) {
     if (!propertyListener || typeof propertyListener.applyUserProperties !== "function") return;
     try {
-      propertyListener.applyUserProperties(props || {});
+      propertyListener.applyUserProperties(weOrderUserProperties(props || {}));
     } catch (_) {
       /* 壁纸脚本抛错不打断宿主 */
     }
