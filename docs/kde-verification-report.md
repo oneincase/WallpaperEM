@@ -30,6 +30,7 @@
 | `org.freedesktop.ScreenSaver` 判空闲 | ❌ 本机 `NotSupported` | 强 |
 | `kscreen-doctor -j` 作每屏默认数据源 | ⚠️ 无头下无输出 | 中 |
 | KWin 5 的 `Layer=Desktop` 窗口规则 | ⚠️ 未能证实 | 弱（仅二进制字符串） |
+| `scripts/linux-kde-smoke.sh` 在真机会话里跑通 | ✅ 5/5 断言 PASS（连跑 2 次一致） | 强（见 §6.1） |
 | Plasma 6 全部专属机制 | ⛔ 本机不可验 | — |
 
 ## 3. 核心发现：壁纸窗口的落点
@@ -130,6 +131,42 @@ PROBE bus_org.kde.StatusNotifierWatcher = absent
 | 托盘 | `org.kde.StatusNotifierWatcher` = **absent** | Plasma 5.27 无 SNI 宿主（Plasma 6 才有）→ 托盘在 5.27 上属额外依赖项 |
 | 快捷键 | `org.kde.kglobalaccel` = present | X11 可用；实际注册待验 |
 
+### 6.1 KDE 冒烟脚本真机首跑（现已 5/5 通过）
+
+命令（VM 上，`KDE_SMOKE_STRICT` 语义的 X11 档）：
+
+```bash
+cd ~/WallpaperEM && SMOKE_WITH_PLASMA=1 bash scripts/linux-kde-smoke.sh
+```
+
+结果（连跑两次一致）：
+
+| 断言 | 结果 |
+| --- | --- |
+| 应用存活 30s 无退出 | ✅ PASS |
+| 日志含窗口创建/桌面层应用记录 | ✅ PASS |
+| 日志无 `panic` | ✅ PASS |
+| 壁纸窗口 `_NET_WM_WINDOW_TYPE` 含 `DESKTOP` | ✅ PASS（`id=0x600036`） |
+| 壁纸窗口之上存在普通窗口（证明在普通窗口之下） | ✅ PASS |
+
+同一轮的 stacking（自底向上，plasmashell 也在跑）：
+
+```
+#1 0x400015  type=DESKTOP  name= Desktop @ QRect(0,0 1280x800)   ← plasmashell 桌面视图
+#2 0x600036  type=DESKTOP  name=                                 ← 我们的壁纸窗口
+#3 0x600003  type=NORMAL   name= WallpaperEM
+#4 0x40002b  type=NORMAL   name=                                 ← Plasma 面板
+```
+
+`共存 desktop 窗口数 = 2` —— 即 §3 的核心发现在冒烟里可被自动复现。
+
+首跑失败并暴露了**两个真缺陷**（都已修入 `scripts/linux-kde-smoke.sh`）：
+
+1. **kwin 启动等待循环形同虚设**：`xprop -root _NET_SUPPORTING_WM_CHECK >/dev/null 2>&1 && break` —— `xprop` 对「属性不存在」同样返回 0，循环第一次就 `break`，kwin 完全没有启动宽限期。改为看输出内容（`| grep -q 'window id'`）。
+2. **只等 `xdpyinfo` 不足以判定 X 可用**：`xdpyinfo` 走 Xlib，**抽象 unix socket 也认**；而 kwin 用的 Qt5 `xcb` 插件只认文件 socket `/tmp/.X11-unix/X<N>`。只等 `xdpyinfo` 会撞上「抽象 socket 已通、文件 socket 还没建好（或残留陈旧文件）」的窗口，症状是 `qt.qpa.xcb: could not connect to display :99` + `Could not load the Qt platform plugin "xcb"`，而同一时刻 `xdpyinfo` 明明成功。现在改为**显式等文件 socket**，超时则直接报错并提示 `rm -f /tmp/.X11-unix/X99`。
+
+诊断方法（可复用）：在失败分支打印 `xdpyinfo` 首行、`pgrep -a -x Xvfb`、`ss -xl | grep X11-unix`、`ls -la /tmp/.X11-unix/`，四条一起看就能区分「X 没起来 / X 起来了但没有文件 socket / X 被别人占着」。
+
 ## 7. 对方案的影响（已回填 [kde-adaptation-plan.md](kde-adaptation-plan.md) §2.5）
 
 1. **§4.1 机制①的定义要改**：从「拿桌面层语义并保住图标」改为「拿桌面窗口语义（跳任务栏/全桌面/在普通窗口之下）」，**图标可见性另立一条路**（Plasma 6 Wayland 的 layer-shell `Background`，或 §4.5 壁纸插件）。X11 上无解，别承诺。
@@ -158,7 +195,7 @@ PROBE bus_org.kde.StatusNotifierWatcher = absent
 | `scripts/kde-vm-verify-state.sh` | 恢复后体检：根分区 rw、ext4 无新错、包完整性、二进制存在 |
 | `scripts/kde-vm-session.sh` | **核心**：真实用户总线上拉起 Xvfb+kwin_x11+plasmashell，提供 `probes` / `realbuscase` / `belowtest` / `smoke` / `shell` 五种模式 |
 | `scripts/kde-probes.sh` | 机制探针（`PROBE 名 = 值`），不需要应用二进制 |
-| `scripts/linux-kde-smoke.sh` | 有断言的 KDE/X11 冒烟（CI 用，走私有总线） |
+| `scripts/linux-kde-smoke.sh` | 有断言的 KDE/X11 冒烟：真机走真实用户总线、CI 无用户会话时自动退回 `dbus-run-session`；已在 VM 上 5/5 通过（见 §6.1） |
 | `docs/kde-smoke-setup.md` | 装配说明与覆盖率对照 |
 | `docs/kde-adaptation-plan.md` | 适配方案（§2.5 已回填本轮实测） |
 | `docs/kde-plasma-constraints.md` | 上游约束调研（12 条硬约束 + 71 链接） |

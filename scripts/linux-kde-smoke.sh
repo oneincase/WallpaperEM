@@ -98,14 +98,24 @@ export LIBGL_ALWAYS_SOFTWARE=1          # Xvfb 无 GPU
 echo "  [info] XDG_CURRENT_DESKTOP=$XDG_CURRENT_DESKTOP XDG_SESSION_TYPE=$XDG_SESSION_TYPE"
 
 # 1) 启动 kwin_x11（合成器 + 窗口管理器；_NET_CLIENT_LIST_STACKING 由它提供）
+# X 连接自检：kwin 连不上时，先分清是「X 没起来」还是「kwin 自己起不来」
+echo "  [info] X 自检: DISPLAY=$DISPLAY / $(xdpyinfo 2>&1 | head -1)"
 kwin_x11 --replace > "$WORK/kwin.log" 2>&1 &
 KWIN_PID=$!
 for i in $(seq 1 30); do
-  xprop -root _NET_SUPPORTING_WM_CHECK >/dev/null 2>&1 && break
+  # 注意：xprop 对「属性不存在」也返回 0，必须看输出内容，否则循环第一次就 break，
+  # kwin 完全没有启动宽限期（实测踩过：kwin 明明能起来却判成未成为 WM）
+  xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q 'window id' && break
   sleep 0.5
 done
 if ! xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q 'window id'; then
-  fail "kwin_x11 未成为 WM（看 $WORK/kwin.log）"; exit 1
+  fail "kwin_x11 未成为 WM（看 $WORK/kwin.log）"
+  # 现场诊断：kwin 连不上 X 时，先证明 X 到底还在不在、socket 是谁的
+  echo "  [info] 诊断 X: $(xdpyinfo 2>&1 | head -1)"
+  echo "  [info] 诊断 Xvfb: $(pgrep -a -x Xvfb | head -2 | tr '\n' ' ')"
+  ss -xl 2>/dev/null | grep -iE 'X11-unix|X99|:99' | head -6
+  ls -la /tmp/.X11-unix/ 2>&1 | head -6
+  exit 1
 fi
 WM_NAME="$(xprop -root _NET_WM_NAME 2>/dev/null | cut -d= -f2- | tr -d ' "')"
 echo "  [info] WM = $WM_NAME"
@@ -250,16 +260,61 @@ XVFB_PID=""
 if xdpyinfo >/dev/null 2>&1; then
   echo "  [info] DISPLAY=$DISPLAY 上已有 X server，复用"
 else
-  Xvfb "$DISPLAY" -screen 0 "${SCREEN_W}x${SCREEN_H}x24" +extension GLX +render -noreset \
+  # setsid 是必须的：本脚本常从 SSH 的非交互 shell 里跑，Xvfb 若留在同一
+  # 进程组，会话一结束就被 SIGHUP 带走（真机实测：kwin 随后报
+  # `could not connect to display :99`，而 Xvfb 日志本身是干净的）。
+  setsid Xvfb "$DISPLAY" -screen 0 "${SCREEN_W}x${SCREEN_H}x24" +extension GLX +render -noreset \
     > "$WORK/xvfb.log" 2>&1 &
   XVFB_PID=$!
-  for i in $(seq 1 20); do xdpyinfo >/dev/null 2>&1 && break; sleep 0.5; done
+  XVFB_READY=0
+  for _ in $(seq 1 60); do          # 至多 30s：慢 VM/冷启动下 Xvfb 的 xkbcomp 阶段可能很慢
+    if xdpyinfo >/dev/null 2>&1; then XVFB_READY=1; break; fi
+    sleep 0.5
+  done
+  # xdpyinfo 走的是 Xlib，抽象 unix socket 也认；Qt5 的 xcb 插件只认文件 socket
+  # （/tmp/.X11-unix/X<N>）。实测踩过：抽象 socket 已可用、文件 socket 还没建好时，
+  # xdpyinfo 成功但 kwin_x11 报 `could not connect to display :99`。
+  # 所以这里必须等「文件 socket 出现」，它才是 kwin 能连上的充要条件。
+  XNUM="${DISPLAY#:}"; XNUM="${XNUM%%.*}"
+  XSOCK="/tmp/.X11-unix/X${XNUM}"
+  for _ in $(seq 1 40); do
+    [ -S "$XSOCK" ] && break
+    sleep 0.25
+  done
+  if [ ! -S "$XSOCK" ]; then
+    echo "  [FAIL] Xvfb 起来了但没有文件 socket $XSOCK（只有抽象 socket）" >&2
+    echo "         多半是上一轮残留的陈旧 socket：删掉它再重跑（rm -f $XSOCK）" >&2
+    [ "$KEEP_LOGS" != "1" ] && rm -rf "$WORK"
+    exit 2
+  fi
+  if [ "$XVFB_READY" != "1" ]; then
+    # 不复用「等一下也许就好了」的侥幸：X 起不来后面全是噪声失败，直接说清楚
+    echo "  [FAIL] Xvfb 未能就绪（DISPLAY=$DISPLAY，30s 超时）；日志尾部：" >&2
+    tail -5 "$WORK/xvfb.log" >&2 || true
+    [ "$KEEP_LOGS" != "1" ] && rm -rf "$WORK"
+    exit 2
+  fi
+fi
+
+if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "/run/user/$(id -u)/bus" ]; then
+  # SSH 登录等场景下变量没被导出，但用户会话总线其实存在（实测：接上后
+  # kglobalaccel/KScreen/kactivitymanagerd 全部正常，plasmashell 才能加载）
+  echo "  [info] 探测到用户会话总线 /run/user/$(id -u)/bus（未导出，自动接上）"
+  export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
+  export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 fi
 
 if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
   echo "  [info] 复用真实用户会话总线: $DBUS_SESSION_BUS_ADDRESS"
   BUS_RUNNER=(bash)
 else
+  # 私有总线上没有 kactivitymanagerd，plasmashell 会直接
+  # `Aborting shell load: The activity manager daemon (kactivitymanagerd) is not running`
+  # —— 与其记一条必然失败的断言，不如自动降级为「只跑 kwin_x11」并把原因说清楚。
+  if [ "$SMOKE_WITH_PLASMA" = "1" ]; then
+    echo "  [warn] 无用户会话总线：私有总线上 plasmashell 无法加载（kactivitymanagerd 缺失）→ 本次跳过 plasmashell"
+    SMOKE_WITH_PLASMA=0
+  fi
   echo "  [info] 用私有总线（dbus-run-session）——仅适用于无用户会话的容器"
   BUS_RUNNER=(dbus-run-session -- bash)
 fi

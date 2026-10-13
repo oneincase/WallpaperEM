@@ -278,7 +278,7 @@ pub fn detect() -> KdeEnv;           // 纯函数入口，输入是 env 快照�
 | `P0` | ✅ 已落地 | `src-tauri/src/kde.rs`：`KdeEnv`/`KdeScope`/`env_snapshot`/`detect_with`/`env()`（`OnceLock` 缓存）+ 桌面容器判定（`parse_containments`/`desktop_containment`/`log_desktop_icons_status`）；17 个单测通过；非 KDE 行为零变化 |
 | `P1` | ✅ **已定论：窗口方案在此路不通** | 四轮 spike（`p1b`/`p1c`/`p1d`/`p1e`）：透明化桌面背景在「无法沉底」的前提下无意义；四种沉底原语全部无效。结论已写入 §2.5 与 §4.1 |
 | `P2` | 🟡 部分落地 | `src-tauri/src/kwin.rs` 规则文件层（合并/幂等/回滚/校验，13 单测）+ `org.kde.KWin reconfigure`。真机实测：KWin **5** 下规则键可写入但不影响层序（`layerrule` 长期 unused）⇒ 该部分价值在 **Plasma 6/Wayland**，不要再当 X11 的图标解药 |
-| `P3` | 🟡 已就绪待 CI 验证 | `scripts/linux-kde-smoke.sh`（真实总线 + `kwin_x11` + 断言）、`scripts/kde-vm-session.sh`（`probes`/`smoke`/`shell`/`realbuscase`/`belowtest`/`ruleinstall`/`p1b`–`p1e`）、`scripts/kde-kwin-layer.sh`、CI `kde-smoke` job |
+| `P3` | ✅ 真机通过（Plasma 5.27/X11） | `scripts/linux-kde-smoke.sh`（真实总线 + `kwin_x11` + `plasmashell` + 5 条断言）在 VM 上 **5/5 PASS，连跑两次一致**，并自动复现「两个 desktop 窗口共存、我们在 plasmashell 桌面视图之上」；另产出 `scripts/kde-vm-session.sh`（`probes`/`smoke`/`shell`/`realbuscase`/`belowtest`/`ruleinstall`/`p1b`–`p1e`）、`scripts/kde-kwin-layer.sh`、CI `kde-smoke` job。CI 侧仍待真实 Actions 跑一次 |
 | `P4` | 🟡 本轮更新 | 本文 §2.5/§4.1/§5 已回填真机结论；`README.md` 增加 KDE 小节（图标取舍 + 冒烟命令）；`CHANGELOG.md` Unreleased 记录用户可见变化 |
 | `P5` | 🟡 部分落地 | `kwin.rs` 的 KScreen 每屏解析、`idle_seconds`（D-Bus + 2 秒缓存）、`reconfigure`；`wallpaper/linux.rs::display_asleep` 已接入。`occlusion_snapshot`/`frontmost_kind` 仍为空实现（X11 侧用 `x11rb` 已可用，Wayland 侧无解） |
 | `P6` | ✅ 已合入（commit `27d4ccf`） | KDE 静态壁纸三级回退（portal → `plasma-apply-wallpaperimage` → `qdbus evaluateScript`），9 个单测；非 KDE 分支逐字未动 |
@@ -326,7 +326,7 @@ pub fn detect() -> KdeEnv;           // 纯函数入口，输入是 env 快照�
 > - `scripts/kde-verify-preflight.sh` —— 只读环境预检，回答「这台机器能验证哪几条」，并在缺 `xvfb`/无 `sudo`/非 Plasma 6 时明确报 `[BLOCK]`/`[WARN]`；
 > - `scripts/kde-probes.sh` —— **不需要应用二进制**，直接在活会话里实测 §7 的开放问题（`evaluateScript` 能不能拿到 desktop containment 的 `wallpaper` 对象、机制② 的配置键、KWin 规则/D-Bus 面、`kscreen-doctor`、空闲源、SNI、portal 快捷键），输出 `PROBE <名> = <值>` 便于回填本文 §7；
 > - `scripts/kde-vm-session.sh` —— **真机核心入口**：在真实用户总线上拉起 `Xvfb` + `kwin_x11` + `plasmashell`，提供 `probes` / `realbuscase`（应用冒烟 + 像素取证）/ `belowtest`（置底可行性对照）/ `smoke` / `shell` 五种模式；`Xvfb`/`kwin_x11` 用 `setsid` 脱离 SSH 会话，避免 SIGHUP 带走；
-> - `scripts/linux-kde-smoke.sh` —— 上面第 1 档的可执行版本（容器/CI 用）：起 `Xvfb` + `dbus-run-session` + `kwin_x11`（可选 `plasmashell`），**显式设 `XDG_CURRENT_DESKTOP=KDE`**（现有 Docker 冒烟漏了这一步，等于没测 KDE），断言 `_NET_WM_WINDOW_TYPE` 含 `_NET_WM_WINDOW_TYPE_DESKTOP`、该窗口在 `_NET_CLIENT_LIST_STACKING` 中位于普通窗口之下、日志有创建/应用记录、进程存活无 panic；每步 `[PASS]/[FAIL]` 计数并据此返回退出码；
+> - `scripts/linux-kde-smoke.sh` —— 上面第 1 档的可执行版本：起 `Xvfb` + `kwin_x11`（可选 `plasmashell`），**显式设 `XDG_CURRENT_DESKTOP=KDE`**（现有 Docker 冒烟漏了这一步，等于没测 KDE），断言 `_NET_WM_WINDOW_TYPE` 含 `_NET_WM_WINDOW_TYPE_DESKTOP`、该窗口在 `_NET_CLIENT_LIST_STACKING` 中位于普通窗口之下、日志有创建/应用记录、进程存活无 panic；每步 `[PASS]/[FAIL]` 计数并据此返回退出码。真机走**真实用户总线**（`/run/user/$(id -u)/bus`），容器/CI 无用户会话时自动退回 `dbus-run-session` 并跳过 `plasmashell`。**已在 Plasma 5.27/X11 VM 上 5/5 通过（连跑两次一致）**，逐条结果与两处被修掉的缺陷（`xprop` 空属性也返回 0 导致 kwin 无宽限期；只等 `xdpyinfo` 会漏掉 Qt 需要的文件 socket）见 [kde-verification-report.md](kde-verification-report.md) §6.1；
 > - `scripts/kde-vm-setup.sh` / `kde-vm-build.sh` / `kde-vm-sync.sh` / `kde-vm-verify-state.sh` —— 真机装配、构建、同步、故障后体检（ext4 日志中止那次事故的产物）。
 
 ### 6.3 手工验收矩阵（发版前，真机）
