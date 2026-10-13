@@ -12,12 +12,12 @@
 
 | 会话 | 现状 | 方案主路径 | 落地工作量 |
 | --- | --- | --- | --- |
-| **KDE / X11** | **已实测**（Plasma 5.27）：壁纸窗口拿到 `NET::Desktop` 与桌面语义（跨桌面/跳任务栏/在普通窗口之下），但 stacked 在 plasmashell 自绘层之上 → **图标被盖**；`_NET_WM_STATE_BELOW` 无效 | 机制 ①止步于「拿桌面语义」；**图标可见性**要么靠 plasmashell 桌面背景透明化（`P1` spike，仍未证成）要么走 Plasma 6 Wayland 的 layer-shell `Background` 或 §4.5 壁纸插件；机制 ②兜底：用户确认后关闭 plasmashell 桌面容器（`P2`，代价是失去系统图标样式的容器） | 中（1 spike + 1 工作包）；**X11 侧不要承诺图标可见** |
+| **KDE / X11** | **已实测穷尽**（Plasma 5.27）：壁纸窗口拿到 `NET::Desktop` 与桌面语义（跨桌面/跳任务栏/不在任务栏/位于普通窗口与面板之下），但 plasmashell 桌面视图**恒占 stacking 最底**，客户端无法插到它下面（`_NET_WM_STATE_BELOW`、`XConfigureWindow(sibling,Below)`、`_NET_RESTACK_WINDOW`、override-redirect 四种原语全部实测无效）→ **图标必被盖**，且因点击穿透**仍可点中却看不见** | 机制 ①「透明化桌面背景」**在本机已被证明没有意义**（沉底不可能，实测透明前后截图逐像素一致）；窗口方案只剩 ②**让桌面不再是文件夹视图**（用户确认后关闭桌面图标容器，一键可回滚）；要「壁纸+图标」全满足只能走 ③壁纸插件（`P9`，已升级为战略路径） | 小（②的判定与提示已随本轮落地）；**X11 侧不要承诺图标可见** |
 | **KDE / Wayland** | 桌面类型 hint 被忽略，壁纸退化为「置底普通窗口」；自动暂停、全局快捷键、熄屏暂停全部失效 | ①**KWin 窗口规则**（`Layer=Desktop` 能覆盖 `belongsToLayer()`，配合 `AcceptFocus=false`/`Skip*`/全桌面）为基线（⚠️ KWin 5 的 `Layer` 是否为 unused **未证**，KWin 6 才是确定路径）；②进阶：`zwlr_layer_shell_v1` `Background` 层（KWin 已实现且无白名单，**需 spike**，这是 X11 那条死路的唯一替代） | 中（1 工作包 + 1 spike） |
 | **两者共通的 KDE 集成** | 全仓零 KWin/KScreen/logind/portal 调用 | 新增 `src-tauri/src/kwin.rs` + `kde` 能力探测，承接：会话探测、鼠标穿透、遮挡快照、熄屏、每屏几何、快捷键、静态壁纸 | 中（4 个工作包） |
 | **工程化** | Linux 冒烟只有 Xvfb(X11)、无断言、CI 无 KDE | 新增 KDE X11 + KDE Wayland（nested `kwin_wayland --virtual`）两级冒烟，纯函数单测覆盖规则生成/会话探测/配置读写 | 中（2 个工作包） |
 
-**一句话**：KDE 适配的**真正难点是「桌面图标与壁纸在 plasmashell 里是同一个窗口」**——窗口堆叠技巧解决不了它；方案因此分成「透明化 plasmashell 背景」（首选，待 spike）与「关闭 plasmashell 桌面容器」（确定可行，代价是失去系统图标）两条路，其余工作是把现在靠 GTK 硬凑的桌面语义换成 KWin 自己的窗口规则 / D-Bus 表达。
+**一句话**：KDE 适配的**真正难点是「桌面图标与壁纸在 plasmashell 里是同一个窗口」**——真机四轮实验已证明窗口堆叠技巧**完全解决不了**它（KWin 不让任何客户端窗口排到桌面视图之下）。所以方案只剩两条诚实的路：**② 让桌面不再是文件夹视图**（窗口方案里唯一可行，代价是用户失去桌面图标），或 **③ 做成 Plasma 壁纸插件**（唯一「壁纸+图标」全满足解，`P9` 战略路径）；其余工作是把现在靠 GTK 硬凑的桌面语义换成 KWin 自己的窗口规则 / D-Bus 表达。
 
 ---
 
@@ -100,6 +100,17 @@
 - 像素取证：壁纸窗口在世 vs 杀掉后，桌面图标区截图哈希不同（`6f431327…` vs `483a9692…`）→ 确认壁纸确实画在桌面视图之上（图标被盖）。截图见 `scripts/kde-vm-session.sh` 输出目录的 `screen-with-app.png` / `screen-without-app.png`。
 - 复现该结论的脚本断言在**修复后**应把「壁纸窗口在 stacking 中存在且 type=DESKTOP」判 PASS、把「盖住图标区」记为**已知降级 FAIL**（本轮即如此，`realbuscase` 退出码 1 属预期）。
 
+**机制①（把壁纸压到 plasmashell 桌面视图之下）在 X11 上已被穷尽证伪**（`p1c` 模式，三次独立原语 + 一个对照组）：
+
+- 层序实测（自底向上）：`#1 plasmashell DESKTOP` → `#2 我们的 DESKTOP` → `#3 我们的 NORMAL` → `#4 plasmashell 面板`。等离子桌面视图**始终是最底层**。
+- 三种「排到兄弟之下」的原语全部无效：
+  1. `_NET_WM_STATE_BELOW` 加在我们的 DESKTOP 窗口上 → 名次不变（p1b/p1c 两次实测，且 plasmashell 桌面窗口本身就带 `BELOW`）。
+  2. `XConfigureWindow(sibling=plasmashell 窗口, stack_mode=Below)` → X 服务端直接 `BadMatch (invalid parameter attributes)`，KWin 不接受这种 sibling 重排。
+  3. EWMH `_NET_RESTACK_WINDOW`（`_NET_SUPPORTED` 里**确实声明了**该原子）`detail=Below, sibling=plasmashell 桌面视图` → 名次不变；连 `detail=Above` 也同样无效。
+- 结论：**KWin 自行管理桌面型窗口的层内次序，客户端无法把窗口插到 plasmashell 桌面视图之下。** 因此在 X11 上「动态壁纸 + 系统桌面图标同时可见」**不可能**通过窗口方案达成——不是「还没试对」，而是已被穷尽。
+- 这条结论**不必外推到 Plasma 6/Wayland 的 layer-shell**：那里壁纸走 `zwlr_layer_shell_v1` 的 `Background` 层，与 plasmashell 的 desktop 窗口是否同层、谁在上，仍属 Plasma 6 专属待验项（本机拿不到 Plasma 6）。但**上游实证已给出悲观先例**：linux-wallpaperengine#370（Plasma 6.3.4）就是「第三方桌面层窗口上去之后桌面图标消失」。
+- 因此 §4.1 的机制排序必须改：**① 在 X11 上出局**；窗口方案下唯一稳的是 **②（关掉/透明化该层，接受图标取舍）**；而「壁纸+图标都要」只剩 **③ Plasma 壁纸插件**这条路（它不是演进彩蛋，而是该诉求的唯一正解）。
+
 **同一轮证伪/证实的两条早期判断：**
 
 - 会话总线：KDE 服务必须挂在**真实用户总线**上。用 `dbus-run-session` 起私有总线的旧冒烟里，`kglobalaccel`/`kactivitymanagerd`/`KScreen` 全部 `Spawn.ChildSignaled`（signal 6）死亡，`plasmashell` 直接 `Aborting shell load: The activity manager daemon (kactivitymanagerd) is not running`；换成 `/run/user/1000/bus` 后 `org.kde.KWin`/`org.kde.plasmashell`/`org.kde.KScreen`/`org.kde.kglobalaccel`/`org.freedesktop.portal.Desktop` **全部 present**。
@@ -139,27 +150,28 @@ Plasma 6 的**桌面图标与桌面壁纸在同一个窗口里**：DesktopView �
 
 > ❌ **已推翻的设想：把壁纸窗口抬（raise）到 plasmashell 桌面窗口之上。** 窗口间 stacking 压不过窗口内绘制顺序——这样做会把 plasmashell 桌面窗口**连同它画的图标一起**盖住，而不是让图标浮到壁纸上；而且按现状壁纸本来就在 plasmashell 之上，raise 不产生任何可观察变化，只留下两个 desktop 窗口并存的副作用。**不要按这个思路排期。**
 
-于是「壁纸在最底、图标浮在壁纸之上」在 KDE 上只有三条真正可行的机制：
+于是「壁纸在最底、图标浮在壁纸之上」在 KDE 上只剩三条候选机制，而**其中两条已被真机实测改写**：
 
-| 机制 | X11 | Wayland | 性质 |
+| 机制 | X11（Plasma 5.27 实测） | Wayland（Plasma 6，本机不可验） | 性质 |
 | --- | --- | --- | --- |
-| **① 让 plasmashell 桌面背景变透明** | ★ 主路径（`P1`） | 同样适用 | 期望最小、最符合「壁纸+图标都要」的诉求；但**无官方开关**，需实测可行性 |
-| **② 关掉 plasmashell 桌面容器**（官方配置项：桌面布局选「无/桌面」而非「文件夹视图」），让图标不再由 plasmashell 绘制 | ★ 推荐（`P2`） | 同样适用 | 100% 支持、可逆；代价：用户失去桌面图标 |
-| **③ 做成 Plasma 壁纸插件**（跑在 plasmashell 内，壁纸成为 containment 的背景层） | 可行但重 | 可行但重 | 唯一「原生完美」解，但需自研帧传输、崩溃会带崩 plasmashell（演进项 `P9`） |
+| **① 让 plasmashell 桌面背景变透明** | ❌ **无效**：它只在「我们已沉到桌面视图之下」时才有意义，而沉底已被穷尽证伪；单独做透明前后截图逐像素一致 | ❓ 存疑：`zwlr_layer_shell_v1` 的 `Background` 与 plasmashell 的 desktop 窗口谁在上未验 | 不要按「先透明化」排期 |
+| **② 关掉 plasmashell 桌面容器**（桌面布局选「桌面」而非「文件夹视图」），让图标不再由 plasmashell 绘制 | ✅ **唯一可行的窗口方案** | ✅ 同样适用 | 100% 支持、可逆；代价：用户失去桌面图标 |
+| **③ 做成 Plasma 壁纸插件**（跑在 plasmashell 内，壁纸成为 containment 的背景层） | ✅ 唯一「壁纸+图标」全满足解 | ✅ 同样适用 | 需自研帧传输、崩溃会带崩 plasmashell（`P9`，**本轮升级为战略路径**） |
 
-**KDE / X11 —— 主路径 ①，兜底 ②**
+**KDE / X11 —— 结论：外部窗口方案只能与「无桌面图标」共存**
 
-- **① 透明化 plasmashell 桌面背景（`P1`，spike 后定）**：把壁纸窗口保持在 DesktopLayer **底部**（现在的 `lower_below_desktop_icons()` 对 KDE 直接 return，改为「KDE 也下沉」只会让 plasmashell 的不透明背景重新盖住壁纸——所以必须同时让那层背景透明）。
-  - 手段（按优先级实测）：`org.kde.PlasmaShell.evaluateScript` 找到 desktop containment 的 `wallpaper` 对象（`desktop`/`containment` 的 `wallpaper` 属性）设 `visible=false` 或换成透明图；失败则退 `plasma-apply-wallpaperimage` 设一张全透明 PNG。
-  - **这是未验证路径**：`evaluateScript` 只暴露 `desktop()`/`panel()`/`activity()` 一组宽松的类型化 QObject 包装（`panel()` 的返回类型甚至标成 `QObject`），能否稳定拿到 desktop containment 的 root object / `wallpaper` 属性**必须实测**；且 `org.kde.PlasmaShell` 整体是上游 **Internal API**，行为不保证跨版本兼容。
-  - 若成功：壁纸可见 + 图标（同一窗口绘制、背景透明）浮在壁纸之上且可点，**诉求完全达成**。
-  - 若失败：明确记录并转 ②，不要在这条路上反复试。
-- **② 关闭 plasmashell 桌面容器（`P2`，确定可行）**：Plasma 本身支持「桌面布局 = 无」（`~/.config/plasma-org.kde.plasma.desktop-appletsrc` 里 desktop containment 的 `formfactor`/`plugin` 配置），关闭后桌面窗口不再绘制图标，我们的 DesktopLayer 壁纸就是唯一可见的底层。
-  - 实现方式：不手改用户配置，而是在应用内引导（`org.kde.plasma-desktop` 的右键「配置桌面」入口）+ 提供「一键切换（写配置前备份、可回滚）」。
-  - 代价：用户失去桌面图标/右键桌面菜单，需在设置页**明确告知**并让用户确认；这是「壁纸引擎」类产品的常规取舍（Wallpaper Engine 在 Windows 上关图标也是同一逻辑）。
-- **③ `P9`（见 §4.5）**：真需要「壁纸+图标+原生」且 ① 实测失败时，做 Plasma 壁纸插件。
+- **沉底被穷尽证伪**（`p1b`/`p1c`/`p1d`/`p1e` 四轮，全部实测）：`_NET_WM_STATE_BELOW`（DESKTOP 与 NORMAL 两种窗口类型都试过）、`XConfigureWindow(sibling=桌面视图, stack_mode=Below)`（X 服务端 `BadMatch`）、`_NET_RESTACK_WINDOW(detail=Below/Above)`、`xdotool windowraise`（抬 plasmashell 自己）、override-redirect 全屏窗口——**没有一条能把我们的窗口排到 plasmashell 桌面视图之下**。桌面视图自己带 `_NET_WM_STATE_BELOW` 并固定占据 stacking 的 `#1`（最底），KWin 自行维护该层内次序，客户端无法插到它下面。
+- **机制① 因此失去意义**：透明化只在「我们已在桌面视图之下」时才产生可观察差异。实测证据：桌面壁纸换成全透明 PNG（`plasma-apply-wallpaperimage` 报 `Successfully set the wallpaper for all desktops`）前后截图**逐像素一致**——品红替身窗口在「默认壁纸」与「全透明壁纸」两个阶段都是整屏 `(255,0,255)`。
+- **能拿到的仍然有效**：我们的 `DESKTOP` 类型窗口确实拿到了「桌面窗口语义」——实测 stacking 自底向上为 `#1 plasmashell 桌面视图 → #2 我们的壁纸窗口 → #3 我们的 NORMAL 窗口 → #4 plasmashell 面板`，即**在普通窗口之下、面板之下**，跳任务栏/全桌面/不抢焦点也都在（`_NET_WM_STATE = STICKY, SKIP_TASKBAR, SKIP_PAGER`）。机制①的价值应重述为「拿桌面窗口语义」，**不是**「保住桌面图标」。
+- 因此 KDE/X11 的落地选择只剩三条，且必须在设置页如实呈现：
+  1. **②「关闭桌面图标」（推荐）**：把桌面 containment 从「文件夹视图」改成纯桌面。此后我们的 DesktopLayer 窗口覆盖的是一块只画壁纸的空白 containment，图标问题不复存在。实现方式：不手改用户配置，改为应用内引导 + 可回滚的一键切换（写前备份）；用户失去桌面图标与桌面右键菜单，需明确告知并确认。
+  2. **③ 壁纸插件（`P9`，唯一全满足解）**：见 §4.5。
+  3. **默认现状（不推荐，但必须如实告知）**：保留桌面图标 ⇒ 图标被壁纸**盖住**；又因为默认 `interactive=false` 会走 `set_ignore_cursor_events(true)`，**图标仍可点中却看不见**（`p1c` 截图实证）——这比「点不到」更糟。首次在 KDE 上启动时必须提示，并给出上面的 ② 入口。
+- `P2` 的窗口规则与 `P1` 的 layer-shell 仍有价值（跳任务栏/全桌面/不抢焦点/层归属），但**都不要指望它们解决图标可见性**。
 
 **KDE / Wayland —— 规则路径（`P2`）为基线，layer-shell（`P1` spike）为进阶**
+
+> ⚠️ 上一条结论是**结构性的**，不是 X11 的实现细节：桌面图标与壁纸画在**同一个窗口**里，所以任何外部窗口要么盖住图标、要么被不透明桌面背景盖住。因此 Wayland 上同样只有 ② 与 ③ 两条路；layer-shell 的价值是「拿到 Background 层归属」，**不等于**「拿到图标之下」。Plasma 6 上 `Background` 层与 plasmashell 桌面窗口的先后关系仍属待验项，且上游已有悲观先例 linux-wallpaperengine#370（Plasma 6.3.4 桌面图标消失）。
 
 - **基线（`P2`）KWin 窗口规则**：`Layer=Desktop` + `SkipTaskbar/SkipPager/SkipSwitcher=true` + `Desktops=所有` + `Activity=所有` + `DecorationPolicy=None` + `AcceptFocus=false`（**注意：KWin 规则里没有 `FocusPolicy` 字段**，不取焦点要写 `AcceptFocus=false`；透明度字段是 `OpacityActive`/`OpacityInactive`，也没有单数 `Opacity`），按窗口 `resourceClass`（GTK 的 `WM_CLASS`；Tauri 是否把它设成 identifier **需实测**，不能假定）写成规则，写入 `~/.config/kwinrulesrc` 后 `qdbus org.kde.KWin /KWin reconfigure` 生效。
   - 已核实：`Layer` 规则的 `checkLayer()` 优先于 `belongsToLayer()`，**能**把普通窗口强制放进 DesktopLayer。
@@ -257,10 +269,25 @@ pub fn detect() -> KdeEnv;           // 纯函数入口，输入是 env 快照�
 | **P6** | 缩放与静态壁纸同步 | `wallpaper/linux.rs`（`query_monitors`）、`system_wallpaper.rs` | P0 | 125%/150% 缩放下壁纸像素对齐；KDE 静态壁纸三级回退（portal → CLI → evaluateScript）各自成功路径可用 |
 | **P7** | 快捷键、托盘、无边框与模糊协议 | `src-tauri/src/hotkeys.rs`、`src-tauri/src/lib.rs`（tray）、`src-tauri/src/blur.rs`、`src/components/WindowControls.tsx`、`src/lib/platform.ts`、`src-tauri/src/props_window.rs` | P0 | KDE Wayland 下快捷键可用或明确显示「未绑定/由系统管理」；托盘图标与名称正确；无边框窗口四边可缩放（实测后决定是否自绘）、双击 header 最大化；Wayland 模糊按 `ext_background_effect_manager_v1`/`org_kde_kwin_blur` 分版本走通，不可用时静默降级不报错 |
 | **P8** | 打包与依赖声明 | `src-tauri/tauri.conf.json`、`.github/workflows/build-linux.yml`、`Dockerfile.linux` | — | deb 显式补 `libayatana-appindicator3-1`（托盘 SNI 运行库，见 §2.3）与 KDE 相关 `recommends`（`plasma-workspace`、`qdbus`/`qt6-tools`、`pulseaudio-utils`\|`pipewire-bin`、`kscreen`）；AppImage 文档说明外部命令要求 |
-| **P9** | Plasma 壁纸插件（演进，不在本期） | 新目录（KPackage `Plasma/Wallpaper` + QML）、`wallpaper/` 外挂帧传输 | P1 失败结论、P2 | 帧传输（DMA-BUF + sync fence）零拷贝；插件崩溃不拖垮 plasmashell 的隔离方案；跨虚拟桌面限制写入文档 |
+| **P9** | Plasma 壁纸插件（**战略路径**：`P1` 已证明窗口方案无法同时保住图标，这是唯一全满足解） | 新目录（KPackage `Plasma/Wallpaper` + QML）、`wallpaper/` 外挂帧传输 | P1 实测结论、P2 | 帧传输（DMA-BUF + sync fence）零拷贝；插件崩溃不拖垮 plasmashell 的隔离方案；跨虚拟桌面限制写入文档 |
+
+**进展（2026-10-14，真机验证底座 = Plasma 5.27/X11 + `kwin 5.27.11`）**
+
+| 工作包 | 状态 | 实际产出 / 证据 |
+| --- | --- | --- |
+| `P0` | ✅ 已落地 | `src-tauri/src/kde.rs`：`KdeEnv`/`KdeScope`/`env_snapshot`/`detect_with`/`env()`（`OnceLock` 缓存）+ 桌面容器判定（`parse_containments`/`desktop_containment`/`log_desktop_icons_status`）；17 个单测通过；非 KDE 行为零变化 |
+| `P1` | ✅ **已定论：窗口方案在此路不通** | 四轮 spike（`p1b`/`p1c`/`p1d`/`p1e`）：透明化桌面背景在「无法沉底」的前提下无意义；四种沉底原语全部无效。结论已写入 §2.5 与 §4.1 |
+| `P2` | 🟡 部分落地 | `src-tauri/src/kwin.rs` 规则文件层（合并/幂等/回滚/校验，13 单测）+ `org.kde.KWin reconfigure`。真机实测：KWin **5** 下规则键可写入但不影响层序（`layerrule` 长期 unused）⇒ 该部分价值在 **Plasma 6/Wayland**，不要再当 X11 的图标解药 |
+| `P3` | 🟡 已就绪待 CI 验证 | `scripts/linux-kde-smoke.sh`（真实总线 + `kwin_x11` + 断言）、`scripts/kde-vm-session.sh`（`probes`/`smoke`/`shell`/`realbuscase`/`belowtest`/`ruleinstall`/`p1b`–`p1e`）、`scripts/kde-kwin-layer.sh`、CI `kde-smoke` job |
+| `P4` | 🟡 本轮更新 | 本文 §2.5/§4.1/§5 已回填真机结论；`README.md` 增加 KDE 小节（图标取舍 + 冒烟命令）；`CHANGELOG.md` Unreleased 记录用户可见变化 |
+| `P5` | 🟡 部分落地 | `kwin.rs` 的 KScreen 每屏解析、`idle_seconds`（D-Bus + 2 秒缓存）、`reconfigure`；`wallpaper/linux.rs::display_asleep` 已接入。`occlusion_snapshot`/`frontmost_kind` 仍为空实现（X11 侧用 `x11rb` 已可用，Wayland 侧无解） |
+| `P6` | ✅ 已合入（commit `27d4ccf`） | KDE 静态壁纸三级回退（portal → `plasma-apply-wallpaperimage` → `qdbus evaluateScript`），9 个单测；非 KDE 分支逐字未动 |
+| `P7` | 🟡 已交付待复核 | 快捷键：KDE Wayland 标记「由桌面接管」+ `HotkeyStatus` 可观测（10 单测）；托盘：Linux 改用彩色 `icons/32x32.png` + 自启补键（12 单测）；模糊：`ext_background_effect_manager_v1` 优先 + `org_kde_kwin_blur` 回退，X11 原子路径逐字不变 |
+| `P8` | 🟡 已交付待复核 | `deb.depends` 补 `libayatana-appindicator3-1`；`recommends` 收窄为 `gstreamer1.0-pipewire`/`ffmpeg`/`kscreen`/`pulseaudio-utils \| pipewire-bin`；`Dockerfile.linux`/entrypoint `SMOKE_MODE`；CI `kde-smoke` |
+| `P9` | ⬜ 未开工 | 本轮结论把它从「演进彩蛋」升级为**唯一全满足解**；建议在 Plasma 6 底座上先做帧传输 spike |
 
 **推荐顺序**：`P0 → P1(spike，决定主线) → P5 → P6 → P7 → P8 → P2 → P3 → P4 → P9`。
-说明：`P1` 是唯一能改变整体形态的实验，必须最先做；`P2` 依赖它的结论（机制 ① 成了就不必让用户关图标）。`P5/P6/P7` 与桌面层机制无关，可与 `P1` 并行推进。
+说明：`P1` 是唯一能改变整体形态的实验，必须最先做——**本轮已做完并给出否定结论**，所以后续排期的重心应转向 `P9`（壁纸插件）与「② 让桌面不再是文件夹视图」的用户引导；`P2` 的规则文件层留给 Plasma 6/Wayland 验证。
 
 ---
 
@@ -365,4 +392,4 @@ pub fn detect() -> KdeEnv;           // 纯函数入口，输入是 env 快照�
 - 脚本：`scripts/kde-verify-preflight.sh`（环境预检）、`scripts/kde-probes.sh`（机制实测探针）、`scripts/kde-vm-session.sh`（**真机核心**：真实用户总线上拉起 Xvfb+KWin+plasmashell，含 `probes`/`realbuscase`/`belowtest` 模式）、`scripts/linux-kde-smoke.sh`（KDE/X11 冒烟断言，CI 用）、`scripts/kde-vm-setup.sh` / `kde-vm-build.sh` / `kde-vm-sync.sh` / `kde-vm-verify-state.sh`（真机装配、构建、同步、故障后体检）；
 - `README.md` 的 Linux 段重写：KDE 支持矩阵（Plasma 5/6 × X11/Wayland × 功能）、外部命令依赖（`plasma-apply-wallpaperimage`/`qdbus`/`kscreen-doctor`/`parec|pw-record`/`pactl|wpctl`）、Wayland 下的已知限制；**并修掉一处自相矛盾**：`README.md:410` 说「自动暂停尚未实现」，而 `README.md:220` 的功能列表把它列为已实现（Rust 侧确有实现，`README.md:410` 是过时表述，改它而不是改 :220）；
 - `CHANGELOG.md` 按仓库实际惯例追加到 `## [Unreleased]` 的中文分类小节（`### 🛠 改变 / Changed` 等），条目形如 `- **短标题**：什么条件下什么行为变了`（本仓不用 `type(scope):` 前缀，全文 0 例）；
-- `docs/release-notes/` 在**下个版本的文件**（现为 `v2.2.0.md`，发布时按实际版本号新建）里增加一节「KDE Plasma 支持（X11 / Wayland）」，写明机制 ①/② 二选一的用户可见后果（是否失去系统桌面图标）。
+- `docs/release-notes/` 在**发布时按实际版本号新建**（`<tag>.md`，见 `scripts/release-finish.mjs:39-41`）的文件里增加一节「KDE Plasma 支持（X11 / Wayland）」，写明 ②/③ 二选一的用户可见后果（是否失去系统桌面图标）。**本轮已先把用户可见变化写进 `CHANGELOG.md` 的 `[Unreleased]`**（仓库惯例），到发版时才落 `<tag>.md`，避免现在猜版本号。

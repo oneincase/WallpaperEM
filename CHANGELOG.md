@@ -4,7 +4,29 @@
 
 ## [Unreleased]
 
+### 🚀 新增 / Added
+
+- **KDE Plasma 桌面适配**：Linux 下新增 KDE 会话探测与能力路由（`src-tauri/src/kde.rs`，
+  按 `XDG_CURRENT_DESKTOP`/`KDE_FULL_SESSION`/`KDE_SESSION_VERSION`/`XDG_SESSION_TYPE`
+  判定，并按「X11 = 桌面层语义可用 / Wayland = 只走后端能力」分流），配套 KWin/Plasma
+  后端（`src-tauri/src/kwin.rs`：`kwinrulesrc` 窗口规则文件合并与回滚、`org.kde.KWin`
+  `reconfigure`、KScreen 每屏查询、`ScreenSaver` 空闲秒数）。KDE 静态壁纸改为
+  `org.freedesktop.impl.portal.Wallpaper`（Plasma 6.5+）→ `plasma-apply-wallpaperimage`
+  → `qdbus … evaluateScript` 三级回退；模糊在 Wayland 上由 `org_kde_kwin_blur` 迁移到
+  `ext_background_effect_manager_v1`（新协议优先、旧协议回退、X11 原子路径不变）。
+- **KDE 桌面图标取舍的启动提示**：桌面为「文件夹视图」时
+  （`plasma-org.kde.plasma.desktop-appletsrc`）启动写一条 `warn`，如实说明动态壁纸会盖住
+  桌面图标（图标仍可点中却看不见）以及如何改成「桌面」布局。判定只读，不改用户配置。
+
 ### 🛠 改变 / Changed
+
+- **Linux 托盘图标不再用 macOS 的 `tray-44.png`**：该图是纯黑剪影，在 Linux 面板（尤其
+  深色主题）上不可辨；Linux 改用彩色的 `icons/32x32.png`，macOS 分支逐字不变。
+- **KDE 空闲检测接入**：`display_asleep()` 原为恒 `false`，现按 `org.freedesktop.ScreenSaver`
+  的 `GetActive`/`GetSessionIdleTime` 判定（2 秒缓存；Plasma 5.27 实测这两个方法返回
+  `NotSupported`，此时按「未睡眠」处理而不是报错）。
+- **快捷键在 KDE Wayland 下不再静默失败**：改为标记「由桌面接管」（`HotkeyStatus`），
+  X11 仍走原有 XGrabKey；单条注册失败不再中断整批。
 
 - **`webwallgl` 改走 npm 依赖（3.0.0）**：渲染库此前是 `file:../webwallgl-github/dist/lib`，
   必须把库仓库克隆到本仓平级并先 `pnpm run build:lib`，否则 `pnpm install` 解析不到。
@@ -18,6 +40,15 @@
   —— file: 依赖改了内容、预构建缓存不按内容失效，开发服务器会一直发旧库。换成 npm 依赖后
   内容只随版本号变，缓存自然失效，故去掉；库本体 1.4 MB 且静态 import `mediabunny`，
   交给 Vite 预构建反而更快。
+
+### 🐛 修复 / Fixed
+
+- **KDE 静态壁纸失败后不再无法回退**：原实现里 `plasma-apply-wallpaperimage` 与
+  `qdbus … evaluateScript` 两条路径各自 `return`，第一条失败就到此为止（`swww`/`feh`
+  等后续手段在 KDE 分支上永远不会被执行）；现改为三级链式回退，任一成功即止。
+- **自启条目补齐启用键**：`auto-launch` 写出的 `~/.config/autostart/*.desktop` 缺少
+  `X-GNOME-Autostart-enabled=true` 与 `StartupNotify=false`，启动后幂等补齐（文件不存在
+  则不动，失败只 warn）。
 
 ## [v2.2.0] - 2026-10-04
 

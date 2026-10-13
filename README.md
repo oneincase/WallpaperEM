@@ -407,8 +407,18 @@ repository template (the “改动 / 验证” sections are required and checked
 ### Linux
 
 - 主路径是 **X11**。Wayland 下壁纸窗口退化为「置底 + 全工作区」的普通无边框窗口；**GNOME Wayland 不支持桌面层窗口**（上游协议限制），建议使用 X11 会话。
-- 相较 macOS：**系统音频可视化暂未接入**（待 PipeWire）；**自动暂停**尚未实现；指针注入不可用。
-- **托盘**：GNOME 需要 AppIndicator 扩展（如 `gnome-shell-extension-appindicator`）；KDE / Cinnamon / XFCE 自带。
+- 相较 macOS：**系统音频可视化暂未接入**（待 PipeWire）；**自动暂停**未完整（遮挡/前台窗口检测在 Linux 上仍是空实现，空闲/屏保检测已接 KWin）；指针注入不可用。
+- **托盘**：GNOME 需要 AppIndicator 扩展（如 `gnome-shell-extension-appindicator`）；KDE / Cinnamon / XFCE 自带。Linux 托盘图标用 `icons/32x32.png`（彩色），不用 macOS 的 `tray-44.png`（纯黑剪影，Linux 面板上不可辨）。
+
+#### KDE Plasma（真机实测，Plasma 5.27 / X11；详见 [`docs/kde-adaptation-plan.md`](docs/kde-adaptation-plan.md)）
+
+- **桌面图标会被动态壁纸盖住**：KDE 的桌面背景与桌面图标由 plasmashell 的**同一个桌面窗口**绘制，而 KWin 不允许客户端窗口排到该窗口之下（`_NET_WM_STATE_BELOW`、`XConfigureWindow(sibling,Below)`、`_NET_RESTACK_WINDOW`、override-redirect 四种原语均已实测无效）。图标不会消失，**仍可点中却看不见**，所以启动时会写一条 `warn` 日志如实提示。
+- **想让图标可见**：把桌面布局从「文件夹视图」改成「桌面」（右键桌面 → 配置桌面），桌面不再画图标，壁纸即成为唯一可见的底层。这是 KDE/X11 上唯一可行的窗口方案；Windows 版 Wallpaper Engine 的同类取舍一致。
+- **KDE/X11 已拿到**：壁纸窗口带 `_NET_WM_WINDOW_TYPE_DESKTOP`，且位于普通窗口与面板之下、跳过任务栏/分页器、全工作区——即桌面窗口语义正常。
+- **KDE/Wayland**：桌面层窗口语义不可用（同 GNOME 的上游限制），退化为置底普通窗口；全局快捷键在 Wayland 只能走 portal（当前标记为「由桌面接管」，不做 X11 抢键）。
+- **静态壁纸**：KDE 下按 `org.freedesktop.impl.portal.Wallpaper`（Plasma 6.5+）→ `plasma-apply-wallpaperimage` → `qdbus … evaluateScript` 三级回退，任一成功即止。
+- **自启**：`~/.config/autostart/*.desktop` 会自动补齐 `X-GNOME-Autostart-enabled=true` 与 `StartupNotify=false`（KDE 认同一套 XDG autostart 语义）。
+- **冒烟测试**：`bash scripts/linux-kde-smoke.sh`（Xvfb + kwin_x11 + 真实会话总线，含 `_NET_WM_WINDOW_TYPE`、stacking 与 `panic` 断言）；真机 KDE 会话取证用 `bash scripts/kde-vm-session.sh realbuscase`。
 - **视频编解码（必装）**：WebKitGTK 的音视频播放依赖系统 GStreamer 插件，缺失会**黑屏/无声**（日志出现 `GStreamer element appsink/autoaudiosink not found`）。deb 包已声明依赖自动安装；AppImage 需手动装：
 
   ```bash
