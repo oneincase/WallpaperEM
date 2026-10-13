@@ -244,16 +244,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # webwallgl 是同级自有仓库：package.json 依赖 `file:../webwallgl-github/dist/lib`，
-      # dist/lib 是构建产物不在源码里，必须先检出源码并构建，否则 pnpm install 解析不到。
-      - name: 检出 webwallgl（源码）
-        uses: actions/checkout@v4
-        with:
-          repository: oneincase/webwallgl
-          path: webwallgl-github-src
-
-      - name: 移到仓库平级目录
-        run: mv webwallgl-github-src ../webwallgl-github
+      # 前端渲染库 webwallgl 自 3.0.0 起走 npm 依赖（registry 上的 webwallgl@^3.0.0），
+      # 不再需要平级检出源码、也不再需要先构建 dist/lib。
 
       - name: 安装 pnpm
         uses: pnpm/action-setup@v4
@@ -265,13 +257,6 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-
-      # 同 build-test.yml：webwallgl 在迭代，lockfile 可能滞后于源码，这里不要求 frozen
-      - name: 构建 webwallgl dist/lib
-        working-directory: ../webwallgl-github
-        run: |
-          pnpm install --no-frozen-lockfile
-          pnpm run build:lib
 
       - name: 安装依赖（frozen，保证仓库状态可复现）
         run: pnpm install --frozen-lockfile

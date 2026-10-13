@@ -51,15 +51,10 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      # webwallgl 是自维护渲染库（package.json 里 file:../webwallgl-github/dist/lib），
-      # 需先拉到仓库平级目录并构建出 dist/lib，否则 pnpm install 解析不到
-      - name: 检出 webwallgl
-        uses: actions/checkout@v4
-        with:
-          repository: oneincase/webwallgl
-          path: webwallgl-github-src
+      # 前端渲染库 webwallgl 自 3.0.0 起走 npm 依赖（registry 上的 webwallgl@^3.0.0），
+      # 不再需要平级检出源码、也不再需要先构建 dist/lib。
 
-      # media-bridge 同样是同级自有仓库（src-tauri/Cargo.toml 里
+      # media-bridge 是同级自有仓库（src-tauri/Cargo.toml 里
       # path = "../../media-bridge/crates/media-bridge"），缺了它 cargo 直接报
       # 找不到 path 依赖；纯 Rust 依赖，检出即可，无需额外构建步骤
       - name: 检出 media-bridge
@@ -69,10 +64,8 @@ jobs:
           path: media-bridge-src
 
       # actions/checkout 不允许直接检出到 workspace 外，先落到子目录再移到平级
-      - name: 移动到仓库平级目录
-        run: |
-          mv webwallgl-github-src ../webwallgl-github
-          mv media-bridge-src ../media-bridge
+      - name: 移动 media-bridge 到仓库平级目录
+        run: mv media-bridge-src ../media-bridge
 
       - name: 安装 Tauri Linux 依赖
         run: |
@@ -110,12 +103,6 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-
-      - name: 构建 webwallgl 库产物（dist/lib）
-        working-directory: ../webwallgl-github
-        run: |
-          pnpm install --frozen-lockfile
-          pnpm run build:lib
 
       - name: 安装依赖
         run: pnpm install --frozen-lockfile

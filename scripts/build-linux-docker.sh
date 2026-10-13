@@ -4,9 +4,8 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-WEBWALLGL="${WEBWALLGL_DIR:-$REPO/../webwallgl-github}"
 # media-bridge 是 Cargo 的 path 依赖（src-tauri/Cargo.toml 里 ../../media-bridge），
-# 与 webwallgl 一样必须挂进容器，否则 cargo 直接报找不到 path 依赖
+# 必须挂进容器，否则 cargo 直接报找不到 path 依赖
 MEDIA_BRIDGE="${MEDIA_BRIDGE_DIR:-$REPO/../media-bridge}"
 PLATFORM="linux/arm64"
 TAG="wpem-linux-build:arm64"
@@ -18,7 +17,6 @@ if [ "${1:-}" = "--amd64" ]; then
   TARGET_VOL="wpem-target-linux-amd64"
 fi
 
-[ -d "$WEBWALLGL/dist/lib" ] || { echo "缺少 $WEBWALLGL/dist/lib（webwallgl 库产物）"; exit 1; }
 [ -f "$MEDIA_BRIDGE/Cargo.toml" ] || { echo "缺少 $MEDIA_BRIDGE（media-bridge 源码仓库）"; exit 1; }
 
 mkdir -p "$REPO/dist-linux"
@@ -29,7 +27,6 @@ docker build --platform "$PLATFORM" -f "$REPO/Dockerfile.linux" -t "$TAG" "$REPO
 echo "==> 容器内构建（cargo/pnpm 缓存走 named volume，二次构建会很快）"
 docker run --rm --platform "$PLATFORM" \
   -v "$REPO":/src/app:ro \
-  -v "$WEBWALLGL":/src/webwallgl:ro \
   -v "$MEDIA_BRIDGE":/src/media-bridge:ro \
   -v wpem-cargo-registry:/root/.cargo/registry \
   -v wpem-pnpm-store:/root/.local/share/pnpm \
