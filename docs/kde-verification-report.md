@@ -167,6 +167,42 @@ cd ~/WallpaperEM && SMOKE_WITH_PLASMA=1 bash scripts/linux-kde-smoke.sh
 
 诊断方法（可复用）：在失败分支打印 `xdpyinfo` 首行、`pgrep -a -x Xvfb`、`ss -xl | grep X11-unix`、`ls -la /tmp/.X11-unix/`，四条一起看就能区分「X 没起来 / X 起来了但没有文件 socket / X 被别人占着」。
 
+### 6.2 KWin 的 Wayland 全局清单（实测，`scripts/kde-wayland-globals.sh`）
+
+在 VM 上起嵌套合成器 `kwin_wayland --virtual --width 1280 --height 800 --socket wallpaperem-wlprobe --no-lockscreen`（socket 约 1s 就绪），用 `wayland-info` 连上其 Wayland socket 取全局清单：
+
+| 接口 | 本机实测（kwin_wayland **5.27.11**，aarch64） | 意义 |
+| --- | --- | --- |
+| `zwlr_layer_shell_v1` | ✅ **v3** | 方案 §4.1 的 Wayland「层归属」路径在本机成立（上游源码在 Plasma 6 上是 v5，版本随 Plasma 递进） |
+| `ext_background_effect_manager_v1` | ❌ 未广告 | 印证方案 §3 约束 6：新模糊协议是 Plasma 6.7+ 才有 |
+| `org_kde_kwin_blur_manager` | ✅ v1 | 旧协议在 5.27 上确实还在 → `blur.rs` 的回退分支是本机主路径 |
+| `org_kde_kwin_idle` / `ext_idle_notifier_v1` | ✅ v1 / ✅ v1 | 自动暂停的空闲源在 Wayland 上可选（比 `ScreenSaver.GetActive` 可靠，后者 5.27 上返回 `NotSupported`） |
+| `zwp_linux_dmabuf_v1` | ✅ **v4** | P9 插件做零拷贝帧传输（DMA-BUF + sync fence）在协议层可行 |
+| `wp_fractional_scale_manager_v1` / `wp_viewporter` | ✅ v1 / ✅ v1 | 分数缩放路径可用（客户端不要自己乘 `wl_output.scale`） |
+| `zxdg_output_manager_v1` | ✅ v3 | 每屏枚举可用 |
+| `zwp_keyboard_shortcuts_inhibit_manager_v1` | ✅ v1 | 录制快捷键时可抑制桌面快捷键（Wayland 上的正确做法） |
+| `wp_tearing_control_manager_v1` | ✅ v1 | 以后若要低延迟整帧撕裂控制可用 |
+| `org_kde_plasma_shell` | ✅ v8（**第三方不得使用**，仅作对照） | 方案 §3 约束 5 |
+
+同时也修掉了本脚本自己的一个**假阴性**：`wayland-info` 把接口名写成 `'name'`（带单引号）且名字后面紧跟逗号，原先的 `grep "interface: *name "` 一个都匹配不上，导致首轮输出「全部未广告」。现在先 `tr -d "'"`，并按 `^interface: *NAME[, ]` 匹配（另外全局名是**工厂**名：`org_kde_kwin_blur_manager`、`wp_fractional_scale_manager_v1`）。
+
+### 6.3 P9 插件包的显示端验证（`scripts/kde-plugin-check.sh`）
+
+`packaging/plasma-wallpaper/io.github.oneincase.wallpaperem` —— **11 项断言全过**：
+
+| 断言 | 结果 |
+| --- | --- |
+| 包结构（`metadata.json` + `contents/config/main.xml` + `contents/ui/{main,config}.qml`） | ✅ |
+| `metadata.json` 必备键（`Id`/`Name`/`ServiceTypes=["Plasma/Wallpaper"]`/`X-KDE-ParentApp=org.kde.plasmashell`，键集照抄 `/usr/share/plasma/wallpapers/org.kde.image/metadata.json`） | ✅ |
+| `kpackagetool5 --type Plasma/Wallpaper --install` | ✅ 落到 `~/.local/share/plasma/wallpapers/io.github.oneincase.wallpaperem` |
+| `--list` 可见 / 卸载后不可见 | ✅（脚本跑完自动卸载，不留痕迹） |
+| QML 显示引擎写出的帧 | ✅ 帧文件为品红时，`qmlscene`+Xvfb 截图取样得 `srgb(255,0,255)` |
+| 帧文件缺失时兜底 | ✅ 取样得 `#101014`，且只产生设计内的 `QML Image: Cannot open`，不崩 |
+
+过程中修掉的**真 bug**（记下来是因为它只在真 Qt 上才炸）：`main.qml` 的独立运行桩最初写成 `property string FramePath`，Qt 报 `Property names cannot begin with an upper case letter` —— QML 自定义属性不能首字母大写，配置键 `FramePath` 的大小写只存在于 Plasma 注入的 QObject 上，因此桩用小写、读取时显式映射。
+
+**仍只是「显示端」**：真 plasmashell 里选为壁纸、引擎侧帧传输（DMA-BUF/socket）、多屏按实例分帧都未做（见 §8）。
+
 ## 7. 对方案的影响（已回填 [kde-adaptation-plan.md](kde-adaptation-plan.md) §2.5）
 
 1. **§4.1 机制①的定义要改**：从「拿桌面层语义并保住图标」改为「拿桌面窗口语义（跳任务栏/全桌面/在普通窗口之下）」，**图标可见性另立一条路**（Plasma 6 Wayland 的 layer-shell `Background`，或 §4.5 壁纸插件）。X11 上无解，别承诺。
@@ -178,7 +214,9 @@ cd ~/WallpaperEM && SMOKE_WITH_PLASMA=1 bash scripts/linux-kde-smoke.sh
 
 ## 8. 仍未验证 / 无法验证
 
-- **Plasma 6 全部专属项**：layer-shell `Background` 层、`ext_background_effect_manager_v1`、portal `Wallpaper`(6.5)、Plasma 6 托盘 SNI、每虚拟桌面独立壁纸。需 Ubuntu 25.04 / Fedora KDE / openSUSE 的 arm64 或 amd64 机器。
+- **Plasma 6 全部专属项**：layer-shell `Background` 层（本机 5.27 实测有 `zwlr_layer_shell_v1` **v3**，但 v5 与「Background 层里排到 plasmashell 桌面视图之下」仍未证）、`ext_background_effect_manager_v1`（5.27 实测未广告，符合预期）、portal `Wallpaper`(6.5)、Plasma 6 托盘 SNI、每虚拟桌面独立壁纸。需 Ubuntu 25.04 / Fedora KDE / openSUSE 的 arm64 或 amd64 机器。
+- **P9 插件在真 plasmashell 里选为壁纸**：只验到「KPackage 能装能注册 + QML 能把帧画出来」（§6.3）；把插件设成当前桌面壁纸需要能正常登录的图形会话（无头 Xvfb 下的 plasmashell 只被用来做冒烟，不适合做交互式设置）。
+- **引擎侧帧传输**：DMA-BUF/socket 那条路一行代码都还没有；`zwp_linux_dmabuf_v1` v4 只是证明协议可用。
 - **KWin 5 的 `Layer` 窗口规则是否可用**：需在能弹确认框的交互会话里跑 `qdbus org.kde.KWin /Scripting …`，或直接写 `~/.config/kwinrulesrc` 后 `reconfigure` 再观察。
 - **`global-hotkey` 在 KDE 下是否与 KWin 抢键**：需手工按键验证。
 - **无边框窗口在 KWin 下的拖拽/缩放/阴影**：无头 Xvfb 里 `Meta+左键` 无法模拟。
@@ -196,6 +234,9 @@ cd ~/WallpaperEM && SMOKE_WITH_PLASMA=1 bash scripts/linux-kde-smoke.sh
 | `scripts/kde-vm-session.sh` | **核心**：真实用户总线上拉起 Xvfb+kwin_x11+plasmashell，提供 `probes` / `realbuscase` / `belowtest` / `smoke` / `shell` 五种模式 |
 | `scripts/kde-probes.sh` | 机制探针（`PROBE 名 = 值`），不需要应用二进制 |
 | `scripts/linux-kde-smoke.sh` | 有断言的 KDE/X11 冒烟：真机走真实用户总线、CI 无用户会话时自动退回 `dbus-run-session`；已在 VM 上 5/5 通过（见 §6.1） |
+| `scripts/kde-wayland-globals.sh` | KWin 的 Wayland 全局清单探测（自起嵌套 `kwin_wayland --virtual` 或 attach 现有会话）；§6.2 的全部数据来自它 |
+| `scripts/kde-plugin-check.sh` | P9 插件包验证：结构 → `kpackagetool5` 安装注册 → `qmlscene` 渲染取样 → 卸载（11 项，见 §6.3） |
+| `packaging/plasma-wallpaper/io.github.oneincase.wallpaperem/` | P9 的 Plasma 壁纸插件（`metadata.json` + KConfigXT + `main.qml`/`config.qml` + 引擎契约 README） |
 | `docs/kde-smoke-setup.md` | 装配说明与覆盖率对照 |
 | `docs/kde-adaptation-plan.md` | 适配方案（§2.5 已回填本轮实测） |
 | `docs/kde-plasma-constraints.md` | 上游约束调研（12 条硬约束 + 71 链接） |

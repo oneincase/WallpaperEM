@@ -1,0 +1,16 @@
+{
+    "KPlugin": {
+        "Id": "io.github.oneincase.wallpaperem",
+        "Name": "WallpaperEM",
+        "Description": "使用 WallpaperEM 引擎的动态壁纸（帧由外部引擎渲染，插件只负责显示）",
+        "Description[en]": "WallpaperEM dynamic wallpaper (frames rendered by the external engine, this plugin only displays them)",
+        "Icon": "preferences-desktop-wallpaper",
+        "License": "GPL-3.0",
+        "Version": "0.1.0",
+        "ServiceTypes": [
+            "Plasma/Wallpaper"
+        ],
+        "Website": "https://github.com/oneincase/WallpaperEM"
+    },
+    "X-KDE-ParentApp": "org.kde.plasmashell"
+}
