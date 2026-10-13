@@ -267,14 +267,14 @@ pub fn pitfalls_json() -> Value {
                 "id": "angles-animation-hangs",
                 "状态": "**已在渲染库 38e877c 修复**（2026-09-28）。当前链接的库实测同一条最小复现正常 ready；校验器不再对此告警。",
                 "历史症状": "旧版（≤ 2.0.1 / b11e839）里：图层 angles 带关键帧动画会让首帧永不完成，诊断停在 \"renderer started: N layers\" 之后，没有 ready 也没有错误，mount() 永久挂起（webwallgl#9）",
-                "若你现在仍遇到": "八成是**链接的 dist 比源码旧**（见下一条 stale-linked-dist）：重建库 + 同步 + 重启 dev 即可",
+                "若你现在仍遇到": "八成是**应用装的库版本比你手上的源码旧**（见下一条 stale-linked-dist）：先按那一条的「验证」确认版本",
             },
             {
                 "id": "stale-linked-dist",
                 "症状": "改了渲染库源码（或拉了新提交），但应用行为完全没变：该修的问题还在、该有的新诊断没有",
-                "原因": "应用链接的是**渲染库的构建产物** `node_modules/.pnpm/webwallgl@file+..+webwallgl-github+dist+lib/node_modules/webwallgl/`，源码改动不会自动生效；而且 Vite 忽略 node_modules 变化，即使同步了文件也要**重启 dev server**",
-                "改法": "① `cd <库仓库> && npm run build:lib`；② `rsync -a --delete dist/lib/ <上面那个链接目录>/`；③ 重启 `pnpm tauri dev`",
-                "验证": "同步后 grep 新字符串：`grep -c \"效果文件不支持直接写 shader\" <链接目录>/webwallgl.global.js`（新构建应为 1）",
+                "原因": "应用装的是 **npm 上的发布包**（`node_modules/webwallgl` → `.pnpm/webwallgl@<版本>/…`）—— 自 3.0.0 起不再是 `file:` 指向本机库产物。只在库仓库里改代码、不换版本，应用侧不会有任何变化；另外 Vite 会对依赖做预构建，同版本号下手工替换 node_modules 里的文件，缓存也不会自动失效",
+                "改法": "① 联调本地改动：库仓库构建后用 `pnpm pack` 装本地包，或临时把 `package.json` 的 webwallgl 指向本地产物（`file:`）再 `pnpm install`；② 换版本/换依赖后删 `node_modules/.vite` 或 `vite --force`，再重启 `pnpm tauri dev`；③ 别把「手改 node_modules 里的文件」当常规做法",
+                "验证": "先看装的是哪一版：`node -p \"require('./node_modules/webwallgl/package.json').version\"`（npm 包只发 ESM `webwallgl.mjs` 与 UMD `webwallgl.global.min.js`）；改完库后 `node_modules/.vite` 应重建，没重建就 `--force`",
             },
             {
                 "id": "effect-missing-vert",
@@ -571,7 +571,7 @@ pub fn capabilities_json() -> Value {
                 "status": "已修并验证（渲染库 38e877c）",
                 "history": "旧版（≤2.0.1）angles 带关键帧动画会让首帧永不完成、mount 永久挂起（webwallgl#9）",
                 "shape": "\"angles\": {\"value\":\"0 0 0\", \"animation\": {\"c0\":[{\"frame\":0,\"value\":\"0 0 -0.02\"},{\"frame\":300,\"value\":\"0 0 0.02\"},{\"frame\":600,\"value\":\"0 0 -0.02\"}], \"options\":{\"fps\":30,\"length\":600,\"mode\":\"loop\",\"name\":\"极光摆动\"}}}",
-                "note": "示例里极光层已重新启用 angles 摆动（±0.02 rad / 20s）。若你的库还是旧 dist，症状见 pitfalls「stale-linked-dist」。",
+                "note": "示例里极光层已重新启用 angles 摆动（±0.02 rad / 20s）。若你的库还是 2.x（本仓现装 3.0.0），症状见 pitfalls「stale-linked-dist」。",
             },
             {
                 "能力": "用户属性绑定 vector 字段（含 text 类型属性）",
