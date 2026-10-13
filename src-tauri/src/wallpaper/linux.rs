@@ -191,9 +191,17 @@ fn query_monitors() -> Vec<(ScreenInfo, f64)> {
         .collect()
 }
 
-/// 主显示器是否睡眠。Linux 无统一查询（logind/DPMS 分属不同栈），恒 false。
+/// 主显示器是否睡眠。
+///
+/// 只在确认是 KDE 会话时才去问会话总线（`org.freedesktop.ScreenSaver`）：其他 DE 上
+/// 这个接口不一定有人实现，问了也只是白等一次超时。查询带 2 秒缓存（见
+/// [`crate::kwin::idle_seconds`]），取不到就按「没睡」处理——宁可继续播放，也不要
+/// 因为一次查询失败把壁纸误停（自动暂停默认还是关的，见 `wallpaper_auto_pause`）。
 pub fn display_asleep() -> bool {
-    false
+    if !crate::kde::env().is_kde {
+        return false;
+    }
+    matches!(crate::kwin::idle_seconds(), Some(u64::MAX))
 }
 
 /// 设置窗口 frame（逻辑坐标）

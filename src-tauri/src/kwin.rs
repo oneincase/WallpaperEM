@@ -687,12 +687,60 @@ pub fn reconfigure_kwin() -> bool {
     )
 }
 
+/// 空闲查询的缓存新鲜度窗口。
+///
+/// `idle_seconds` 会被壁纸监控 tick（1 Hz）调用，每次都发一次 D-Bus 往返
+/// （最坏 700ms）会拖慢 tick，所以这里缓存 2 秒。壁纸暂停的判定粒度远粗于 2 秒，
+/// 这点陈旧完全无害。
+const IDLE_CACHE_TTL: Duration = Duration::from_secs(2);
+
+/// 最近一次空闲查询的结果与时刻（进程级）。
+///
+/// 编码：`u64::MAX` = 已睡着；`u64::MAX - 1` = 查询失败（不要用 Option，避免额外锁）。
+fn idle_cache() -> &'static (Mutex<(u64, Option<std::time::Instant>)>) {
+    static CACHE: OnceLock<Mutex<(u64, Option<std::time::Instant>)>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new((0, None)))
+}
+
 /// 系统空闲秒数（替代 Linux 上恒 false 的「显示器睡着」判断）。
 ///
 /// 先问 `GetActive`：屏幕已关/已锁直接返回 `u64::MAX`（表示“睡着了”）；否则用
 /// `GetSessionIdleTime`。任何一步失败都返回 `None`，由调用方回落到「认为没睡」——
-/// 宁可继续播放，也不要因为查询失败把壁纸误停。
+/// 宁可继续播放，也不要因为查询失败把壁纸误停。结果缓存 [`IDLE_CACHE_TTL`]。
 pub fn idle_seconds() -> Option<u64> {
+    // 先看缓存
+    if let Ok(g) = idle_cache().lock() {
+        let (value, at) = *g;
+        if let Some(at) = at {
+            if at.elapsed() < IDLE_CACHE_TTL {
+                return decode_idle(value);
+            }
+        }
+    }
+    let fresh = query_idle_seconds();
+    if let Ok(mut g) = idle_cache().lock() {
+        *g = (encode_idle(fresh), Some(std::time::Instant::now()));
+    }
+    fresh
+}
+
+fn encode_idle(v: Option<u64>) -> u64 {
+    match v {
+        Some(u64::MAX) => u64::MAX,
+        Some(s) => s,
+        None => u64::MAX - 1,
+    }
+}
+
+fn decode_idle(v: u64) -> Option<u64> {
+    if v == u64::MAX - 1 {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+fn query_idle_seconds() -> Option<u64> {
     match dbus_query(DbusQuery::ScreenSaverActive, Duration::from_millis(600)) {
         Some(DbusValue::Bool(true)) => return Some(u64::MAX),
         Some(DbusValue::Bool(false)) => {}

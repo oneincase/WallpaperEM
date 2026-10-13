@@ -231,6 +231,201 @@ pub fn shell_icons_are_overlay_with(env: &EnvSnapshot, kde: &KdeEnv) -> bool {
         .any(|t| matches!(t.to_ascii_lowercase().as_str(), "gnome" | "budgie" | "pantheon"))
 }
 
+// ---------- 桌面容器（图标承载方式）：决定「壁纸会不会盖住桌面图标」 ----------
+//
+// 结论来源（真机实测，见 docs/kde-adaptation-plan.md §2.5 / §4.1）：KDE 上桌面背景与
+// 桌面图标由 plasmashell **同一个桌面窗口**绘制，而 KWin 不允许任何客户端窗口排到该
+// 窗口之下（四种原语全部实测无效）。因此只要桌面是「文件夹视图」，动态壁纸就必然盖住
+// 图标；唯一可行的窗口方案是让桌面不再是文件夹视图。本模块负责把这件事**如实判断出来**，
+// 交给上层做提示与引导，而不是猜。
+
+/// 桌面 containment 的图标承载方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DesktopIcons {
+    /// 桌面是「文件夹视图」（`plugin=org.kde.plasma.folder`）：图标与壁纸同窗口 → 必然被盖住。
+    FolderView,
+    /// 桌面容器存在但不是文件夹视图（纯桌面，无图标）→ 没有图标可盖。
+    Plain,
+    /// 读不到或读不懂配置（非 KDE、文件不存在、没有桌面型 containment）→ 不下判断。
+    Unknown,
+}
+
+impl DesktopIcons {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DesktopIcons::FolderView => "folder-view",
+            DesktopIcons::Plain => "plain",
+            DesktopIcons::Unknown => "unknown",
+        }
+    }
+}
+
+/// `plasma-org.kde.plasma.desktop-appletsrc` 里的一个 containment 段。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Containment {
+    /// 段号，如 `1`（对应 `[Containments][1]`）。
+    pub id: String,
+    /// `plugin=`：桌面为 `org.kde.plasma.folder`（文件夹视图）或 `org.kde.plasma.desktop`（纯桌面）。
+    pub plugin: Option<String>,
+    /// `formfactor=`：桌面容器为 `0`，面板为 `2`。
+    pub formfactor: Option<String>,
+    /// `location=`：桌面为 `0`。
+    pub location: Option<String>,
+    /// `wallpaperplugin=`。
+    pub wallpaper_plugin: Option<String>,
+}
+
+impl Containment {
+    /// 是否桌面型容器（`formfactor=0` 或 `location=0`）。
+    pub fn is_desktop(&self) -> bool {
+        self.formfactor.as_deref() == Some("0") || self.location.as_deref() == Some("0")
+    }
+
+    /// 是否文件夹视图（= 会画桌面图标）。
+    pub fn is_folder_view(&self) -> bool {
+        self.is_desktop() && self.plugin.as_deref() == Some("org.kde.plasma.folder")
+    }
+}
+
+/// 桌面图标承载方式的判定结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopContainment {
+    pub icons: DesktopIcons,
+    /// 桌面型 containment 的数量（多屏 / 多活动会 >1）。
+    pub desktop_count: usize,
+    /// 其中文件夹视图的数量。
+    pub folder_view_count: usize,
+    /// 第一个桌面容器的壁纸插件（如 `org.kde.image`）。
+    pub wallpaper_plugin: Option<String>,
+}
+
+impl DesktopContainment {
+    /// Plasma 桌面容器的配置文件（相对 `~/.config`）。
+    pub const CONFIG_FILE: &'static str = "plasma-org.kde.plasma.desktop-appletsrc";
+
+    /// 桌面图标会被动态壁纸盖住（需要在首次启动时提示用户 / 引导关掉图标）。
+    pub fn icons_will_be_covered(&self) -> bool {
+        self.icons == DesktopIcons::FolderView
+    }
+
+    pub fn summary(&self) -> String {
+        format!(
+            "icons={} desktop_containments={} folder_views={} wallpaper_plugin={:?}",
+            self.icons.as_str(),
+            self.desktop_count,
+            self.folder_view_count,
+            self.wallpaper_plugin
+        )
+    }
+}
+
+/// 解析 Plasma 桌面容器配置的纯函数（单测入口）。
+///
+/// 只认 `[Containments][<id>]` 这一层；`[Containments][1][Wallpaper][org.kde.image][General]`
+/// 这类子段不产生新 containment，其键也不回填到父段。
+pub fn parse_containments(text: &str) -> Vec<Containment> {
+    let mut out: Vec<Containment> = Vec::new();
+    let mut cur: Option<Containment> = None;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            if let Some(c) = cur.take() {
+                out.push(c);
+            }
+            // 仅 `[Containments][N]`：恰好两组方括号，第二组是纯数字。
+            let inner = &line[1..line.len() - 1];
+            let groups: Vec<&str> = inner.split("][").collect();
+            if groups.len() == 2
+                && groups[0] == "Containments"
+                && !groups[1].is_empty()
+                && groups[1].chars().all(|c| c.is_ascii_digit())
+            {
+                cur = Some(Containment { id: groups[1].to_string(), ..Default::default() });
+            }
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else { continue };
+        let Some(c) = cur.as_mut() else { continue };
+        let value = value.trim().to_string();
+        match key.trim() {
+            "plugin" => c.plugin = Some(value),
+            "formfactor" => c.formfactor = Some(value),
+            "location" => c.location = Some(value),
+            "wallpaperplugin" => c.wallpaper_plugin = Some(value),
+            _ => {}
+        }
+    }
+    if let Some(c) = cur.take() {
+        out.push(c);
+    }
+    out
+}
+
+/// 由配置文本判定桌面图标承载方式（纯函数）。
+pub fn desktop_containment_with(text: &str) -> DesktopContainment {
+    let all = parse_containments(text);
+    let desktops: Vec<&Containment> = all.iter().filter(|c| c.is_desktop()).collect();
+    let folder_views = desktops.iter().filter(|c| c.is_folder_view()).count();
+    let icons = if desktops.is_empty() {
+        DesktopIcons::Unknown
+    } else if folder_views > 0 {
+        DesktopIcons::FolderView
+    } else {
+        DesktopIcons::Plain
+    };
+    DesktopContainment {
+        icons,
+        desktop_count: desktops.len(),
+        folder_view_count: folder_views,
+        wallpaper_plugin: desktops.first().and_then(|c| c.wallpaper_plugin.clone()),
+    }
+}
+
+/// 读取并判定本机桌面图标承载方式（非 Linux 恒 `Unknown`），带 `XDG_CONFIG_HOME` 回落。
+pub fn desktop_containment() -> DesktopContainment {
+    let text = read_desktop_appletsrc();
+    match text {
+        Some(t) => desktop_containment_with(&t),
+        None => DesktopContainment {
+            icons: DesktopIcons::Unknown,
+            desktop_count: 0,
+            folder_view_count: 0,
+            wallpaper_plugin: None,
+        },
+    }
+}
+
+fn read_desktop_appletsrc() -> Option<String> {
+    let base = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(v) if !v.is_empty() => std::path::PathBuf::from(v),
+        _ => std::path::PathBuf::from(std::env::var_os("HOME")?).join(".config"),
+    };
+    std::fs::read_to_string(base.join(DesktopContainment::CONFIG_FILE)).ok()
+}
+
+/// 启动时把「桌面图标会被动态壁纸盖住」这一已知降级如实写进日志（只读，不改用户配置）。
+///
+/// 真机实测（Plasma 5.27/X11）证明：图标不会消失，但会**被盖住且仍可点中**——
+/// 比「点不到」更糟。所以这里必须提示，而不是静默降级。
+pub fn log_desktop_icons_status() {
+    let e = env();
+    if !e.is_kde {
+        return;
+    }
+    let c = desktop_containment();
+    tracing::info!("kde desktop containment: {}", c.summary());
+    if c.icons_will_be_covered() {
+        tracing::warn!(
+            "kde: 桌面为「文件夹视图」，动态壁纸会盖住桌面图标（图标仍可点中却看不见）；\
+             如需图标可见请把桌面布局改为「桌面」（无需文件夹视图），或改用壁纸插件方案。\
+             详见 docs/kde-adaptation-plan.md §4.1"
+        );
+    }
+}
+
 /// `org.kde.KWin` 是否在会话总线上（同步、带超时）。
 #[cfg(target_os = "linux")]
 fn kwin_service_present() -> bool {
@@ -507,5 +702,106 @@ mod tests {
             e.summary(),
             "is_kde=true plasma=Some(6) session=wayland kwin_on_bus=true scope=backend"
         );
+    }
+
+    // ---------- 桌面容器 / 图标承载方式（P4 的判定依据） ----------
+
+    /// Plasma 5.27 真机 `~/.config/plasma-org.kde.plasma.desktop-appletsrc` 的形状：
+    /// 桌面容器 `[Containments][1]`（文件夹视图）+ 面板 `[Containments][2]` +
+    /// 壁纸子段（子段不得产生新 containment，也不得回填父段）。
+    const APPLETSRC_FOLDER_VIEW: &str = "\
+[Containments][1]
+activityId=1dfc8044-0000-0000-0000-000000000000
+formfactor=0
+lastScreen=0
+location=0
+plugin=org.kde.plasma.folder
+wallpaperplugin=org.kde.image
+
+[Containments][1][Wallpaper][org.kde.image][General]
+Color=0,0,0
+Image=file:///usr/share/wallpapers/Next/contents/images/1280x800.png
+
+[Containments][2]
+formfactor=2
+location=4
+plugin=org.kde.panel
+wallpaperplugin=org.kde.image
+";
+
+    #[test]
+    fn folder_view_desktop_is_detected() {
+        let c = desktop_containment_with(APPLETSRC_FOLDER_VIEW);
+        assert_eq!(c.icons, DesktopIcons::FolderView);
+        assert_eq!(c.desktop_count, 1, "面板 formfactor=2/location=4 不算桌面");
+        assert_eq!(c.folder_view_count, 1);
+        assert_eq!(c.wallpaper_plugin.as_deref(), Some("org.kde.image"));
+        assert!(c.icons_will_be_covered());
+        assert!(c.summary().contains("icons=folder-view"));
+    }
+
+    #[test]
+    fn plain_desktop_is_not_folder_view() {
+        let text = "[Containments][1]\nformfactor=0\nlocation=0\nplugin=org.kde.plasma.desktop\n";
+        let c = desktop_containment_with(text);
+        assert_eq!(c.icons, DesktopIcons::Plain);
+        assert_eq!(c.desktop_count, 1);
+        assert_eq!(c.folder_view_count, 0);
+        assert!(!c.icons_will_be_covered());
+    }
+
+    #[test]
+    fn multiple_desktops_count_and_any_folder_view_wins() {
+        let text = "\
+[Containments][1]
+formfactor=0
+location=0
+plugin=org.kde.plasma.desktop
+
+[Containments][3]
+formfactor=0
+location=0
+plugin=org.kde.plasma.folder
+wallpaperplugin=org.kde.image
+";
+        let c = desktop_containment_with(text);
+        assert_eq!(c.desktop_count, 2);
+        assert_eq!(c.folder_view_count, 1);
+        assert_eq!(c.icons, DesktopIcons::FolderView, "任一桌面是文件夹视图即会画图标");
+    }
+
+    #[test]
+    fn panel_only_or_missing_config_is_unknown() {
+        let panel_only = "[Containments][2]\nformfactor=2\nlocation=4\nplugin=org.kde.panel\n";
+        let c = desktop_containment_with(panel_only);
+        assert_eq!(c.icons, DesktopIcons::Unknown, "没有桌面型 containment 时不下判断");
+        assert_eq!(c.desktop_count, 0);
+        assert_eq!(desktop_containment_with("").icons, DesktopIcons::Unknown);
+    }
+
+    #[test]
+    fn garbage_appletsrc_does_not_panic_and_stays_unknown() {
+        for text in [
+            "not an ini at all\n===\n[Containments]\nplugin=org.kde.plasma.folder\n",
+            "[Containments][x]\nformfactor=0\nplugin=org.kde.plasma.folder\n",
+            "[]\n[]\nplugin=org.kde.plasma.folder\n",
+            "[Containments][1]\nformfactor=0\n",
+        ] {
+            let c = desktop_containment_with(text);
+            assert!(
+                matches!(c.icons, DesktopIcons::Unknown | DesktopIcons::Plain),
+                "垃圾输入不得判成文件夹视图（拿不准时不下判断）: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_ignores_wallpaper_subsections() {
+        let all = parse_containments(APPLETSRC_FOLDER_VIEW);
+        assert_eq!(all.len(), 2, "子段 [Containments][1][Wallpaper] 不得产生第三个 containment");
+        assert_eq!(all[0].id, "1");
+        assert_eq!(all[0].plugin.as_deref(), Some("org.kde.plasma.folder"));
+        assert_eq!(all[1].id, "2");
+        assert!(!all[1].is_desktop());
     }
 }
