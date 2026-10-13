@@ -16,8 +16,29 @@
 // 菜单键位或全局热键**吞掉**，keydown 根本到不了录制框（「不能录制 command+
 // 其它键」）。所以录制前后整组挂起/恢复：hotkeys_record_begin 摘菜单 + 注销
 // 全部全局热键，record_end 反向恢复。
+//
+// KDE / Wayland（T-P7H）——本模块的第二个策略维度：
+//   底层的 `global-hotkey 0.8.0` 只有 macos / windows / x11 三套实现，**没有
+//   Wayland 后端**，`grab_key` 是 X11 专有（`src/platform_impl/x11/mod.rs`）。
+//   Wayland 会话里注册要么直接失败，要么经 XWayland「成功」——但那种 grab 只在
+//   X11 客户端拿到焦点时才触发，表现就是**静默失效**：状态显示已注册、按键没反应。
+//   KDE 的全局快捷键真由 KWin 内嵌的 KGlobalAccelD 管理
+//   （`kwin/src/globalshortcuts.cpp:97`），第三方应用的正路是
+//   `org.freedesktop.portal.GlobalShortcuts`（KDE 后端自 Plasma 5.27 起，
+//   `xdg-desktop-portal-kde/src/globalshortcuts.cpp`）。所以：
+//     * KDE/Wayland → [`ShortcutBackend::KdeSystem`]：**不做 X11 抢键**，每个动作
+//       标 [`HotkeyStatus::SystemManaged`] 并带出 [`KDE_SYSTEM_MANAGED_NOTE`] 文案；
+//     * 非 KDE/Wayland → [`ShortcutBackend::Unsupported`]：同样不抢键，标
+//       [`HotkeyStatus::Unavailable`] 并说明原因（本应用尚未接 portal）；
+//     * KDE/X11 → 仍走 X11 全局热键（X11 下 XGrabKey 确实全局有效），但默认键位
+//       必须避开 KWin 的保留区（[`KDE_BANNED_DEFAULTS`] / [`kde_default_conflict`]）。
+//   portal 的接缝已留好（[`PortalRegistration`] / [`portal_bind_plan`] /
+//   [`portal_register`]，标注 `TODO(P7-Wayland-portal)`）：实现后状态自动变成
+//   [`HotkeyStatus::Bound`]，调用方与前端 JSON 形状都不用改。
 use std::collections::HashMap;
 use std::sync::Mutex;
+
+use crate::kde::{KdeEnv, SessionKind};
 
 use tauri::{
     menu::{Menu, MenuItem, MenuItemKind, PredefinedMenuItem, Submenu},
@@ -37,12 +58,185 @@ pub const ACTIONS: &[(&str, &str)] = &[
     ("prev_wallpaper", "上一个壁纸"),
 ];
 
+/// 宿主 OS 类别。**纯数据**（不进 `#[cfg]`）：这样「macOS / Windows /
+/// Linux+KDE / Linux 非 KDE」四条分支的逻辑与单测在任何宿主上都能跑全 ——
+/// macOS 开发机上也要能验证 KDE 分支，否则那套策略永远没人看（同文件下方
+/// 「两份保留清单都常驻」的理由）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OsClass {
+    Macos,
+    Windows,
+    Linux,
+}
+
+pub fn current_os_class() -> OsClass {
+    if cfg!(target_os = "macos") {
+        OsClass::Macos
+    } else if cfg!(target_os = "windows") {
+        OsClass::Windows
+    } else {
+        OsClass::Linux
+    }
+}
+
+/// 全局快捷键在本会话由谁负责（判定是纯函数，理由见文件头 KDE/Wayland 段）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutBackend {
+    /// 本应用用 tauri-plugin-global-shortcut 真注册（macOS / Windows / Linux X11）。
+    App,
+    /// KDE 管理：KWin 内嵌 KGlobalAccelD，第三方不抢键（抢了 = 静默失效）。
+    KdeSystem,
+    /// 平台没有可用后端：Wayland 且非 KDE（`global-hotkey` 无 Wayland 实现，
+    /// 本应用尚未接 portal）。
+    Unsupported,
+}
+
+impl ShortcutBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ShortcutBackend::App => "app",
+            ShortcutBackend::KdeSystem => "kde_system",
+            ShortcutBackend::Unsupported => "unsupported",
+        }
+    }
+
+    /// 由平台/桌面代管时给前端的一句话说明（`App` 没有）。
+    pub fn note(self) -> Option<&'static str> {
+        match self {
+            ShortcutBackend::App => None,
+            ShortcutBackend::KdeSystem => Some(KDE_SYSTEM_MANAGED_NOTE),
+            ShortcutBackend::Unsupported => Some(WAYLAND_UNSUPPORTED_REASON),
+        }
+    }
+}
+
+/// 纯函数：当前 OS + 桌面 → 谁负责全局快捷键（文件头「KDE / Wayland」段的判定）。
+///
+/// * macOS / Windows → [`ShortcutBackend::App`]；
+/// * Linux/X11（含 KDE/X11）→ [`ShortcutBackend::App`]：X11 的 XGrabKey 确实全局
+///   有效，被 KWin 占用的组合会让注册直接报错，如实落成 [`HotkeyStatus::Failed`]；
+/// * Linux/Wayland + KDE → [`ShortcutBackend::KdeSystem`]（不抢键，走 portal 接缝）；
+/// * Linux/Wayland 非 KDE → [`ShortcutBackend::Unsupported`]；
+/// * 会话未知（既无 `DISPLAY`/`WAYLAND_DISPLAY` 也无 `XDG_SESSION_TYPE`）→ 仍试
+///   `App`：注册失败会带出底层错误，比「猜成不支持」信息量更大。
+pub fn shortcut_backend_with(os: OsClass, kde: &KdeEnv) -> ShortcutBackend {
+    match os {
+        OsClass::Macos | OsClass::Windows => ShortcutBackend::App,
+        OsClass::Linux => match kde.session {
+            SessionKind::Wayland => {
+                if kde.is_kde {
+                    ShortcutBackend::KdeSystem
+                } else {
+                    ShortcutBackend::Unsupported
+                }
+            }
+            SessionKind::X11 | SessionKind::Unknown => ShortcutBackend::App,
+        },
+    }
+}
+
+/// [`shortcut_backend_with`] 的真机版本（macOS 分支不摸 D-Bus）。
+pub fn shortcut_backend() -> ShortcutBackend {
+    match current_os_class() {
+        OsClass::Macos => ShortcutBackend::App,
+        os => shortcut_backend_with(os, crate::kde::env()),
+    }
+}
+
+/// KDE/Wayland 下每个动作的状态说明。措辞要点：**别承诺当前不生效的东西**。
+/// 本应用尚未接 portal/KGlobalAccel，所以动作现在不会出现在系统设置的快捷键表里；
+/// portal 接上之后（KDE 会弹一次确认对话框）才会出现、才能改键。
+pub const KDE_SYSTEM_MANAGED_NOTE: &str = "KDE Wayland：全局快捷键由桌面管理（KWin 内嵌 KGlobalAccelD）。\
+本应用不在 Wayland 上做 X11 抢键（那会「显示已注册、按键却不生效」）。键位已保存在本地；\
+接入 org.freedesktop.portal.GlobalShortcuts 后可在「系统设置 → 快捷键」中查看与修改，\
+在此之前请用主窗口或托盘操作。";
+
+/// Wayland 且非 KDE 的说明。
+pub const WAYLAND_UNSUPPORTED_REASON: &str = "Wayland 会话下 global-hotkey 只有 X11 后端；\
+本应用尚未接入 org.freedesktop.portal.GlobalShortcuts，故不注册（避免静默失效）。\
+键位已保存，接入后自动生效。";
+
+/// 动作没有任何绑定时的状态说明（用户清空绑定是合法状态）。
+pub const NO_BINDING_NOTE: &str = "该动作当前没有绑定按键";
+
+/// 录制期间的状态说明：全局热键与菜单被临时摘除（见 `hotkeys_record_begin`）。
+pub const RECORDING_NOTE: &str = "录制中：全局热键已临时摘除，录制结束自动恢复";
+
+/// KWin/Plasma 默认占用、KDE 会话下**不允许**当默认值的组合。
+///
+/// 依据（KWin/Plasma 默认快捷键；调研见 `docs/kde-plasma-constraints.md` §9）：
+/// `Meta+方向`（贴边/最大化）、`Meta+L`（锁屏）、`Meta+P`（显示切换）、
+/// `Meta+数字`（任务栏/活动）、`Ctrl+Alt+*`（切虚拟桌面、TTY 等）。
+/// 本表只用于「默认值不许落在这里」，用户显式录制这些组合仍然允许（前端用
+/// [`RESERVED_KDE`] 提示冲突）。
+pub const KDE_BANNED_DEFAULTS: &[&str] = &[
+    "super+left",
+    "super+right",
+    "super+up",
+    "super+down",
+    "super+l",
+    "super+p",
+    "super+1",
+    "super+2",
+    "super+3",
+    "ctrl+alt+left",
+    "ctrl+alt+right",
+    "ctrl+alt+up",
+    "ctrl+alt+down",
+    "ctrl+alt+t",
+    "ctrl+alt+l",
+    "ctrl+alt+delete",
+];
+
+/// 纯函数：该组合在 KDE 下是否属于「默认值禁区」。`None` = 可安全用作默认值。
+///
+/// 判定与 [`KDE_BANNED_DEFAULTS`] 同源，但按**语义**判（而不是查表），这样
+/// `super+9`、`super+shift+left` 这类表里没列的写法也挡得住：
+///   1. 用到 `super`（= `cmd`/`meta`/`LOGO`）→ KWin 自己拿 Meta 当快捷键前缀，
+///      第三方默认值不该占；
+///   2. 同时按 `ctrl` 和 `alt` → KWin/GNOME 的传统保留区（切桌面等）；
+///   3. 方向键带修饰 → KWin 的贴边/最大化默认键。
+pub fn kde_default_conflict(accel: &str) -> Option<&'static str> {
+    // 先查显式表：表里是逐条核过的 KWin/Plasma 默认键（语义规则之外的兜底）
+    let lower = accel.trim().to_ascii_lowercase();
+    if KDE_BANNED_DEFAULTS.contains(&lower.as_str()) {
+        return Some(
+            "该组合在 KWin/Plasma 的默认快捷键表里（见 docs/kde-plasma-constraints.md §9）",
+        );
+    }
+    let parts: Vec<String> = accel
+        .split('+')
+        .map(|p| p.trim().to_ascii_lowercase())
+        .filter(|p| !p.is_empty())
+        .collect();
+    let (key, mods) = parts.split_last()?;
+    let has_super = mods
+        .iter()
+        .any(|m| matches!(m.as_str(), "super" | "cmd" | "command" | "meta" | "logo"));
+    let has_ctrl = mods.iter().any(|m| m == "ctrl" || m == "control");
+    let has_alt = mods.iter().any(|m| m == "alt" || m == "option");
+    let is_arrow = matches!(
+        key.as_str(),
+        "left" | "right" | "up" | "down" | "arrowleft" | "arrowright" | "arrowup" | "arrowdown"
+    );
+
+    if has_super {
+        return Some("KWin 用 Meta(Super) 作为自身快捷键修饰键（Meta+方向/数字/L/P），默认值不应占用");
+    }
+    if has_ctrl && has_alt {
+        return Some("Ctrl+Alt+* 是 KWin/GNOME 的保留区（切虚拟桌面、TTY 等）");
+    }
+    if is_arrow && !mods.is_empty() {
+        return Some("方向键带修饰是 KWin 的贴边/最大化默认键");
+    }
+    None
+}
+
 /// macOS 默认：主窗口用系统惯例键 ⌘M/⌘H（菜单快捷键，不劫持其它 App），
 /// 另配一枚 ⌘⇧M 作**全局**键 —— ⌘M/⌘H 只在应用内生效，窗口隐藏后人在
 /// 其它应用里要能把主窗口唤回来，必须有一枚全局的。
 /// 其余沿用 ⌘⇧ 字母（历史上就在这套）。
-#[cfg(target_os = "macos")]
-fn default_bindings(action: &str) -> Vec<String> {
+fn mac_bindings(action: &str) -> Vec<String> {
     match action {
         "toggle_main_window" => vec!["cmd+m".into(), "cmd+h".into(), "cmd+shift+m".into()],
         "toggle_props_window" => vec!["cmd+shift+s".into()],
@@ -55,9 +249,8 @@ fn default_bindings(action: &str) -> Vec<String> {
     }
 }
 
-/// 非 macOS：Ctrl+Shift+字母，全部走全局热键（无菜单键位可依）。
-#[cfg(not(target_os = "macos"))]
-fn default_bindings(action: &str) -> Vec<String> {
+/// Windows 与非 KDE Linux：`Ctrl+Shift+字母`，全部走全局热键（无菜单键位可依）。
+fn linux_generic_bindings(action: &str) -> Vec<String> {
     match action {
         "toggle_main_window" => vec!["ctrl+shift+m".into()],
         "toggle_props_window" => vec!["ctrl+shift+s".into()],
@@ -67,6 +260,51 @@ fn default_bindings(action: &str) -> Vec<String> {
         "next_wallpaper" => vec!["ctrl+shift+n".into()],
         "prev_wallpaper" => vec!["ctrl+shift+b".into()],
         _ => vec![],
+    }
+}
+
+/// KDE 默认键位：只占 `Ctrl+Shift+<字母>` 这片 KWin 默认表里空着的空间。
+///
+/// * 依据：KWin 的默认快捷键集中在 `Meta+*` 与 `Ctrl+Alt+*`（见表
+///   [`KDE_BANNED_DEFAULTS`] 的注释），`Ctrl+Shift+字母` 不在其中；
+/// * KDE 下第三方的 Meta(Super) 组合可能先被 KWin 自己吞掉，故 KDE 默认
+///   **不使用 Meta**（由 [`kde_default_conflict`] 钉住）；
+/// * 键位当前与通用 Linux 分支相同 —— 独立成函数是为了让 KDE 的策略能独立演进，
+///   并由单测把上面两条约束钉死（改坏了立刻红）。
+fn kde_bindings(action: &str) -> Vec<String> {
+    match action {
+        "toggle_main_window" => vec!["ctrl+shift+m".into()],
+        "toggle_props_window" => vec!["ctrl+shift+s".into()],
+        "toggle_pause" => vec!["ctrl+shift+p".into()],
+        "toggle_auto_pause" => vec!["ctrl+shift+a".into()],
+        "toggle_rotation" => vec!["ctrl+shift+r".into()],
+        "next_wallpaper" => vec!["ctrl+shift+n".into()],
+        "prev_wallpaper" => vec!["ctrl+shift+b".into()],
+        _ => vec![],
+    }
+}
+
+/// 平台/桌面判定是纯函数：任意宿主上都能把四条分支测一遍。
+pub fn default_bindings_with(action: &str, os: OsClass, kde: &KdeEnv) -> Vec<String> {
+    match os {
+        OsClass::Macos => mac_bindings(action),
+        OsClass::Windows => linux_generic_bindings(action),
+        OsClass::Linux => {
+            if kde.is_kde {
+                kde_bindings(action)
+            } else {
+                linux_generic_bindings(action)
+            }
+        }
+    }
+}
+
+/// [`default_bindings_with`] 的真机版本。
+fn default_bindings(action: &str) -> Vec<String> {
+    match current_os_class() {
+        // macOS 分支与 KDE 无关，别为它去摸一次 D-Bus
+        OsClass::Macos => mac_bindings(action),
+        os => default_bindings_with(action, os, crate::kde::env()),
     }
 }
 
@@ -119,6 +357,274 @@ pub const RESERVED: &[&str] = RESERVED_MACOS;
 #[cfg(not(target_os = "macos"))]
 pub const RESERVED: &[&str] = RESERVED_OTHER;
 
+/// KDE 专有的保留组合（供前端冲突提示；只在 KDE 会话下附加到 [`RESERVED_OTHER`] 后面）。
+///
+/// 用 `super+`（而不是 `meta+`）是因为解析器（`global-hotkey`）只认
+/// `SUPER`/`CMD`/`COMMAND` 作为 Super 修饰键名，写 `meta+` 会解析失败 ——
+/// 保留清单的既有单测会立刻抓到这种错字。
+#[allow(dead_code)]
+pub const RESERVED_KDE: &[&str] = &[
+    // KWin 窗口管理（贴边/最大化/最小化/锁屏/显示切换）
+    "super+left",
+    "super+right",
+    "super+up",
+    "super+down",
+    // KWin / Plasma 全局
+    "super+l",
+    "super+p",
+    // 任务栏与活动
+    "super+1",
+    "super+2",
+    "super+3",
+    "super+4",
+    "super+5",
+    // 虚拟控制台（切 TTY）
+    "ctrl+alt+f1",
+    "ctrl+alt+f2",
+    "ctrl+alt+f3",
+    "ctrl+alt+f4",
+    "ctrl+alt+f5",
+    "ctrl+alt+f6",
+];
+
+/// 该平台 + 桌面下给前端做冲突提示的保留组合。
+///
+/// 非 KDE 的 Linux 会话不该冒出 KWin 的 `super+*`（那是 KDE 专用表）；
+/// KDE/Wayland 上这些组合更是被 KWin 直接截走，录制框大概率录不到 ——
+/// 但作为「冲突提示」多一条无害，反而能解释「为什么录不出来」。
+pub fn reserved_for(os: OsClass, kde: &KdeEnv) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = match os {
+        OsClass::Macos => RESERVED_MACOS.to_vec(),
+        OsClass::Windows => RESERVED_OTHER.to_vec(),
+        OsClass::Linux => {
+            let mut v = RESERVED_OTHER.to_vec();
+            if kde.is_kde {
+                v.extend_from_slice(RESERVED_KDE);
+            }
+            v
+        }
+    };
+    out.dedup();
+    out
+}
+
+/// 每个动作当前的注册状态（前端「快捷键」页据此显示，而不是让用户猜）。
+///
+/// 这是本次改动的主产出：以前注册失败只有一行 `warn!`，用户看到的是「按了没反应」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HotkeyStatus {
+    /// 已由本应用注册成功（macOS 的菜单加速键也算 —— 它在应用内生效）。
+    Bound,
+    /// 由桌面代管：本应用不抢键。当前 KDE/Wayland 落到这里
+    /// （见 [`KDE_SYSTEM_MANAGED_NOTE`]）。
+    SystemManaged { note: String },
+    /// 本平台/本动作没有可用绑定：Wayland 无后端、或用户清空了该动作的绑定。
+    Unavailable { reason: String },
+    /// 尝试注册但失败（被系统或其它应用占用）。
+    Failed { reason: String },
+}
+
+impl HotkeyStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HotkeyStatus::Bound => "bound",
+            HotkeyStatus::SystemManaged { .. } => "system_managed",
+            HotkeyStatus::Unavailable { .. } => "unavailable",
+            HotkeyStatus::Failed { .. } => "failed",
+        }
+    }
+
+    /// 给用户看的补充说明（`Bound` 为 `None`）。
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            HotkeyStatus::Bound => None,
+            HotkeyStatus::SystemManaged { note } => Some(note),
+            HotkeyStatus::Unavailable { reason } => Some(reason),
+            HotkeyStatus::Failed { reason } => Some(reason),
+        }
+    }
+
+    /// `hotkeys_list` 里的 JSON 形状：`{"state": "...", "detail": "..."}`。
+    pub fn to_json(&self) -> serde_json::Value {
+        match self.detail() {
+            Some(d) => serde_json::json!({ "state": self.as_str(), "detail": d }),
+            None => serde_json::json!({ "state": self.as_str() }),
+        }
+    }
+}
+
+/// 一行式摘要，给日志用（真机取证时 grep `hotkeys:`）。
+pub fn status_digest(status: &HashMap<String, HotkeyStatus>) -> String {
+    let mut counts: HashMap<&'static str, usize> = HashMap::new();
+    for s in status.values() {
+        *counts.entry(s.as_str()).or_insert(0) += 1;
+    }
+    let mut parts: Vec<String> = counts
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    parts.sort();
+    format!("{} 个动作 [{}]", status.len(), parts.join(" "))
+}
+
+// ---- org.freedesktop.portal.GlobalShortcuts（KDE Wayland 的正路）----
+//
+// TODO(P7-Wayland-portal)：D-Bus 调用未实现 —— 这里只交付**接缝**（签名 + 调用
+// 顺序 + 纯函数部分）。诚实说明：`portal_register` 目前恒返回
+// `PortalRegistration::Unavailable`，KDE/Wayland 的动作因此显示
+// `SystemManaged`，不会假装「已注册」。
+
+/// portal `BindShortcuts` 的一条条目（纯数据，便于单测）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortalShortcut {
+    /// 我们的动作 id（portal 侧叫 shortcut id；`Activated` 信号原样带回来）。
+    pub id: String,
+    /// 给用户看的描述（KDE 的确认对话框里显示）。
+    pub description: String,
+    /// 首选键位，格式见 [`portal_trigger`]。`None` = 键位无法映射成 portal 写法，
+    /// 仍然提交（让用户/后续实现在系统设置里指派）。
+    pub preferred_trigger: Option<String>,
+}
+
+/// portal 注册结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortalRegistration {
+    /// 会话建立且 `BindShortcuts` 被接受。
+    // 目前只有测试构造它（真实实现见 `TODO(P7-Wayland-portal)`）；这里保留是为了
+    // 实现落地时 `to_json()`/调用方与前端 JSON 形状都不用改。
+    #[allow(dead_code)]
+    Registered {
+        session_handle: String,
+        portal_version: u32,
+    },
+    /// 没有 portal（旧版/非 KDE）或本应用尚未实现。
+    Unavailable { reason: String },
+}
+
+impl PortalRegistration {
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            PortalRegistration::Registered {
+                session_handle,
+                portal_version,
+            } => serde_json::json!({
+                "implemented": true,
+                "state": "registered",
+                "session_handle": session_handle,
+                "portal_version": portal_version,
+            }),
+            PortalRegistration::Unavailable { reason } => serde_json::json!({
+                "implemented": false,
+                "state": "unavailable",
+                "detail": reason,
+            }),
+        }
+    }
+}
+
+/// 我们的快捷键写法 → portal `preferred_trigger`。
+///
+/// 格式依据 KDE 后端自己的解析器 `xdg-desktop-portal-kde/src/xdgshortcut.cpp::parse`：
+/// * 修饰键名**大写**且只认 `SHIFT` / `CAPS` / `CTRL` / `ALT` / `NUM` / `LOGO`
+///   （`LOGO` = Super/Meta）；
+/// * 键名走 `xkb_keysym_from_name(..., XKB_KEYSYM_CASE_INSENSITIVE)`，即 XKB keysym
+///   名（`a` / `F5` / `Left` / `space` …），大小写不敏感；
+/// * 分隔符 `+`，空段非法（`CTRL++a` 直接失败）。
+///
+/// 返回 `None` = 本次映射不了（未知修饰键、未知键名、或没有修饰键的组合）——
+/// 调用方只记 `debug`，不 panic、不静默吞掉（[`PortalShortcut::preferred_trigger`]
+/// 会带 `None` 上报）。
+pub fn portal_trigger(accel: &str) -> Option<String> {
+    let parts: Vec<String> = accel
+        .split('+')
+        .map(|p| p.trim().to_ascii_lowercase())
+        .filter(|p| !p.is_empty())
+        .collect();
+    let (key, mods) = parts.split_last()?;
+    if mods.is_empty() {
+        // portal 的首选键位要求是「修饰键 + 键」的组合；裸 F 键留给用户在系统设置里指派
+        return None;
+    }
+    let mut out: Vec<String> = Vec::new();
+    for m in mods {
+        let name = match m.as_str() {
+            "ctrl" | "control" => "CTRL",
+            "alt" | "option" => "ALT",
+            "shift" => "SHIFT",
+            "cmd" | "command" | "super" | "meta" | "logo" => "LOGO",
+            _ => return None,
+        };
+        if !out.iter().any(|x| x == name) {
+            out.push(name.to_string());
+        }
+    }
+    let key = match key.as_str() {
+        "left" | "arrowleft" => "Left".to_string(),
+        "right" | "arrowright" => "Right".to_string(),
+        "up" | "arrowup" => "Up".to_string(),
+        "down" | "arrowdown" => "Down".to_string(),
+        "space" => "space".to_string(),
+        k if k.len() == 1 && k.chars().all(|c| c.is_ascii_alphanumeric()) => k.to_string(),
+        k if k.starts_with('f') && k[1..].parse::<u32>().is_ok() => k.to_uppercase(),
+        _ => return None,
+    };
+    out.push(key);
+    Some(out.join("+"))
+}
+
+/// 把当前绑定整理成 portal 请求清单（纯函数）。
+///
+/// 每个动作取**第一枚能映射**的绑定作为 `preferred_trigger`（portal 的一个
+/// shortcut id 只有一个首选键位；它的最终键位由用户在 KDE 的确认对话框/系统设置里定）。
+pub fn portal_bind_plan(bindings: &HashMap<String, Vec<String>>) -> Vec<PortalShortcut> {
+    let mut out = Vec::with_capacity(ACTIONS.len());
+    for (id, label) in ACTIONS {
+        let accels = bindings.get(*id);
+        let trigger = accels.and_then(|v| v.iter().find_map(|a| portal_trigger(a)));
+        if let Some(v) = accels {
+            if trigger.is_none() && !v.is_empty() {
+                tracing::debug!(
+                    "hotkeys: portal 无法映射 {id} 的键位 {v:?}，将不提交 preferred_trigger"
+                );
+            }
+        }
+        out.push(PortalShortcut {
+            id: (*id).to_string(),
+            description: (*label).to_string(),
+            preferred_trigger: trigger,
+        });
+    }
+    out
+}
+
+/// 真实 portal 注册（**未实现**）。签名与调用顺序已经定死，实现时只补 D-Bus 部分。
+///
+/// 调用顺序（`org.freedesktop.portal.GlobalShortcuts`，KDE 后端实现见
+/// `xdg-desktop-portal-kde/src/globalshortcuts.cpp`）：
+/// 1. `CreateSession(a{sv}) -> o request`，options 带 `handle_token` 与
+///    `session_handle_token`；等 `org.freedesktop.portal.Request::Response(u, a{sv})`
+///    拿 `session_handle`（`o`，路径形如 `/org/freedesktop/portal/desktop/session/...`）。
+/// 2. `BindShortcuts(o session_handle, a(sa{sv}) shortcuts, s parent_window, a{sv}) -> o request`
+///    （`shortcuts` 每项 = `(id, {description, preferred_trigger})`）。
+///    **KDE 会弹一次确认对话框**（`GlobalShortcutsDialog.qml`）；用户拒绝时 portal 仍会
+///    以「无键位」注册，之后可在系统设置 → 快捷键里指派（上游代码注释明确写了这条）。
+/// 3. 订阅 `Activated(o session_handle, s shortcut_id, t timestamp, a{sv} options)`
+///    → 按 shortcut_id 调 [`dispatch`]（与全局热键 handler 汇合）。
+/// 4. 订阅 `org.freedesktop.portal.Session::Closed`；会话失效后要重新 `CreateSession`
+///    （portal 的会话随应用/桌面的生命周期结束）。
+///
+/// 需要 zbus（`Cargo.toml` 的 Linux target 下已有 `zbus = "5.19"`）。**当前恒返回
+/// `Unavailable`**：KDE/Wayland 的动作因此显示 `SystemManaged`，不会假装已注册。
+pub fn portal_register(_app: &AppHandle, plan: &[PortalShortcut]) -> PortalRegistration {
+    tracing::debug!(
+        "hotkeys: TODO(P7-Wayland-portal) 未发起 portal 调用（计划提交 {} 条）",
+        plan.len()
+    );
+    PortalRegistration::Unavailable {
+        reason: "TODO(P7-Wayland-portal)：尚未实现 CreateSession → BindShortcuts → Activated 流程".into(),
+    }
+}
+
 const SETTING_KEY: &str = "hotkeys_v1";
 
 pub struct Hotkeys {
@@ -131,11 +637,31 @@ pub struct Hotkeys {
     saved_menu: Mutex<Option<Menu<Wry>>>,
     /// 录制中：全局热键与菜单已摘除
     suspended: Mutex<bool>,
+    /// 动作 id → 当前注册状态（每次 [`apply`] 后刷新，前端在 `hotkeys_list` 里读）
+    status: Mutex<HashMap<String, HotkeyStatus>>,
+    /// 最近一次 portal 注册结果（`App` 后端下为 `None`；前端据此说明「尚未接 portal」）
+    portal: Mutex<Option<PortalRegistration>>,
+}
+
+/// 取锁且**不 panic**：mutex 中毒（某个持锁线程 panic 过）时取回内部值继续用。
+/// 快捷键状态不值得让整个应用崩掉 —— 而且托盘/窗口回调里 panic 会很难查。
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl Hotkeys {
     fn snapshot(&self) -> HashMap<String, Vec<String>> {
-        self.bindings.lock().unwrap().clone()
+        lock(&self.bindings).clone()
+    }
+
+    /// 状态快照（`hotkeys_list` 与其它 Rust 模块读这里）。
+    pub fn status_snapshot(&self) -> HashMap<String, HotkeyStatus> {
+        lock(&self.status).clone()
+    }
+
+    /// 最近一次 portal 注册结果（`App` 后端下恒 `None`）。
+    pub fn portal_snapshot(&self) -> Option<PortalRegistration> {
+        lock(&self.portal).clone()
     }
 }
 
@@ -235,64 +761,203 @@ pub fn init(app: &AppHandle) -> Result<(), String> {
         map.entry((*id).to_string())
             .or_insert_with(|| default_bindings(id));
     }
+    // 状态先全部标成「尚未注册」：apply 里任何早退（例如 macOS 菜单构建失败）
+    // 都会留下诚实的状态，而不是空表让前端以为一切正常
+    let mut pending: HashMap<String, HotkeyStatus> = HashMap::new();
+    for (id, _) in ACTIONS {
+        pending.insert(
+            (*id).to_string(),
+            HotkeyStatus::Unavailable {
+                reason: "尚未注册（初始化未走完）".into(),
+            },
+        );
+    }
     app.manage(Hotkeys {
         bindings: Mutex::new(map),
         lookup: Mutex::new(HashMap::new()),
         saved_menu: Mutex::new(None),
         suspended: Mutex::new(false),
+        status: Mutex::new(pending),
+        portal: Mutex::new(None),
     });
-    // 注册失败不能掀掉整个 setup：绑定已入库，下次启动或改绑时会再试
+    // 注册失败不能掀掉整个 setup：绑定已入库，下次启动或改绑时会再试。
+    // 但**不许静默**：状态已写进 state（前端读 `hotkeys_list` 就能看到哪条失败），
+    // 日志里带上原因与状态摘要，真机取证时 grep `hotkeys`。
     if let Err(e) = apply(app) {
-        tracing::warn!("hotkeys apply at init failed (bindings kept): {e}");
+        tracing::warn!("hotkeys apply at init failed (bindings kept, 见 hotkeys_list 状态): {e}");
     }
     Ok(())
 }
 
-/// （重新）注册全部绑定：装菜单（⌘+单键）+ 注册全局热键（其余）。
+/// 某动作在 `App` 后端下的状态。空绑定是合法状态，单独说明。
+fn app_status(accels: &[String], failure: Option<&String>) -> HotkeyStatus {
+    if accels.is_empty() {
+        return HotkeyStatus::Unavailable {
+            reason: NO_BINDING_NOTE.into(),
+        };
+    }
+    match failure {
+        Some(reason) => HotkeyStatus::Failed {
+            reason: reason.clone(),
+        },
+        None => HotkeyStatus::Bound,
+    }
+}
+
+/// 某动作在不抢键的 Wayland 后端下的状态（portal 接缝见 [`portal_register`]）。
+fn wayland_status(
+    backend: ShortcutBackend,
+    accels: &[String],
+    registration: &PortalRegistration,
+) -> HotkeyStatus {
+    if accels.is_empty() {
+        return HotkeyStatus::Unavailable {
+            reason: NO_BINDING_NOTE.into(),
+        };
+    }
+    match (backend, registration) {
+        (ShortcutBackend::KdeSystem, PortalRegistration::Registered { .. }) => HotkeyStatus::Bound,
+        (ShortcutBackend::KdeSystem, PortalRegistration::Unavailable { .. }) => {
+            HotkeyStatus::SystemManaged {
+                note: KDE_SYSTEM_MANAGED_NOTE.into(),
+            }
+        }
+        _ => HotkeyStatus::Unavailable {
+            reason: WAYLAND_UNSUPPORTED_REASON.into(),
+        },
+    }
+}
+
+/// （重新）注册全部绑定，并刷新每个动作的 [`HotkeyStatus`]。
+///
+/// * [`ShortcutBackend::App`]：装菜单（macOS）+ 逐条注册全局热键。单条失败**不再**
+///   中断整批（继续注册其余），最后把失败原因合成一个 `Err` 上报 —— 「一个键被占用
+///   就全部失效」变成「其余仍可用 + 前端看得到哪条失败」。`hotkeys_set` 的非 force
+///   路径仍靠这个 `Err` 回滚，语义不变。
+/// * [`ShortcutBackend::KdeSystem`] / [`ShortcutBackend::Unsupported`]：**一次 grab
+///   都不做**，只写状态（原因见文件头 KDE/Wayland 段）。
 pub fn apply(app: &AppHandle) -> Result<(), String> {
-    let state = app.state::<Hotkeys>();
+    let state = app
+        .try_state::<Hotkeys>()
+        .ok_or("快捷键未初始化（Hotkeys state 缺失）")?;
+    let backend = shortcut_backend();
     let bindings = state.snapshot();
-    *state.suspended.lock().unwrap() = false;
+    *lock(&state.suspended) = false;
 
     let gs = app.global_shortcut();
     let _ = gs.unregister_all();
     // 快捷键 → 动作 的反查表（handler 只拿得到 Shortcut，用它的 Display 当键，
     // 两侧都经同一类型序列化，格式不依赖手写约定）
     let mut lookup: HashMap<String, String> = HashMap::new();
+    let mut fresh: HashMap<String, HotkeyStatus> = HashMap::new();
 
     #[cfg(target_os = "macos")]
     {
-        let menu = build_app_menu(app, &bindings).map_err(|e| e.to_string())?;
-        *state.saved_menu.lock().unwrap() = Some(menu.clone());
-        app.set_menu(menu).map_err(|e| e.to_string())?;
-    }
-
-    let mut registered: Vec<String> = Vec::new();
-    for (action, accels) in &bindings {
-        for accel in accels {
-            if is_mac_menu_accel(accel) {
-                continue; // 菜单快捷键已在上面处理
-            }
-            match gs.register(accel.as_str()) {
-                Ok(_) => {
-                    registered.push(accel.clone());
-                    if let Ok(sk) = accel.parse::<Shortcut>() {
-                        lookup.insert(sk.to_string(), action.clone());
-                    }
+        match build_app_menu(app, &bindings).and_then(|menu| {
+            *lock(&state.saved_menu) = Some(menu.clone());
+            app.set_menu(menu)
+        }) {
+            Ok(_) => {}
+            Err(e) => {
+                // 菜单挂了就不存在「应用内快捷键」了，如实标 Failed 再上报
+                let reason = format!("应用菜单构建失败: {e}");
+                for (id, _) in ACTIONS {
+                    fresh.insert(
+                        (*id).to_string(),
+                        HotkeyStatus::Failed {
+                            reason: reason.clone(),
+                        },
+                    );
                 }
-                Err(e) => {
-                    // 半途失败要收干净：注销已注册的，别留一堆孤儿热键
-                    for a in &registered {
-                        let _ = gs.unregister(a.as_str());
-                    }
-                    return Err(format!("快捷键 {accel} 注册失败（可能被系统或其它应用占用）: {e}"));
-                }
+                *lock(&state.status) = fresh;
+                return Err(reason);
             }
         }
     }
-    // 反查表存回 state：给 handler 用
-    *state.lookup.lock().unwrap() = lookup;
+
+    match backend {
+        ShortcutBackend::KdeSystem | ShortcutBackend::Unsupported => {
+            // 一次 X11/XWayland grab 都不做。KDE 走 portal 接缝（当前恒 Unavailable）。
+            let registration = match backend {
+                ShortcutBackend::KdeSystem => {
+                    let plan = portal_bind_plan(&bindings);
+                    portal_register(app, &plan)
+                }
+                _ => PortalRegistration::Unavailable {
+                    reason: WAYLAND_UNSUPPORTED_REASON.into(),
+                },
+            };
+            tracing::info!(
+                "hotkeys: backend={} 不抢键；portal={}",
+                backend.as_str(),
+                registration_state(&registration)
+            );
+            *lock(&state.portal) = Some(registration.clone());
+            for (action, accels) in &bindings {
+                fresh.insert(
+                    action.clone(),
+                    wayland_status(backend, accels, &registration),
+                );
+            }
+        }
+        ShortcutBackend::App => {
+            let mut failures: HashMap<String, String> = HashMap::new();
+            for (action, accels) in &bindings {
+                for accel in accels {
+                    if is_mac_menu_accel(accel) {
+                        continue; // 菜单快捷键已在上面处理
+                    }
+                    match gs.register(accel.as_str()) {
+                        Ok(_) => {
+                            if let Ok(sk) = accel.parse::<Shortcut>() {
+                                lookup.insert(sk.to_string(), action.clone());
+                            }
+                        }
+                        Err(e) => {
+                            // 记录原因继续注册其余组合（旧行为是立刻收摊 + 全组失效）
+                            let reason =
+                                format!("快捷键 {accel} 注册失败（可能被系统或其它应用占用）: {e}");
+                            tracing::warn!("hotkeys: {reason}");
+                            failures.entry(action.clone()).or_insert(reason);
+                        }
+                    }
+                }
+            }
+            for (action, accels) in &bindings {
+                fresh.insert(action.clone(), app_status(accels, failures.get(action)));
+            }
+            *lock(&state.lookup) = lookup;
+            *lock(&state.status) = fresh.clone();
+            tracing::debug!("hotkeys: backend=app {}", status_digest(&fresh));
+            if !failures.is_empty() {
+                let mut msgs: Vec<&String> = failures.values().collect();
+                msgs.sort();
+                return Err(msgs
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("；"));
+            }
+            return Ok(());
+        }
+    }
+
+    // 不抢键的分支：反查表留空（没有全局热键 handler 会命中），状态落库
+    *lock(&state.lookup) = lookup;
+    *lock(&state.status) = fresh.clone();
+    tracing::debug!(
+        "hotkeys: backend={} {}",
+        backend.as_str(),
+        status_digest(&fresh)
+    );
     Ok(())
+}
+
+fn registration_state(registration: &PortalRegistration) -> &'static str {
+    match registration {
+        PortalRegistration::Registered { .. } => "registered",
+        PortalRegistration::Unavailable { .. } => "unavailable",
+    }
 }
 
 /// 全局热键 handler 入口：Shortcut → 动作 id → 分发。
@@ -312,12 +977,19 @@ pub fn dispatch_by_shortcut(app: &AppHandle, shortcut: &Shortcut) {
 #[tauri::command]
 pub fn hotkeys_record_begin(app: AppHandle) -> Result<(), String> {
     let state = app.state::<Hotkeys>();
-    *state.suspended.lock().unwrap() = true;
+    *lock(&state.suspended) = true;
     let _ = app.global_shortcut().unregister_all();
+    // 录制期间热键真的被摘掉了：状态如实标成「临时摘除」，别让前端继续显示 bound。
+    // 录制结束（成功或取消）都走 hotkeys_record_end → apply() 重算状态。
+    for s in lock(&state.status).values_mut() {
+        *s = HotkeyStatus::Unavailable {
+            reason: RECORDING_NOTE.into(),
+        };
+    }
     #[cfg(target_os = "macos")]
     {
         if let Ok(Some(menu)) = app.remove_menu() {
-            *state.saved_menu.lock().unwrap() = Some(menu);
+            *lock(&state.saved_menu) = Some(menu);
         }
     }
     Ok(())
@@ -334,20 +1006,48 @@ pub fn hotkeys_record_end(app: AppHandle) -> Result<(), String> {
 pub fn hotkeys_list(app: AppHandle) -> Result<serde_json::Value, String> {
     let state = app.try_state::<Hotkeys>().ok_or("快捷键未初始化")?;
     let bindings = state.snapshot();
+    let status = state.status_snapshot();
+    let backend = shortcut_backend();
+    let kde = crate::kde::env();
+    // KDE 会话才追加 KWin 保留区（非 KDE 不该冒出 super+* 那张表）
+    let kde_reserved: &[&str] = if kde.is_kde { RESERVED_KDE } else { &[] };
     let items: Vec<serde_json::Value> = ACTIONS
         .iter()
         .map(|(id, label)| {
+            // 状态是本模块的主产出：前端「按了没反应」时要能直接显示原因
+            let status_json = status
+                .get(*id)
+                .map_or_else(|| serde_json::json!({ "state": "unknown" }), HotkeyStatus::to_json);
             serde_json::json!({
                 "id": id,
                 "label": label,
                 "bindings": bindings.get(*id).cloned().unwrap_or_default(),
                 "defaults": default_bindings(id),
+                "status": status_json,
             })
         })
         .collect();
     Ok(serde_json::json!({
         "items": items,
+        // `reserved` 与既有前端契约逐字一致；KDE 追加项走下面两个新字段
         "reserved": RESERVED,
+        "reserved_kde": kde_reserved,
+        "reserved_with_kde": reserved_for(current_os_class(), kde),
+        "backend": {
+            "kind": backend.as_str(),
+            "note": backend.note(),
+            "kde": kde.is_kde,
+            "plasma_major": kde.plasma_major,
+            "session": kde.session.as_str(),
+        },
+        "portal": state.portal_snapshot().map_or_else(
+            || serde_json::json!({
+                "implemented": false,
+                "state": "unavailable",
+                "detail": "当前后端不需要 portal（或尚未初始化）",
+            }),
+            |r| r.to_json(),
+        ),
     }))
 }
 
@@ -366,6 +1066,17 @@ pub fn hotkeys_set(
     }
     for a in &bindings {
         validate_accel(a)?;
+    }
+    // KDE 下只提醒、不阻止：用户显式录制的组合就是他的选择（KWin 占用时注册会失败，
+    // 失败原因由 `apply` 落成 HotkeyStatus::Failed，前端看得到）
+    if cfg!(target_os = "linux") && crate::kde::env().is_kde {
+        for a in &bindings {
+            if let Some(why) = kde_default_conflict(a) {
+                tracing::warn!(
+                    "hotkeys: {action} 绑定 {a} 落在 KWin 保留区（{why}），可能被 KWin 截走"
+                );
+            }
+        }
     }
     let state = app.state::<Hotkeys>();
     // 互斥：同一组合不能挂两个动作
@@ -760,5 +1471,323 @@ mod tests {
     fn menu_accel_formats_for_muda() {
         assert_eq!(menu_accel("cmd+shift+s"), "Cmd+Shift+S");
         assert_eq!(menu_accel("cmd+m"), "Cmd+M");
+    }
+
+    // ---------- T-P7H：KDE/Wayland 后端判定 + 安全默认键位 ----------
+
+    /// 用环境快照造 `KdeEnv` —— 复用 `kde.rs` 的判定链，测试不复刻规则。
+    fn kde_env(de: &str, session: &str) -> KdeEnv {
+        let snap: crate::kde::EnvSnapshot = [
+            ("XDG_CURRENT_DESKTOP", de),
+            ("XDG_SESSION_TYPE", session),
+            ("KDE_SESSION_VERSION", "6"),
+        ]
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+        crate::kde::detect_with(&snap, true)
+    }
+
+    fn accels(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn backend_matrix_by_os_and_session() {
+        let kde_x11 = kde_env("KDE", "x11");
+        let kde_wl = kde_env("KDE:Plasma", "wayland");
+        let gnome_wl = kde_env("GNOME", "wayland");
+        let gnome_x11 = kde_env("GNOME", "x11");
+        // macOS / Windows 一律自注册（与桌面无关）
+        for os in [OsClass::Macos, OsClass::Windows] {
+            for kde in [&kde_x11, &kde_wl, &gnome_wl] {
+                assert_eq!(shortcut_backend_with(os, kde), ShortcutBackend::App);
+            }
+        }
+        // X11（含 KDE/X11）：XGrabKey 全局有效，真注册、失败如实上报
+        assert_eq!(
+            shortcut_backend_with(OsClass::Linux, &kde_x11),
+            ShortcutBackend::App
+        );
+        assert_eq!(
+            shortcut_backend_with(OsClass::Linux, &gnome_x11),
+            ShortcutBackend::App
+        );
+        // Wayland：KDE 交给桌面（KWin 内嵌 KGlobalAccelD），其它桌面没有可用后端
+        assert_eq!(
+            shortcut_backend_with(OsClass::Linux, &kde_wl),
+            ShortcutBackend::KdeSystem
+        );
+        assert_eq!(
+            shortcut_backend_with(OsClass::Linux, &gnome_wl),
+            ShortcutBackend::Unsupported
+        );
+        // 「不抢键」的两个后端必须带文案；App 没有
+        assert!(ShortcutBackend::KdeSystem.note().is_some());
+        assert!(ShortcutBackend::Unsupported.note().is_some());
+        assert!(ShortcutBackend::App.note().is_none());
+    }
+
+    /// KDE 默认键位的硬约束：不许落在 KWin 保留区，且必须是能真正注册的写法。
+    #[test]
+    fn kde_defaults_stay_out_of_kwin_reserved_area() {
+        for de in ["KDE", "KDE:Plasma"] {
+            let kde = kde_env(de, "x11");
+            for (id, _) in ACTIONS {
+                for a in default_bindings_with(id, OsClass::Linux, &kde) {
+                    assert!(
+                        kde_default_conflict(&a).is_none(),
+                        "{id} 的 KDE 默认键位 {a} 落在 KWin 保留区"
+                    );
+                    assert!(a.parse::<Shortcut>().is_ok(), "默认键位无法解析: {a}");
+                }
+            }
+        }
+        // 非 KDE 的 Linux 默认值同表校验：KDE 用户切桌面时也不能踩雷
+        let gnome = kde_env("GNOME", "x11");
+        for (id, _) in ACTIONS {
+            for a in default_bindings_with(id, OsClass::Linux, &gnome) {
+                assert!(
+                    kde_default_conflict(&a).is_none(),
+                    "{id} 的通用 Linux 默认键位 {a} 撞 KWin 保留区"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kde_conflict_rules_are_semantic_not_just_table_lookup() {
+        // 表里的逐条命中
+        for a in KDE_BANNED_DEFAULTS {
+            assert!(kde_default_conflict(a).is_some(), "{a} 应判为冲突");
+        }
+        // 表里没有、但语义上同样冲突的写法（大小写/写法变体都要挡住）
+        for a in [
+            "super+9",
+            "Meta+L",
+            "meta+shift+left",
+            "LOGO+x",
+            "ctrl+alt+f9",
+            "alt+Left",
+            "ctrl+alt+arrowright",
+        ] {
+            assert!(kde_default_conflict(a).is_some(), "{a} 应判为冲突");
+        }
+        // 可用区：Ctrl+Shift+字母 与不涉保留区的组合
+        for a in ["ctrl+shift+m", "ctrl+shift+p", "ctrl+shift+f12", "alt+f4", "f5"] {
+            assert!(kde_default_conflict(a).is_none(), "{a} 不该判为冲突");
+        }
+        // 坏写法不 panic（调用方另有 validate_accel 把关）
+        assert!(kde_default_conflict("").is_none());
+        assert!(kde_default_conflict("+").is_none());
+    }
+
+    #[test]
+    fn reserved_lists_parse_and_kde_entries_are_session_scoped() {
+        for a in RESERVED_KDE {
+            assert!(a.parse::<Shortcut>().is_ok(), "KDE 保留组合无法解析: {a}");
+        }
+        let kde = kde_env("KDE", "wayland");
+        let gnome = kde_env("GNOME", "wayland");
+        let kde_list = reserved_for(OsClass::Linux, &kde);
+        let gnome_list = reserved_for(OsClass::Linux, &gnome);
+        assert!(kde_list.contains(&"super+left"));
+        assert!(kde_list.contains(&"ctrl+alt+f1"));
+        assert!(
+            !gnome_list.contains(&"super+left"),
+            "非 KDE 会话不该冒出 KWin 的 super+* 表"
+        );
+        assert_eq!(reserved_for(OsClass::Macos, &kde), RESERVED_MACOS.to_vec());
+        assert_eq!(reserved_for(OsClass::Windows, &kde), RESERVED_OTHER.to_vec());
+    }
+
+    // ---------- T-P7H：portal 接缝（TODO(P7-Wayland-portal)） ----------
+
+    #[test]
+    fn portal_trigger_uses_kde_backend_syntax() {
+        // 格式依据 xdg-desktop-portal-kde 的 xdgshortcut.cpp::parse（LOGO = Super/Meta）
+        assert_eq!(
+            portal_trigger("ctrl+shift+m").as_deref(),
+            Some("CTRL+SHIFT+m")
+        );
+        assert_eq!(
+            portal_trigger("cmd+shift+n").as_deref(),
+            Some("LOGO+SHIFT+n")
+        );
+        assert_eq!(portal_trigger("super+left").as_deref(), Some("LOGO+Left"));
+        assert_eq!(portal_trigger("ctrl+alt+f5").as_deref(), Some("CTRL+ALT+F5"));
+        // 重复修饰键只出现一次
+        assert_eq!(portal_trigger("ctrl+ctrl+a").as_deref(), Some("CTRL+a"));
+        // 映射不了的写法：没有修饰键 / 未知键名 / 未知修饰键 / 空串
+        assert_eq!(portal_trigger("f5"), None);
+        assert_eq!(portal_trigger("ctrl+shift+notakey"), None);
+        assert_eq!(portal_trigger("hyper+a"), None);
+        assert_eq!(portal_trigger(""), None);
+    }
+
+    #[test]
+    fn portal_bind_plan_covers_every_action() {
+        let mut bindings: HashMap<String, Vec<String>> = HashMap::new();
+        for (id, _) in ACTIONS {
+            bindings.insert((*id).to_string(), kde_bindings(id));
+        }
+        let plan = portal_bind_plan(&bindings);
+        assert_eq!(plan.len(), ACTIONS.len(), "每个动作都要出现在 portal 清单里");
+        for (id, label) in ACTIONS {
+            let item = plan.iter().find(|s| s.id == *id).expect("缺动作");
+            assert_eq!(item.description, *label);
+        }
+        assert!(
+            plan.iter().all(|s| s.preferred_trigger.is_some()),
+            "KDE 默认键位都应能映射成 portal 的首选键位: {plan:?}"
+        );
+        // 空绑定：条目仍在（保留 id 与描述），但没有首选键位
+        let mut empty: HashMap<String, Vec<String>> = HashMap::new();
+        empty.insert("toggle_pause".to_string(), Vec::new());
+        let p2 = portal_bind_plan(&empty);
+        assert_eq!(p2.len(), ACTIONS.len());
+        assert!(p2.iter().all(|s| s.preferred_trigger.is_none()));
+    }
+
+    #[test]
+    fn portal_registration_json_shape_is_stable() {
+        let unavailable = PortalRegistration::Unavailable {
+            reason: "TODO(P7-Wayland-portal)".into(),
+        };
+        let j = unavailable.to_json();
+        assert_eq!(j["implemented"], serde_json::json!(false));
+        assert_eq!(j["state"], "unavailable");
+        let registered = PortalRegistration::Registered {
+            session_handle: "/org/freedesktop/portal/desktop/session/1_1/wem".into(),
+            portal_version: 1,
+        };
+        let j = registered.to_json();
+        assert_eq!(j["implemented"], serde_json::json!(true));
+        assert_eq!(j["state"], "registered");
+        assert_eq!(j["portal_version"], serde_json::json!(1));
+        assert_eq!(registration_state(&unavailable), "unavailable");
+        assert_eq!(registration_state(&registered), "registered");
+    }
+
+    // ---------- T-P7H：状态可观测（本模块的主产出） ----------
+
+    #[test]
+    fn app_status_reflects_binding_and_failure() {
+        let bound = accels(&["ctrl+shift+p"]);
+        assert_eq!(app_status(&bound, None), HotkeyStatus::Bound);
+        let fail = "快捷键 ctrl+shift+p 注册失败（可能被系统或其它应用占用）: boom".to_string();
+        assert_eq!(
+            app_status(&bound, Some(&fail)),
+            HotkeyStatus::Failed {
+                reason: fail.clone()
+            }
+        );
+        assert_eq!(
+            app_status(&[], None),
+            HotkeyStatus::Unavailable {
+                reason: NO_BINDING_NOTE.into()
+            }
+        );
+    }
+
+    /// 关键诚实性约束：portal 没接上时，KDE/Wayland **不许**报 `Bound`。
+    #[test]
+    fn wayland_status_never_claims_bound_without_portal() {
+        let bound = accels(&["ctrl+shift+p"]);
+        let not_impl = PortalRegistration::Unavailable {
+            reason: WAYLAND_UNSUPPORTED_REASON.into(),
+        };
+        match wayland_status(ShortcutBackend::KdeSystem, &bound, &not_impl) {
+            HotkeyStatus::SystemManaged { note } => assert_eq!(note, KDE_SYSTEM_MANAGED_NOTE),
+            other => panic!("KDE/Wayland 应为 SystemManaged，实际 {other:?}"),
+        }
+        match wayland_status(ShortcutBackend::Unsupported, &bound, &not_impl) {
+            HotkeyStatus::Unavailable { reason } => assert_eq!(reason, WAYLAND_UNSUPPORTED_REASON),
+            other => panic!("非 KDE/Wayland 应为 Unavailable，实际 {other:?}"),
+        }
+        // portal 真接上后才允许 Bound（今天只有测试构造得出这个状态）
+        let ok = PortalRegistration::Registered {
+            session_handle: ":1.1".into(),
+            portal_version: 1,
+        };
+        assert_eq!(
+            wayland_status(ShortcutBackend::KdeSystem, &bound, &ok),
+            HotkeyStatus::Bound
+        );
+        // 空绑定优先于后端：没键可注册就不该说「已注册」
+        assert_eq!(
+            wayland_status(ShortcutBackend::KdeSystem, &[], &ok),
+            HotkeyStatus::Unavailable {
+                reason: NO_BINDING_NOTE.into()
+            }
+        );
+    }
+
+    #[test]
+    fn status_json_and_digest_are_frontend_ready() {
+        assert_eq!(
+            HotkeyStatus::Bound.to_json(),
+            serde_json::json!({ "state": "bound" })
+        );
+        let j = HotkeyStatus::Failed {
+            reason: "被占用".into(),
+        }
+        .to_json();
+        assert_eq!(j["state"], "failed");
+        assert_eq!(j["detail"], "被占用");
+        assert_eq!(
+            HotkeyStatus::SystemManaged { note: "n".into() }.as_str(),
+            "system_managed"
+        );
+
+        let mut m: HashMap<String, HotkeyStatus> = HashMap::new();
+        m.insert("a".into(), HotkeyStatus::Bound);
+        m.insert("b".into(), HotkeyStatus::Bound);
+        m.insert(
+            "c".into(),
+            HotkeyStatus::Failed {
+                reason: "x".into(),
+            },
+        );
+        let d = status_digest(&m);
+        assert!(d.contains("3 个动作"), "digest 缺动作数: {d}");
+        assert!(d.contains("bound=2"), "digest 缺 bound 计数: {d}");
+        assert!(d.contains("failed=1"), "digest 缺 failed 计数: {d}");
+    }
+
+    /// KDE/Wayland 全链路（纯函数）冒烟：后端 → portal 接缝 → 每动作状态，
+    /// 断言「不做 X11 抢键 + 状态不是 Bound」——防止将来有人为了「看起来能用」
+    /// 把 Wayland 分支改回 App。
+    #[test]
+    fn kde_wayland_chain_smoke() {
+        let kde = kde_env("KDE", "wayland");
+        let backend = shortcut_backend_with(OsClass::Linux, &kde);
+        assert_eq!(backend, ShortcutBackend::KdeSystem);
+
+        let mut bindings: HashMap<String, Vec<String>> = HashMap::new();
+        for (id, _) in ACTIONS {
+            bindings.insert((*id).to_string(), default_bindings_with(id, OsClass::Linux, &kde));
+        }
+        let plan = portal_bind_plan(&bindings);
+        let registration = portal_register_plan_stub(&plan);
+        assert!(
+            matches!(registration, PortalRegistration::Unavailable { .. }),
+            "TODO(P7-Wayland-portal) 落地前必须如实报告不可用"
+        );
+        for (id, _) in ACTIONS {
+            let a = bindings.get(*id).cloned().unwrap_or_default();
+            let st = wayland_status(backend, &a, &registration);
+            assert_ne!(st, HotkeyStatus::Bound, "{id} 不该在未接 portal 时报 Bound");
+            assert!(st.detail().is_some(), "{id} 必须带原因说明");
+        }
+    }
+
+    /// 与 `portal_register` 同形但不需要 `AppHandle` 的桩（单测无法构造 Tauri app）。
+    fn portal_register_plan_stub(plan: &[PortalShortcut]) -> PortalRegistration {
+        assert!(!plan.is_empty());
+        PortalRegistration::Unavailable {
+            reason: "TODO(P7-Wayland-portal)：尚未实现 CreateSession → BindShortcuts → Activated 流程"
+                .into(),
+        }
     }
 }
