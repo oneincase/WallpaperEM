@@ -184,7 +184,10 @@ export function HotkeysPage() {
       const occupier = info2.items.find(
         (it) => it.id !== action && it.bindings.includes(accel),
       );
-      const reserved = info2.reserved.includes(accel);
+      // KDE 会话下后端会追加 KWin 的 Meta+* 保留区（reserved_with_kde）；
+      // 老后端没有该字段时退回 reserved，行为不变
+      const reservedSet = info2.reserved_with_kde ?? info2.reserved;
+      const reserved = reservedSet.includes(accel);
       if (occupier || reserved) {
         setConflict({
           accel,
@@ -327,6 +330,13 @@ export function HotkeysPage() {
         </div>
       ) : (
         <div className="flex flex-col">
+          {/* KDE Wayland 下后端不抢键（由桌面管理），这句直接来自 Rust 的
+              KDE_SYSTEM_MANAGED_NOTE —— 不写死在 UI 里，平台判定只有一处 */}
+          {info.backend?.note && (
+            <div className="mb-3 rounded-xl border border-[var(--separator)] bg-[var(--content)] px-3 py-2 text-[12px] leading-relaxed text-[var(--text-2)]">
+              {info.backend.note}
+            </div>
+          )}
           {info.items.map((it) => (
             <HotkeyRow
               key={it.id}
@@ -383,6 +393,12 @@ function HotkeyRow({
   onRemove: (accel: string) => void;
   onReset: () => void;
 }) {
+  // 只在「绑了却不会生效」的三种状态下提示；bound / unknown 不打扰
+  const state = item.status?.state;
+  const statusNote =
+    state === "system_managed" || state === "unavailable" || state === "failed"
+      ? item.status?.detail
+      : undefined;
   return (
     <div className="flex items-center justify-between gap-4 border-b border-[var(--separator)] py-3 last:border-0">
       <div className="min-w-0">
@@ -413,6 +429,14 @@ function HotkeyRow({
             ))
           )}
         </div>
+        {/* 「按了没反应」时把后端给的原因显示在动作名下：KDE Wayland 是
+            system_managed、Wayland 非 KDE 是 unavailable、注册被拒是 failed。
+            文案全部来自 Rust，前端不做平台判断 */}
+        {!recording && statusNote && (
+          <div className="mt-1 text-[11px] leading-relaxed text-[var(--text-2)]">
+            {statusNote}
+          </div>
+        )}
       </div>
       <div className="flex shrink-0 items-center gap-1.5">
         {recording ? (

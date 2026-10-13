@@ -736,12 +736,35 @@ export interface HotkeyItem {
   bindings: string[];
   /** 默认绑定（「恢复默认」用） */
   defaults: string[];
+  /** 注册状态（Rust `HotkeyStatus::to_json`）；旧后端没这字段 → undefined = 不显示提示 */
+  status?: HotkeyStatus;
+}
+
+/** 单条快捷键的注册状态。state 不是 bound 时 detail 是后端给的中文人话原因。 */
+export interface HotkeyStatus {
+  /** bound=已注册；system_managed=归桌面管（KDE Wayland）；unavailable=本平台不支持；failed=注册被拒 */
+  state: "bound" | "system_managed" | "unavailable" | "failed" | "unknown" | (string & {});
+  detail?: string;
 }
 
 export interface HotkeysInfo {
   items: HotkeyItem[];
   /** 系统/菜单已占用、不建议覆盖的组合 */
   reserved: string[];
+  /** KDE 会话才追加的保留组合（KWin 的 Meta+*）；非 KDE 为空数组，旧后端缺省 */
+  reserved_kde?: string[];
+  /** 当前平台实际生效的保留组合（= reserved + KDE 追加项），冲突提示用这一份 */
+  reserved_with_kde?: string[];
+  /** 全局快捷键由谁负责：kind="kde_system" 时 note 说明「由桌面管理」 */
+  backend?: {
+    kind: string;
+    note?: string | null;
+    kde: boolean;
+    plasma_major?: number | null;
+    session: string;
+  };
+  /** portal GlobalShortcuts 接入状态（未接入 → implemented=false） */
+  portal?: { implemented: boolean; state: string; detail?: string };
 }
 
 /**
