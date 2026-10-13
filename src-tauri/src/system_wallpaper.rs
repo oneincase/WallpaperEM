@@ -480,6 +480,227 @@ mod imp {
 #[cfg(target_os = "macos")]
 use imp::{extract_image_frame, extract_video_frame, set_all_screens};
 
+// ---------- KDE 静态壁纸三级回退链（平台无关的决策逻辑） ----------
+//
+// 为什么把这段放在 `imp` 外面：三级链的**决策**（试哪几级、谁先谁后、成功即停、
+// 每级失败留什么日志、三级全败合成什么错误）是纯逻辑，必须能在**非 Linux 宿主**
+// 上单测 —— 宿主 macOS 上 `#[cfg(target_os = "linux")] mod imp` 整个不参与编译，
+// 逻辑写在里面就永远测不到。这里只有「决策」，真正的 D-Bus / 进程调用留在
+// `imp::LinuxKdeWallpaper`（那是唯一被 `cfg(target_os = "linux")` 隔离的部分）。
+//
+// 回退顺序（Plasma 版本越新越靠前，上游 Internal API 压到最后兜底）：
+//   1. portal `org.freedesktop.impl.portal.Wallpaper.SetWallpaper`（Plasma 6.5+，公开标准）
+//   2. `plasma-apply-wallpaperimage` CLI（Plasma 5/6 都可能装）
+//   3. `qdbus ... evaluateScript`（org.kde.plasmashell，上游 Internal API，仅兜底）
+// 任一级成功即返回；三级全败时不静默吞掉，逐级 warn 后合成一条错误返回，
+// 调用方 `sync_after_apply` 的容错行为（失败只记日志、不中断 apply 流程）保持不变。
+
+/// 回退链的一级。顺序即尝试顺序 —— 单测直接断言这个顺序表。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // 决策链唯一调用点在 Linux 分支
+pub enum KdeFallbackStep {
+    /// 一级：freedesktop portal（Plasma 6.5.0+）
+    PortalWallpaper,
+    /// 二级：`plasma-apply-wallpaperimage`
+    PlasmaApplyWallpaperImage,
+    /// 三级：`qdbus org.kde.plasmashell evaluateScript`（上游 Internal API）
+    QdbusEvaluateScript,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl KdeFallbackStep {
+    /// 声明式顺序表：**唯一**的事实来源，执行与日志/错误文案都由它推导。
+    pub const ORDER: [KdeFallbackStep; 3] = [
+        KdeFallbackStep::PortalWallpaper,
+        KdeFallbackStep::PlasmaApplyWallpaperImage,
+        KdeFallbackStep::QdbusEvaluateScript,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KdeFallbackStep::PortalWallpaper => "portal",
+            KdeFallbackStep::PlasmaApplyWallpaperImage => "plasma-apply-wallpaperimage",
+            KdeFallbackStep::QdbusEvaluateScript => "qdbus-evaluatescript",
+        }
+    }
+
+    /// 人话一级名，进日志与错误（真机取证时直接 grep 这一串）。
+    pub fn label(self) -> &'static str {
+        match self {
+            KdeFallbackStep::PortalWallpaper => "portal Wallpaper.SetWallpaper",
+            KdeFallbackStep::PlasmaApplyWallpaperImage => "plasma-apply-wallpaperimage",
+            KdeFallbackStep::QdbusEvaluateScript => "qdbus evaluateScript",
+        }
+    }
+
+    /// 一级失败时的日志文案模板。`{err}` 由调用点填具体错误。
+    pub fn fail_msg_template(self) -> &'static str {
+        match self {
+            KdeFallbackStep::PortalWallpaper => {
+                "system wallpaper: KDE 一级 portal Wallpaper.SetWallpaper 失败: {err}"
+            }
+            KdeFallbackStep::PlasmaApplyWallpaperImage => {
+                "system wallpaper: KDE 二级 plasma-apply-wallpaperimage 失败: {err}"
+            }
+            KdeFallbackStep::QdbusEvaluateScript => {
+                "system wallpaper: KDE 三级 qdbus evaluateScript 失败: {err}"
+            }
+        }
+    }
+}
+
+/// 一次尝试的结果 + 该级的失败原因（成功时 `error` 为 `None`）。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KdeAttempt {
+    pub step: KdeFallbackStep,
+    pub ok: bool,
+    /// 失败原因。`is_available` 判定命令不存在时也是失败（原因写明未安装）。
+    /// 三级全失败的错误信息只回填**真跑过**的级，没装的级不塞噪音。
+    pub error: Option<String>,
+}
+
+/// 回退链结果：`attempts` 是**实际尝试过**的级（按序，含首个成功的级）；
+/// 全失败时 `attempts` 长度即尝试次数，`error` 为合成错误。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KdeChainOutcome {
+    pub ok: bool,
+    pub attempts: Vec<KdeAttempt>,
+    pub error: Option<String>,
+}
+
+/// 三级回退链要用的三件事。抽成 trait 是为了单测注入假实现 —— 决策逻辑
+/// （顺序、短路、日志文案、合成错误）因此可以纯内存断言，**不起进程、不连 D-Bus**。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub trait KdeWallpaperTool {
+    /// 命令存在性探测（真实现是 `sh -c command -v`）。
+    fn is_available(&self, cmd: &str) -> bool;
+    /// 一级：portal `SetWallpaper(file:// URI)`。
+    fn attempt_portal(&self, _progress: &mut dyn FnMut(&str)) -> Result<(), String> {
+        Err("portal 未实现".into())
+    }
+    /// 二级：`plasma-apply-wallpaperimage <path>`。
+    fn attempt_plasma_apply(&self, _path: &str) -> Result<(), String> {
+        Err("plasma-apply-wallpaperimage 未实现".into())
+    }
+    /// 三级：`qdbus org.kde.plasmashell evaluateScript <js>`。
+    fn attempt_evaluate_script(&self, _js: &str) -> Result<(), String> {
+        Err("qdbus evaluateScript 未实现".into())
+    }
+}
+
+/// 三级全败时的合成错误：点名每一级与原因，调用方日志里一眼看出试过什么。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn kde_chain_error(attempts: &[KdeAttempt]) -> String {
+    let detail = attempts
+        .iter()
+        .map(|a| {
+            format!(
+                "{}={}",
+                a.step.label(),
+                a.error.as_deref().unwrap_or("未知错误")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "KDE 静态壁纸三级回退链全部失败（已尝试 {} 级）: {}",
+        attempts.len(),
+        detail
+    )
+}
+
+/// 跑一遍 KDE 静态壁纸回退链。纯决策，无平台依赖。
+///
+/// - 每级失败：`tracing::debug!` 记录「哪一级 + 什么错误」，继续下一级；
+/// - `step` 可达性由 caller 决定（`PlasmaApplyWallpaperImage` 只在 `is_available` 为真时调用，
+///   与旧行为一致：命令不存在时不再拿一次「command not found」当失败）；
+/// - 三级全失败：`tracing::warn!` 记一条总结，返回 `Ok(KdeChainOutcome{ok:false,..})`
+///   —— **不是** `Err`。错误语义留在 `error` 字段里，由调用方决定怎么呈现。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn run_kde_wallpaper_chain(
+    js: &str,
+    path: &str,
+    progress: &mut dyn FnMut(&str),
+    tool: &dyn KdeWallpaperTool,
+) -> KdeChainOutcome {
+    let mut attempts: Vec<KdeAttempt> = Vec::new();
+    progress("kde: 静态壁纸回退链开始（portal → plasma-apply-wallpaperimage → qdbus）");
+
+    for step in KdeFallbackStep::ORDER {
+        let result = match step {
+            KdeFallbackStep::PortalWallpaper => tool.attempt_portal(progress),
+            KdeFallbackStep::PlasmaApplyWallpaperImage => {
+                if !tool.is_available("plasma-apply-wallpaperimage") {
+                    // 命令不存在不算「试过」：跳过不记尝试，与旧行为（which 为假直接下一路）一致
+                    progress("kde: 未找到 plasma-apply-wallpaperimage，跳过二级");
+                    continue;
+                }
+                tool.attempt_plasma_apply(path)
+            }
+            KdeFallbackStep::QdbusEvaluateScript => tool.attempt_evaluate_script(js),
+        };
+
+        match result {
+            Ok(()) => {
+                attempts.push(KdeAttempt {
+                    step,
+                    ok: true,
+                    error: None,
+                });
+                tracing::info!(
+                    "system wallpaper: KDE 回退链在第 {} 级（{}）成功",
+                    attempts.len(),
+                    step.label()
+                );
+                progress(&format!(
+                    "kde: 回退链成功于 {}（第 {} 级）",
+                    step.label(),
+                    attempts.len()
+                ));
+                return KdeChainOutcome {
+                    ok: true,
+                    attempts,
+                    error: None,
+                };
+            }
+            Err(e) => {
+                tracing::debug!("{}", step.fail_msg_template().replace("{err}", &e));
+                progress(&format!(
+                    "kde: 回退链 {} 失败，继续下一级: {e}",
+                    step.label()
+                ));
+                attempts.push(KdeAttempt {
+                    step,
+                    ok: false,
+                    error: Some(e),
+                });
+            }
+        }
+    }
+
+    let error = kde_chain_error(&attempts);
+    tracing::warn!(
+        "system wallpaper: {error}；本次系统静态壁纸同步已跳过（不影响壁纸应用流程）"
+    );
+    KdeChainOutcome {
+        ok: false,
+        attempts,
+        error: Some(error),
+    }
+}
+
+/// KDE 分支的 JS 脚本（三级里 qdbus 那级用）。抽成函数是为了让单测能直接断言
+/// 脚本里确实写了 `org.kde.image` / `Image` —— 这段 JS 是历史包袱（上游 Internal API），
+/// 合错了会静默把壁纸设成纯色而不报错。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn kde_evaluate_script(uri: &str) -> String {
+    format!(
+        "var d=desktops();for(var i=0;i<d.length;i++){{d[i].wallpaperPlugin='org.kde.image';d[i].currentConfigGroup=['Wallpaper','org.kde.image','General'];d[i].writeConfig('Image','{uri}');}}"
+    )
+}
+
 // ---------- Linux：ffmpeg 抽帧 + 按桌面环境设置 ----------
 
 #[cfg(target_os = "linux")]
@@ -533,6 +754,136 @@ mod imp {
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
+    }
+
+    /// 回退链的真实现：唯一被 `cfg(target_os = "linux")` 隔离的部分（进程 / D-Bus）。
+    /// 决策逻辑在平台无关的 [`super::run_kde_wallpaper_chain`]，宿主 macOS 上可单测。
+    ///
+    /// 一级为什么用 `zbus::blocking` 而不是 `gdbus` CLI 子进程：
+    /// - zbus 已在 Linux 依赖里（`Cargo.toml` 的 linux target，kde.rs 也在用），
+    ///   `blocking` 走 async-io 的 `block_on`，**借不借 tokio 运行时都能跑**；
+    /// - `gdbus` 属于 glib2 附带工具，精简发行版 / Flatpak 里未必有，拿它当一级
+    ///   等于把「portal 可用」这个判断建立在另一个外部命令上；
+    /// - 子进程还要处理 stdout 解析与退出码，错误信息更糊。
+    /// 代价是 zbus 首次连接要几百毫秒，故整级包 1500ms 超时（见 [`portal_set_wallpaper`]）。
+    struct LinuxKdeWallpaper {
+        /// 一级 portal 要的 `file://` URI（portal 只吃 URI，不吃路径）。
+        uri: String,
+    }
+
+    impl super::KdeWallpaperTool for LinuxKdeWallpaper {
+        fn is_available(&self, cmd: &str) -> bool {
+            which(cmd)
+        }
+
+        fn attempt_portal(&self, progress: &mut dyn FnMut(&str)) -> Result<(), String> {
+            // 老版本 Plasma 上没有 portal 后端：先看服务名在不在，省一次必然的超时。
+            if !portal_service_present() {
+                return Err("会话总线上没有 org.freedesktop.portal.Desktop".into());
+            }
+            progress("kde: 一级 portal Wallpaper.SetWallpaper 开始");
+            portal_set_wallpaper(&self.uri)
+        }
+
+        fn attempt_plasma_apply(&self, path: &str) -> Result<(), String> {
+            run(
+                Command::new("plasma-apply-wallpaperimage").arg(path),
+                "plasma-apply-wallpaperimage",
+            )
+        }
+
+        fn attempt_evaluate_script(&self, js: &str) -> Result<(), String> {
+            run(
+                Command::new("qdbus").args([
+                    "org.kde.plasmashell",
+                    "/PlasmaShell",
+                    "org.kde.PlasmaShell.evaluateScript",
+                    js,
+                ]),
+                "qdbus plasmashell",
+            )
+        }
+    }
+
+    /// portal 服务名是否在会话总线上（`NameHasOwner`，250ms 超时；任何失败都当「不在」）。
+    fn portal_service_present() -> bool {
+        use std::time::Duration;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _ = std::thread::Builder::new()
+            .name("kde-portal-probe".into())
+            .spawn(move || {
+                let ok = (|| {
+                    let conn = zbus::blocking::Connection::session().ok()?;
+                    let reply = conn
+                        .call_method(
+                            Some("org.freedesktop.DBus"),
+                            "/org/freedesktop/DBus",
+                            Some("org.freedesktop.DBus"),
+                            "NameHasOwner",
+                            &("org.freedesktop.portal.Desktop",),
+                        )
+                        .ok()?;
+                    reply.body().deserialize::<bool>().ok()
+                })()
+                .unwrap_or(false);
+                let _ = tx.send(ok);
+            });
+        rx.recv_timeout(Duration::from_millis(250)).unwrap_or(false)
+    }
+
+    /// 一级：`org.freedesktop.impl.portal.Wallpaper.SetWallpaper(uri, showPreview, options)`
+    /// （`org.freedesktop.portal.Desktop` 的 `/org/freedesktop/portal/desktop`）。
+    ///
+    /// 只吃 `file://` URI，不接受路径；`options` 是 `a{sv}`，带一个 handle_token 便于
+    /// 真机取证时和 portal 日志对齐。返回的 object path **不代表已生效**，这里只把它
+    /// 当「调用被接受」；真正的失败（后端不支持）会以 D-Bus 错误回来。
+    ///
+    /// 整级 1500ms 超时：portal 后端缺失时调用可能长时间无响应，而本函数在 apply 流程
+    /// 的收尾路径上，不能把主线程吊死在一个「锦上添花」的静态壁纸上。超时后线程自然结束
+    /// （进程退出即回收），只是不再等它的结果。
+    fn portal_set_wallpaper(uri: &str) -> Result<(), String> {
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        let mut options: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::new();
+        options.insert(
+            "handle_token",
+            zbus::zvariant::Value::from("wallpaperem_sync"),
+        );
+        // 调用要挪进子线程（超时用），所以 URI 必须先转 owned —— `&str` 活不到 'static
+        let uri: String = uri.to_string();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("kde-portal-wallpaper".into())
+            .spawn(move || {
+                let call = (|| -> Result<String, String> {
+                    let conn = zbus::blocking::Connection::session()
+                        .map_err(|e| format!("会话总线连接失败: {e}"))?;
+                    let reply = conn
+                        .call_method(
+                            Some("org.freedesktop.portal.Desktop"),
+                            "/org/freedesktop/portal/desktop",
+                            Some("org.freedesktop.impl.portal.Wallpaper"),
+                            "SetWallpaper",
+                            &(uri.as_str(), false, &options),
+                        )
+                        .map_err(|e| format!("SetWallpaper 调用失败: {e}"))?;
+                    reply
+                        .body()
+                        .deserialize::<zbus::zvariant::OwnedObjectPath>()
+                        .map(|p| p.as_str().to_string())
+                        .map_err(|e| format!("SetWallpaper 返回值无法解析: {e}"))
+                })();
+                let _ = tx.send(call);
+            })
+            .map_err(|e| format!("portal 调用线程启动失败: {e}"))?;
+
+        match rx.recv_timeout(Duration::from_millis(1500)) {
+            Ok(Ok(_handle)) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err("portal SetWallpaper 超时（1500ms）".into()),
+        }
     }
 
     /// 按桌面环境把 img 设为所有屏幕的静态壁纸（best-effort，逐项尝试）
@@ -621,26 +972,23 @@ mod imp {
             }
             return Ok(());
         }
-        if d.contains("KDE") {
-            if which("plasma-apply-wallpaperimage") {
-                return run(
-                    Command::new("plasma-apply-wallpaperimage").arg(&path),
-                    "plasma-apply-wallpaperimage",
-                );
-            }
-            // 老版本 Plasma：qdbus 执行 js 设置
-            let js = format!(
-                "var d=desktops();for(var i=0;i<d.length;i++){{d[i].wallpaperPlugin='org.kde.image';d[i].currentConfigGroup=['Wallpaper','org.kde.image','General'];d[i].writeConfig('Image','{uri}');}}"
-            );
-            return run(
-                Command::new("qdbus").args([
-                    "org.kde.plasmashell",
-                    "/PlasmaShell",
-                    "org.kde.PlasmaShell.evaluateScript",
-                    &js,
-                ]),
-                "qdbus plasmashell",
-            );
+        if crate::kde::env().is_kde {
+            // KDE 判定统一走 crate::kde（冒号列表 / 大小写 / KDE_FULL_SESSION 都已处理）：
+            // 旧代码在这里自己大写比较 `XDG_CURRENT_DESKTOP`，历史值 `KDE:Plasma` 之外
+            // 的写法会漏判（见 src-tauri/src/kde.rs 顶部两条硬规则）。
+            //
+            // 三级回退链（portal → plasma-apply-wallpaperimage → qdbus evaluateScript）：
+            // 旧实现两级都 `return`，第一级失败就直接放弃同步静态壁纸 —— 于是 Plasma 6.5+
+            // 上 portal 可用、或只有 qdbus 可用的机器永远设不上。现在逐级降级。
+            let tool = LinuxKdeWallpaper { uri: uri.clone() };
+            let js = kde_evaluate_script(&uri);
+            let outcome = run_kde_wallpaper_chain(&js, &path, &mut |m| tracing::debug!("{m}"), &tool);
+            return match outcome.error {
+                None => Ok(()),
+                // 三级全失败：错误原样上抛给 sync_after_apply，由它决定只记 warn
+                // （容错语义与旧实现一致：静态壁纸同步失败绝不中断 apply 流程）。
+                Some(e) => Err(e),
+            };
         }
         // wlroots 系 / 其他：swww 优先，feh 兜底
         if which("swww") {
@@ -959,4 +1307,252 @@ pub async fn capture_wallpaper_png(
     Err("这个平台没有原生窗口快照（仅 macOS 有）；web 类型请用应用内预览，\
          或改用 scene / video / gif / image 类型（那几类走渲染器自抓帧，三平台都能截）"
         .into())
+}
+
+// ---------- KDE 回退链单测（平台无关；宿主 macOS / Linux / Windows 都可跑） ----------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    /// 假实现：按剧本逐级返回成功/失败，并把**调用顺序**记下来。
+    /// 不碰进程、不连 D-Bus，所以整套失败矩阵在宿主 macOS 上就能跑。
+    struct FakeKde {
+        /// 命令存在性探测的回答（默认 plasma-apply 与 qdbus 都在）
+        installed: Vec<String>,
+        portal: Result<(), String>,
+        plasma: Result<(), String>,
+        qdbus: Result<(), String>,
+        /// 记录每次真实调用：「is_available:<cmd>」/「portal:<uri>」/「plasma:<path>」/「qdbus:<js>」
+        log: RefCell<Vec<String>>,
+    }
+
+    impl FakeKde {
+        fn all_fail() -> Self {
+            Self {
+                installed: vec!["plasma-apply-wallpaperimage".into(), "qdbus".into()],
+                portal: Err("PortalNotFound: 后端不支持".into()),
+                plasma: Err("plasma-apply-wallpaperimage: 退出码 1".into()),
+                qdbus: Err("qdbus plasmashell: Could not connect to D-Bus".into()),
+                log: RefCell::new(Vec::new()),
+            }
+        }
+        fn record(&self, entry: String) {
+            self.log.borrow_mut().push(entry);
+        }
+        fn calls(&self) -> Vec<String> {
+            self.log.borrow().clone()
+        }
+    }
+
+    impl KdeWallpaperTool for FakeKde {
+        fn is_available(&self, cmd: &str) -> bool {
+            self.record(format!("is_available:{cmd}"));
+            self.installed.iter().any(|c| c == cmd)
+        }
+        fn attempt_portal(&self, _progress: &mut dyn FnMut(&str)) -> Result<(), String> {
+            self.record("portal".into());
+            self.portal.clone()
+        }
+        fn attempt_plasma_apply(&self, path: &str) -> Result<(), String> {
+            self.record(format!("plasma:{path}"));
+            self.plasma.clone()
+        }
+        fn attempt_evaluate_script(&self, js: &str) -> Result<(), String> {
+            self.record(format!("qdbus:{js}"));
+            self.qdbus.clone()
+        }
+    }
+
+    const IMG: &str = "/tmp/wall wallpaper/frame.png";
+
+    fn run(tool: &FakeKde) -> KdeChainOutcome {
+        let js = kde_evaluate_script("file:///tmp/wall%20wallpaper/frame.png");
+        // progress 走闭包收集，不接 tracing（单测不该依赖 subscriber）
+        let mut notes: Vec<String> = Vec::new();
+        let out = run_kde_wallpaper_chain(&js, IMG, &mut |m| notes.push(m.to_string()), tool);
+        assert!(!notes.is_empty(), "回退链必须留下 progress 轨迹");
+        out
+    }
+
+    // ---------- 顺序表 ----------
+
+    #[test]
+    fn chain_order_is_portal_then_cli_then_qdbus() {
+        assert_eq!(
+            KdeFallbackStep::ORDER,
+            [
+                KdeFallbackStep::PortalWallpaper,
+                KdeFallbackStep::PlasmaApplyWallpaperImage,
+                KdeFallbackStep::QdbusEvaluateScript,
+            ],
+            "回退顺序硬约束：portal → plasma-apply-wallpaperimage → qdbus"
+        );
+    }
+
+    // ---------- 矩阵：谁先成功 ----------
+
+    #[test]
+    fn portal_success_short_circuits_rest() {
+        let tool = FakeKde {
+            portal: Ok(()),
+            ..FakeKde::all_fail()
+        };
+        let out = run(&tool);
+        assert!(out.ok);
+        assert_eq!(out.attempts.len(), 1);
+        assert_eq!(out.attempts[0].step, KdeFallbackStep::PortalWallpaper);
+        assert!(out.error.is_none());
+        // 一级成功即返回：二级的命令探测与三级都不许发生
+        assert_eq!(tool.calls(), vec!["portal".to_string()]);
+    }
+
+    #[test]
+    fn portal_fails_then_cli_succeeds() {
+        let tool = FakeKde {
+            plasma: Ok(()),
+            ..FakeKde::all_fail()
+        };
+        let out = run(&tool);
+        assert!(out.ok, "一级失败必须降级到二级，而不是像旧代码那样直接放弃");
+        assert_eq!(
+            out.attempts.iter().map(|a| a.step).collect::<Vec<_>>(),
+            vec![
+                KdeFallbackStep::PortalWallpaper,
+                KdeFallbackStep::PlasmaApplyWallpaperImage
+            ]
+        );
+        assert!(out.attempts[0].error.is_some(), "失败的那级要留下原因");
+        assert_eq!(
+            tool.calls(),
+            vec![
+                "portal".to_string(),
+                "is_available:plasma-apply-wallpaperimage".to_string(),
+                format!("plasma:{IMG}"),
+            ],
+            "二级成功则三级（qdbus）不应再尝试"
+        );
+    }
+
+    #[test]
+    fn portal_and_cli_fail_then_qdbus_succeeds() {
+        let tool = FakeKde {
+            qdbus: Ok(()),
+            ..FakeKde::all_fail()
+        };
+        let out = run(&tool);
+        assert!(out.ok);
+        assert_eq!(out.attempts.len(), 3);
+        assert_eq!(
+            out.attempts.last().unwrap().step,
+            KdeFallbackStep::QdbusEvaluateScript
+        );
+        let calls = tool.calls();
+        assert_eq!(calls.first().unwrap(), "portal");
+        assert_eq!(
+            calls.last().unwrap().split(':').next().unwrap(),
+            "qdbus",
+            "三级兜底必须真的执行 evaluateScript"
+        );
+        // JS 里必须是 org.kde.image + writeConfig('Image', ...)，写错了会静默设成纯色
+        assert!(calls.last().unwrap().contains("org.kde.image"));
+        assert!(calls.last().unwrap().contains("writeConfig('Image'"));
+        assert!(calls.last().unwrap().contains("file:///tmp/wall%20wallpaper/frame.png"));
+    }
+
+    // ---------- 全失败 / 命令不存在 ----------
+
+    #[test]
+    fn all_three_fail_returns_skipped_with_full_diagnostics() {
+        let tool = FakeKde::all_fail();
+        let out = run(&tool);
+        assert!(!out.ok, "三级全失败不能报成功");
+        assert_eq!(out.attempts.len(), 3, "三级都试过");
+        assert!(out.attempts.iter().all(|a| !a.ok && a.error.is_some()));
+
+        let err = out.error.clone().expect("全失败必须带错误信息");
+        // 错误里点名每一级与原因 —— 真机取证时一眼看出试过什么
+        assert!(err.contains("三级回退链全部失败"), "{err}");
+        assert!(err.contains("已尝试 3 级"), "{err}");
+        assert!(err.contains("portal Wallpaper.SetWallpaper"), "{err}");
+        assert!(err.contains("plasma-apply-wallpaperimage"), "{err}");
+        assert!(err.contains("qdbus evaluateScript"), "{err}");
+        assert!(err.contains("PortalNotFound"), "{err}");
+        assert!(err.contains("Could not connect to D-Bus"), "{err}");
+    }
+
+    #[test]
+    fn missing_cli_is_skipped_not_counted_as_an_attempt() {
+        // 只装了 qdbus：plasma-apply-wallpaperimage 不存在
+        let tool = FakeKde {
+            installed: vec!["qdbus".into()],
+            qdbus: Ok(()),
+            ..FakeKde::all_fail()
+        };
+        let out = run(&tool);
+        assert!(out.ok);
+        assert_eq!(
+            out.attempts.iter().map(|a| a.step).collect::<Vec<_>>(),
+            vec![
+                KdeFallbackStep::PortalWallpaper,
+                KdeFallbackStep::QdbusEvaluateScript
+            ],
+            "命令不存在的级不算尝试（旧行为：which 为假直接下一路）"
+        );
+    }
+
+    #[test]
+    fn missing_cli_and_qdbus_failure_reports_only_real_failures() {
+        let tool = FakeKde {
+            installed: vec![], // plasma-apply 与 qdbus 都没装
+            ..FakeKde::all_fail()
+        };
+        let out = run(&tool);
+        assert!(!out.ok);
+        // 只有 portal 真跑过；plasma 级被跳过
+        assert_eq!(out.attempts.len(), 2);
+        let err = out.error.unwrap();
+        assert!(err.contains("已尝试 2 级"), "{err}");
+        assert!(!err.contains("plasma-apply-wallpaperimage="), "{err}");
+    }
+
+    // ---------- 日志文案模板 ----------
+
+    #[test]
+    fn fail_log_templates_name_the_level_and_hold_the_error() {
+        let cases = [
+            (
+                KdeFallbackStep::PortalWallpaper,
+                "一级 portal Wallpaper.SetWallpaper",
+            ),
+            (
+                KdeFallbackStep::PlasmaApplyWallpaperImage,
+                "二级 plasma-apply-wallpaperimage",
+            ),
+            (
+                KdeFallbackStep::QdbusEvaluateScript,
+                "三级 qdbus evaluateScript",
+            ),
+        ];
+        for (step, want) in cases {
+            let msg = step.fail_msg_template().replace("{err}", "BOOM");
+            assert!(msg.starts_with("system wallpaper: KDE "), "{msg}");
+            assert!(msg.contains(want), "{msg} 应点名是哪一级");
+            assert!(msg.ends_with(": BOOM"), "{msg} 应带上具体错误");
+        }
+    }
+
+    // ---------- JS 生成（历史包袱，静默失败风险点） ----------
+
+    #[test]
+    fn evaluate_script_targets_image_plugin() {
+        let js = kde_evaluate_script("file:///a%20b.png");
+        assert!(js.contains("d[i].wallpaperPlugin='org.kde.image'"), "{js}");
+        assert!(
+            js.contains("currentConfigGroup=['Wallpaper','org.kde.image','General']"),
+            "{js}"
+        );
+        assert!(js.contains("writeConfig('Image','file:///a%20b.png')"), "{js}");
+    }
 }
