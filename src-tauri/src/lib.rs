@@ -35,6 +35,12 @@ mod secure_store;
 mod steam;
 mod subscriptions;
 mod system_wallpaper;
+// Linux 桌面的两处「平台策略」：托盘图标选图 + autostart .desktop 补键。
+// Linux 或测试构建下编译 —— 开发机上 Linux 调用点不参与类型检查，把纯逻辑放在
+// 这个模块里，`cargo test --lib` 才能在非 Linux 宿主上真实编译并执行它们（见文件头）。
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod tray_linux;
 mod update;
 mod util;
 mod wallpaper;
@@ -223,6 +229,16 @@ pub fn run() {
             // 要建注册表缓存，可能耗时一秒级，放阻塞线程）
             #[cfg(target_os = "linux")]
             tauri::async_runtime::spawn_blocking(check_gstreamer_elements);
+            // 自启条目补键：auto-launch 写出的 ~/.config/autostart/*.desktop 缺
+            // 「启用」类键，启动后幂等补齐。文件不存在（用户没开自启）就什么都不做，
+            // 失败只 warn，不影响 setup（细节见 src-tauri/src/tray_linux.rs 文件头）
+            #[cfg(target_os = "linux")]
+            tray_linux::ensure_autostart_entry_keys(app.handle());
+            // KDE：桌面是「文件夹视图」时，动态壁纸必然盖住桌面图标（真机实测四种
+            // 沉底原语全部无效，见 docs/kde-adaptation-plan.md §2.5/§4.1）。启动时
+            // 只读判定并如实提示，不静默降级、不改用户配置。
+            #[cfg(target_os = "linux")]
+            crate::kde::log_desktop_icons_status();
             tracing::info!("app setup complete");
             Ok(())
         })
@@ -1126,13 +1142,19 @@ fn build_tray(app: &AppHandle) -> tauri::Result<TrayMenu> {
     // 由 scripts/make_tray_icon.py 从应用 logo 极简化生成）。macOS 上托盘图标必须显式设置，
     // 否则状态栏只显示一个「空位」。icon_as_template(true) 是原生状态栏做法：
     // 系统按菜单栏深浅自动着色——深色菜单栏呈白色、浅色呈黑色。
-    // 编译期内嵌，不依赖 bundle 图标；Windows/Linux 不识别模板，沿用原彩色应用图标。
+    // 编译期内嵌，不依赖 bundle 图标；Windows 不识别模板，沿用原彩色应用图标。
+    // Linux 托盘主机（KDE Plasma 的 SNI 宿主、AppIndicator）同样不做 symbolic 重着色，
+    // 这张纯黑剪影在深色面板上等于看不见 —— 所以 Linux 单独走 tray_linux 分支选图。
     #[cfg(target_os = "macos")]
     {
         builder = builder.icon(tauri::include_image!("icons/tray-44.png"));
         builder = builder.icon_as_template(true);
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        builder = tray_linux::apply_tray_icon(builder, app);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         if let Some(icon) = app.default_window_icon() {
             let icon = icon.clone();
