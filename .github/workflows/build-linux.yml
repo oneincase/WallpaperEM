@@ -163,3 +163,83 @@ jobs:
             --notes-file "$RUNNER_TEMP/release-notes.md"
           gh release upload "$GITHUB_REF_NAME" "latest-linux-${{ matrix.updater_arch }}.json" \
             --repo "${{ github.repository }}" --clobber
+
+  # ------------------------------------------------------------------------- #
+  # KDE/X11 会话冒烟：在真 KDE 会话（Xvfb + kwin_x11 + plasmashell）里跑应用，
+  # 断言桌面层窗口类型/堆叠顺序/存活无 panic。脚本与断言见
+  # docs/kde-adaptation-plan.md §6.2，说明见 docs/kde-packaging-notes.md。
+  #
+  # 为什么测**已上传的 AppImage 产物**而不是重新编译：省掉第二次 20 分钟编译，
+  # 且验的就是用户实际拿到的那个二进制。runner 无 FUSE，用 AppImage 运行时的
+  # APPIMAGE_EXTRACT_AND_RUN=1 自解包模式直跑（与 build 作业里 linuxdeploy 的
+  # 兜底开关同一个机制）。
+  #
+  # 为什么 continue-on-error: true：本作业是新增的，Plasma 5.27 底座上升级到
+  # 真实 kwin/plasmashell 后的断言尚无 CI 实测记录；先只标红本作业、不阻塞 tag
+  # 发布（发布门禁在 preflight）。CI 跑稳后删掉这一行即转为硬门禁。
+  # 注：只跑 x64 一个架构 —— KDE 会话逻辑与架构无关，arm64 再跑一遍没有新增信息。
+  kde-smoke:
+    needs: [preflight, build-linux]
+    continue-on-error: true
+    runs-on: ubuntu-22.04
+    name: "KDE-X11-smoke (x64)"
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 下载 x64 构建产物（deb + AppImage）
+        uses: actions/download-artifact@v4
+        with:
+          name: WallpaperEM-linux-x64-${{ github.ref_name }}
+          path: artifacts
+
+      - name: 安装 KDE/X11 冒烟依赖
+        # ubuntu-22.04 / 24.04 官方仓库只有 Plasma 5.27（kwin_x11 + plasmashell），
+        # 够跑本作业的 X11 断言；Wayland 档需要的 Plasma 6 不在这里跑（§6.2 的实测修正）。
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb dbus-x11 xdotool x11-utils imagemagick \
+            kwin-x11 plasma-workspace
+          kwin_x11 --version || true
+          plasmashell --version || true
+
+      - name: 校验 deb 的依赖/建议声明
+        # 断言「声明真的进了 control 文件」——配置写了但没生效是这类任务最典型的假绿。
+        run: |
+          set -euo pipefail
+          deb=$(ls artifacts/*.deb | head -1)
+          echo "== $deb"
+          echo "-- Depends --"
+          dpkg-deb -f "$deb" Depends
+          echo "-- Recommends --"
+          dpkg-deb -f "$deb" Recommends
+          dpkg-deb -f "$deb" Depends | tr -d '\n' | grep -q 'libayatana-appindicator3-1' \
+            || { echo "[FAIL] Depends 缺 libayatana-appindicator3-1（tray 运行时库）"; exit 1; }
+
+      - name: 选定被测二进制（AppImage 无 FUSE 直跑）
+        run: |
+          set -euo pipefail
+          app=$(ls "$GITHUB_WORKSPACE"/artifacts/*.AppImage | head -1)
+          test -n "$app"
+          chmod +x "$app"
+          echo "APP=$app" >> "$GITHUB_ENV"
+          echo "APPIMAGE_EXTRACT_AND_RUN=1" >> "$GITHUB_ENV"
+          echo "被测二进制：$app"
+
+      - name: 跑 KDE/X11 冒烟
+        env:
+          # 保留 /tmp/kde-smoke.* 临时目录（kwin.log / app.log / screen.png）供下面上传
+          KEEP_LOGS: '1'
+          SMOKE_WITH_PLASMA: '1'
+        run: bash scripts/linux-kde-smoke.sh
+
+      - name: 上传冒烟日志与截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kde-smoke-logs-${{ github.ref_name }}
+          path: |
+            /tmp/kde-smoke.*/**
+            /tmp/kde-smoke-screen.png
+          if-no-files-found: warn

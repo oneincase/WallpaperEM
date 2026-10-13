@@ -7,6 +7,8 @@
 # - Ubuntu 24.04 自带 libwebkit2gtk-4.1-dev（Tauri 2.x 需要）
 # - Node 用官方 tarball（nodesource 之外的零依赖方案），按构建架构自动选 arm64/x64
 # - 预装 xvfb + dbus-x11 + mesa，供容器内无头冒烟测试（能真实创建窗口/起内容服务器）
+# - 还预装 KDE/X11 冒烟依赖（kwin_x11 + plasmashell + 断言工具），让 entrypoint 里
+#   那一档从「起得来就算过」升级成 scripts/linux-kde-smoke.sh 的真断言（镜像 +约 1GB）
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -21,6 +23,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav \
     # 无头冒烟测试
     xvfb dbus-x11 libgl1-mesa-dri libegl-mesa0 libgles2 \
+    # KDE/X11 冒烟（scripts/linux-kde-smoke.sh）：起 kwin_x11 + plasmashell，
+    # 断言桌面层窗口的 _NET_WM_WINDOW_TYPE 与堆叠顺序；xdotool/x11-utils 断言、
+    # imagemagick(import)/x11-apps(xwd) 取截图。不需要这一档时可整段删掉：
+    # entrypoint 检测到缺件会打印 SKIP 而不是失败（见 scripts/linux-docker-entrypoint.sh）
+    kwin-x11 plasma-workspace xdotool x11-utils x11-apps imagemagick \
     && rm -rf /var/lib/apt/lists/*
 
 # Node 22 LTS（pnpm 11 需要 >= 22.13）

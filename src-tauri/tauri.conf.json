@@ -61,11 +61,14 @@
           "gstreamer1.0-plugins-base",
           "gstreamer1.0-plugins-good",
           "gstreamer1.0-plugins-bad",
-          "gstreamer1.0-libav"
+          "gstreamer1.0-libav",
+          "libayatana-appindicator3-1"
         ],
         "recommends": [
           "gstreamer1.0-pipewire",
-          "ffmpeg"
+          "ffmpeg",
+          "kscreen",
+          "pulseaudio-utils | pipewire-bin"
         ]
       }
     },
