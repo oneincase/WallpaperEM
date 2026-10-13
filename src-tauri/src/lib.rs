@@ -16,6 +16,10 @@ mod keychain;
 // KDE Plasma 会话探测与能力路由（Linux 桌面适配的收口点，见 docs/kde-adaptation-plan.md §4.2）。
 // 非 Linux 平台也编译：这些平台上 `detect()` 恒为「非 KDE」，调用点无需 cfg 分叉。
 mod kde;
+// KWin/Plasma 后端能力：窗口规则纯函数 + 副作用薄层（见 docs/kde-adaptation-plan.md §4.3、§4.4）。
+// 全平台编译：纯函数（规则合并/解析、kscreen JSON 解析）与平台无关，便于在任何开发机上跑单测；
+// 需要 KWin D-Bus / kscreen-doctor 的分支在非 Linux 上直接返回「不可用」。
+mod kwin;
 mod library;
 mod main_window;
 mod mcp;
