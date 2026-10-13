@@ -267,14 +267,17 @@ fn lower_below_desktop_icons<R: Runtime>(window: &WebviewWindow<R>) {
 /// GNOME(DING)/Budgie/Pantheon 满足；KDE/XFCE/MATE/Cinnamon 不满足（桌面窗口
 /// 自绘背景，或图标与背景同窗口绘制）。
 fn shell_icons_are_overlay() -> bool {
-    let de = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
-    let overlay = de
-        .split(':')
-        .map(|t| t.trim().to_ascii_lowercase())
-        .any(|t| matches!(t.as_str(), "gnome" | "budgie" | "pantheon"));
+    // 判定统一收口到 kde 模块（能力路由 P0）：它同时回答「是不是 KDE」和
+    // 「XDG_CURRENT_DESKTOP 里的覆盖层式图标 DE 白名单」。非 KDE 的白名单
+    // 语义与改动前逐字一致（GNOME/Budgie/Pantheon 为真，其余为假）。
+    let env = crate::kde::env_snapshot();
+    let kde = crate::kde::env();
+    let overlay = crate::kde::shell_icons_are_overlay_with(&env, kde);
     if !overlay {
+        let de = env.get("XDG_CURRENT_DESKTOP").map(String::as_str).unwrap_or("");
         tracing::debug!(
-            "linux: XDG_CURRENT_DESKTOP={de:?} 非覆盖层式图标 DE，跳过壁纸沉底（避免被桌面背景窗口遮住）"
+            "linux: XDG_CURRENT_DESKTOP={de:?} kde={} 非覆盖层式图标 DE，跳过壁纸沉底（避免被桌面背景窗口遮住）",
+            kde.is_kde
         );
     }
     overlay

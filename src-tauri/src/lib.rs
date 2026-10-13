@@ -13,6 +13,9 @@ mod ffmpeg;
 mod hotkeys;
 mod i18n;
 mod keychain;
+// KDE Plasma 会话探测与能力路由（Linux 桌面适配的收口点，见 docs/kde-adaptation-plan.md §4.2）。
+// 非 Linux 平台也编译：这些平台上 `detect()` 恒为「非 KDE」，调用点无需 cfg 分叉。
+mod kde;
 mod library;
 mod main_window;
 mod mcp;
