@@ -4,6 +4,21 @@
 
 ## [Unreleased]
 
+### 🛠 改变 / Changed
+
+- **`webwallgl` 改走 npm 依赖（3.0.0）**：渲染库此前是 `file:../webwallgl-github/dist/lib`，
+  必须把库仓库克隆到本仓平级并先 `pnpm run build:lib`，否则 `pnpm install` 解析不到。
+  现在直接装 registry 上的 `webwallgl@^3.0.0`：解包体积 38 MB → 2.8 MB（不再带 sourcemap、
+  同一份引擎不再打四遍），视频解码库 `mediabunny` 从内联改为普通依赖由包管理器装上。
+  本地开发不再需要平级克隆渲染库源码。3.0.0 是**包拆分**版，桌面端与渲染效果和
+  2.2.1 相同（相对本仓此前的 2.1.0 累积了 2.2.x 的播放侧修复，例如贴图通道子网格不再被
+  当成普通几何绘制）；只用 `import … from "webwallgl"` 的项目不受其破坏性变更影响
+  （受影响的是 `webwallgl/core`、`webwallgl/editor` 子路径，已拆成 `@webwallgl/*` 独立包）。
+- **`vite.config.ts` 移除 `optimizeDeps.exclude: ["webwallgl"]`**：这条是为 file: 依赖加的
+  —— file: 依赖改了内容、预构建缓存不按内容失效，开发服务器会一直发旧库。换成 npm 依赖后
+  内容只随版本号变，缓存自然失效，故去掉；库本体 1.4 MB 且静态 import `mediabunny`，
+  交给 Vite 预构建反而更快。
+
 ## [v2.2.0] - 2026-10-04
 
 ### 🚀 新增 / Added

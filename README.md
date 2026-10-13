@@ -310,26 +310,26 @@ sudo apt install libwebkit2gtk-4.1-dev build-essential curl wget file \
 
 ### 安装依赖 / Install dependencies
 
-WallpaperEM 依赖两个同作者的自维护仓库，都以**仓库平级目录**的形式接入（即克隆到
-WallpaperEM 旁边），缺一个就装不上 / 编译不过：
+前端渲染库 `webwallgl` 走 **npm 依赖**（registry 上的 `webwallgl@^3.0.0`，其视频解码依赖
+`mediabunny` 由包管理器一并装上），克隆本仓后 `pnpm install` 即可，**不需要**再平级克隆渲染库
+源码、也不需要先构建库产物。
+
+`media-bridge` 仍是同作者的自维护仓库，以 **Cargo path 依赖**接入
+（`src-tauri/Cargo.toml` 里是 `path = "../../media-bridge/crates/media-bridge"`），
+必须克隆到 WallpaperEM 旁边，否则 Rust 侧编译不过：
 
 ```bash
-git clone https://github.com/oneincase/webwallgl.git     # 渲染库（file: 依赖）
-git clone https://github.com/oneincase/media-bridge.git  # 媒体桥接（Cargo path 依赖）
+git clone https://github.com/oneincase/media-bridge.git  # 媒体桥接（Cargo path 依赖，必须平级）
 git clone https://github.com/oneincase/WallpaperEM.git
 cd WallpaperEM
 pnpm install
 ```
 
-- `webwallgl` 需**先构建出库产物**（前端依赖 `file:../webwallgl-github/dist/lib`，
-  注意目录名是 `webwallgl-github`，克隆后请保持或改 `package.json` 里的路径）：
-
-  ```bash
-  cd ../webwallgl && pnpm install && pnpm run build:lib
-  ```
-
-- `media-bridge` 无需构建，但必须与 WallpaperEM 平级（`src-tauri/Cargo.toml` 里是
-  `path = "../../media-bridge/crates/media-bridge"`）。
+- `media-bridge` 无需预先构建，平级放好即可。
+- 要联调 `webwallgl` 本地源码改动，就在库仓库构建好后临时把依赖指向本地产物（`file:` 路径）。
+  注意 3.0.0 起 npm 包只发 ESM `webwallgl.mjs` 与自包含 UMD `webwallgl.global.min.js`，
+  旧的 `webwallgl/core`、`webwallgl/editor` 子路径已拆成独立包 `@webwallgl/core`、
+  `@webwallgl/editor`。
 
 ### 开发运行 / Run in development
 

@@ -11,14 +11,13 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   clearScreen: false,
-  // webwallgl 是 file: 依赖（../webwallgl-github/dist/lib）。开发服务器对它做**依赖预构建**
-  // 后会一直发缓存里的旧包 —— vite 的预构建缓存只按锁文件/配置哈希失效、**不看内容**，
-  // 所以「改了库 → pnpm install 重链 → 甚至重启 tauri dev」都可能还在跑旧库
-  // （踩过两次：三组诊断实验全白做、视频纹理修复重启后不生效）。
-  // 库产物是单文件自包含（无外部 import），排除预构建即可每次按 mtime 从磁盘重读。
+  // webwallgl 自 3.0.0 起是**npm 依赖**（registry 上的 webwallgl@^3.0.0），不再是
+  // file:../webwallgl-github/dist/lib。历史上踩的坑是：file: 依赖做依赖预构建后会一直发
+  // 缓存里的旧包（vite 预构建缓存只按锁文件/配置哈希失效、不看内容），当时用
+  // optimizeDeps.exclude 绕开。换成 npm 依赖后内容只随版本号变，预构建缓存随之失效，
+  // 这个绕法不需要了 —— 库本体 1.4 MB 且静态 import mediabunny，交给 Vite 预构建反而更快。
   // 另注：**残留的旧 vite 会占住 1420**（strictPort），新实例静默起不来、页面继续走旧进程，
   // 重启前先确认没有旧的 vite 在跑。
-  optimizeDeps: { exclude: ["webwallgl"] },
   server: {
     port: 1420,
     strictPort: true,
