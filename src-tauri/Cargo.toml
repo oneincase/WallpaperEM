@@ -96,11 +96,23 @@ keyring = { version = "3", features = ["linux-native"] }
 # gtk 直依赖：与 tao/desktop-underlay 同一大版本（0.18），用于壁纸窗口 realize 状态检测
 gtk = "0.18"
 # 主窗口模糊（KDE KWin，见 blur.rs）：X11 设 _KDE_NET_WM_BLUR_BEHIND_REGION；
-# Wayland 走 org_kde_kwin_blur。client_system = 复用 GDK 的系统 wl_display 连接
+# Wayland 优先 ext_background_effect_manager_v1（Plasma 6.7+），bind 失败回退
+# org_kde_kwin_blur（Plasma ≤6.6）。client_system = 复用 GDK 的系统 wl_display 连接
 x11rb = "0.13"
 wayland-client = "0.31"
 wayland-backend = { version = "0.3", features = ["client_system"] }
 wayland-protocols-plasma = { version = "0.3", features = ["client"] }
+# ext_background_effect_v1 绑定生成：protocols/ext_background_effect.rs 里的
+# generate_interfaces!/generate_client_code! 在编译期读 src/protocols/ 下的 XML。
+# wayland-scanner 0.31 只有 proc-macro 形态（0.30 的 generate_code() 构建脚本 API
+# 已移除），所以这里是普通依赖而不是 build-dependency；版本与 Cargo.lock 中已有的
+# 0.31.11 一致，不新增锁条目。生成代码只随 Linux 目标的 blur.rs 一起编译。
+wayland-scanner = "0.31"
+# 生成代码里的 bitfield 枚举（本协议的 capability）由 wayland-scanner 展开为
+# `bitflags::bitflags!`，需要 bitflags 在作用域内；上游 wayland-protocols 0.32.13
+# 也是为此写了直接依赖（其 Cargo.toml.orig:35 `bitflags = "2"`）。版本已在
+# Cargo.lock 里作为传递依赖存在（2.13.1），不引入新的 crates。
+bitflags = "2"
 # KDE/KWin 集成（kde.rs 的会话总线探测、kwin.rs 的窗口规则与空闲/遮挡查询）。
 # 版本与 Cargo.lock 里 media-bridge 传递进来的 zbus 保持一致，避免二份 zbus。
 zbus = "5.19"

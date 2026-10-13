@@ -21,6 +21,10 @@ fn main() {
     println!("cargo:rerun-if-changed=tauri.conf.json");
     println!("cargo:rerun-if-changed=capabilities");
     println!("cargo:rerun-if-changed=bin-info.plist");
+    // Wayland 协议 XML：由 blur.rs → protocols/ext_background_effect.rs 里的
+    // wayland-scanner proc-macro 在编译期读取。proc-macro 的文件读取不进 cargo
+    // 指纹，这里显式声明，改 XML 才会重新生成绑定。
+    println!("cargo:rerun-if-changed=src/protocols/ext-background-effect-v1.xml");
 }
 
 /// 把 bin-info.plist 内嵌进可执行文件的 `__TEXT __info_plist` 段（仅 macOS bin 目标）。
