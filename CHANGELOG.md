@@ -84,6 +84,14 @@
 
 ### 🐛 修复 / Fixed
 
+- **KDE 分支新增的 77 条后端文案补上英文**：`hotkeys` / `kde_plugin` / `kwin` /
+  `system_wallpaper` / `frame_export` / `wallpaper::linux` / `wallpaper::platform` 的中文
+  错误与状态消息此前只有中文，英文界面会直接弹中文；`scripts/i18n-audit.mjs` 因此报
+  「后端缺失 77」并让 CI 的「中英词条审计」步骤变红（v2.2.0 的基线是 0 —— 这是本次 KDE
+  落地引入的回归，只因审计仅在改动落到 `src/` 时才跑，前一次推送没暴露）。77 条已全部补进
+  `EN_US_BACKEND`（占位符与密钥同名，含 `{e}`/`{w}`/`{PLUGIN_LABEL}` 这类具名参数），
+  审计回到 0/0/0/0。
+
 - **KDE 静态壁纸失败后不再无法回退**：原实现里 `plasma-apply-wallpaperimage` 与
   `qdbus … evaluateScript` 两条路径各自 `return`，第一条失败就到此为止（`swww`/`feh`
   等后续手段在 KDE 分支上永远不会被执行）；现改为三级链式回退，任一成功即止。
