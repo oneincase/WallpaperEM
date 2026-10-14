@@ -4,11 +4,14 @@
 //! 后端只留这一小撮系统级文案，沿用同一套约定：中文原文当键、查不到就原样返回。
 //! 好处是漏翻只会露出中文，不会露出 key 或空白。
 //!
-//! 语言的权威在前端：用户在设置里选了什么，由 `app_set_locale` 推过来。
-//! 启动默认值只是兜底 —— 主窗口的 JS 起来（几百毫秒）就会推一次，
-//! 兜底准不准只影响这一小段窗口期内托盘菜单长什么样。
+//! 语言的权威在前端：用户在设置里选了什么，由 `app_set_locale` 推过来。后端把
+//! 它记进 settings 表（`app.locale`），启动时先读这份（`init_from_settings`），
+//! 读不到才跟随系统环境 —— 托盘是在 `setup` 里建的，只跟系统语言的话，
+//! 「系统英语 + 用户选了中文」的机器上托盘第一帧会是英文。
 
 use std::sync::atomic::{AtomicU8, Ordering};
+
+use tauri::Manager;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Locale {
@@ -20,11 +23,25 @@ pub enum Locale {
 /// 用原子量而不是 OnceLock：用户随时可以来回切，必须能反复写。
 static CURRENT: AtomicU8 = AtomicU8::new(0);
 
+/// 用户选的语言在 settings 表里的键。前端也把它存在自己的 localStorage
+/// （`we.locale`），但那份只有 JS 起来之后才读得到 —— 启动时先把这份读出来，
+/// 托盘/应用菜单的**第一帧**语言才不会跟界面不一致（见 `init_from_settings`）。
+pub const SETTING_KEY: &str = "app.locale";
+
 pub fn locale() -> Locale {
     if CURRENT.load(Ordering::Relaxed) == 1 {
         Locale::EnUs
     } else {
         Locale::ZhCn
+    }
+}
+
+/// 当前语言的 BCP-47 标签（落盘、日志用；与前端 LOCALES 的取值一致）
+pub fn locale_tag() -> &'static str {
+    if is_en() {
+        "en-US"
+    } else {
+        "zh-CN"
     }
 }
 
@@ -34,9 +51,13 @@ pub fn is_en() -> bool {
 
 /// 前端推来的语言标签（`"zh-CN"` / `"en-US"`）。只区分「是不是英文」——
 /// 将来加语言时这里扩展，前端那张表也要跟着加（见 i18n.ts 的 LOCALES）。
-pub fn set_locale(tag: &str) {
+///
+/// 返回**是否真的变了**：平台原生文案的重写代价不低（Linux 上要整份重建托盘菜单，
+/// 见 `crate::rebuild_tray_menu`），前端每次启动都会推一次，没必要白重建。
+pub fn set_locale(tag: &str) -> bool {
     let en = tag.to_ascii_lowercase().starts_with("en");
-    CURRENT.store(u8::from(en), Ordering::Relaxed);
+    let next = u8::from(en);
+    CURRENT.swap(next, Ordering::Relaxed) != next
 }
 
 /// 启动兜底：跟随系统语言。只读环境变量 —— GUI 启动的 macOS/Windows 进程
@@ -53,6 +74,33 @@ pub fn init_from_system() {
         .iter()
         .any(|p| lower.starts_with(p));
     CURRENT.store(u8::from(en), Ordering::Relaxed);
+}
+
+/// 启动时定语言：**优先用户上次选的那份**（settings 表的 `app.locale`），
+/// 没有记录（升级上来的老库，或从未切过语言）才跟随系统环境。
+///
+/// 为什么不能只靠前端推：主窗口的 JS 起来要几百毫秒，而托盘在 `setup` 里就建好了
+/// —— 用系统环境兜底的那段时间里，「系统英语 + 用户选了中文」的机器上托盘会先是
+/// 英文（用户看到的正是「界面中文、托盘英文」）。读到用户自己的选择，第一帧就是对的。
+pub fn init_from_settings(app: &tauri::AppHandle) {
+    let stored = app
+        .try_state::<std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>>()
+        .and_then(|db| {
+            db.lock()
+                .ok()
+                .and_then(|c| crate::db::get_setting(&c, SETTING_KEY))
+        })
+        .filter(|tag| !tag.is_empty());
+    match stored {
+        Some(tag) => {
+            set_locale(&tag);
+            tracing::info!("后端语言取自用户设置: {tag}");
+        }
+        None => {
+            init_from_system();
+            tracing::debug!("后端语言取自系统环境: {}", locale_tag());
+        }
+    }
 }
 
 /// 取词：中文原文 → 当前语言。查不到就原样返回中文（宁可露出中文，也不要空白）。
@@ -163,12 +211,27 @@ fn en(zh: &str) -> Option<&'static str> {
     })
 }
 
-/// 前端在设置里切语言时调用：落定语言，并把**原生绘制**的文案重写一遍。
+/// 前端在设置里切语言时调用：落定语言，把**原生绘制**的文案重写一遍，
+/// 并记进 settings 表 —— 下次启动托盘就能在没有前端参与时就取到正确语言
+/// （见 `init_from_settings`）。
 /// 不返回值：前端那边是 fire-and-forget（切语言不该因为托盘不可用而报错）。
 #[tauri::command]
 pub fn app_set_locale(app: tauri::AppHandle, locale: String) {
-    set_locale(&locale);
-    crate::retranslate_native_ui(&app);
+    let changed = set_locale(&locale);
+    if let Some(db) = app.try_state::<std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>>() {
+        match db.lock() {
+            Ok(conn) => {
+                if let Err(e) = crate::db::set_setting(&conn, SETTING_KEY, &locale) {
+                    tracing::warn!("语言落盘失败（下次启动会跟随系统语言）: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("语言落盘失败（DB 锁被毒化）: {e}"),
+        }
+    }
+    // 没变就不动原生菜单：Linux 上这是一次整份菜单重建（见 rebuild_tray_menu）
+    if changed {
+        crate::retranslate_native_ui(&app);
+    }
 }
 
 #[cfg(test)]
@@ -198,6 +261,18 @@ mod tests {
         assert!(is_en());
         set_locale("zh-Hans-CN");
         assert!(!is_en());
+    }
+
+    #[test]
+    fn locale_tag_round_trips() {
+        // 落盘 / 日志用的标签要与前端 LOCALES 的取值一致；键名改了会让老库里的
+        // 选择变成孤儿（启动退回系统语言），所以也钉一下
+        assert_eq!(SETTING_KEY, "app.locale");
+        set_locale("zh-CN");
+        assert_eq!(locale_tag(), "zh-CN");
+        set_locale("en-US");
+        assert_eq!(locale_tag(), "en-US");
+        set_locale("zh-CN");
     }
 
     #[test]

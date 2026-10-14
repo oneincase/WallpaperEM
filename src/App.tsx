@@ -77,6 +77,14 @@ function Shell() {
     return () => window.clearInterval(t);
   }, []);
 
+  // 启动时把已选语言推给 Rust：托盘菜单 / macOS 应用菜单这些原生文案由后端取词，
+  // 后端兜底只跟系统语言（Linux/Windows 能读到 LANG，macOS GUI 读不到），
+  // 系统语言与用户选择不一致时托盘会一直停在后一种语言。切语言时 setLocale()
+  // 也会推一次；这里补的是「启动即中文/英文」这条路。
+  useEffect(() => {
+    pushLocaleToBackend();
+  }, []);
+
   const navigate = (p: PageId) => {
     if (detailCloseTimer.current) {
       clearTimeout(detailCloseTimer.current);

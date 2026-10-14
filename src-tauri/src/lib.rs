@@ -99,7 +99,8 @@ pub fn run() {
         })
         .setup(|app| {
             // 原生文案（托盘菜单 / 应用菜单 / 窗口标题）的语言兜底值要先定下来，
-            // 下面几步就会用到；前端的权威值随后由 app_set_locale 推过来。
+            // 下面几步就会用到；用户自己选过的语言在库里（db::init 之后就能读，
+            // 见下面的 init_from_settings）。
             i18n::init_from_system();
             init_logging(app.handle())?;
             // panic 钩子：tokio 任务与主线程回调里的 panic 会被各自的
@@ -117,6 +118,10 @@ pub fn run() {
                 }));
             }
             db::init(app.handle())?;
+            // 用户上次选的语言（settings 表）优先于系统环境：托盘在下面 build_tray 里
+            // 就建好了，而前端 JS 还要几百毫秒才推得过来 —— 少了这一步，
+            // 「系统英语 + 界面中文」的机器上托盘第一帧会是英文（用户报的正是这个）
+            i18n::init_from_settings(app.handle());
             init_steam(app.handle())?;
             // 自愈：升级老版本写下的无条件 KeepAlive plist（否则用户退出会被
             // launchd 立即复活，表现为"退出软件后一直自己重新启动"）
@@ -129,7 +134,7 @@ pub fn run() {
             // 托盘失败不致命：Linux 无托盘协议的环境（GNOME 未装 AppIndicator 扩展、
             // 容器/无头会话）里 TrayIconBuilder::build 会报错，不能让整个 setup 崩掉 ——
             // 退化为「无托盘常驻」，主窗口与壁纸功能照常（研究文档 §3.2 的降级策略）
-            // 托盘菜单的句柄要留着（语言切换时原地改文字，不重建菜单，见 TrayMenu）
+            // 托盘菜单的句柄要留着（语言切换时整份重建菜单，见 TrayMenu/rebuild_tray_menu）
             let tray = match build_tray(app.handle()) {
                 Ok(t) => Some(t),
                 Err(e) => {
@@ -137,7 +142,9 @@ pub fn run() {
                     None
                 }
             };
-            app.manage(NativeMenuState { tray });
+            app.manage(NativeMenuState {
+                tray: Mutex::new(tray),
+            });
             // 轮播状态文案（当前项 / 暂停·恢复）按启动时状态刷新一次
             update_tray_rotation(app.handle());
             // 托盘「显示器」子菜单按当前屏 + 会话填充（之后随插拔/绑定变化重建）
@@ -524,55 +531,26 @@ const QUALITY_ITEMS: &[(&str, &str)] = &[
     ("custom", "自定义"),
 ];
 
-/// 托盘菜单项的句柄集合。留着只为一件事：**切换语言时原地改文字**。
-/// 不重建菜单 —— 重建会让 on_menu_event 闭包里捕获的勾选句柄指向已脱离菜单的
-/// 旧对象，之后点「清晰度」就再没有勾选反馈了。
+/// 托盘菜单里**动态**那部分的句柄集合：设置变更改勾选、轮播/显示器子菜单要重建内容。
+/// 语言切换时整份菜单会被换掉（[`rebuild_tray_menu`]），这些句柄随之更新指向新菜单。
 pub struct TrayMenu {
-    show: MenuItem<tauri::Wry>,
-    item_props: MenuItem<tauri::Wry>,
     auto_pause: CheckMenuItem<tauri::Wry>,
     displays_menu: Submenu<tauri::Wry>,
-    rot_menu: Submenu<tauri::Wry>,
     rot_status: MenuItem<tauri::Wry>,
     rot_prev: MenuItem<tauri::Wry>,
     rot_next: MenuItem<tauri::Wry>,
     rot_pause: MenuItem<tauri::Wry>,
-    quality_menu: Submenu<tauri::Wry>,
     quality_items: Vec<CheckMenuItem<tauri::Wry>>,
-    filter_menu: Submenu<tauri::Wry>,
     filter_items: Vec<CheckMenuItem<tauri::Wry>>,
-    reveal_menu: Submenu<tauri::Wry>,
     reveal_items: Vec<CheckMenuItem<tauri::Wry>>,
-    quit: MenuItem<tauri::Wry>,
 }
 
 impl TrayMenu {
-    fn retranslate(&self, app: &AppHandle) -> tauri::Result<()> {
-        self.show.set_text(i18n::tr("显示主窗口"))?;
-        self.item_props.set_text(i18n::tr("壁纸设置"))?;
-        self.auto_pause.set_text(i18n::tr("自动暂停"))?;
-        self.quit.set_text(i18n::tr("退出"))?;
-        self.rot_menu.set_text(i18n::tr("轮播"))?;
-        self.rot_prev.set_text(i18n::tr("上一张"))?;
-        self.rot_next.set_text(i18n::tr("下一张"))?;
-        self.quality_menu.set_text(i18n::tr("画质档位"))?;
-        self.filter_menu.set_text(i18n::tr("滤镜效果"))?;
-        self.reveal_menu.set_text(i18n::tr("切换效果"))?;
-        for (item, (_, label)) in self.quality_items.iter().zip(QUALITY_ITEMS) {
-            item.set_text(i18n::tr(label))?;
-        }
-        for (item, (_, label)) in self.filter_items.iter().zip(wallpaper::WALLPAPER_FILTERS) {
-            item.set_text(i18n::tr(label))?;
-        }
-        for (item, (_, label)) in self.reveal_items.iter().zip(wallpaper::REVEAL_FX) {
-            item.set_text(i18n::tr(label))?;
-        }
-        // 轮播状态文案是动态的（当前项 / 暂停·恢复），按当前状态重写
-        self.refresh_rotation(app)?;
-        // 「显示器」子菜单整棵都是动态的（每屏一项、含列表名）：按当前语言重建
-        self.refresh_displays(app)?;
-        Ok(())
-    }
+    /// ⚠️ 没有 `retranslate`：Linux(muda 的 GTK 后端) 上 `Submenu::set_text` 静默无效 ——
+    /// 子菜单文字挂在 GtkMenuItem 内部的 AccelLabel 上，而 `MenuChild::set_text`
+    /// （muda-0.19.3/src/platform_impl/gtk/mod.rs:658）改的是 GtkMenuItem 自己的
+    /// label 属性，看不到任何变化也不报错。所以语言切换走
+    /// [`rebuild_tray_menu`]：整份菜单重建 + `TrayIcon::set_menu` 换上去。
 
     /// 重建「显示器」子菜单：每块屏一个子菜单 —— 当前壁纸（只读）/ 壁纸设置… /
     /// 轮播列表（含「不轮播」，单选）/ 清除壁纸。显示器插拔、每屏绑定或清除、
@@ -768,19 +746,17 @@ pub(crate) fn notify_setting_changed(app: &AppHandle, key: &str, value: &str) {
         "wallpaper_resources",
         "wallpaper_resources_normal",
     ];
-    if let Some(state) = app.try_state::<NativeMenuState>() {
-        if let Some(tray) = &state.tray {
-            tray.apply_setting(key, value);
-            // 画质档位是按六个参数整组反推的：任一参数变了都重算一次勾选
-            if QUALITY_KEYS.contains(&key) {
-                if let Some(db) = app.try_state::<Arc<Mutex<Connection>>>() {
-                    if let Ok(conn) = db.lock() {
-                        tray.apply_quality_preset(wallpaper::derive_quality_preset_id(&conn));
-                    }
+    with_tray(app, |tray| {
+        tray.apply_setting(key, value);
+        // 画质档位是按六个参数整组反推的：任一参数变了都重算一次勾选
+        if QUALITY_KEYS.contains(&key) {
+            if let Some(db) = app.try_state::<Arc<Mutex<Connection>>>() {
+                if let Ok(conn) = db.lock() {
+                    tray.apply_quality_preset(wallpaper::derive_quality_preset_id(&conn));
                 }
             }
         }
-    }
+    });
     let _ = app.emit(
         "settings-changed",
         serde_json::json!({ "key": key, "value": value }),
@@ -789,13 +765,11 @@ pub(crate) fn notify_setting_changed(app: &AppHandle, key: &str, value: &str) {
 
 /// 轮播状态变化（切换 / 激活 / 暂停）后刷新托盘「轮播」子菜单文案
 pub(crate) fn update_tray_rotation(app: &AppHandle) {
-    if let Some(state) = app.try_state::<NativeMenuState>() {
-        if let Some(tray) = &state.tray {
-            if let Err(e) = tray.refresh_rotation(app) {
-                tracing::warn!("refresh tray rotation failed: {e}");
-            }
+    with_tray(app, |tray| {
+        if let Err(e) = tray.refresh_rotation(app) {
+            tracing::warn!("refresh tray rotation failed: {e}");
         }
-    }
+    });
 }
 
 /// 显示器集合 / 每屏会话 / 每屏绑定变化后重建托盘「显示器」子菜单。
@@ -803,31 +777,35 @@ pub(crate) fn update_tray_rotation(app: &AppHandle) {
 /// 重建原生菜单在菜单打开时会引起重绘。**调用方须在 DB 锁外调用**
 /// （内部走 displays_list，会自己拿锁）。
 pub(crate) fn update_tray_displays(app: &AppHandle) {
-    if let Some(state) = app.try_state::<NativeMenuState>() {
-        if let Some(tray) = &state.tray {
-            if let Err(e) = tray.refresh_displays(app) {
-                tracing::warn!("refresh tray displays failed: {e}");
-            }
+    with_tray(app, |tray| {
+        if let Err(e) = tray.refresh_displays(app) {
+            tracing::warn!("refresh tray displays failed: {e}");
         }
-    }
+    });
 }
 
 /// 会被语言影响的原生菜单/标题。语言切换时由 retranslate_native_ui 整份重写
 pub struct NativeMenuState {
-    /// 托盘不可用的环境（Linux 无 AppIndicator 等）为 None，见 build_tray 的降级说明
-    tray: Option<TrayMenu>,
+    /// 托盘不可用的环境（Linux 无 AppIndicator 等）为 None，见 build_tray 的降级说明。
+    /// 放在 Mutex 里是因为**语言切换要整份换掉句柄**（重建菜单，见 rebuild_tray_menu）
+    tray: Mutex<Option<TrayMenu>>,
+}
+
+/// 对当前托盘句柄做一次只读操作；无托盘（降级环境）时返回 None
+fn with_tray<R>(app: &AppHandle, f: impl FnOnce(&TrayMenu) -> R) -> Option<R> {
+    let state = app.try_state::<NativeMenuState>()?;
+    let guard = state.tray.lock().ok()?;
+    guard.as_ref().map(f)
 }
 
 /// 语言变了：把**原生绘制**的文案重写一遍（托盘菜单、macOS 应用菜单、独立窗口标题）。
 /// 菜单只在打开的瞬间可见，所以效果是「下次打开就跟上」；这里不等用户操作，立即同步。
 pub(crate) fn retranslate_native_ui(app: &AppHandle) {
-    if let Some(state) = app.try_state::<NativeMenuState>() {
-        if let Some(tray) = &state.tray {
-            if let Err(e) = tray.retranslate(app) {
-                tracing::warn!("retranslate tray failed: {e}");
-            }
-        }
-    }
+    // 托盘菜单**整份重建**：Linux(muda 的 GTK 后端) 上 `Submenu::set_text` 是静默无效的
+    // （子菜单文字挂在 GtkMenuItem 内部的 AccelLabel 上，而 set_text 改的是 GtkMenuItem
+    // 自己的 label 属性），逐项改文字会让 5 个子菜单标题永远停在「建菜单那一刻」的语言，
+    // 而叶子项是新语言 —— 用户看到的就是「切了中文，托盘菜单部分还是英文」。
+    rebuild_tray_menu(app);
     // macOS 应用菜单里的快捷键项（⌘M/⌘H 等）跟着语言重写
     hotkeys::retranslate(app);
     // 独立「壁纸设置」窗口的原生标题由 Rust 侧绘制（label 形如 props-<itemId>）
@@ -835,6 +813,45 @@ pub(crate) fn retranslate_native_ui(app: &AppHandle) {
         if label.starts_with("props-") {
             let _ = win.set_title(i18n::tr("壁纸设置"));
         }
+    }
+}
+
+/// 语言切换：整份重建托盘菜单，换给同一个托盘图标（[`TrayMenu`] 上的说明解释了
+/// 为什么 Linux 上只能这么做）。菜单项 id 与建菜单时完全一致，事件分发不受影响；
+/// 勾选状态由 build_tray_menu 按 settings 当前值重放，所以不会丢。
+fn rebuild_tray_menu(app: &AppHandle) {
+    let Some(state) = app.try_state::<NativeMenuState>() else {
+        return;
+    };
+    // 降级环境（无托盘）不需要重建
+    if state.tray.lock().map(|g| g.is_none()).unwrap_or(true) {
+        return;
+    }
+    let Some(tray_icon) = app.tray_by_id("main-tray") else {
+        tracing::warn!("重建托盘菜单：找不到 main-tray");
+        return;
+    };
+    match build_tray_menu(app) {
+        Ok((menu, handles)) => {
+            if let Err(e) = tray_icon.set_menu(Some(menu)) {
+                tracing::warn!("重建托盘菜单失败：{e}");
+                return;
+            }
+            if let Ok(mut guard) = state.tray.lock() {
+                *guard = Some(handles);
+            }
+            // 新菜单里「轮播」是初始文案、「显示器」是空的：按当前状态补齐
+            update_tray_rotation(app);
+            update_tray_displays(app);
+            // 排查「切了语言托盘还是旧语言」时这条日志直接给结论：
+            // 当前 locale 是哪个、托盘首个菜单项会被翻成什么
+            tracing::debug!(
+                "托盘菜单已按语言重建：locale={}，托盘「{}」",
+                i18n::locale_tag(),
+                i18n::tr("显示主窗口")
+            );
+        }
+        Err(e) => tracing::warn!("重建托盘菜单失败：{e}"),
     }
 }
 
@@ -859,8 +876,10 @@ const DISP_STOP_PREFIX: &str = "disp_stop:";
 const DISP_ROT_OFF_PREFIX: &str = "disp_rot_off:";
 const DISP_ROT_PREFIX: &str = "disp_rot:";
 
-/// 托盘：显示主窗口 / 壁纸设置 / 暂停播放 / 全局快速设置（显示模式·清晰度·帧率上限）/ 退出
-fn build_tray(app: &AppHandle) -> tauri::Result<TrayMenu> {
+/// 托盘：显示主窗口 / 壁纸设置 / 暂停播放 / 全局快速设置（显示模式·清晰度·帧率上限）/ 退出。
+/// 只建**菜单**（返回菜单本体 + 句柄），不建托盘图标 —— 语言切换要拿它整份重建菜单。
+/// 勾选状态在这里按 settings 表当前值重放，所以重建后勾选不会丢。
+fn build_tray_menu(app: &AppHandle) -> tauri::Result<(Menu<tauri::Wry>, TrayMenu)> {
     let show = MenuItem::with_id(app, "show", i18n::tr("显示主窗口"), true, None::<&str>)?;
     let item_props = MenuItem::with_id(app, "item_props", i18n::tr("壁纸设置"), true, None::<&str>)?;
 
@@ -952,26 +971,26 @@ fn build_tray(app: &AppHandle) -> tauri::Result<TrayMenu> {
         ],
     )?;
 
-    // 句柄副本留给 NativeMenuState（语言切换时改文字）；原件随 on_menu_event 闭包走
+    // 句柄副本留给 NativeMenuState（语言切换时整份换新）；原件随 TrayIcon 走
     let state = TrayMenu {
-        show: show.clone(),
-        item_props: item_props.clone(),
         auto_pause: auto_pause_item.clone(),
         displays_menu: displays_menu.clone(),
-        rot_menu: rot_menu.clone(),
         rot_status: rot_status.clone(),
         rot_prev: rot_prev.clone(),
         rot_next: rot_next.clone(),
         rot_pause: rot_pause.clone(),
-        quality_menu: quality_menu.clone(),
         quality_items: quality_items.clone(),
-        filter_menu: filter_menu.clone(),
-        reveal_menu: reveal_menu.clone(),
         filter_items: filter_items.clone(),
         reveal_items: reveal_items.clone(),
-        quit: quit.clone(),
     };
 
+    Ok((menu, state))
+}
+
+/// 起托盘图标：菜单由 build_tray_menu 建。语言切换只换菜单（tray.set_menu），
+/// 图标与事件处理闭包都不动 —— 事件按菜单项 id 分发、闭包不捕获任何句柄。
+fn build_tray(app: &AppHandle) -> tauri::Result<TrayMenu> {
+    let (menu, state) = build_tray_menu(app)?;
     let mut builder = TrayIconBuilder::with_id("main-tray")
         .menu(&menu)
         .tooltip("WallpaperEM")

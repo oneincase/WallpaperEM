@@ -35,6 +35,7 @@
 | 引擎侧帧导出驱动插件（`frame_export`） | ✅ 端到端 19 项断言全过 | 强（见 §6.6） |
 | 应用内「一键启用 KDE 插件」 | ✅ 后端+打包+前端落地，真机 38 项断言全过（含装成 deb 复验） | 强（见 §6.7/§6.8） |
 | 设置页「KDE 桌面集成」分组与按钮真的渲染出来 | ✅ 无障碍（AT-SPI）6 项断言全过（截图仍拿不到，改走 a11y） | 强（见 §6.10） |
+| 托盘菜单跟着界面语言走（含 5 个子菜单标题） | ✅ 真机抓 `GetLayout`，10 项断言全过（修掉两层原因） | 强（见 §6.11） |
 | Plasma 6 全部专属机制 | ⛔ 本机不可验 | — |
 
 ## 3. 核心发现：壁纸窗口的落点
@@ -520,6 +521,50 @@ KDE 分组按钮（`Enable` / `一键启用` 任一）→ 断言它**紧邻**「
 真实窗口，CI 的 Xvfb 环境下未验证过，放进去只会变成随机红的噪音；它在 VM 上跑。
 
 
+### 6.11 托盘菜单的语言（用户报障：切中文后「部分还是英文」；10 项断言）
+
+界面语言与**原生**菜单语言的权威都在前端（`src/lib/i18n.ts`），后端只拿 `app_set_locale`
+推来的值取词。用户报「界面切成中文后，托盘菜单部分还是英文」，实测下来是**两层原因叠在一起**：
+
+| # | 原因 | 证据 | 修法 |
+|---|------|------|------|
+| 1 | 语言**从没推给后端**：`src/App.tsx` 只 import 了 `pushLocaleToBackend`，全文只出现 1 次（从未调用） | VM 的 `LANG=en_US.UTF-8`，localStorage `we.locale=zh-CN`，settings 表里**没有** `app.locale`；`GetLayout` 抓到的托盘菜单全是英文 | `app_set_locale` 把选择落进 `app.locale`；启动时 `i18n::init_from_settings` 优先读它（托盘在 `setup` 里就建好，第一帧就是对的）；主窗口挂载时补一次推送 |
+| 2 | 就算推来了，**子菜单标题也改不动**：muda 0.19.3 的 GTK 后端把子菜单文字放在 `GtkMenuItem` 内部的 `AccelLabel` 里，而 `MenuChild::set_text`（`muda-0.19.3/src/platform_impl/gtk/mod.rs:658`）改的是 `GtkMenuItem` 自己的 label 属性 —— **静默无效**（所以日志里没有 `retranslate tray failed`） | 只做原因 1 的修复后抓菜单：叶子项已是中文，`Slideshow / Displays / Quality Preset / Filter / Transition` 5 个子菜单标题仍是英文 | 语言变化时**整份重建菜单**（`build_tray` 拆出 `build_tray_menu`；`TrayMenu` 句柄放进 `Mutex<Option<..>>` 以便替换；`TrayIcon::set_menu` 换上；事件按菜单项 id 分发，闭包不捕获句柄，不受影响），并按 settings 当前值重放勾选；语言没变则不重建 |
+
+验证脚本 `scripts/kde-vm-tray-i18n-check.sh`（跑在真实会话 `DISPLAY=:0`）：从
+`org.kde.StatusNotifierWatcher` 找到本应用的 SNI，再走 `com.canonical.dbusmenu.GetLayout`
+把标签逐条读出来 —— 抓的是**用户在面板上看到的那份文字**，不是应用内部的字符串表。两条路径都验：
+先故意把 settings 表的 `app.locale` 置成与界面相反的语言（模拟「上次启动是另一种语言」），
+启动后前端会推来界面语言 → 必须走重建路径；再重启一次，验第一帧。
+
+实跑（对着 `/usr/bin/WallpaperEM`，界面 `zh-CN`，装出来的是含本修复的产物）：
+
+```
+=== A. 运行中切换（先让托盘按 en-US 建起来，再由前端推成 zh-CN） ===
+  [PASS] 启动第一帧用的是 settings 表里的 en-US（后端语言取自用户设置: en-US）
+  [PASS] 前端推来 zh-CN 后走了重建路径（托盘菜单已按语言重建：locale=zh-CN）
+  [PASS] 抓到真实托盘菜单（41 个标签）
+  [PASS] 5 个子菜单标题都是中文：轮播 显示器 画质档位 滤镜效果 切换效果
+  [PASS] 没有任何子菜单标题停在 en-US
+  [PASS] 叶子项抽样都在中文：显示主窗口 壁纸设置 自动暂停 退出
+  [info] 菜单标签（层级）：
+    显示主窗口 / 壁纸设置 / 自动暂停 / 轮播（轮播：未启用·上一张·下一张·暂停轮播）
+    / 显示器（Virtual-1（主屏）→ 当前：… / 壁纸设置… / 轮播列表 / 清除壁纸）
+    / 画质档位（低中高自定义）/ 滤镜效果（无·高斯模糊·黑白·怀旧·鲜艳·暖色·冷色·反色·提亮·压暗·高对比）
+    / 切换效果（叠化·推近·模糊·景深·圆形揭示·横向擦除·滑入）/ 退出
+=== B. 启动第一帧（settings 表已是 zh-CN，托盘不必等前端推） ===
+  [PASS] 启动第一帧直接取用户设置的语言（后端语言取自用户设置: zh-CN）
+  [PASS] 抓到真实托盘菜单（36 个标签）
+  [PASS] 重启后菜单（含子菜单标题）直接就是中文
+  [PASS] 重启后没有残留另一种语言
+==== 结果：10 项通过 / 0 项失败 ====
+```
+
+**局限**：脚本按「界面语言」断言（界面语言从 localStorage `we.locale` 读），这台 VM 的界面是
+`zh-CN`，所以**英文方向**没有单独断言 —— 英文侧靠 §6.11 表里修复前的那份「全英文」抓取 +
+`i18n.rs` 的单测覆盖。要单验英文方向得改用户 localStorage，脚本刻意不动它。
+
+
 ## 7. 对方案的影响（已回填 [kde-adaptation-plan.md](kde-adaptation-plan.md) §2.5）
 
 1. **§4.1 机制①的定义要改**：从「拿桌面层语义并保住图标」改为「拿桌面窗口语义（跳任务栏/全桌面/在普通窗口之下）」，**图标可见性另立一条路**（Plasma 6 Wayland 的 layer-shell `Background`，或 §4.5 壁纸插件）。X11 上无解，别承诺。
@@ -560,6 +605,7 @@ KDE 分组按钮（`Enable` / `一键启用` 任一）→ 断言它**紧邻**「
 | `src/api/kde.ts` + 设置页「KDE 集成」分组 | 前端按钮与状态展示（仅 Linux 渲染），文案在 `src/locales/en-US.ts` |
 | `packaging/plasma-wallpaper/io.github.oneincase.wallpaperem/` | P9 的 Plasma 壁纸插件（`metadata.json` + KConfigXT + `main.qml`/`config.qml` + 引擎契约 README）；**由 `scripts/sync-plasma-plugin.sh` 从独立仓单向同步**，并经 `tauri.conf.json` 的 `bundle.resources` 打进安装包（`$RESOURCE/plasma-wallpaper/`） |
 | `scripts/kde-vm-ui-check.sh` | **设置页 UI 的无障碍断言**（AT-SPI，6 项）：起应用 → 断言 `document web` 出现（页面真加载了）→ 点「设置 → 通用」→ 断言 KDE 分组按钮存在且紧邻缓存组；不依赖截图（§6.10） |
+| `scripts/kde-vm-tray-i18n-check.sh` | **托盘菜单语言自检**（10 项）：从 `StatusNotifierWatcher` 找到本应用 SNI，走 `com.canonical.dbusmenu.GetLayout` 读出真实标签（用户看到的那份）→ 验「运行中切语言要走重建路径」「重启后第一帧就是对的语言」两条路径，并逐条检查 5 个子菜单标题（§6.11） |
 | `scripts/kde-vm-deb.sh` | 在 VM 上按 tauri-bundler 布局**手工组装并安装 deb**（arm64 没有官方预编译 tauri-cli）：解析 `tauri.linux.conf.json` 的 resources/依赖 → 组装 `usr/bin` + `usr/lib/<productName>` → `dpkg-deb` → `apt-get install --reinstall`（§6.8） |
 | `docs/kde-smoke-setup.md` | 装配说明与覆盖率对照 |
 | `docs/kde-adaptation-plan.md` | 适配方案（§2.5 已回填本轮实测） |

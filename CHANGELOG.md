@@ -91,6 +91,32 @@
 
 ### 🐛 修复 / Fixed
 
+- **界面切成中文后，托盘菜单还是英文**（用户报障，两层原因，都已修）：
+  ①**界面语言从没推给后端**：托盘/应用菜单这类**原生**文案由 Rust 侧取词
+  （`src-tauri/src/i18n.rs`），语言本该由前端 `app_set_locale` 推过来，但主窗口
+  （`src/App.tsx`）只 import 了 `pushLocaleToBackend` 却**没调它**，于是后端一路沿用
+  启动时的系统语言兜底（`init_from_system`，Linux/Windows 读 `LANG`，如 VM 的
+  `en_US.UTF-8`）——界面是用户选的 `zh-CN`（localStorage `we.locale`），托盘却是
+  `Show Main Window` / `Quality Preset` / `Slideshow` 一整套英文。修两处：
+  `app_set_locale` 把选择落进 settings 表（`app.locale`），启动时 `init_from_settings`
+  在读得到用户选择时优先于系统环境（托盘在 `setup` 里就建好了，这样第一帧就是对的）；
+  主窗口挂载时补一次 `pushLocaleToBackend()`，老库（没有 `app.locale` 记录）也能在一次
+  启动内自愈。
+  ②**改文字对「子菜单标题」无效**：即便把语言推了过来，Linux 上 `Submenu::set_text`
+  也是**静默无效**的 —— muda 0.19.3 的 GTK 后端把子菜单文字放在 GtkMenuItem 内部的
+  `AccelLabel` 里（`create_gtk_item_for_submenu`），而 `MenuChild::set_text`
+  （`muda-0.19.3/src/platform_impl/gtk/mod.rs:658`）改的是 GtkMenuItem 自己的 label
+  属性：不报错、也看不到任何变化。于是叶子项跟着新语言、`轮播/显示器/画质档位/滤镜效果/
+  切换效果` 这 5 个子菜单标题永远停在「建菜单那一刻」的语言 —— 正是用户看到的
+  「部分还是英文」。改为**整份重建菜单**（`TrayMenu` 句柄放进 `Mutex` 可替换 +
+  `TrayIcon::set_menu`，新 `build_tray_menu` 按 settings 当前值重放勾选；事件按 id 分发，
+  不受影响）。语言没变时不再重建（`i18n::set_locale` 返回是否变化）。
+  真机复核（Ubuntu 24.04 ARM64 VM，`LANG=en_US.UTF-8` + 界面 `zh-CN`，走
+  `com.canonical.dbusmenu.GetLayout` 抓**真实托盘菜单**，脚本
+  `scripts/kde-vm-tray-i18n-check.sh`）：修复前抓到的标签全是英文；修复后
+  「先以 en-US 建菜单、再由前端推成 zh-CN」的路径下 41 个标签**全为中文（含 5 个子菜单
+  标题）**，重启后第一帧直接是中文 —— 10 项断言全过。
+
 - **手工构建漏 `--features tauri/custom-protocol` → 装好的 app 主窗口连 `localhost:1420`**：
   用户在真机装完 deb 打开，主窗口里是 `Could not connect to localhost: Connection refused`
   （Chromium 错误页）。根因：tauri 2.11.5 的 `build.rs:256-261` 是 `let dev = !custom_protocol;`
