@@ -45,7 +45,8 @@
     ],
     "resources": {
       "../dist/renderer": "renderer",
-      "../dist/assets": "assets"
+      "../dist/assets": "assets",
+      "../packaging/plasma-wallpaper": "plasma-wallpaper"
     },
     "macOS": {
       "entitlements": "entitlements.plist",

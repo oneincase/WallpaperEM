@@ -334,6 +334,25 @@ pub fn definitions() -> Vec<Value> {
             "inputSchema": obj(json!({}), json!([])),
         }),
         json!({
+            "name": "kde_plugin_status",
+            "description": "KDE Plasma 壁纸插件（WallpaperEM-Plasma）的只读状态：supported（Linux + 正在跑的 plasmashell）/session/plasmashell/script_tool/package_ready/installed(+installed_version)/active（桌面壁纸当前是不是本插件，读 appletsrc）/enabled（用户点过启用）/exporting（引擎在不在导出帧）/engine_playing（有没有正在播放的壁纸）/frame_dir/fps/note。不产生任何副作用。",
+            "inputSchema": obj(json!({}), json!([])),
+        }),
+        json!({
+            "name": "kde_plugin_enable",
+            "description": "**一键启用 KDE 壁纸插件**（Linux/Plasma）：把随应用分发的插件包装进 `~/.local/share/plasma/wallpapers/<id>`，记住切换前的壁纸配置，用 plasmashell 自己的脚本接口（`qdbus … org.kde.PlasmaShell.evaluateScript`，与 plasma-apply-wallpaperimage 同一套）把每个桌面的壁纸换成它并写 FramePath/SeqPath，最后开始帧导出（windowCapture + hideWindow 自动带上，这两项在 Linux 上是必需的，见 frame_export_start）。前置条件：plasmashell 在跑 + 引擎已有正在播放的壁纸，否则返回人话错误而不是留下一个兜底色的桌面。幂等：重复调用等于「重装包 + 重新切壁纸 + 重起导出」。",
+            "inputSchema": obj(json!({
+                "frameDir": { "type": "string", "description": "帧文件目录，默认 /dev/shm/wallpaperem（与插件的默认 FramePath 同源）" },
+                "fps": { "type": "integer", "description": "导出帧率，默认 20，范围 1..60" },
+                "maxWidth": { "type": "integer", "description": "抓帧最大宽度，默认 1920；传 0 = 原尺寸" },
+            }), json!([])),
+        }),
+        json!({
+            "name": "kde_plugin_disable",
+            "description": "关闭 KDE 壁纸插件：停掉帧导出，并把 `kde_plugin_enable` 记下的原壁纸配置（插件 id + General 组键值）原样写回每个桌面。插件包留在用户目录（再次启用不必重装）。没有记录到原配置时只停导出，并在 note 里说明需要用户自己在 Plasma 设置里改回壁纸。",
+            "inputSchema": obj(json!({}), json!([])),
+        }),
+        json!({
             "name": "list_sessions",
             "description": "当前各屏的壁纸会话（label → 配置）与全局暂停态。",
             "inputSchema": obj(json!({}), json!([])),
@@ -870,6 +889,12 @@ async fn call_inner(app: &AppHandle, name: &str, args: &Value) -> Result<Value, 
         "frame_export_start" => frame_export_start(app, args).await,
         "frame_export_stop" => frame_export_stop().await,
         "frame_export_status" => frame_export_status(),
+        "kde_plugin_status" => Ok(serde_json::to_value(crate::kde_plugin::status(app))
+            .map_err(|e| e.to_string())?),
+        "kde_plugin_enable" => kde_plugin_enable(app, args).await,
+        "kde_plugin_disable" => crate::kde_plugin::disable(app)
+            .await
+            .and_then(|o| serde_json::to_value(o).map_err(|e| e.to_string())),
         "list_sessions" => list_sessions(app),
         "displays_list" => crate::wallpaper::displays_list(app.clone()),
         "playlist_list" => {
@@ -1620,6 +1645,25 @@ async fn frame_export_stop() -> Result<Value, String> {
 
 fn frame_export_status() -> Result<Value, String> {
     serde_json::to_value(crate::wallpaper::frame_export::status_global()).map_err(|e| e.to_string())
+}
+
+/// `kde_plugin_enable`：参数覆盖默认的帧目录/帧率/最大宽度，其余交给 kde_plugin 模块。
+async fn kde_plugin_enable(app: &AppHandle, args: &Value) -> Result<Value, String> {
+    let mut opts = crate::kde_plugin::EnableOptions::from_settings(app);
+    if let Some(dir) = opt_str(args, "frameDir") {
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            opts.frame_dir = dir.to_string();
+        }
+    }
+    if let Some(fps) = args.get("fps").and_then(|v| v.as_u64()) {
+        opts.fps = (fps as u32).clamp(1, 60);
+    }
+    if let Some(w) = args.get("maxWidth").and_then(|v| v.as_u64()) {
+        opts.max_width = if w == 0 { None } else { Some(w as u32) };
+    }
+    let out = crate::kde_plugin::enable(app, opts).await?;
+    serde_json::to_value(out).map_err(|e| e.to_string())
 }
 
 /// 按关键词查踩坑清单（省 token：不用整份 pitfalls 都读进来）。

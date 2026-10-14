@@ -31,6 +31,10 @@
 | `kscreen-doctor -j` 作每屏默认数据源 | ⚠️ 无头下无输出 | 中 |
 | KWin 5 的 `Layer=Desktop` 窗口规则 | ⚠️ 未能证实 | 弱（仅二进制字符串） |
 | `scripts/linux-kde-smoke.sh` 在真机会话里跑通 | ✅ 5/5 断言 PASS（连跑 2 次一致） | 强（见 §6.1） |
+| P9 插件在真实 plasmashell 里当壁纸 | ✅ 18 项断言全过，图标层逐像素不变 | 强（见 §6.5） |
+| 引擎侧帧导出驱动插件（`frame_export`） | ✅ 端到端 19 项断言全过 | 强（见 §6.6） |
+| 应用内「一键启用 KDE 插件」 | ✅ 后端+打包+前端落地，真机 33 项断言全过 | 强（见 §6.7） |
+| 设置页按钮的视觉确认（截图） | ⚠️ 本机抓屏恒全黑，未能留图 | 弱（环境限制） |
 | Plasma 6 全部专属机制 | ⛔ 本机不可验 | — |
 
 ## 3. 核心发现：壁纸窗口的落点
@@ -322,6 +326,49 @@ md5 各不相同、应用日志 `particles live: 79 across 2 systems`）。同�
 复现：`ssh <vm> 'USE_XVFB=1 bash -s' < scripts/kde-frame-export-check.sh`
 （依赖应用已构建；脚本自起 Xvfb + kwin_x11，造一张 web 类型动画壁纸，跑完停壁纸并删条目）。
 
+### 6.7 应用内「一键启用 KDE 插件」（端到端 33 项断言全过）
+
+设置页「通用 → KDE 集成」（仅 Linux 显示）多了「启用 KDE 插件」按钮：点一次就把插件包装进
+plasmashell、用官方脚本接口把桌面壁纸切过去、同时起帧导出；再点「关闭并还原」走反向路径
+（停导出 → 写回原壁纸 → 不透明度还回去）。后端是 `src-tauri/src/kde_plugin.rs`，三个 Tauri
+命令与三个同名 MCP 工具（`kde_plugin_status`/`enable`/`disable`）走**同一条**代码路径，
+所以 MCP 驱动的自检覆盖的就是按钮本身的产品路径。
+
+插件包由 `scripts/sync-plasma-plugin.sh` 从独立仓库 `../WallpaperEM-Plasma` **单向**同步进
+`packaging/plasma-wallpaper/io.github.oneincase.wallpaperem/`，再经 `tauri.conf.json` 的
+`bundle.resources` 映射到 `$RESOURCE/plasma-wallpaper/`（真机构建后确认该资源目录存在，
+`resolve_package_dir` 就是按这个顺序找包：环境变量 → 资源目录 → 源码树）。
+
+真机自检 `scripts/kde-plugin-enable-check.sh`（新，344 行）：自起 `Xvfb :104` + `kwin_x11` +
+`plasmashell`，全程只在自建会话里动 `appletsrc`/`app.db`，跑前备份、收尾还原（`set -u` 下早期
+退出也安全）。为什么不用 VM 的真实 `:0`：它经常处于 kscreenlocker 锁屏，且真会话里切壁纸会
+动到用户自己的桌面配置。**结果 33/33 PASS**，关键几项：
+
+| 断言 | 实测 |
+| --- | --- |
+| 启用前基线 | `supported=true`、`session=x11`、`plasmashell=true`、`installed=false`、`exporting=false`、`engine_playing=true` |
+| 启用返回值 | `installed=true`、`switched_desktops=3`、`export.running=true` |
+| 插件包落位 | `~/.local/share/plasma/wallpapers/io.github.oneincase.wallpaperem/`，含 `contents/ui/main.qml` |
+| 桌面确实换成本插件 | appletsrc 里 `wallpaperplugin=io.github.oneincase.wallpaperem` |
+| 真出帧 | `frame.ppm` + `frame.seq` 生成、帧内容非全黑、序号在长（62 → 218） |
+| 状态可读 | `status.active/exporting/enabled=true`、`installed_version=0.1.0` |
+| 插件模式生效 | 引擎壁纸窗口 `_NET_WM_WINDOW_OPACITY=0`（整窗透明，不是隐藏） |
+| 关闭可逆 | `restored=true`、`stopped=true`、原壁纸写回 `org.kde.image`、appletsrc 里已不是本插件、`exporting/active=false`、包保留（重启用不必重装）、不透明度恢复 `4294967295`、序号不再增长 |
+| 收尾干净 | 自检条目已清理 |
+
+复现（宿主机 rsync+构建后）：
+
+```bash
+ssh <vm> 'APP_BIN=/home/parallels/WallpaperEM/src-tauri/target/release/WallpaperEM bash -s' \
+  < scripts/kde-plugin-enable-check.sh     # 33 项断言；SECS / XVFB_DISPLAY 可调
+```
+
+> 首次跑出 29/33，4 条失败全是脚本自身断言函数的 bug（`jget` 把 Python 的 `True` 当字面量
+> 漏判、嵌套字段 `export.running` 取不到）——换成支持点号路径 + 小写布尔的 `jbool` 后 33/33。
+> 另有一个环境限制：本机 Xvfb+kwin 下 `import`/`xwd` 抓屏拿到的永远是全黑（合成器把窗口内容
+> 重定向了），所以设置页截图在**自建 Xvfb 会话里拿不到**；功能正确性靠上面的断言 + 前端
+> `pnpm typecheck` + i18n 审计，真机 UI 目视确认留给有物理/远程桌面的会话。
+
 ## 7. 对方案的影响（已回填 [kde-adaptation-plan.md](kde-adaptation-plan.md) §2.5）
 
 1. **§4.1 机制①的定义要改**：从「拿桌面层语义并保住图标」改为「拿桌面窗口语义（跳任务栏/全桌面/在普通窗口之下）」，**图标可见性另立一条路**（Plasma 6 Wayland 的 layer-shell `Background`，或 §4.5 壁纸插件）。X11 上无解，别承诺。
@@ -334,14 +381,14 @@ md5 各不相同、应用日志 `particles live: 79 across 2 systems`）。同�
 ## 8. 仍未验证 / 无法验证
 
 - **Plasma 6 全部专属项**：layer-shell `Background` 层（本机 5.27 实测有 `zwlr_layer_shell_v1` **v3**，但 v5 与「Background 层里排到 plasmashell 桌面视图之下」仍未证）、`ext_background_effect_manager_v1`（5.27 实测未广告，符合预期）、portal `Wallpaper`(6.5)、Plasma 6 托盘 SNI、每虚拟桌面独立壁纸。需 Ubuntu 25.04 / Fedora KDE / openSUSE 的 arm64 或 amd64 机器。
-- **P9 插件在真 plasmashell 里选为壁纸**：✅ 已由 §6.5 补上（真实会话 `:0`，18 项断言全过，图标层逐像素不变）。仍未量化的只有**长期帧率/合成开销**与**插件异常对 plasmashell 的影响面**（需真实使用观察），以及多屏按实例分帧、Plasma 6 实测。
+- **P9 插件在真 plasmashell 里选为壁纸**：✅ 已由 §6.5 补上（真实会话 `:0`，18 项断言全过，图标层逐像素不变）。仍未量化的只有**长期帧率/合成开销**与**插件异常对 plasmashell 的影响面**（需真实使用观察），以及多屏按实例分帧、Plasma 6 实测。**应用内一键启用**已由 §6.7 补上（33 项断言，走的就是按钮那条产品路径）；剩下没做到的只是**设置页按钮的目视确认**——本机 Xvfb/KWin 下抓屏恒为全黑（合成器把窗口内容重定向了），`import`/`xwd` 都拿不到画面。
 - **引擎侧帧传输**：DMA-BUF/socket 那条路一行代码都还没有；`zwp_linux_dmabuf_v1` v4 只是证明协议可用。
 - **KWin 5 的 `Layer` 窗口规则是否可用**：需在能弹确认框的交互会话里跑 `qdbus org.kde.KWin /Scripting …`，或直接写 `~/.config/kwinrulesrc` 后 `reconfigure` 再观察。
 - **`global-hotkey` 在 KDE 下是否与 KWin 抢键**：需手工按键验证。
 - **无边框窗口在 KWin 下的拖拽/缩放/阴影**：无头 Xvfb 里 `Meta+左键` 无法模拟。
 - **图标实际可见性的人工确认**：像素哈希已证「壁纸覆盖图标区」，但「图标是否还能被看见/点中」需人工看 `screen-with-app.png`（已留在 VM 的会话目录里）。
 
-## 9. 产物清单（均为未跟踪新文件）
+## 9. 产物清单（本轮新增；已随本轮提交落库）
 
 | 文件 | 作用 |
 | --- | --- |
@@ -355,7 +402,11 @@ md5 各不相同、应用日志 `particles live: 79 across 2 systems`）。同�
 | `scripts/linux-kde-smoke.sh` | 有断言的 KDE/X11 冒烟：真机走真实用户总线、CI 无用户会话时自动退回 `dbus-run-session`；已在 VM 上 5/5 通过（见 §6.1） |
 | `scripts/kde-wayland-globals.sh` | KWin 的 Wayland 全局清单探测（自起嵌套 `kwin_wayland --virtual` 或 attach 现有会话）；§6.2 的全部数据来自它 |
 | `scripts/kde-plugin-check.sh` | P9 插件包验证：结构 → `kpackagetool5` 安装注册 → `qmlscene` 渲染取样 → 卸载（12 项，见 §6.3） |
-| `packaging/plasma-wallpaper/io.github.oneincase.wallpaperem/` | P9 的 Plasma 壁纸插件（`metadata.json` + KConfigXT + `main.qml`/`config.qml` + 引擎契约 README） |
+| `scripts/kde-plugin-enable-check.sh` | **应用内「一键启用」端到端自检**：自起 Xvfb+KWin+plasmashell（MCP 驱动，走按钮同一条产品路径），33 项断言覆盖装包 / 切换 appletsrc / 真出帧 / 状态 / 恢复 / 清理（§6.7） |
+| `scripts/sync-plasma-plugin.sh` | 把独立仓 `../WallpaperEM-Plasma` 的插件包**单向**同步进 `packaging/plasma-wallpaper/`（真源在插件仓，本仓那份是打包副本，别在本仓直接改） |
+| `src-tauri/src/kde_plugin.rs` | 「一键启用」后端：状态探测、装包、切 appletsrc、回滚、设置项持久化（3 个 Tauri 命令 + 3 个同名 MCP 工具） |
+| `src/api/kde.ts` + 设置页「KDE 集成」分组 | 前端按钮与状态展示（仅 Linux 渲染），文案在 `src/locales/en-US.ts` |
+| `packaging/plasma-wallpaper/io.github.oneincase.wallpaperem/` | P9 的 Plasma 壁纸插件（`metadata.json` + KConfigXT + `main.qml`/`config.qml` + 引擎契约 README）；**由 `scripts/sync-plasma-plugin.sh` 从独立仓单向同步**，并经 `tauri.conf.json` 的 `bundle.resources` 打进安装包（`$RESOURCE/plasma-wallpaper/`） |
 | `docs/kde-smoke-setup.md` | 装配说明与覆盖率对照 |
 | `docs/kde-adaptation-plan.md` | 适配方案（§2.5 已回填本轮实测） |
 | `docs/kde-plasma-constraints.md` | 上游约束调研（12 条硬约束 + 71 链接） |

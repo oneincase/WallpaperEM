@@ -20,6 +20,9 @@ mod kde;
 // 全平台编译：纯函数（规则合并/解析、kscreen JSON 解析）与平台无关，便于在任何开发机上跑单测；
 // 需要 KWin D-Bus / kscreen-doctor 的分支在非 Linux 上直接返回「不可用」。
 mod kwin;
+// Plasma 壁纸插件的一键启用/关闭（装包 → 切壁纸 → 导出帧，全程可逆）。
+// 全平台编译：appletsrc 解析与脚本生成是纯函数（有单测），真动作在非 Linux 上直接报错。
+mod kde_plugin;
 mod library;
 mod main_window;
 mod mcp;
@@ -239,6 +242,10 @@ pub fn run() {
             // 只读判定并如实提示，不静默降级、不改用户配置。
             #[cfg(target_os = "linux")]
             crate::kde::log_desktop_icons_status();
+            // KDE 壁纸插件：上次点过「启用」且桌面壁纸仍是本插件 → 把帧导出接回来
+            // （引擎重启后插件只会一直显示最后一帧，用户看到的就是「壁纸不动了」）。
+            // 放最后：它要读 settings、要起导出，前面这些都得先就绪。
+            tauri::async_runtime::spawn(kde_plugin::resume_on_startup(app.handle().clone()));
             tracing::info!("app setup complete");
             Ok(())
         })
@@ -264,6 +271,9 @@ pub fn run() {
             commands::settings_set,
             commands::autostart_status,
             commands::autostart_set,
+            kde_plugin::kde_plugin_status,
+            kde_plugin::kde_plugin_enable,
+            kde_plugin::kde_plugin_disable,
             wallpaper::apply,
             wallpaper::apply_item,
             wallpaper::library_preview,

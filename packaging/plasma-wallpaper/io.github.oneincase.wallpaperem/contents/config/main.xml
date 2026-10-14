@@ -5,26 +5,85 @@
       http://www.kde.org/standards/kcfg/1.0/kcfg.xsd" >
   <kcfgfile name=""/>
 
+  <!--
+    Plasma 壁纸插件的配置项定义（KConfigXT）。
+    name 就是 QML 里 cfg_<name> 与运行期 cfg["<name>"] 的大小写；
+    type 用小写（bool/int/String），与官方插件（如 org.kde.image）一致。
+    改了本文件必须用 kpackagetool5 -u 重装，否则 plasmashell 读的还是旧 schema。
+  -->
   <group name="General">
-    <!-- 引擎写出的「当前帧」文件路径。契约：引擎原子替换（写 .tmp 后 rename），
-         插件只读、不写、不删。见同目录 README.md -->
+    <!-- 引擎写出的「当前帧」文件路径。契约：引擎先写 <path>.tmp 再 rename 覆盖，
+         插件只读、不写、不删。完整契约见 docs/engine-contract.md。
+         支持 %SCREEN% 占位符（配合 PerScreen=true），例如
+         /dev/shm/wallpaperem/%SCREEN%/frame.ppm -->
     <entry name="FramePath" type="String">
-      <label>当前帧文件路径（由 WallpaperEM 引擎写出）</label>
-      <default>/tmp/wallpaperem/frame.png</default>
+      <label>当前帧文件路径</label>
+      <default>/dev/shm/wallpaperem/frame.ppm</default>
     </entry>
-    <!-- 刷新间隔（毫秒）。引擎若改用 socket/DMA-BUF 传输，本项会被忽略 -->
+
+    <!-- 按屏幕取不同帧：把 FramePath 里的 %SCREEN% 替换为本实例所在屏幕名
+         （如 DP-1 / HDMI-A-1，非字母数字一律换成下划线） -->
+    <entry name="PerScreen" type="bool">
+      <label>每块屏幕使用独立的帧文件（替换路径中的 %SCREEN%）</label>
+      <default>false</default>
+    </entry>
+
+    <!-- 检查新帧的间隔（毫秒）。0 = 只读一次（静态画面）。 -->
     <entry name="RefreshMs" type="int">
-      <label>刷新间隔（毫秒，0 = 跟随引擎信号）</label>
-      <default>66</default>
+      <label>刷新间隔（毫秒，0 = 只读一次）</label>
+      <default>40</default>
+      <min>0</min>
+      <max>5000</max>
     </entry>
-    <!-- 引擎未启动时显示的兜底色 -->
-    <entry name="FallbackColor" type="Color">
+
+    <!-- 引擎没跑起来时的兜底色（十六进制字符串；QML 会自动转成颜色）。
+         刻意用 String 而不是 Color：配置界面里一个文本框就能改，
+         且不需要 QtQuick.Dialogs / Kirigami 的版本分支。 -->
+    <entry name="FallbackColor" type="String">
       <label>引擎未运行时的背景色</label>
       <default>#101014</default>
     </entry>
+
+    <!-- 帧不可用（未运行/还没出帧）时显示的静态图片。留空 = 显示 FallbackColor。 -->
+    <entry name="FallbackImage" type="String">
+      <label>帧不可用时的静态图片路径（可留空）</label>
+      <default></default>
+    </entry>
+
+    <!-- 引擎每写一帧就把一个自增整数写进这个文件（同样原子替换）。
+         插件读它来决定「要不要重新解码帧」以及「引擎是不是停了」：
+         序号不变就不解码（省 CPU/GPU），超过 StallMs 没变就当引擎停了。
+         留空或 UseSeqFile=false 时退回「每个 tick 都重新解码」。 -->
+    <entry name="SeqPath" type="String">
+      <label>帧序号文件路径（自增整数；配合 %SCREEN% 同上）</label>
+      <default>/dev/shm/wallpaperem/frame.seq</default>
+    </entry>
+
+    <entry name="UseSeqFile" type="bool">
+      <label>用帧序号文件避免重复解码</label>
+      <default>true</default>
+    </entry>
+
+    <!-- 序号超过这么久没变化就认为引擎已停止（毫秒） -->
+    <entry name="StallMs" type="int">
+      <label>判定引擎停止的静默时长（毫秒）</label>
+      <default>3000</default>
+      <min>500</min>
+      <max>60000</max>
+    </entry>
+
+    <!-- 填充方式：0 拉伸、1 等比裁切、2 等比适应 -->
     <entry name="FillMode" type="int">
       <label>填充方式（0=拉伸 1=等比裁切 2=等比适应）</label>
       <default>1</default>
+      <min>0</min>
+      <max>2</max>
+    </entry>
+
+    <!-- 是否显示「引擎未运行」之类的状态文字 -->
+    <entry name="ShowStatusText" type="bool">
+      <label>显示状态提示文字</label>
+      <default>true</default>
     </entry>
   </group>
 </kcfg>

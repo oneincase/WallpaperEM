@@ -50,7 +50,16 @@
   （实测隐藏后 140 帧仅 1 帧变化，透明则 83/83 全变），且 `stop` 会把不透明度还原。
   端到端自检 `scripts/kde-frame-export-check.sh`（Xvfb + KWin + web 类型动画壁纸，
   19 项断言：帧头/字节数、内容 md5 变化、非黑占比、帧源、透明化、停止可逆与无残留）全过。
-  应用内一键启用（图形界面按钮）尚未做，目前经 MCP 调用。
+- **应用内「一键启用 KDE 插件」**（设置 → 通用 → KDE 集成，仅 Linux 显示）：
+  一个按钮把壁纸插件装进 plasmashell 并切过去，再点一次恢复原来的壁纸（写前备份、
+  可逆）。后端新增 `src-tauri/src/kde_plugin.rs`（状态探测 / 装包 / 切换 appletsrc /
+  回滚 + 设置项 `kde.plugin.enabled`/`kde.plugin.previous` 持久化），前端 `src/api/kde.ts`
+  + 设置页分组，另配三个同名 MCP 工具（`kde_plugin_status`/`enable`/`disable`）。
+  插件包由 `scripts/sync-plasma-plugin.sh` 从独立仓库**单向**同步进
+  `packaging/plasma-wallpaper/`，并经 `tauri.conf.json` 的 resources 打进安装包。
+  真机自检 `scripts/kde-plugin-enable-check.sh`（自起 Xvfb+KWin+plasmashell，**33 项断言
+  全过**）覆盖：从随包资源装包、切换 appletsrc、真出帧、状态可读、卸载恢复原壁纸、
+  备份与设置项无残留。
 
 - **`webwallgl` 改走 npm 依赖（3.0.0）**：渲染库此前是 `file:../webwallgl-github/dist/lib`，
   必须把库仓库克隆到本仓平级并先 `pnpm run build:lib`，否则 `pnpm install` 解析不到。

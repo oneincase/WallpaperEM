@@ -673,6 +673,17 @@ export const EN_US: Record<string, string> = {
   "AI 客户端连上后，这里会显示每次工具调用的耗时与结果":
     "Once an AI client connects, each tool call shows up here with its duration and result",
   "复制": "Copy",
+  // KDE 桌面集成（仅 Linux 显示；状态说明与错误由后端返回中文，此处只翻界面文案）
+  "KDE 桌面集成": "KDE desktop integration",
+  "KDE 壁纸插件": "KDE wallpaper plugin",
+  "一键启用": "Enable",
+  "关闭并还原": "Disable and restore",
+  "已装版本": "Installed version",
+  "帧目录": "Frame directory",
+  "当前是 Wayland 会话：帧源还没实现（需要 KWin 截屏接口），启用后插件会停在最后一帧":
+    "This is a Wayland session: the frame source is not implemented yet (it needs KWin's screen-capture interface), so the plugin will freeze on its last frame once enabled",
+  "还没有正在播放的壁纸：先在库里应用一张动态壁纸，再回来一键启用":
+    "No wallpaper is playing yet: apply a live wallpaper from your library first, then come back and enable this",
   "缓存": "Cache",
   "当前缓存": "Current cache",
   "。清除后预览图需要重新下载、壁纸封面会重新生成，不影响已下载的壁纸与设置":

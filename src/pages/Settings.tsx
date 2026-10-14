@@ -16,6 +16,12 @@ import {
   type SteamcmdInstallProgress,
   type UpdateInfo,
 } from "../api/steam";
+import {
+  kdePluginDisable,
+  kdePluginEnable,
+  kdePluginStatus,
+  type KdePluginStatus,
+} from "../api/kde";
 import { formatBytes } from "../lib/format";
 import {
   POST_STOPS,
@@ -197,6 +203,8 @@ export function SettingsPage() {
   // 平台判断：文案里平台分支很多（权限、抽帧、代理、自启），散着写 os === "..." 容易漏改
   const isMac = os === "macos";
   const isWin = os === "windows";
+  // KDE 壁纸插件只对 Linux 有意义（后端也会挡），组只在 Linux 上渲染
+  const isLinux = os === "linux";
   // ---- 下载工具（账号页）派生状态 ----
   const dlBackend: DownloadBackend = tool?.backend ?? "steamcmd";
   const isDD = dlBackend === "depotdownloader";
@@ -224,6 +232,12 @@ export function SettingsPage() {
   const [cacheMsg, setCacheMsg] = useState("");
   const [clearingCache, setClearingCache] = useState(false);
   const [confirmClearCache, setConfirmClearCache] = useState(false);
+  // KDE 壁纸插件（Linux）：状态快照 + 操作反馈。状态只在挂载时拉一次，
+  // 每次启用/关闭后再刷新一次（切换壁纸后回到本页需要重新挂载才会更新）
+  const [kde, setKde] = useState<KdePluginStatus | null>(null);
+  const [kdeBusy, setKdeBusy] = useState(false);
+  const [kdeMsg, setKdeMsg] = useState("");
+  const [kdeErr, setKdeErr] = useState(false);
 
   useEffect(() => {
     invoke<boolean>("autostart_status").then(setAutostart).catch(console.warn);
@@ -392,6 +406,40 @@ export function SettingsPage() {
       void un.then((f) => f());
     };
   }, []);
+
+  // ---- KDE 壁纸插件（仅 Linux）----
+  // 状态里带 plasmashell 与壁纸引擎的实时情况，只在挂载时与每次操作后各拉一次，
+  // 不做轮询：这个页面是低频开关面板，轮询反而会打扰 plasmashell
+  const loadKde = useCallback(
+    () =>
+      kdePluginStatus()
+        .then(setKde)
+        .catch((e) => {
+          setKdeErr(true);
+          setKdeMsg(String(e));
+        }),
+    [],
+  );
+  useEffect(() => {
+    if (isLinux) void loadKde();
+  }, [isLinux, loadKde]);
+
+  /** 一键启用 / 关闭并还原：做完后重新拉一次状态，让按钮文案与提示跟着真实情况走 */
+  const toggleKde = useCallback(async () => {
+    setKdeBusy(true);
+    setKdeMsg("");
+    setKdeErr(false);
+    try {
+      const out = kde?.active ? await kdePluginDisable() : await kdePluginEnable();
+      setKdeMsg(out.note);
+      await loadKde();
+    } catch (e) {
+      setKdeErr(true);
+      setKdeMsg(String(e));
+    } finally {
+      setKdeBusy(false);
+    }
+  }, [kde?.active, loadKde]);
 
   // ---- 缓存（预览图/网页缓存 + 壁纸首帧封面）----
   // 统计要递归遍历目录，几百 MB 时是毫秒级但不是零成本，所以只在进设置页
@@ -2346,6 +2394,65 @@ export function SettingsPage() {
               )}
               {localAssetsMsg && (
                 <div className="px-3 pb-1 text-[12px] text-red-500">{trMsg(localAssetsMsg)}</div>
+              )}
+            </Group>
+          )}
+
+          {tab === "general" && isLinux && (
+            <Group title={tr("KDE 桌面集成")}>
+              <Row
+                label={tr("KDE 壁纸插件")}
+                desc={
+                  kde
+                    ? kde.supported
+                      ? trMsg(kde.note)
+                      : trMsg(kde.unsupported_reason)
+                    : tr("正在读取…")
+                }
+                control={
+                  <button
+                    className="btn !py-1 text-[11.5px] disabled:opacity-50"
+                    disabled={kdeBusy || !kde?.supported}
+                    onClick={() => void toggleKde()}
+                  >
+                    {kdeBusy
+                      ? tr("处理中…")
+                      : kde?.active
+                        ? tr("关闭并还原")
+                        : tr("一键启用")}
+                  </button>
+                }
+              />
+              {kde && (
+                <div className="px-3 pb-1 text-[12px] text-[var(--text-2)]">
+                  {kde.installed_version
+                    ? `${tr("已装版本")} v${kde.installed_version} · `
+                    : ""}
+                  {tr("帧目录")} {kde.frame_dir} · {kde.fps}fps
+                </div>
+              )}
+              {kde && kde.session === "wayland" && (
+                <div className="px-3 pb-1 text-[12px] text-amber-500">
+                  {tr(
+                    "当前是 Wayland 会话：帧源还没实现（需要 KWin 截屏接口），启用后插件会停在最后一帧",
+                  )}
+                </div>
+              )}
+              {kde && !kde.enabled && !kde.engine_playing && (
+                <div className="px-3 pb-1 text-[12px] text-[var(--text-2)]">
+                  {tr(
+                    "还没有正在播放的壁纸：先在库里应用一张动态壁纸，再回来一键启用",
+                  )}
+                </div>
+              )}
+              {kdeMsg && (
+                <div
+                  className={`px-3 pb-1 text-[12px] break-all ${
+                    kdeErr ? "text-red-500" : "text-green-400"
+                  }`}
+                >
+                  {trMsg(kdeMsg)}
+                </div>
               )}
             </Group>
           )}

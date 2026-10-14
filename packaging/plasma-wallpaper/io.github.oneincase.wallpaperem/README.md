@@ -1,83 +1,52 @@
-# WallpaperEM 的 Plasma 壁纸插件（P9）
+# WallpaperEM 的 Plasma 壁纸插件（打包进安装包的副本）
 
-> ⚠️ **已迁走，本目录只是历史留存，请勿在此继续开发。**
-> 插件的主体现在在**独立仓库** `WallpaperEM-Plasma`（与主仓同级目录）：
-> 完整实现（双缓冲显示端、序号轮询、`%SCREEN%`、停帧提示、10 个配置项）、
-> 引擎↔插件帧契约 `docs/engine-contract.md`、帧泵 `tools/frame-pump.py`，
-> 以及验证脚本 `scripts/verify.sh`（16 项 Xvfb+qmlscene）与
-> `scripts/plasma-real-test.sh`（18 项**真桌面**断言：帧画到桌面且图标层逐像素不变）。
-> 安装用该仓的 `scripts/install.sh`，或 `kpackagetool5 --type Plasma/Wallpaper --install <独立仓根目录>`。
+> **不要在这里改代码。** 这里的内容是**单向同步过来的副本**：
+> 插件的主体在同级独立仓库 **`WallpaperEM-Plasma`**（与主仓同级目录，
+> https://github.com/oneincase/WallpaperEM-Plasma ），改完在那边提交，再跑
+> ```bash
+> bash scripts/sync-plasma-plugin.sh            # 默认取 ../WallpaperEM-Plasma
+> ```
+> 把 `metadata.json` + `contents/` 搬进来（本文件与独立仓的 README 不同，脚本不会覆盖它）。
 
-这是「壁纸 + 桌面图标同时可见」在 KDE 下的**唯一**可行路径：插件跑在 `plasmashell`
-进程里，和桌面图标同属一个 containment，因此不存在「谁盖住谁」的问题。
+为什么仓库里要留一份副本：应用内「一键启用 KDE 插件」
+（设置 → 通用 → KDE 桌面集成，`src-tauri/src/kde_plugin.rs`）按的是**随安装包分发**的
+那份包 —— `src-tauri/tauri.conf.json` 的 `bundle.resources` 把
+`../packaging/plasma-wallpaper` 映射成 `$RESOURCE/plasma-wallpaper`，运行时
+`kde_plugin::resolve_package_dir()` 从这里找包，再拷进
+`~/.local/share/plasma/wallpapers/io.github.oneincase.wallpaperem/`。
+也就是说：**这份副本不同步，用户点「启用」装上的就是旧插件。**
 
-> 背景：外部窗口方案已被真机实测穷尽证伪——KWin 自管桌面层的层内次序，
-> `_NET_WM_STATE_BELOW` / `_NET_RESTACK_WINDOW` / `XConfigureWindow` / override-redirect
-> 全都无法把窗口排到 plasmashell 桌面视图之下，而桌面图标就画在那个窗口里。
-> 证据见 [docs/kde-adaptation-plan.md](../../../../docs/kde-adaptation-plan.md) §2.5 与
-> [docs/kde-verification-report.md](../../../../docs/kde-verification-report.md)。
+## 为什么必须是插件（而不是引擎自己开窗口）
 
-## 当前状态（2026-10-14）
+外部窗口方案已被真机实测穷尽证伪：KWin 自管桌面层的层内次序，
+`_NET_WM_STATE_BELOW` / `_NET_RESTACK_WINDOW` / `XConfigureWindow` / override-redirect
+全都无法把窗口排到 plasmashell 桌面视图之下，而桌面图标就画在那个窗口里
+（证据见 [docs/kde-adaptation-plan.md](../../../../docs/kde-adaptation-plan.md) §2.5 与
+[docs/kde-verification-report.md](../../../../docs/kde-verification-report.md)）。
 
-| 能力 | 状态 |
-| --- | --- |
-| KPackage 结构 / `kpackagetool5` 安装注册 | ✅ 真机验证（Plasma 5.27.12，VM `10.211.55.5`） |
-| QML 把「引擎写出的帧文件」显示出来 | ✅ 真机验证（`qmlscene` + Xvfb 截图取样，帧为品红时取到 `srgb(255,0,255)`） |
-| 帧文件缺失时纯色兜底、不报错 | ✅ 真机验证（取到 `#101014`） |
-| 在真 plasmashell 里被选为桌面壁纸 | ⬜ 未验证（需要能正常登录的图形会话） |
-| 引擎侧帧传输（DMA-BUF / socket） | ⬜ 未实现（`zwp_linux_dmabuf_v1` 在 5.27 上实测 v4 可用） |
-| 每虚拟桌面独立壁纸 | ⬜ 不可行（plasmashell 本身不支持，KDE bug 341143） |
+插件跑在 `plasmashell` 进程里、和桌面图标同属一个 containment，因此不存在
+「谁盖住谁」的问题 —— 这是「壁纸 + 桌面图标同时可见」在 KDE 下的**唯一**可行路径。
 
-复现：`bash scripts/kde-plugin-check.sh`（12 项断言，自带 Xvfb + qmlscene，跑完自动卸载）。
-
-## 引擎 ↔ 插件契约
-
-插件是**纯显示端**，不做渲染、不碰网络、不写文件。
-
-1. **帧文件**：引擎把最新帧写成 PNG 到配置项 `FramePath`（默认
-   `/tmp/wallpaperem/frame.png`）。
-2. **原子替换**：先写 `<FramePath>.tmp`，再 `rename()` 覆盖。<u>不要原地覆写</u>——
-   插件随时可能在读，原地写会让它读到半张图（表现为撕裂/花屏）。
-3. **只读**：插件永不写、删、改名该文件；引擎负责清理。
-4. **不存在时的行为**：显示 `FallbackColor`（默认 `#101014`）并居中提示
-   「WallpaperEM 引擎未运行」；等离子桌面不受影响。
-5. **刷新**：插件按 `RefreshMs`（默认 66ms ≈ 15fps）轮询。引擎写得更快也没用，
-   写得更慢就是掉帧。`RefreshMs=0` = 只读一次（静态图模式）。
-6. **尺寸**：插件按 `FillMode`（0 拉伸 / 1 等比裁切 / 2 等比适应）铺满 containment。
-   引擎应按 `逻辑尺寸 × devicePixelRatio` 渲染，否则会被放大糊掉。
-7. **崩溃隔离**：插件在 plasmashell 进程内运行，**它崩 = 整个桌面崩**。因此这里
-   不得有阻塞 IO、不得抛异常、不得引入会 abort 的 C++ 插件依赖。解码走 `Image`
-   的异步路径是刻意的。
-8. **每个 containment 一个实例**：多屏/多活动各有自己的插件实例，目前的配置是
-   每实例独立存的，但引擎侧还没做「按实例区分帧文件」——多屏下会互相覆盖，
-   属于已知缺口。
-
-## 为什么不用「插件内跑 WebKitGTK」
-
-渲染栈（WebKitGTK + GL + 音频可视化）已经在主应用里跑通并且要和播放列表、
-音频捕获、自动暂停共享状态。把它塞进 plasmashell 进程会让桌面稳定性绑定在
-整个渲染栈上（任一崩溃=桌面崩溃），也拿不到 GPU 上下文配额保证。所以插件
-只做显示端，渲染留在引擎进程。
-
-## 目录
+## 这份副本包含什么
 
 ```
 io.github.oneincase.wallpaperem/
-├── metadata.json            # KPlugin 元数据（ServiceTypes=["Plasma/Wallpaper"]）
+├── metadata.json            # KPlugin 元数据（ServiceTypes=["Plasma/Wallpaper"]，Id 见上）
 └── contents/
-    ├── config/main.xml      # KConfigXT：FramePath / RefreshMs / FallbackColor / FillMode
+    ├── config/main.xml      # KConfigXT：10 个配置项（FramePath/SeqPath/UseSeqFile/…）
     └── ui/
-        ├── main.qml         # 显示端；无 plasmashell 时用内部 stub 配置（可独立渲染）
+        ├── main.qml         # 纯显示端：双缓冲贴帧、序号轮询、停帧提示、兜底色/图
         └── config.qml       # 配置对话框（cfg_<Key> 别名绑定）
 ```
 
-## 安装（用户）
+## 状态
 
-```bash
-kpackagetool5 --type Plasma/Wallpaper --install packaging/plasma-wallpaper/io.github.oneincase.wallpaperem
-# 然后在「桌面设置 → 壁纸 → 类型」里选 WallpaperEM
-# 卸载：kpackagetool5 --type Plasma/Wallpaper --remove io.github.oneincase.wallpaperem
-```
+| 能力 | 状态 |
+| --- | --- |
+| 独立仓 `scripts/verify.sh`（Xvfb + qmlscene，16 项） | ✅ 通过（Plasma 5.27.12） |
+| 独立仓 `scripts/plasma-real-test.sh`（真 plasmashell + 真桌面，18 项） | ✅ 通过：与 `org.kde.image` 铺同一张图逐像素一致，桌面图标/面板完好 |
+| 引擎侧帧导出 → 插件显示（端到端，19 项） | ✅ 通过（`scripts/kde-frame-export-check.sh`，`hideWindow` + `windowCapture`） |
+| 应用内一键启用/关闭（本仓 `kde_plugin`） | ✅ 已实现，走 MCP 在真机验过 |
 
-Plasma 6 用户把 `kpackagetool5` 换成 `kpackagetool6`（本目录未在 Plasma 6 上验证过，
-这是本轮唯一拿不到 Plasma 6 底座造成的缺口）。
+复现与细节见独立仓的 `README.md`、`docs/engine-contract.md`
+（帧契约全文 + §9 引擎侧实现状态）与 `docs/real-plasma-verification.md`（证据图）。
