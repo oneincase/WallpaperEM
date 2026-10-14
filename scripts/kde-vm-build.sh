@@ -51,7 +51,13 @@ cd "$REPO/src-tauri"
 BUILD_LOG="/tmp/wallpaperem-build.log"
 # CARGO_BUILD_JOBS=2：VM 只有 2 vCPU，避免并行链接把 3.8 GiB 吃爆
 # 输出同时进日志与 stdout（tail -f 不适合无人值守；用 tee 让宿主后台作业能看到进度）
-CARGO_BUILD_JOBS=2 cargo build $PROFILE_FLAG --locked 2>&1 | tee "$BUILD_LOG"
+#
+# ⚠️ `--features tauri/custom-protocol` 不能省：tauri 的 build.rs 是
+#    `let dev = !custom_protocol;`（tauri-2.11.5/build.rs:256-260），没有这个 feature
+#    编出来的二进制**是开发模式**，主窗口会去连 `devUrl`（localhost:1420）→ 用户看到的
+#    是「Could not connect to localhost: Connection refused」。官方 `tauri build` 会自动
+#    带上它，手工 cargo build 必须自己带（真机踩过：装好的 deb 打开就是连接被拒）。
+CARGO_BUILD_JOBS=2 cargo build $PROFILE_FLAG --locked --features tauri/custom-protocol 2>&1 | tee "$BUILD_LOG"
 RC=${PIPESTATUS[0]}
 if [ "$RC" != "0" ]; then
   echo

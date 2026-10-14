@@ -243,6 +243,21 @@ if [ -d "$RES_ROOT/renderer" ] || [ -d "$RES_ROOT/assets" ]; then
     grep -rq "$cmd" $FRONT_DIRS 2>/dev/null && ok "bundle 里有 invoke(\"$cmd\")" \
       || bad "bundle 里没有 $cmd"
   done
+  # 二进制必须是**生产构建**：tauri 的 build.rs 里 `dev = !custom_protocol`
+  # （tauri-2.11.5/build.rs:256-260），漏了 `--features tauri/custom-protocol` 编出来的
+  # 是开发模式，主窗口会去连 devUrl（localhost:1420）→ 用户看到就是「Could not connect
+  # to localhost: Connection refused」。判据：内嵌资源里必有 assets 目录下的
+  # index-<hash>.js 文件名（生产构建才把它编进二进制）。
+  ASSET_NAME="$(basename "$(ls "$RES_ROOT"/assets/index-*.js 2>/dev/null | head -1)")"
+  if [ -n "$ASSET_NAME" ]; then
+    # 直接让 grep 读文件：`cat huge | grep -q` 在 `set -o pipefail` 下会因为 grep 提前
+    # 命中、cat 收到 SIGPIPE（141）而把整条管道判成失败 —— 断言自己假红（实测踩过）。
+    if grep -qa -- "$ASSET_NAME" "$APP_BIN" 2>/dev/null; then
+      ok "二进制是生产构建（内嵌 $ASSET_NAME）"
+    else
+      bad "二进制里没有内嵌前端资源 —— 像是开发模式构建（主窗口会连 localhost:1420 报「Connection refused」）"
+    fi
+  fi
 else
   info "跳过安装产物自检：$RES_ROOT/renderer 与 assets 都不存在（开发态二进制）"
 fi

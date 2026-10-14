@@ -57,11 +57,11 @@
   + 设置页分组，另配三个同名 MCP 工具（`kde_plugin_status`/`enable`/`disable`）。
   插件包由 `scripts/sync-plasma-plugin.sh` 从独立仓库**单向**同步进
   `packaging/plasma-wallpaper/`，并经 `tauri.conf.json` 的 resources 打进安装包。
-  真机自检 `scripts/kde-plugin-enable-check.sh`（自起 Xvfb+KWin+plasmashell，**37 项断言
-  全过**：33 项行为 + 4 项安装产物）覆盖：从随包资源装包、切换 appletsrc、真出帧、状态可读、
+  真机自检 `scripts/kde-plugin-enable-check.sh`（自起 Xvfb+KWin+plasmashell，**38 项断言
+  全过**：33 项行为 + 5 项安装产物）覆盖：从随包资源装包、切换 appletsrc、真出帧、状态可读、
   卸载恢复原壁纸、备份与设置项无残留，以及「装成 deb 之后」的复验（见上）。
 
-- **真装成 deb 之后的复验（37 项断言）**：新增 `scripts/kde-vm-deb.sh` —— arm64 上没有官方
+- **真装成 deb 之后的复验（38 项断言）**：新增 `scripts/kde-vm-deb.sh` —— arm64 上没有官方
   预编译的 aarch64 tauri-cli，所以按 tauri-bundler 的布局手工组装并安装 deb
   （`usr/bin/<productName>` + `usr/lib/<productName>/{renderer,assets,plasma-wallpaper,libsteam_api.so}`，
   这正是 tauri 2.11.5 在 Linux 非 AppImage 下 `resource_dir()` 的语义），包名/版本与官方一致。
@@ -83,6 +83,16 @@
   交给 Vite 预构建反而更快。
 
 ### 🐛 修复 / Fixed
+
+- **手工构建漏 `--features tauri/custom-protocol` → 装好的 app 主窗口连 `localhost:1420`**：
+  用户在真机装完 deb 打开，主窗口里是 `Could not connect to localhost: Connection refused`
+  （Chromium 错误页）。根因：tauri 2.11.5 的 `build.rs:256-261` 是 `let dev = !custom_protocol;`
+  —— 不带这个 feature 的 `cargo build --release` 编出来**就是开发模式**，主窗口去加载
+  `tauri.conf.json` 的 `build.devUrl`（Vite 开发服务器）。官方 `tauri build` 会自动带上它，
+  所以 CI 产物不受影响，坏的是 `scripts/kde-vm-build.sh` / `scripts/kde-vm-deb.sh` 这条手工路径。
+  修：两处构建命令加 `--features tauri/custom-protocol`；`scripts/kde-plugin-enable-check.sh`
+  补第 38 项断言「二进制里必须内嵌 `assets/index-*.js`」（生产构建才有的痕迹），
+  专堵「能跑 MCP 但交付形态不对」这类假绿。
 
 - **KDE 分支新增的 77 条后端文案补上英文**：`hotkeys` / `kde_plugin` / `kwin` /
   `system_wallpaper` / `frame_export` / `wallpaper::linux` / `wallpaper::platform` 的中文

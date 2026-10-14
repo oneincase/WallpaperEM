@@ -101,7 +101,9 @@ if [ "$DO_BUILD" = "1" ]; then
   export PATH="$HOME/.cargo/bin:$PATH"
   BUILD_LOG=/tmp/wem-deb-build.log
   # CARGO_BUILD_JOBS=2：VM 只有 2 vCPU，避免并行链接把 3.8 GiB 吃爆
-  CARGO_BUILD_JOBS=2 cargo build --release --locked 2>&1 | tee "$BUILD_LOG" | tail -3
+  # --features tauri/custom-protocol：没有它编出来是**开发模式**二进制，主窗口连
+  # devUrl（localhost:1420）→「Connection refused」（tauri-2.11.5/build.rs:256 `dev = !custom_protocol`）
+  CARGO_BUILD_JOBS=2 cargo build --release --locked --features tauri/custom-protocol 2>&1 | tee "$BUILD_LOG" | tail -3
   RC="${PIPESTATUS[0]}"
   [ "$RC" = "0" ] || { tail -30 "$BUILD_LOG"; die "cargo build 失败（rc=$RC）"; }
 fi

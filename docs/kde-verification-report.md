@@ -33,7 +33,7 @@
 | `scripts/linux-kde-smoke.sh` 在真机会话里跑通 | ✅ 5/5 断言 PASS（连跑 2 次一致） | 强（见 §6.1） |
 | P9 插件在真实 plasmashell 里当壁纸 | ✅ 18 项断言全过，图标层逐像素不变 | 强（见 §6.5） |
 | 引擎侧帧导出驱动插件（`frame_export`） | ✅ 端到端 19 项断言全过 | 强（见 §6.6） |
-| 应用内「一键启用 KDE 插件」 | ✅ 后端+打包+前端落地，真机 33 项断言全过 | 强（见 §6.7） |
+| 应用内「一键启用 KDE 插件」 | ✅ 后端+打包+前端落地，真机 38 项断言全过（含装成 deb 复验） | 强（见 §6.7/§6.8） |
 | 设置页按钮的视觉确认（截图） | ⚠️ 本机抓屏恒全黑，未能留图 | 弱（环境限制） |
 | Plasma 6 全部专属机制 | ⛔ 本机不可验 | — |
 
@@ -326,7 +326,7 @@ md5 各不相同、应用日志 `particles live: 79 across 2 systems`）。同�
 复现：`ssh <vm> 'USE_XVFB=1 bash -s' < scripts/kde-frame-export-check.sh`
 （依赖应用已构建；脚本自起 Xvfb + kwin_x11，造一张 web 类型动画壁纸，跑完停壁纸并删条目）。
 
-### 6.7 应用内「一键启用 KDE 插件」（端到端 33 项断言全过）
+### 6.7 应用内「一键启用 KDE 插件」（端到端 33 项行为断言全过）
 
 设置页「通用 → KDE 集成」（仅 Linux 显示）多了「启用 KDE 插件」按钮：点一次就把插件包装进
 plasmashell、用官方脚本接口把桌面壁纸切过去、同时起帧导出；再点「关闭并还原」走反向路径
@@ -360,7 +360,7 @@ plasmashell、用官方脚本接口把桌面壁纸切过去、同时起帧导出
 
 ```bash
 ssh <vm> 'APP_BIN=/home/parallels/WallpaperEM/src-tauri/target/release/WallpaperEM bash -s' \
-  < scripts/kde-plugin-enable-check.sh     # 33 项断言；SECS / XVFB_DISPLAY 可调
+  < scripts/kde-plugin-enable-check.sh     # 38 项断言；SECS / XVFB_DISPLAY 可调
 ```
 
 > 首次跑出 29/33，4 条失败全是脚本自身断言函数的 bug（`jget` 把 Python 的 `True` 当字面量
@@ -369,7 +369,7 @@ ssh <vm> 'APP_BIN=/home/parallels/WallpaperEM/src-tauri/target/release/Wallpaper
 > 重定向了），所以设置页截图在**自建 Xvfb 会话里拿不到**；功能正确性靠上面的断言 + 前端
 > `pnpm typecheck` + i18n 审计，真机 UI 目视确认留给有物理/远程桌面的会话。
 
-### 6.8 装成 deb 之后的复验（33 → 37 项，并抓到一个发布级缺陷）
+### 6.8 装成 deb 之后的复验（33 → 38 项，并抓到两个发布级缺陷）
 
 上一节的 33 项跑的是**开发态二进制**（`src-tauri/target/release/WallpaperEM`）——路径、权限、
 资源布局都和用户机上的真实安装不同。补了 `scripts/kde-vm-deb.sh` 把最新版真装进 VM 再复验。
@@ -414,13 +414,13 @@ denied (os error 13)`），4 项红。为什么开发态测试看不见：那会
   会话干掉（现象：ssh 返回 255、输出半截）。改成按 `/proc/<pid>/exe` 精确匹配真正的二进制。
   残留进程还会污染下一次自检（`appletsrc` 断言假红），所以自检前必须清干净。
 
-**结果**：`APP_BIN=/usr/bin/WallpaperEM bash scripts/kde-plugin-enable-check.sh` → **37/37 PASS**
-（33 项行为断言 + 4 项安装产物自检），且 `kde_plugin_status.package_dir` 实测为
+**结果**：`APP_BIN=/usr/bin/WallpaperEM bash scripts/kde-plugin-enable-check.sh` → **38/38 PASS**
+（33 项行为断言 + 5 项安装产物自检），且 `kde_plugin_status.package_dir` 实测为
 `/usr/lib/WallpaperEM/plasma-wallpaper/…`，即 `resolve_package_dir` 在真实安装下按资源目录找到了包；
 安装后的 `metadata.json`/`main.qml` 对 `nobody` 用户可读；bundle 里确认含「KDE 桌面集成」
 （`assets/index-1dTsR9_F.js`）与三个 `kde_plugin_*` 命令名（`assets/ui-qH7NIsJZ.js`）。
 
-**新增 4 项「安装产物自检」**（合计 37 项）：前端 bundle 必须含「KDE 桌面集成」与
+**新增 5 项「安装产物自检」**（合计 38 项）：前端 bundle 必须含「KDE 桌面集成」与
 `kde_plugin_status`/`kde_plugin_enable`/`kde_plugin_disable` 三个命令名。前两个包在 HTML 外壳的
 同级 `assets/` 目录里（**不是** `renderer/`），第一版断言只扫 `renderer` 导致假红 4 项 —— 这也是
 「断言自己也会错」的例子。它专防「装完 deb 跑的
@@ -437,7 +437,56 @@ denied (os error 13)`），4 项红。为什么开发态测试看不见：那会
   （kwin 合成器重定向）。Xvfb+kwin 下 `import` 更是恒为 263 字节空白 PNG。
 
 结论：Linux 上的 UI 目视确认需要物理/远程桌面会话；本轮以前端 `pnpm typecheck` + i18n 审计 +
-「安装产物里确实有这段界面代码」的断言代替，功能正确性由 37 项端到端断言覆盖。
+「安装产物里确实有这段界面代码」的断言代替，功能正确性由 38 项端到端断言覆盖（§6.9 补上了第 38 项：产物必须是生产构建）。
+
+### 6.9 用户实测抓到：手工构建漏了 `custom-protocol` → 主窗口连 `localhost:1420`（已修）
+
+装完 deb 在真机打开，主窗口里是 Chromium 的错误页 **`Could not connect to localhost:
+Connection refused`**（用户截图，2026-10-14）。查下来不是 UI 代码问题，而是**我给 VM 手工
+构建的这份产物是「开发模式」二进制**：
+
+- `src-tauri/tauri.conf.json` 的 `build.devUrl` 是 `http://localhost:1420`（Vite 开发服务器）；
+- tauri 2.11.5 的 `build.rs:256-261`：`let dev = !custom_protocol;` 然后 `cargo:dev={dev}`；
+  tauri-build 2.6.3 的 `is_dev()`（`src/lib.rs:425-429`）读 `DEP_TAURI_DEV`；
+- 于是**不带 `--features tauri/custom-protocol` 的 `cargo build --release` 编出来就是开发模式**，
+  主窗口去连 `localhost:1420` → 连接被拒。官方 `tauri build` 会自动带上这个 feature，所以
+  **CI 出的官方 deb 不受影响**，受影响的只有 `scripts/kde-vm-deb.sh` 这条手工路径。
+
+**证据（二进制层面，不依赖像素）**：
+
+| 探针 | 开发模式（坏） | 生产构建（好） |
+| --- | --- | --- |
+| `grep -c 'localhost:1420' <exe>` | `1`（devUrl 被用上） | 也会有 1 条（配置总是内嵌） |
+| `grep -c 'index-*.js' <exe>`（`assets/` 里的哈希文件名） | `0` | `≥1`（前端资源被编进二进制） |
+
+实测坏产物：`/usr/bin/WallpaperEM` 与 `target/release/WallpaperEM` 均为
+`localhost:1420 → 1`、`index-1dTsR9_F.js → 0`。
+
+**为什么 37 项断言没抓住**：那 4 项安装产物断言读的是**资源目录里的文件**，没有看**二进制
+本身**；而窗口加载失败并不影响 MCP 工具与帧导出，所以 33 项行为断言照样全绿。这正是「断言
+覆盖不到的地方就是假绿」。
+
+**修法**（三处一起堵）：
+
+1. `scripts/kde-vm-build.sh`、`scripts/kde-vm-deb.sh` 的构建命令加
+   `--features tauri/custom-protocol`（注释里写明依据的 tauri 源码行号）；
+2. `scripts/kde-plugin-enable-check.sh` 新增第 **38** 项断言：**二进制里必须内嵌
+   `assets/index-*.js`**（生产构建才有的痕迹），否则直接红并给出「这是开发模式构建」的提示；
+3. 文档与 CHANGELOG 记下这条坑（本条）。
+
+**教训**：手工复刻官方构建路径时，**编译期 feature 也是路径的一部分** —— 能跑通 MCP 自检
+不等于交付形态正确；凡是「打包/安装」相关的验证，断言要落到**产物本身**（二进制/包内容），
+而不是只看旁边放着的文件。
+
+**这条新断言自己也假红过一次**（值得记）：第一版写成 `cat "$APP_BIN" | grep -qa "$ASSET_NAME"`，
+而脚本开头是 `set -uo pipefail` —— grep 一命中就提前退出，`cat` 收 SIGPIPE 以 141 结束，
+pipefail 把整条管道判成失败，于是「生产构建」明明成立却报红。改成让 grep 直接读文件
+（`grep -qa -- "$ASSET_NAME" "$APP_BIN"`）即可。
+
+**复验结果**：修好构建与断言后重新打包装机 →
+`APP_BIN=/usr/bin/WallpaperEM bash scripts/kde-plugin-enable-check.sh` →
+**38 项通过 / 0 项失败**，其中第 38 项输出「二进制是生产构建（内嵌 `index-CQlQn0nT.js`）」；
+二进制 47.8 MB → **49.5 MB**（多出的约 1.1 MB 就是内嵌的前端资源）。
 
 ## 7. 对方案的影响（已回填 [kde-adaptation-plan.md](kde-adaptation-plan.md) §2.5）
 
@@ -451,7 +500,7 @@ denied (os error 13)`），4 项红。为什么开发态测试看不见：那会
 ## 8. 仍未验证 / 无法验证
 
 - **Plasma 6 全部专属项**：layer-shell `Background` 层（本机 5.27 实测有 `zwlr_layer_shell_v1` **v3**，但 v5 与「Background 层里排到 plasmashell 桌面视图之下」仍未证）、`ext_background_effect_manager_v1`（5.27 实测未广告，符合预期）、portal `Wallpaper`(6.5)、Plasma 6 托盘 SNI、每虚拟桌面独立壁纸。需 Ubuntu 25.04 / Fedora KDE / openSUSE 的 arm64 或 amd64 机器。
-- **装成 deb 之后的复验**：✅ 已由 §6.8 补上（真装 `wallpaper-em_2.2.0_arm64.deb`，`/usr/bin/WallpaperEM` 跑 37 项断言全过，并因此修掉一个发布级权限缺陷）。仍未用**真实安装包**验证的只剩：设置页按钮的目视确认（见下条）、以及 AppImage/官方打包器（本机 arm64 无 aarch64 预编译 tauri-cli）。
+- **装成 deb 之后的复验**：✅ 已由 §6.8 补上（真装 `wallpaper-em_2.2.0_arm64.deb`，`/usr/bin/WallpaperEM` 跑 38 项断言全过，并因此修掉两个发布级缺陷（打包权限 0600、手工构建漏 `custom-protocol`））。仍未用**真实安装包**验证的只剩：设置页按钮的目视确认（见下条）、以及 AppImage/官方打包器（本机 arm64 无 aarch64 预编译 tauri-cli）。
 - **P9 插件在真 plasmashell 里选为壁纸**：✅ 已由 §6.5 补上（真实会话 `:0`，18 项断言全过，图标层逐像素不变）。仍未量化的只有**长期帧率/合成开销**与**插件异常对 plasmashell 的影响面**（需真实使用观察），以及多屏按实例分帧、Plasma 6 实测。**应用内一键启用**已由 §6.7 补上（33 项断言，走的就是按钮那条产品路径）；剩下没做到的只是**设置页按钮的目视确认**——本机 Xvfb/KWin 下抓屏恒为全黑（合成器把窗口内容重定向了），`import`/`xwd` 都拿不到画面。
 - **引擎侧帧传输**：DMA-BUF/socket 那条路一行代码都还没有；`zwp_linux_dmabuf_v1` v4 只是证明协议可用。
 - **KWin 5 的 `Layer` 窗口规则是否可用**：需在能弹确认框的交互会话里跑 `qdbus org.kde.KWin /Scripting …`，或直接写 `~/.config/kwinrulesrc` 后 `reconfigure` 再观察。
@@ -473,7 +522,7 @@ denied (os error 13)`），4 项红。为什么开发态测试看不见：那会
 | `scripts/linux-kde-smoke.sh` | 有断言的 KDE/X11 冒烟：真机走真实用户总线、CI 无用户会话时自动退回 `dbus-run-session`；已在 VM 上 5/5 通过（见 §6.1） |
 | `scripts/kde-wayland-globals.sh` | KWin 的 Wayland 全局清单探测（自起嵌套 `kwin_wayland --virtual` 或 attach 现有会话）；§6.2 的全部数据来自它 |
 | `scripts/kde-plugin-check.sh` | P9 插件包验证：结构 → `kpackagetool5` 安装注册 → `qmlscene` 渲染取样 → 卸载（12 项，见 §6.3） |
-| `scripts/kde-plugin-enable-check.sh` | **应用内「一键启用」端到端自检**：自起 Xvfb+KWin+plasmashell（MCP 驱动，走按钮同一条产品路径），断言覆盖装包 / 切换 appletsrc / 真出帧 / 状态 / 恢复 / 清理（33 项）+ 安装产物自检（4 项，§6.8） |
+| `scripts/kde-plugin-enable-check.sh` | **应用内「一键启用」端到端自检**：自起 Xvfb+KWin+plasmashell（MCP 驱动，走按钮同一条产品路径），断言覆盖装包 / 切换 appletsrc / 真出帧 / 状态 / 恢复 / 清理（33 项）+ 安装产物自检（5 项，§6.8/§6.9） |
 | `scripts/sync-plasma-plugin.sh` | 把独立仓 `../WallpaperEM-Plasma` 的插件包**单向**同步进 `packaging/plasma-wallpaper/`（真源在插件仓，本仓那份是打包副本，别在本仓直接改） |
 | `src-tauri/src/kde_plugin.rs` | 「一键启用」后端：状态探测、装包、切 appletsrc、回滚、设置项持久化（3 个 Tauri 命令 + 3 个同名 MCP 工具） |
 | `src/api/kde.ts` + 设置页「KDE 集成」分组 | 前端按钮与状态展示（仅 Linux 渲染），文案在 `src/locales/en-US.ts` |
