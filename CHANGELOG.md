@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [v2.3.0] - 2026-10-14
+
 ### 🚀 新增 / Added
 
 - **KDE Plasma 桌面适配**：Linux 下新增 KDE 会话探测与能力路由（`src-tauri/src/kde.rs`，
