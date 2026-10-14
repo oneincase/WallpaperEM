@@ -68,7 +68,8 @@ info "kwin_x11: $(command -v kwin_x11) ($(kwin_x11 --version 2>&1 | head -1))"
 WORK="$(mktemp -d /tmp/kde-smoke.XXXXXX)"
 cleanup() {
   [ -n "${APP_PID:-}" ] && kill "$APP_PID" 2>/dev/null
-  [ -n "${PLASMA_PID:-}" ] && kill "$PLASMA_PID" 2>/dev/null
+  # 只收自己起的 plasmashell；复用的（外层会话的）留给外层
+  [ "${PLASMA_OWNED:-0}" = "1" ] && [ -n "${PLASMA_PID:-}" ] && kill "$PLASMA_PID" 2>/dev/null
   [ -n "${KWIN_PID:-}" ] && kill "$KWIN_PID" 2>/dev/null
   sleep 1
   [ -n "${APP_PID:-}" ] && kill -9 "$APP_PID" 2>/dev/null
@@ -122,15 +123,27 @@ echo "  [info] WM = $WM_NAME"
 WIN_COUNT_0="$(xdotool search --onlyvisible --name '.' 2>/dev/null | wc -l)"
 
 # 2) 可选：启动 plasmashell（提供真实的 KDE 桌面窗口，测「壁纸 vs plasmashell 桌面窗口」堆叠）
+#
+# 已经在跑就复用：外层 `kde-vm-session.sh smoke` 会先起一个 plasmashell，再进来的
+# 第二个实例会因为拿不到 shell 而立刻退出 —— 那是「重复启动」而不是平台故障，
+# 所以先探测存活实例，只有「既没复用、自己起的又死了」才算失败。
 PLASMA_PID=""
 if [ "$WITH_PLASMA" = "1" ]; then
-  plasmashell --no-respawn > "$WORK/plasmashell.log" 2>&1 &
-  PLASMA_PID=$!
-  sleep 6
-  if ! kill -0 "$PLASMA_PID" 2>/dev/null; then
-    fail "plasmashell 启动即退出（看 $WORK/plasmashell.log）"
+  EXISTING_PLASMA="$(pgrep -x plasmashell | head -1)"
+  if [ -n "$EXISTING_PLASMA" ]; then
+    PLASMA_PID="$EXISTING_PLASMA"
+    echo "  [info] 复用已在运行的 plasmashell (pid $PLASMA_PID)"
   else
-    echo "  [info] plasmashell 已起 (pid $PLASMA_PID)"
+    plasmashell --no-respawn > "$WORK/plasmashell.log" 2>&1 &
+    PLASMA_PID=$!
+    PLASMA_OWNED=1
+    sleep 6
+    if ! kill -0 "$PLASMA_PID" 2>/dev/null; then
+      fail "plasmashell 启动即退出（看 $WORK/plasmashell.log）"
+      PLASMA_PID=""
+    else
+      echo "  [info] plasmashell 已起 (pid $PLASMA_PID)"
+    fi
   fi
 fi
 

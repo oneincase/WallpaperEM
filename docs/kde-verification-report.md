@@ -188,7 +188,7 @@ cd ~/WallpaperEM && SMOKE_WITH_PLASMA=1 bash scripts/linux-kde-smoke.sh
 
 ### 6.3 P9 插件包的显示端验证（`scripts/kde-plugin-check.sh`）
 
-`packaging/plasma-wallpaper/io.github.oneincase.wallpaperem` —— **11 项断言全过**：
+`packaging/plasma-wallpaper/io.github.oneincase.wallpaperem` —— **12 项断言全过**：
 
 | 断言 | 结果 |
 | --- | --- |
@@ -202,6 +202,40 @@ cd ~/WallpaperEM && SMOKE_WITH_PLASMA=1 bash scripts/linux-kde-smoke.sh
 过程中修掉的**真 bug**（记下来是因为它只在真 Qt 上才炸）：`main.qml` 的独立运行桩最初写成 `property string FramePath`，Qt 报 `Property names cannot begin with an upper case letter` —— QML 自定义属性不能首字母大写，配置键 `FramePath` 的大小写只存在于 Plasma 注入的 QObject 上，因此桩用小写、读取时显式映射。
 
 **仍只是「显示端」**：真 plasmashell 里选为壁纸、引擎侧帧传输（DMA-BUF/socket）、多屏按实例分帧都未做（见 §8）。
+
+### 6.4 前台窗口分类的数据源（`frontmost_kind`，X11）
+
+本轮把 `wallpaper/linux.rs::frontmost_kind` 从「恒 `Unknown`」补成 X11 读 EWMH
+`_NET_ACTIVE_WINDOW`（再看该窗口的 `_NET_WM_PID` 与 `_NET_WM_WINDOW_TYPE`）。
+真机（Xvfb + `kwin_x11 --replace` + `plasmashell --no-respawn`）取证：
+
+```
+--- WM ---
+_NET_SUPPORTING_WM_CHECK(WINDOW): window id # 0x20000b
+--- ACTIVE (root) ---
+_NET_ACTIVE_WINDOW(WINDOW): window id # 0x400011
+--- ACTIVE pid/type ---
+_NET_WM_PID(CARDINAL) = 62739
+_NET_WM_WINDOW_TYPE(ATOM) = _NET_WM_WINDOW_TYPE_DESKTOP
+WM_CLASS(STRING) = "plasmashell", "plasmashell"
+--- stacking types ---
+0x400011 pid=62739 type=_NET_WM_WINDOW_TYPE_DESKTOP
+0x400027 pid=62739 type=_NET_WM_WINDOW_TYPE_DOCK, _KDE_NET_WM_WINDOW_TYPE_OVERRIDE, _NET_WM_WINDOW_TYPE_NORMAL
+```
+
+即：数据源存在、字段可读，分类结果为 `Desktop`（`_NET_WM_WINDOW_TYPE_DESKTOP` 命中）
+→ 自动暂停决策表给出 `Play`（壁纸露着就该播）——从「恒 `Unknown`/`Keep`」变成
+有依据的判定。分类逻辑本身是纯函数（`classify_frontmost`），5 个单测在
+Linux 目标上通过；`cargo test --lib frontmost` 在 VM 上
+`5 passed; 0 failed; 364 filtered out`。
+
+注意两点边界：**Wayland 会话仍恒 `Unknown`**（协议无「当前活动窗口」全局概念，
+KWin 的 D-Bus 在 5.27 上也不提供，只有需注入脚本的 `workspace.activeClient`）；
+`pid` 读不到时判 `Other`（宁可少播也不漏暂停）。
+
+另外确认了一个「面板也带 NORMAL」的边角：KWin 面板窗的 `_NET_WM_WINDOW_TYPE`
+同时含 `DOCK` 与 `NORMAL`，判定取「含 `DOCK` 即 `Desktop`」是正确的（面板在前台
+说明壁纸基本露着）。
 
 ## 7. 对方案的影响（已回填 [kde-adaptation-plan.md](kde-adaptation-plan.md) §2.5）
 
@@ -235,7 +269,7 @@ cd ~/WallpaperEM && SMOKE_WITH_PLASMA=1 bash scripts/linux-kde-smoke.sh
 | `scripts/kde-probes.sh` | 机制探针（`PROBE 名 = 值`），不需要应用二进制 |
 | `scripts/linux-kde-smoke.sh` | 有断言的 KDE/X11 冒烟：真机走真实用户总线、CI 无用户会话时自动退回 `dbus-run-session`；已在 VM 上 5/5 通过（见 §6.1） |
 | `scripts/kde-wayland-globals.sh` | KWin 的 Wayland 全局清单探测（自起嵌套 `kwin_wayland --virtual` 或 attach 现有会话）；§6.2 的全部数据来自它 |
-| `scripts/kde-plugin-check.sh` | P9 插件包验证：结构 → `kpackagetool5` 安装注册 → `qmlscene` 渲染取样 → 卸载（11 项，见 §6.3） |
+| `scripts/kde-plugin-check.sh` | P9 插件包验证：结构 → `kpackagetool5` 安装注册 → `qmlscene` 渲染取样 → 卸载（12 项，见 §6.3） |
 | `packaging/plasma-wallpaper/io.github.oneincase.wallpaperem/` | P9 的 Plasma 壁纸插件（`metadata.json` + KConfigXT + `main.qml`/`config.qml` + 引擎契约 README） |
 | `docs/kde-smoke-setup.md` | 装配说明与覆盖率对照 |
 | `docs/kde-adaptation-plan.md` | 适配方案（§2.5 已回填本轮实测） |

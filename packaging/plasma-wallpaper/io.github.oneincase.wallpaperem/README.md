@@ -20,7 +20,7 @@
 | 引擎侧帧传输（DMA-BUF / socket） | ⬜ 未实现（`zwp_linux_dmabuf_v1` 在 5.27 上实测 v4 可用） |
 | 每虚拟桌面独立壁纸 | ⬜ 不可行（plasmashell 本身不支持，KDE bug 341143） |
 
-复现：`bash scripts/kde-plugin-check.sh`（11 项断言，自带 Xvfb + qmlscene，跑完自动卸载）。
+复现：`bash scripts/kde-plugin-check.sh`（12 项断言，自带 Xvfb + qmlscene，跑完自动卸载）。
 
 ## 引擎 ↔ 插件契约
 

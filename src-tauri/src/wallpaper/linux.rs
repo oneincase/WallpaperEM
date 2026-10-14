@@ -16,10 +16,12 @@
 //!   沉底会让壁纸整个不可见，这些 DE 保持「壁纸在上」的降级行为。
 //! - **「隐藏图标」开关**：macOS 上是窗口层级的两档切换；Linux 无法统一压在
 //!   图标之上，这里只切换鼠标事件穿透。
-//! - **前台应用观察者 / 自动暂停**：Linux 各 DE 没有统一的前台应用通知机制
-//!   （X11 可读 _NET_ACTIVE_WINDOW，Wayland 各家私有协议），前台观察为空实现；
-//!   但自动暂停的判据已改为**遮挡快照**（[`occlusion_snapshot`]，X11 会话有效），
-//!   Wayland 会话无法枚举全局窗口清单，开关不生效（详见该函数说明）。
+//! - **前台应用观察者 / 自动暂停**：X11 下经 [`frontmost_kind`] 读 EWMH
+//!   `_NET_ACTIVE_WINDOW` 分类（桌面/面板 → 播放，自己 → 播放，别的应用 → 暂停）；
+//!   Wayland 没有「当前活动窗口」的全局概念，恒 `Unknown`（判定表恒 Keep，
+//!   不改变播放状态）。自动暂停的另一判据是**遮挡快照**
+//!   （[`occlusion_snapshot`]，X11 会话有效），Wayland 会话无法枚举全局窗口清单，
+//!   开关同样不生效（详见该函数说明）。
 //! - **显示器睡眠**：无统一查询接口（logind/DPMS 各管一段），恒返回 false，
 //!   即不做「合盖暂停/释放壁纸」的自动处理。
 
@@ -442,9 +444,155 @@ pub fn occlusion_snapshot() -> Option<super::auto_pause::OcclusionSnapshot> {
     Some(OcclusionSnapshot { coverages })
 }
 
-/// 前台应用类型（Linux）：无统一实现，恒 Unknown。
+/// 前台窗口分类的纯逻辑：把「已解析出来的 X11 属性」映射成 [`FrontKind`]。
+///
+/// 判定顺序刻意与 macOS 后端一致（Finder → 桌面；自己 → SelfApp）：
+/// 1. 拿不到 `_NET_ACTIVE_WINDOW` → `Unknown`（判定表恒 `Keep`，不改变播放状态）；
+/// 2. 前台窗口是桌面（`_NET_WM_WINDOW_TYPE_DESKTOP`）或面板/程序坞
+///    （`_NET_WM_WINDOW_TYPE_DOCK`）→ `Desktop`（壁纸露着，应播放）；
+/// 3. 前台窗口属于本进程 → `SelfApp`（设置窗/壁纸窗在最前，不应因「被盖住」而暂停）；
+/// 4. 其余 → `Other`（真应用在前台，按「看不见就暂停」处理）。
+///
+/// `active_pid` 取不到时归 `Other` 而不是 `SelfApp`：宁可少播也不要漏暂停。
+fn classify_frontmost(
+    has_active: bool,
+    active_pid: Option<u32>,
+    our_pid: u32,
+    is_desktop: bool,
+    is_dock: bool,
+) -> super::auto_pause::FrontKind {
+    use super::auto_pause::FrontKind;
+    if !has_active {
+        return FrontKind::Unknown;
+    }
+    if is_desktop || is_dock {
+        return FrontKind::Desktop;
+    }
+    match active_pid {
+        Some(pid) if pid == our_pid => FrontKind::SelfApp,
+        _ => FrontKind::Other,
+    }
+}
+
+/// 前台应用类型（Linux/X11）：读 EWMH 的 `_NET_ACTIVE_WINDOW`，再看该窗口的
+/// `_NET_WM_PID` 与 `_NET_WM_WINDOW_TYPE`。分类逻辑见 [`classify_frontmost`]。
+///
+/// **Wayland 会话返回 `Unknown`**：协议没有「当前活动窗口」的全局概念
+/// （KWin 的 `org.kde.KWin` D-Bus 在 5.27 上也不提供查询，KWin 脚本 API 才有
+/// `workspace.activeClient`，但它要求注入脚本、且不是稳定接口）。显式
+/// `GDK_BACKEND=x11`（XWayland 会话）不受此限。失败一律回 `Unknown`，
+/// 不抛错、不阻塞。
 pub fn frontmost_kind(_app: &tauri::AppHandle) -> super::auto_pause::FrontKind {
-    super::auto_pause::FrontKind::Unknown
+    use super::auto_pause::FrontKind;
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
+
+    let force_x11 = std::env::var("GDK_BACKEND").is_ok_and(|b| b == "x11");
+    if !force_x11 && std::env::var("WAYLAND_DISPLAY").is_ok() {
+        return FrontKind::Unknown;
+    }
+    let Some((conn, screen_num)) = x11rb::connect(None).ok() else {
+        return FrontKind::Unknown;
+    };
+    let root = conn.setup().roots[screen_num].root;
+    let intern = |name: &[u8]| -> Option<u32> {
+        Some(conn.intern_atom(false, name).ok()?.reply().ok()?.atom)
+    };
+    let Some(active_atom) = intern(b"_NET_ACTIVE_WINDOW") else {
+        return FrontKind::Unknown;
+    };
+    let prop = |window, atom, kind: AtomEnum, len: u32| -> Option<Vec<u32>> {
+        Some(
+            conn.get_property(false, window, atom, kind, 0, len)
+                .ok()?
+                .reply()
+                .ok()?
+                .value32()?
+                .collect(),
+        )
+    };
+    // 活动窗口 id（WM 会把它写成 0 表示「无前台」）
+    let active = prop(root, active_atom, AtomEnum::WINDOW, 1)
+        .and_then(|v| v.first().copied())
+        .filter(|w| *w != 0);
+    let Some(active) = active else {
+        return FrontKind::Unknown;
+    };
+    let active_pid = intern(b"_NET_WM_PID")
+        .and_then(|atom| prop(active, atom, AtomEnum::CARDINAL, 1))
+        .and_then(|v| v.first().copied());
+    let is_desktop = intern(b"_NET_WM_WINDOW_TYPE_DESKTOP")
+        .zip(intern(b"_NET_WM_WINDOW_TYPE"))
+        .and_then(|(desktop, kind)| {
+            prop(active, kind, AtomEnum::ATOM, 8).map(|types| types.contains(&desktop))
+        })
+        .unwrap_or(false);
+    let is_dock = intern(b"_NET_WM_WINDOW_TYPE_DOCK")
+        .zip(intern(b"_NET_WM_WINDOW_TYPE"))
+        .and_then(|(dock, kind)| {
+            prop(active, kind, AtomEnum::ATOM, 8).map(|types| types.contains(&dock))
+        })
+        .unwrap_or(false);
+    classify_frontmost(true, active_pid, std::process::id(), is_desktop, is_dock)
+}
+
+#[cfg(test)]
+mod frontmost_tests {
+    use super::classify_frontmost;
+    use super::super::auto_pause::FrontKind;
+
+    const OURS: u32 = 4242;
+
+    #[test]
+    fn no_active_window_is_unknown() {
+        assert_eq!(
+            classify_frontmost(false, None, OURS, false, false),
+            FrontKind::Unknown
+        );
+    }
+
+    #[test]
+    fn desktop_and_dock_are_desktop() {
+        assert_eq!(
+            classify_frontmost(true, None, OURS, true, false),
+            FrontKind::Desktop
+        );
+        assert_eq!(
+            classify_frontmost(true, Some(1), OURS, false, true),
+            FrontKind::Desktop
+        );
+    }
+
+    #[test]
+    fn desktop_type_wins_over_our_pid() {
+        // plasmashell 的桌面视图就属于「我们之外」的进程；即便 pid 巧合相同，
+        // 桌面窗口的语义优先（它一在前台就说明壁纸露着）。
+        assert_eq!(
+            classify_frontmost(true, Some(OURS), OURS, true, false),
+            FrontKind::Desktop
+        );
+    }
+
+    #[test]
+    fn our_own_active_window_is_self_app() {
+        assert_eq!(
+            classify_frontmost(true, Some(OURS), OURS, false, false),
+            FrontKind::SelfApp
+        );
+    }
+
+    #[test]
+    fn foreign_window_is_other() {
+        assert_eq!(
+            classify_frontmost(true, Some(1), OURS, false, false),
+            FrontKind::Other
+        );
+        // pid 读不到时宁可判 Other（少播不漏暂停）
+        assert_eq!(
+            classify_frontmost(true, None, OURS, false, false),
+            FrontKind::Other
+        );
+    }
 }
 
 /// 读系统光标位置（逻辑坐标，左上原点）与左键状态。

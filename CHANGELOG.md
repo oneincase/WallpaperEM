@@ -27,6 +27,12 @@
   `NotSupported`，此时按「未睡眠」处理而不是报错）。
 - **快捷键在 KDE Wayland 下不再静默失败**：改为标记「由桌面接管」（`HotkeyStatus`），
   X11 仍走原有 XGrabKey；单条注册失败不再中断整批。
+- **自动暂停的「前台应用」判据在 X11 上从恒 Unknown 变为真实分类**：
+  `frontmost_kind()` 现在读 EWMH `_NET_ACTIVE_WINDOW`，再按该窗口的
+  `_NET_WM_PID` 与 `_NET_WM_WINDOW_TYPE` 分成「桌面/面板 = 播放、自己 = 播放、
+  别的应用 = 暂停」（KDE/X11 真机实测：活动窗口是 plasmashell 的 DESKTOP 窗，
+  分类为桌面 → 播放）。此前该判据恒 `Unknown`（判定表恒 `Keep`，等于不生效）。
+  Wayland 会话仍恒 `Unknown`：协议没有「当前活动窗口」的全局概念。
 
 - **`webwallgl` 改走 npm 依赖（3.0.0）**：渲染库此前是 `file:../webwallgl-github/dist/lib`，
   必须把库仓库克隆到本仓平级并先 `pnpm run build:lib`，否则 `pnpm install` 解析不到。

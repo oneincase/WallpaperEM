@@ -56,7 +56,7 @@
 - **陈旧记账兜底已存在**：`wallpaper/mod.rs:1720-1730` 在建窗时清掉同 label 的 underlay 记账（插件按 label 记账、窗口销毁不清理，见插件 `tauri-plugin-desktop-underlay-0.2.1/src/core/mod.rs:73-80 is_desktop_underlay()` / `:82-87 set_desktop_underlay()`）；应用点在 `wallpaper/mod.rs:1732`（建窗后）与 `:1741`（`show()` 后幂等重放），多屏循环在 `:2487`、`:3964`。
 - **Wayland 下 `_NET_WM_WINDOW_TYPE_DESKTOP` 无效**：`wallpaper/linux.rs:7-16` 模块头已承认，Wayland 下退化为「置底 + 全工作区的普通无边框窗口」。⚠️ 并且要纠正一个常见误判：`set_visible_on_all_workspaces` / `set_skip_taskbar`（`wallpaper/linux.rs:223-224`）**只经 GTK 调用，仓库里没有任何显式的 X11 原子写入**——它们在 X11 与 Wayland 下的落地语义**都未经实测**（`P1` 必须两档都测），不能假定 X11 侧可靠。
 - **遮挡快照在 Wayland 恒失效**：`wallpaper/linux.rs:335-343` → :340 `force_x11 = GDK_BACKEND == "x11"`，:341-343 只要 `WAYLAND_DISPLAY` 存在就 `return None`。理由（:331-334）是 Wayland 无全局窗口清单、Xwayland 清单残缺会误判。数据源实现 `:345-431`（`_NET_CLIENT_LIST_STACKING` :352、过滤自身 PID :382、DESKTOP/DOCK :392、VIEWABLE :400、`covered_ratio` 按 `active_screens()` 还原像素 :419-431）。
-- **其余 Linux 平台接口为空实现**：`frontmost_kind()` 恒 `Unknown`（`wallpaper/linux.rs:435-437`）、`display_asleep()` 恒 `false`（`:195`）、`on_ac_power()` 恒 `None`（`:55`）、`start_auto_pause_observer()` 空（`:315-317`）、`start_desktop_click_monitor()` 空（`:320`）。**这些正是 KDE 下用 KWin/D-Bus 可以补齐的部分**（见 §4.4）。
+- **其余 Linux 平台接口**：`occlusion_snapshot()` 在 X11 会话有真实实现（上一条 `:345-431`），**Wayland 会话恒 `None`**；`frontmost_kind()` 本轮补齐 X11 路径（EWMH `_NET_ACTIVE_WINDOW`，见 §5 `P5`），Wayland 会话恒 `Unknown`；`display_asleep()` 本轮接入 KWin 空闲（`:194-205` → `kwin::idle_seconds`）；仍为空实现的只有 `on_ac_power()` 恒 `None`（`:55`）、`start_auto_pause_observer()`（`:315-317`）、`start_desktop_click_monitor()`（`:320`）。**这些正是 KDE 下用 KWin/D-Bus 可以补齐的部分**（见 §4.4）。
 
 ### 2.2 KDE 特有集成点
 
@@ -223,7 +223,7 @@ pub fn detect() -> KdeEnv;           // 纯函数入口，输入是 env 快照�
 | `wallpaper/linux.rs:335-343 occlusion_snapshot()`（Wayland 恒 None） | `org.kde.KWin` 的窗口信息接口（`queryWindowInfo`/`getWindowInfo`），或 `org.kde.KWin.VirtualDesktopManager` + 活动窗口几何；退路 `kscreen-doctor` + 自有窗口枚举 | **KDE Wayland 下自动暂停复活**（当前完全失效） |
 | `wallpaper/linux.rs:195 display_asleep()` 恒 false | `ext-idle-notify-v1`（KWin 已实现，可订阅 `idled`/`resumed`）或 logind `IdleHint` | 「熄屏暂停壁纸」在 KDE 成立 |
 | `wallpaper/linux.rs:149-193 query_monitors()`（GDK 枚举） | `kscreen-doctor json`（**其与 `~/.config/kwinoutputconfig.json` 的等价性未查证**）；`org.kde.KScreen` 的 KDED 模块作补充——**Plasma 5 起一直有，6.8 起移除** | 每屏几何/缩放/主屏判定权威化，热插拔更准 |
-| `wallpaper/linux.rs:435-437 frontmost_kind()` 恒 Unknown | KWin 活动窗口的 `resourceClass` | 自动暂停「前台是全屏视频/游戏」判据更细 |
+| `frontmost_kind()` 的 Wayland 分支恒 `Unknown`（X11 已在 `P5` 补齐：读 `_NET_ACTIVE_WINDOW` 的 pid/type 分类） | KWin 脚本 API 的 `workspace.activeClient`（需注入脚本，非稳定接口） | 自动暂停「前台是全屏视频/游戏」判据更细 |
 
 统一原则：**D-Bus 调用全部异步 + 超时（≤300ms）+ 失败降级到现状**，绝不因为 D-Bus 不在而阻塞壁纸主循环。
 
@@ -280,11 +280,11 @@ pub fn detect() -> KdeEnv;           // 纯函数入口，输入是 env 快照�
 | `P2` | 🟡 部分落地 | `src-tauri/src/kwin.rs` 规则文件层（合并/幂等/回滚/校验，13 单测）+ `org.kde.KWin reconfigure`。真机实测：KWin **5** 下规则键可写入但不影响层序（`layerrule` 长期 unused）⇒ 该部分价值在 **Plasma 6/Wayland**，不要再当 X11 的图标解药 |
 | `P3` | ✅ 真机通过（Plasma 5.27/X11） | `scripts/linux-kde-smoke.sh`（真实总线 + `kwin_x11` + `plasmashell` + 5 条断言）在 VM 上 **5/5 PASS，连跑两次一致**，并自动复现「两个 desktop 窗口共存、我们在 plasmashell 桌面视图之上」；另产出 `scripts/kde-vm-session.sh`（`probes`/`smoke`/`shell`/`realbuscase`/`belowtest`/`ruleinstall`/`p1b`–`p1e`）、`scripts/kde-kwin-layer.sh`、CI `kde-smoke` job。CI 侧仍待真实 Actions 跑一次 |
 | `P4` | 🟡 本轮更新 | 本文 §2.5/§4.1/§5 已回填真机结论；`README.md` 增加 KDE 小节（图标取舍 + 冒烟命令）；`CHANGELOG.md` Unreleased 记录用户可见变化；快捷键页显示后端注册状态与 KDE 接管提示 |
-| `P5` | 🟡 部分落地 | `kwin.rs` 的 KScreen 每屏解析、`idle_seconds`（D-Bus + 2 秒缓存）、`reconfigure`；`wallpaper/linux.rs::display_asleep` 已接入。`occlusion_snapshot`/`frontmost_kind` 仍为空实现（X11 侧用 `x11rb` 已可用，Wayland 侧无解） |
+| `P5` | 🟡 大部分落地 | `kwin.rs`：KScreen 每屏解析、`idle_seconds`（D-Bus + 2 秒缓存）、`reconfigure`；`wallpaper/linux.rs`：`display_asleep` 接入 KWin 空闲、`frontmost_kind` 补齐 X11（EWMH `_NET_ACTIVE_WINDOW` → 桌面/面板 = 播放、自己 = 播放、别的应用 = 暂停，5 个单测；真机实测 KWin 下活动窗口就是 plasmashell 的 DESKTOP 窗，分类为 `Desktop` → 决策 `Play`，见报告 §6.4）。Wayland 侧两项均无解（无全局活动窗口/窗口清单） |
 | `P6` | ✅ 已合入（commit `27d4ccf`） | KDE 静态壁纸三级回退（portal → `plasma-apply-wallpaperimage` → `qdbus evaluateScript`），9 个单测；非 KDE 分支逐字未动 |
 | `P7` | 🟡 已落地（Wayland 侧未实测） | 快捷键：KDE Wayland 标记「由桌面接管」+ `HotkeyStatus` 可观测（10 单测），前端已显示状态与接管说明；托盘：Linux 改用彩色 `icons/32x32.png` + 自启补键（12 单测，`unwrap` 仅存在于 `cfg(test)`）；模糊：`ext_background_effect_manager_v1` 优先 + `org_kde_kwin_blur` 回退，X11 原子路径 sha256 逐字不变。三项都缺 Plasma 6.7+ 真机验证 |
 | `P8` | 🟡 已交付待复核 | `deb.depends` 补 `libayatana-appindicator3-1`；`recommends` 收窄为 `gstreamer1.0-pipewire`/`ffmpeg`/`kscreen`/`pulseaudio-utils \| pipewire-bin`；`Dockerfile.linux`/entrypoint `SMOKE_MODE`；CI `kde-smoke` |
-| `P9` | 🟡 骨架 + 显示端已真机验证 | 本轮结论把它从「演进彩蛋」升级为**唯一全满足解**。已产出可安装的 KPackage（`packaging/plasma-wallpaper/io.github.oneincase.wallpaperem/`）：`kpackagetool5` 安装/注册/卸载 + QML 显示引擎帧 + 缺帧兜底，11 项断言全过（报告 §6.3）；`zwp_linux_dmabuf_v1` 在本机实测 v4，零拷贝帧传输在协议层可行（§6.2）。**未做**：引擎侧帧传输、真 plasmashell 里选为壁纸、多屏按实例分帧 |
+| `P9` | 🟡 骨架 + 显示端已真机验证 | 本轮结论把它从「演进彩蛋」升级为**唯一全满足解**。已产出可安装的 KPackage（`packaging/plasma-wallpaper/io.github.oneincase.wallpaperem/`）：`kpackagetool5` 安装/注册/卸载 + QML 显示引擎帧 + 缺帧兜底，12 项断言全过（报告 §6.3）；`zwp_linux_dmabuf_v1` 在本机实测 v4，零拷贝帧传输在协议层可行（§6.2）。**未做**：引擎侧帧传输、真 plasmashell 里选为壁纸、多屏按实例分帧 |
 
 **推荐顺序**：`P0 → P1(spike，决定主线) → P5 → P6 → P7 → P8 → P2 → P3 → P4 → P9`。
 说明：`P1` 是唯一能改变整体形态的实验，必须最先做——**本轮已做完并给出否定结论**，所以后续排期的重心应转向 `P9`（壁纸插件）与「② 让桌面不再是文件夹视图」的用户引导；`P2` 的规则文件层留给 Plasma 6/Wayland 验证。
@@ -392,7 +392,7 @@ pub fn detect() -> KdeEnv;           // 纯函数入口，输入是 env 快照�
 
 - 本文（方案）、[kde-plasma-constraints.md](kde-plasma-constraints.md)（上游约束调研，含全部链接）与 [kde-verification-report.md](kde-verification-report.md)（Plasma 5.27/X11 真机实测：机制①落点、`BELOW` 证伪、会话总线要求、`kscreen-doctor`/`ScreenSaver`/SNI 实测）；
 - [kde-smoke-setup.md](kde-smoke-setup.md)（真机验证底座的装配与**覆盖率边界**：这台 Ubuntu 24.04 arm64 验证机只能覆盖 Plasma 5.27/X11，Plasma 6 需换底座）；
-- 脚本：`scripts/kde-verify-preflight.sh`（环境预检）、`scripts/kde-probes.sh`（机制实测探针）、`scripts/kde-vm-session.sh`（**真机核心**：真实用户总线上拉起 Xvfb+KWin+plasmashell，含 `probes`/`realbuscase`/`belowtest` 模式）、`scripts/linux-kde-smoke.sh`（KDE/X11 冒烟断言，CI 用）、`scripts/kde-wayland-globals.sh`（KWin 的 Wayland 全局清单探测：layer-shell/dmabuf/idle/模糊协议版本）、`scripts/kde-plugin-check.sh`（P9 插件包 11 项验证：KPackage 安装注册 + QML 帧显示 + 兜底 + 卸载）、`scripts/kde-vm-setup.sh` / `kde-vm-build.sh` / `kde-vm-sync.sh` / `kde-vm-verify-state.sh`（真机装配、构建、同步、故障后体检）；
+- 脚本：`scripts/kde-verify-preflight.sh`（环境预检）、`scripts/kde-probes.sh`（机制实测探针）、`scripts/kde-vm-session.sh`（**真机核心**：真实用户总线上拉起 Xvfb+KWin+plasmashell，含 `probes`/`realbuscase`/`belowtest` 模式）、`scripts/linux-kde-smoke.sh`（KDE/X11 冒烟断言，CI 用）、`scripts/kde-wayland-globals.sh`（KWin 的 Wayland 全局清单探测：layer-shell/dmabuf/idle/模糊协议版本）、`scripts/kde-plugin-check.sh`（P9 插件包 12 项验证：KPackage 安装注册 + QML 帧显示 + 兜底 + 卸载）、`scripts/kde-vm-setup.sh` / `kde-vm-build.sh` / `kde-vm-sync.sh` / `kde-vm-verify-state.sh`（真机装配、构建、同步、故障后体检）；
 - `packaging/plasma-wallpaper/io.github.oneincase.wallpaperem/`（**P9**）：可安装的 Plasma 壁纸插件包（`metadata.json` + KConfigXT `contents/config/main.xml` + `main.qml`/`config.qml` + 引擎↔插件契约 README），显示端已真机验证；
 - `README.md` 的 Linux 段重写：KDE 支持矩阵（Plasma 5/6 × X11/Wayland × 功能）、外部命令依赖（`plasma-apply-wallpaperimage`/`qdbus`/`kscreen-doctor`/`parec|pw-record`/`pactl|wpctl`）、Wayland 下的已知限制；**并修掉一处自相矛盾**：`README.md:410` 说「自动暂停尚未实现」，而 `README.md:220` 的功能列表把它列为已实现（Rust 侧确有实现，`README.md:410` 是过时表述，改它而不是改 :220）；
 - `CHANGELOG.md` 按仓库实际惯例追加到 `## [Unreleased]` 的中文分类小节（`### 🛠 改变 / Changed` 等），条目形如 `- **短标题**：什么条件下什么行为变了`（本仓不用 `type(scope):` 前缀，全文 0 例）；
