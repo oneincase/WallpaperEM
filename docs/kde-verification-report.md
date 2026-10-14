@@ -578,7 +578,15 @@ KDE 分组按钮（`Enable` / `一键启用` 任一）→ 断言它**紧邻**「
 注意 `localhost:1420` 在生产二进制里也出现 1 次（devUrl 字符串照样编进去），所以判据只能是
 「内嵌了 `assets/index-*.js`」。
 
-**VM 真装**：`Unpacking wallpaper-em (2.3.0) over (2.2.0)` ✓。
+**VM 真装**：`Unpacking wallpaper-em (2.3.0) over (2.2.0)` ✓（先装的是 `scripts/kde-vm-deb.sh`
+手工组装的那份，用来复现首跑的 36/2）。
+
+**官方发行物在 VM 里再跑一遍同一套自检**：`gh release download v2.3.0 -p WallpaperEM_2.3.0_arm64.deb`
+（18741664 字节）→ `apt-get install --reinstall` → `pkg=wallpaper-em version=2.3.0 arch=arm64`，
+装机布局与官方 bundler 一致（`/usr/bin/WallpaperEM` 755 + `/usr/lib/WallpaperEM/{assets,
+libsteam_api.so,plasma-wallpaper,renderer}`，插件资源 644）→
+`APP_BIN=/usr/bin/WallpaperEM bash scripts/kde-plugin-enable-check.sh` → **44 项通过 / 0 项失败**
+（`CHECK_EXIT=0`）。即：**线上那份 arm64 安装包，在 KDE 会话里真装真跑，端到端全过**。
 
 **首跑 36 通过 / 2 失败** —— 失败的正是「关闭并还原」那两条：
 
