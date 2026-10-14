@@ -201,7 +201,7 @@ cd ~/WallpaperEM && SMOKE_WITH_PLASMA=1 bash scripts/linux-kde-smoke.sh
 
 过程中修掉的**真 bug**（记下来是因为它只在真 Qt 上才炸）：`main.qml` 的独立运行桩最初写成 `property string FramePath`，Qt 报 `Property names cannot begin with an upper case letter` —— QML 自定义属性不能首字母大写，配置键 `FramePath` 的大小写只存在于 Plasma 注入的 QObject 上，因此桩用小写、读取时显式映射。
 
-**仍只是「显示端」**：真 plasmashell 里选为壁纸、引擎侧帧传输（DMA-BUF/socket）、多屏按实例分帧都未做（见 §8）。
+**仍只是「显示端」**：真 plasmashell 里选为壁纸、引擎侧帧传输（DMA-BUF/socket）、多屏按实例分帧都未做（见 §8）。其中「真 plasmashell 里选为壁纸」已由 §6.5 补上。
 
 ### 6.4 前台窗口分类的数据源（`frontmost_kind`，X11）
 
@@ -237,6 +237,41 @@ KWin 的 D-Bus 在 5.27 上也不提供，只有需注入脚本的 `workspace.ac
 同时含 `DOCK` 与 `NORMAL`，判定取「含 `DOCK` 即 `Desktop`」是正确的（面板在前台
 说明壁纸基本露着）。
 
+### 6.5 P9 插件在**真实 Plasma 桌面**里被选为壁纸（决定性验证）
+
+§6.3 只证明「QML 显示端行为正确」，证明不了「plasmashell 认不认这个包、认不认这些配置键、
+帧到不到桌面、图标还在不在」。为此做了对照实验并复用**真实登录会话**（不新起合成器、不杀进程）：
+Ubuntu 24.04.3 / Plasma 5.27.11 / X11 / 1024x768，plasmashell pid 2347 常驻 `:0`。
+
+步骤：`org.kde.image` 铺**纯洋红**取基线截图 → 用官方脚本接口
+（`qdbus org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript`，
+与 `plasma-apply-wallpaperimage` 同一条路：`d.wallpaperPlugin = '<id>'` +
+`d.currentConfigGroup = ['Wallpaper','<id>','General']` + `d.writeConfig(k,v)`）
+把壁纸换成 `io.github.oneincase.wallpaperem`，帧文件是**同一张纯洋红** → 再截图 →
+推序号并把帧换成**纯青** → 再截图。
+
+| 断言 | 实测 |
+| --- | --- |
+| 基线背景是纯洋红 | 洋红占比 **0.9342** |
+| 基线桌面区图标在画（非背景像素数，只统计桌面区 1024x718，排除面板） | **3645** |
+| 插件壁纸生效 | 洋红占比 **0.9342**，plasmashell 2347 存活 |
+| **桌面图标/面板图层逐像素保持** | 掩码差异 **0 像素**（非背景同为 3645） |
+| **序号驱动换帧** | 换青后 青 **0.9342** / 洋红 **0.0039** |
+
+`base.png` 与 `plug.png` 的 md5 相同（`1b0bcb8c7879972eef6a2d4bfc5a13d5`）——
+本插件渲染的桌面与 `org.kde.image` 渲染同一张纯色图逐字节一致，换帧后立刻不同。
+截图里洋红铺满桌面、左上角 `desktop.ini` 图标可见、底部面板与时钟正常
+（证据：独立仓库 `docs/evidence/real-plasma/`）。
+
+**结论**：壁纸插件方案在真桌面上成立——**壁纸层在图标层之下，图标与面板不被遮盖**。
+这正是窗口方案（机制①/②）在 X11 上做不到的那一点，`P9` 因此从「演进彩蛋」升为战略路径。
+
+复现：独立仓库 `bash scripts/plasma-real-test.sh`（18 项断言，自动发现 `:0` 或按 `DISP=` 自起会话；
+跑完还原原壁纸并卸载插件）。脚本里为此修掉三个坑：截图前需用 `_NET_SHOWING_DESKTOP=1`
+把压住桌面的普通窗口最小化（面板是 DOCK 不受影响）；已有 plasmashell 时第二个实例
+抢不到 `org.kde.plasmashell` 会立刻退出，必须复用活会话；ImageMagick 掩码必须
+「先把非目标色涂白、再把仍是目标色的涂黑」，顺序反了会把非背景像素数虚报成整块面积。
+
 ## 7. 对方案的影响（已回填 [kde-adaptation-plan.md](kde-adaptation-plan.md) §2.5）
 
 1. **§4.1 机制①的定义要改**：从「拿桌面层语义并保住图标」改为「拿桌面窗口语义（跳任务栏/全桌面/在普通窗口之下）」，**图标可见性另立一条路**（Plasma 6 Wayland 的 layer-shell `Background`，或 §4.5 壁纸插件）。X11 上无解，别承诺。
@@ -249,7 +284,7 @@ KWin 的 D-Bus 在 5.27 上也不提供，只有需注入脚本的 `workspace.ac
 ## 8. 仍未验证 / 无法验证
 
 - **Plasma 6 全部专属项**：layer-shell `Background` 层（本机 5.27 实测有 `zwlr_layer_shell_v1` **v3**，但 v5 与「Background 层里排到 plasmashell 桌面视图之下」仍未证）、`ext_background_effect_manager_v1`（5.27 实测未广告，符合预期）、portal `Wallpaper`(6.5)、Plasma 6 托盘 SNI、每虚拟桌面独立壁纸。需 Ubuntu 25.04 / Fedora KDE / openSUSE 的 arm64 或 amd64 机器。
-- **P9 插件在真 plasmashell 里选为壁纸**：只验到「KPackage 能装能注册 + QML 能把帧画出来」（§6.3）；把插件设成当前桌面壁纸需要能正常登录的图形会话（无头 Xvfb 下的 plasmashell 只被用来做冒烟，不适合做交互式设置）。
+- **P9 插件在真 plasmashell 里选为壁纸**：✅ 已由 §6.5 补上（真实会话 `:0`，18 项断言全过，图标层逐像素不变）。仍未量化的只有**长期帧率/合成开销**与**插件异常对 plasmashell 的影响面**（需真实使用观察），以及多屏按实例分帧、Plasma 6 实测。
 - **引擎侧帧传输**：DMA-BUF/socket 那条路一行代码都还没有；`zwp_linux_dmabuf_v1` v4 只是证明协议可用。
 - **KWin 5 的 `Layer` 窗口规则是否可用**：需在能弹确认框的交互会话里跑 `qdbus org.kde.KWin /Scripting …`，或直接写 `~/.config/kwinrulesrc` 后 `reconfigure` 再观察。
 - **`global-hotkey` 在 KDE 下是否与 KWin 抢键**：需手工按键验证。

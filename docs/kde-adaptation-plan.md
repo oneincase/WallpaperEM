@@ -284,7 +284,7 @@ pub fn detect() -> KdeEnv;           // 纯函数入口，输入是 env 快照�
 | `P6` | ✅ 已合入（commit `27d4ccf`） | KDE 静态壁纸三级回退（portal → `plasma-apply-wallpaperimage` → `qdbus evaluateScript`），9 个单测；非 KDE 分支逐字未动 |
 | `P7` | 🟡 已落地（Wayland 侧未实测） | 快捷键：KDE Wayland 标记「由桌面接管」+ `HotkeyStatus` 可观测（10 单测），前端已显示状态与接管说明；托盘：Linux 改用彩色 `icons/32x32.png` + 自启补键（12 单测，`unwrap` 仅存在于 `cfg(test)`）；模糊：`ext_background_effect_manager_v1` 优先 + `org_kde_kwin_blur` 回退，X11 原子路径 sha256 逐字不变。三项都缺 Plasma 6.7+ 真机验证 |
 | `P8` | 🟡 已交付待复核 | `deb.depends` 补 `libayatana-appindicator3-1`；`recommends` 收窄为 `gstreamer1.0-pipewire`/`ffmpeg`/`kscreen`/`pulseaudio-utils \| pipewire-bin`；`Dockerfile.linux`/entrypoint `SMOKE_MODE`；CI `kde-smoke` |
-| `P9` | 🟡 骨架 + 显示端已真机验证 | 本轮结论把它从「演进彩蛋」升级为**唯一全满足解**。已产出可安装的 KPackage（`packaging/plasma-wallpaper/io.github.oneincase.wallpaperem/`）：`kpackagetool5` 安装/注册/卸载 + QML 显示引擎帧 + 缺帧兜底，12 项断言全过（报告 §6.3）；`zwp_linux_dmabuf_v1` 在本机实测 v4，零拷贝帧传输在协议层可行（§6.2）。**未做**：引擎侧帧传输、真 plasmashell 里选为壁纸、多屏按实例分帧 |
+| `P9` | ✅ 真桌面验证通过（插件已独立成仓） | 本轮结论把它从「演进彩蛋」升级为**唯一全满足解**。插件包已迁到独立仓库 **`../WallpaperEM-Plasma`**（与主仓同级目录）：真机对照实验 18 项断言全过——在**真实 plasmashell**（Plasma 5.27.11 会话 `:0`）里用官方脚本接口把壁纸换成该插件后，帧画到桌面、**桌面图标与面板图层逐像素不变**、推进序号桌面即换色（记录见该仓 `docs/real-plasma-verification.md`，截图在 `docs/evidence/real-plasma/`；本仓报告 §6.5）；显示端另有 16 项 Xvfb+qmlscene 断言（该仓 `scripts/verify.sh`，本仓报告 §6.3）；`zwp_linux_dmabuf_v1` 本机实测 v4，零拷贝帧传输在协议层可行（§6.2）。**未做**：引擎侧帧传输（`frame_export`）、多屏按实例分帧、Plasma 6 实测 |
 
 **推荐顺序**：`P0 → P1(spike，决定主线) → P5 → P6 → P7 → P8 → P2 → P3 → P4 → P9`。
 说明：`P1` 是唯一能改变整体形态的实验，必须最先做——**本轮已做完并给出否定结论**，所以后续排期的重心应转向 `P9`（壁纸插件）与「② 让桌面不再是文件夹视图」的用户引导；`P2` 的规则文件层留给 Plasma 6/Wayland 验证。
@@ -382,7 +382,7 @@ pub fn detect() -> KdeEnv;           // 纯函数入口，输入是 env 快照�
 7. ✅ Tauri 是否把 identifier 设为 GTK 的 `WM_CLASS`？→ 实测壁纸窗口 `WM_CLASS(STRING) = "WallpaperEM", "WallpaperEM"`（**不是** identifier `io.github.oneincase.wallpaperem`）。写 KWin 窗口规则时按 `WM_CLASS=WallpaperEM` 匹配，不要按 identifier。
 8. ✅（新增，结论为否定）能否用 `_NET_WM_STATE_BELOW` 把壁纸窗口压到 plasmashell 桌面视图之下？→ **不能**，三组对照实测层序均为 `2/4`，见报告 §4。不要把它当候选方案。
 9. ⛔（新增）Plasma 6 Wayland 下 `zwlr_layer_shell_v1` 的 `Background` 层是否真能同时保住「壁纸可见 + 图标可见」。这是 X11 上已被证伪的那条路的唯一替代，必须优先在 Plasma 6 机器上验证。（已测到的只是前置条件：KWin 5.27 广告 `zwlr_layer_shell_v1` **v3**，Plasma 6 上游为 v5；层内先后关系仍未证。）
-10. 🟡（新增）P9 插件在**真 plasmashell** 里被选为壁纸后的实际表现（帧率、合成开销、崩溃面）。已验到「KPackage 能装能注册 + QML 能把帧画出来 + 缺帧兜底」，未验「真桌面下选它当壁纸」——那需要能正常登录的图形会话（报告 §6.3）。
+10. ✅（已解，2026-10-14）P9 插件在**真 plasmashell** 里被选为壁纸后的表现 → 已在真实会话（Plasma 5.27.11，`:0`）上用官方脚本接口实测：帧画到桌面、桌面图标与面板图层**逐像素不变**、序号推进即换色（该仓 `scripts/plasma-real-test.sh` 18 项全过、`docs/real-plasma-verification.md`）。仍未量化的只是**长期帧率与合成开销**（1080p@30fps 的 CPU/GPU 占用、以及插件异常时对 plasmashell 的影响面），需要一段时间的真实使用观察。
 
 ---
 
@@ -392,8 +392,9 @@ pub fn detect() -> KdeEnv;           // 纯函数入口，输入是 env 快照�
 
 - 本文（方案）、[kde-plasma-constraints.md](kde-plasma-constraints.md)（上游约束调研，含全部链接）与 [kde-verification-report.md](kde-verification-report.md)（Plasma 5.27/X11 真机实测：机制①落点、`BELOW` 证伪、会话总线要求、`kscreen-doctor`/`ScreenSaver`/SNI 实测）；
 - [kde-smoke-setup.md](kde-smoke-setup.md)（真机验证底座的装配与**覆盖率边界**：这台 Ubuntu 24.04 arm64 验证机只能覆盖 Plasma 5.27/X11，Plasma 6 需换底座）；
-- 脚本：`scripts/kde-verify-preflight.sh`（环境预检）、`scripts/kde-probes.sh`（机制实测探针）、`scripts/kde-vm-session.sh`（**真机核心**：真实用户总线上拉起 Xvfb+KWin+plasmashell，含 `probes`/`realbuscase`/`belowtest` 模式）、`scripts/linux-kde-smoke.sh`（KDE/X11 冒烟断言，CI 用）、`scripts/kde-wayland-globals.sh`（KWin 的 Wayland 全局清单探测：layer-shell/dmabuf/idle/模糊协议版本）、`scripts/kde-plugin-check.sh`（P9 插件包 12 项验证：KPackage 安装注册 + QML 帧显示 + 兜底 + 卸载）、`scripts/kde-vm-setup.sh` / `kde-vm-build.sh` / `kde-vm-sync.sh` / `kde-vm-verify-state.sh`（真机装配、构建、同步、故障后体检）；
-- `packaging/plasma-wallpaper/io.github.oneincase.wallpaperem/`（**P9**）：可安装的 Plasma 壁纸插件包（`metadata.json` + KConfigXT `contents/config/main.xml` + `main.qml`/`config.qml` + 引擎↔插件契约 README），显示端已真机验证；
+- 脚本：`scripts/kde-verify-preflight.sh`（环境预检）、`scripts/kde-probes.sh`（机制实测探针）、`scripts/kde-vm-session.sh`（**真机核心**：真实用户总线上拉起 Xvfb+KWin+plasmashell，含 `probes`/`realbuscase`/`belowtest` 模式）、`scripts/linux-kde-smoke.sh`（KDE/X11 冒烟断言，CI 用）、`scripts/kde-wayland-globals.sh`（KWin 的 Wayland 全局清单探测：layer-shell/dmabuf/idle/模糊协议版本）、`scripts/kde-plugin-check.sh`（**转发入口**：P9 插件包与其验证脚本已迁到独立仓库 `../WallpaperEM-Plasma`，本脚本转发到该仓的 `scripts/verify.sh`，`--real` 转发到 `scripts/plasma-real-test.sh`）、`scripts/kde-vm-setup.sh` / `kde-vm-build.sh` / `kde-vm-sync.sh` / `kde-vm-verify-state.sh`（真机装配、构建、同步、故障后体检）；
+- **独立仓库 `../WallpaperEM-Plasma`（P9 插件的家）**：Plasma 壁纸插件包本体（`metadata.json` + KConfigXT `contents/config/main.xml` + `main.qml`/`config.qml`）、引擎↔插件帧契约 `docs/engine-contract.md`、帧泵参考实现 `tools/frame-pump.py`、验证脚本 `scripts/verify.sh`（16 项 Xvfb+qmlscene）与 `scripts/plasma-real-test.sh`（18 项真桌面）、真桌面验证记录与截图证据；
+- `packaging/plasma-wallpaper/io.github.oneincase.wallpaperem/`（**P9 早期骨架，已被独立仓库取代**，仅作历史留存，勿在此继续开发）；
 - `README.md` 的 Linux 段重写：KDE 支持矩阵（Plasma 5/6 × X11/Wayland × 功能）、外部命令依赖（`plasma-apply-wallpaperimage`/`qdbus`/`kscreen-doctor`/`parec|pw-record`/`pactl|wpctl`）、Wayland 下的已知限制；**并修掉一处自相矛盾**：`README.md:410` 说「自动暂停尚未实现」，而 `README.md:220` 的功能列表把它列为已实现（Rust 侧确有实现，`README.md:410` 是过时表述，改它而不是改 :220）；
 - `CHANGELOG.md` 按仓库实际惯例追加到 `## [Unreleased]` 的中文分类小节（`### 🛠 改变 / Changed` 等），条目形如 `- **短标题**：什么条件下什么行为变了`（本仓不用 `type(scope):` 前缀，全文 0 例）；
 - `docs/release-notes/` 在**发布时按实际版本号新建**（`<tag>.md`，见 `scripts/release-finish.mjs:39-41`）的文件里增加一节「KDE Plasma 支持（X11 / Wayland）」，写明 ②/③ 二选一的用户可见后果（是否失去系统桌面图标）。**本轮已先把用户可见变化写进 `CHANGELOG.md` 的 `[Unreleased]`**（仓库惯例），到发版时才落 `<tag>.md`，避免现在猜版本号。

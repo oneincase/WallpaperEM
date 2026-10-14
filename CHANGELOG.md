@@ -33,6 +33,14 @@
   别的应用 = 暂停」（KDE/X11 真机实测：活动窗口是 plasmashell 的 DESKTOP 窗，
   分类为桌面 → 播放）。此前该判据恒 `Unknown`（判定表恒 `Keep`，等于不生效）。
   Wayland 会话仍恒 `Unknown`：协议没有「当前活动窗口」的全局概念。
+- **KDE 下「壁纸 + 桌面图标」有了可行的第二条路（独立仓库，尚未接入引擎）**：
+  动态壁纸做成 plasmashell 的壁纸插件后，壁纸成为桌面 containment 的背景层，
+  **不再盖住桌面图标**——此前窗口方案在本机已被实测证明做不到（KWin 不让任何客户端
+  窗口排到桌面视图之下）。插件已在**真实 Plasma 桌面**上验证：帧画到桌面、桌面图标与
+  面板图层逐像素不变、按序号换帧（独立仓库 `WallpaperEM-Plasma` 的
+  `scripts/plasma-real-test.sh`，18 项断言）。注意：**引擎侧帧传输还没接**（`frame_export`
+  未实现），现在只能用仓库自带的帧泵喂帧；装插件也仍需手动（`kpackagetool5` / 该仓
+  `scripts/install.sh`），应用内一键启用尚未做。
 
 - **`webwallgl` 改走 npm 依赖（3.0.0）**：渲染库此前是 `file:../webwallgl-github/dist/lib`，
   必须把库仓库克隆到本仓平级并先 `pnpm run build:lib`，否则 `pnpm install` 解析不到。

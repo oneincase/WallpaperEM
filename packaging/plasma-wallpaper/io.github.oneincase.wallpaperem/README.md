@@ -1,5 +1,13 @@
 # WallpaperEM 的 Plasma 壁纸插件（P9）
 
+> ⚠️ **已迁走，本目录只是历史留存，请勿在此继续开发。**
+> 插件的主体现在在**独立仓库** `WallpaperEM-Plasma`（与主仓同级目录）：
+> 完整实现（双缓冲显示端、序号轮询、`%SCREEN%`、停帧提示、10 个配置项）、
+> 引擎↔插件帧契约 `docs/engine-contract.md`、帧泵 `tools/frame-pump.py`，
+> 以及验证脚本 `scripts/verify.sh`（16 项 Xvfb+qmlscene）与
+> `scripts/plasma-real-test.sh`（18 项**真桌面**断言：帧画到桌面且图标层逐像素不变）。
+> 安装用该仓的 `scripts/install.sh`，或 `kpackagetool5 --type Plasma/Wallpaper --install <独立仓根目录>`。
+
 这是「壁纸 + 桌面图标同时可见」在 KDE 下的**唯一**可行路径：插件跑在 `plasmashell`
 进程里，和桌面图标同属一个 containment，因此不存在「谁盖住谁」的问题。
 
