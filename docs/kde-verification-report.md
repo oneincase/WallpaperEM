@@ -34,7 +34,7 @@
 | P9 插件在真实 plasmashell 里当壁纸 | ✅ 18 项断言全过，图标层逐像素不变 | 强（见 §6.5） |
 | 引擎侧帧导出驱动插件（`frame_export`） | ✅ 端到端 19 项断言全过 | 强（见 §6.6） |
 | 应用内「一键启用 KDE 插件」 | ✅ 后端+打包+前端落地，真机 38 项断言全过（含装成 deb 复验） | 强（见 §6.7/§6.8） |
-| 设置页按钮的视觉确认（截图） | ⚠️ 本机抓屏恒全黑，未能留图 | 弱（环境限制） |
+| 设置页「KDE 桌面集成」分组与按钮真的渲染出来 | ✅ 无障碍（AT-SPI）6 项断言全过（截图仍拿不到，改走 a11y） | 强（见 §6.10） |
 | Plasma 6 全部专属机制 | ⛔ 本机不可验 | — |
 
 ## 3. 核心发现：壁纸窗口的落点
@@ -366,8 +366,8 @@ ssh <vm> 'APP_BIN=/home/parallels/WallpaperEM/src-tauri/target/release/Wallpaper
 > 首次跑出 29/33，4 条失败全是脚本自身断言函数的 bug（`jget` 把 Python 的 `True` 当字面量
 > 漏判、嵌套字段 `export.running` 取不到）——换成支持点号路径 + 小写布尔的 `jbool` 后 33/33。
 > 另有一个环境限制：本机 Xvfb+kwin 下 `import`/`xwd` 抓屏拿到的永远是全黑（合成器把窗口内容
-> 重定向了），所以设置页截图在**自建 Xvfb 会话里拿不到**；功能正确性靠上面的断言 + 前端
-> `pnpm typecheck` + i18n 审计，真机 UI 目视确认留给有物理/远程桌面的会话。
+> 重定向了），所以设置页**截图**拿不到。界面本身的确认改走无障碍通道（`scripts/kde-vm-ui-check.sh`，
+> 6 项断言，见 §6.10）——它不依赖像素。
 
 ### 6.8 装成 deb 之后的复验（33 → 38 项，并抓到两个发布级缺陷）
 
@@ -427,17 +427,17 @@ denied (os error 13)`），4 项红。为什么开发态测试看不见：那会
 还是旧 renderer」这类假绿，**不依赖像素**，截图拿不到也能红。同一条自检现在也接进了 CI 的
 `kde-smoke` 作业（先 `apt-get install ./artifacts/*.deb`，再用 `/usr/bin/WallpaperEM` 跑）。
 
-**UI 目视确认的两次额外尝试（都失败，记录以免重复踩）**：
+**UI 取证的两条路（一条彻底失败，另一条后来成功）**：
 
-- AT-SPI：VM 装 `at-spi2-core` + `python3-pyatspi` 后能枚举到应用框架（`APP WallpaperEM` →
-  `frame | WallpaperEM`），但 WebKitGTK 的网页内容**没有**进无障碍树（伴随
-  `A connection to the bus can't be made`），所以无法用无障碍 API 断言/点击按钮。
-- 截图：`import -window root` 在真实 `:0`（Xorg 1366x768 + plasmashell）能拍到 plasmashell，
-  但我们的窗口区域是黑块；`xwd -root` 能出 4MB 数据、自写 XWD→PNG 解码后平均亮度 0.0
-  （kwin 合成器重定向）。Xvfb+kwin 下 `import` 更是恒为 263 字节空白 PNG。
+- 截图：❌ 走不通。`import -window root` 在真实 `:0`（Xorg 1366x768 + plasmashell）能拍到
+  plasmashell，但我们的窗口区域是黑块；`xwd -root` 能出 4MB 数据、自写 XWD→PNG 解码后平均
+  亮度 0.0（kwin 合成器重定向）。Xvfb+kwin 下 `import` 更是恒为 263 字节空白 PNG。
+- 无障碍（AT-SPI）：**当时判成「WebKitGTK 网页内容不进无障碍树」，这个结论是错的** —— 那时装的
+  是开发模式二进制（§6.9），页面根本没加载，当然枚举不到。修好构建后用
+  `scripts/kde-vm-ui-check.sh` 一路断言成功，记在 §6.10。
 
-结论：Linux 上的 UI 目视确认需要物理/远程桌面会话；本轮以前端 `pnpm typecheck` + i18n 审计 +
-「安装产物里确实有这段界面代码」的断言代替，功能正确性由 38 项端到端断言覆盖（§6.9 补上了第 38 项：产物必须是生产构建）。
+本轮功能正确性仍由 38 项端到端断言覆盖（§6.9 补上了第 38 项：产物必须是生产构建），
+前端另有 `pnpm typecheck` + i18n 审计；界面存在性由 §6.10 的 6 项 a11y 断言补上。
 
 ### 6.9 用户实测抓到：手工构建漏了 `custom-protocol` → 主窗口连 `localhost:1420`（已修）
 
@@ -488,6 +488,38 @@ pipefail 把整条管道判成失败，于是「生产构建」明明成立却�
 **38 项通过 / 0 项失败**，其中第 38 项输出「二进制是生产构建（内嵌 `index-CQlQn0nT.js`）」；
 二进制 47.8 MB → **49.5 MB**（多出的约 1.1 MB 就是内嵌的前端资源）。
 
+### 6.10 设置页 UI 的无障碍确认（AT-SPI，6 项断言，不依赖像素）
+
+截图这条路在本机走不通（§6.8），但 **WebKitGTK 会把网页内容暴露给无障碍树**，于是「界面上真的
+有这个按钮」可以自动断言。新增脚本 `scripts/kde-vm-ui-check.sh`，对着**已安装的产物**跑：
+
+```bash
+ssh <vm> 'APP_BIN=/usr/bin/WallpaperEM DISPLAY=:0 bash ~/WallpaperEM/scripts/kde-vm-ui-check.sh'
+```
+
+它做的事：起应用 → 用 `pyatspi` 找到 `WallpaperEM` 应用节点 → 断言出现 `document web`（页面加载
+成功，开发模式二进制在这一步就会红）→ 点「Settings/设置」→ 点「General/通用」→ 断言设置页里存在
+KDE 分组按钮（`Enable` / `一键启用` 任一）→ 断言它**紧邻**「Clear cache/清除缓存」（设计上 KDE 组
+就插在缓存组之前，位置能当交叉佐证）。
+
+实跑结果（对着 `/usr/bin/WallpaperEM`，即 §6.8/§6.9 装出来的 deb）：
+
+```
+[PASS] 无障碍树里存在应用节点 WallpaperEM
+[PASS] WebKitGTK 网页内容已进无障碍树（document web: WallpaperEM）—— 页面确实加载了
+[PASS] 已点开「Settings / 设置」
+[PASS] 已点开「General / 通用」
+[PASS] 设置页存在 KDE 分组按钮：Enable
+[PASS] 按钮紧邻「Clear cache / 清除缓存」——位置与设计一致（KDE 组在缓存组之前）
+==== 结果：6 项通过 / 0 项失败 ====
+```
+
+**踩坑记录**：① 无障碍断言也会被 `pkill -f "$APP_BIN"` 咬到 —— 调用者那条 shell 的命令行里就带着
+`APP_BIN=/usr/bin/WallpaperEM`，pkill 把自己杀了、`ssh` 返回 255；改成按 `/proc/<pid>/exe` 比对
+（和 `kde-plugin-enable-check.sh` 同一个坑）。② 这个检查**没有进 CI**：它依赖会话里的无障碍总线与
+真实窗口，CI 的 Xvfb 环境下未验证过，放进去只会变成随机红的噪音；它在 VM 上跑。
+
+
 ## 7. 对方案的影响（已回填 [kde-adaptation-plan.md](kde-adaptation-plan.md) §2.5）
 
 1. **§4.1 机制①的定义要改**：从「拿桌面层语义并保住图标」改为「拿桌面窗口语义（跳任务栏/全桌面/在普通窗口之下）」，**图标可见性另立一条路**（Plasma 6 Wayland 的 layer-shell `Background`，或 §4.5 壁纸插件）。X11 上无解，别承诺。
@@ -500,8 +532,8 @@ pipefail 把整条管道判成失败，于是「生产构建」明明成立却�
 ## 8. 仍未验证 / 无法验证
 
 - **Plasma 6 全部专属项**：layer-shell `Background` 层（本机 5.27 实测有 `zwlr_layer_shell_v1` **v3**，但 v5 与「Background 层里排到 plasmashell 桌面视图之下」仍未证）、`ext_background_effect_manager_v1`（5.27 实测未广告，符合预期）、portal `Wallpaper`(6.5)、Plasma 6 托盘 SNI、每虚拟桌面独立壁纸。需 Ubuntu 25.04 / Fedora KDE / openSUSE 的 arm64 或 amd64 机器。
-- **装成 deb 之后的复验**：✅ 已由 §6.8 补上（真装 `wallpaper-em_2.2.0_arm64.deb`，`/usr/bin/WallpaperEM` 跑 38 项断言全过，并因此修掉两个发布级缺陷（打包权限 0600、手工构建漏 `custom-protocol`））。仍未用**真实安装包**验证的只剩：设置页按钮的目视确认（见下条）、以及 AppImage/官方打包器（本机 arm64 无 aarch64 预编译 tauri-cli）。
-- **P9 插件在真 plasmashell 里选为壁纸**：✅ 已由 §6.5 补上（真实会话 `:0`，18 项断言全过，图标层逐像素不变）。仍未量化的只有**长期帧率/合成开销**与**插件异常对 plasmashell 的影响面**（需真实使用观察），以及多屏按实例分帧、Plasma 6 实测。**应用内一键启用**已由 §6.7 补上（33 项断言，走的就是按钮那条产品路径）；剩下没做到的只是**设置页按钮的目视确认**——本机 Xvfb/KWin 下抓屏恒为全黑（合成器把窗口内容重定向了），`import`/`xwd` 都拿不到画面。
+- **装成 deb 之后的复验**：✅ 已由 §6.8 补上（真装 `wallpaper-em_2.2.0_arm64.deb`，`/usr/bin/WallpaperEM` 跑 38 项断言全过，并因此修掉两个发布级缺陷（打包权限 0600、手工构建漏 `custom-protocol`））。设置页按钮的「真的渲染出来」已由 §6.10 的无障碍断言补上（截图仍拿不到）。仍未用**真实安装包**验证的只剩：AppImage/官方打包器（本机 arm64 无 aarch64 预编译 tauri-cli）。
+- **P9 插件在真 plasmashell 里选为壁纸**：✅ 已由 §6.5 补上（真实会话 `:0`，18 项断言全过，图标层逐像素不变）。仍未量化的只有**长期帧率/合成开销**与**插件异常对 plasmashell 的影响面**（需真实使用观察），以及多屏按实例分帧、Plasma 6 实测。**应用内一键启用**已由 §6.7/§6.8 补上（38 项断言，走的就是按钮那条产品路径）；设置页里「分组与按钮确实渲染」由 §6.10 的无障碍断言补上——本机 Xvfb/KWin 下抓屏恒为全黑（合成器把窗口内容重定向了），`import`/`xwd` 都拿不到画面，所以改走 a11y。
 - **引擎侧帧传输**：DMA-BUF/socket 那条路一行代码都还没有；`zwp_linux_dmabuf_v1` v4 只是证明协议可用。
 - **KWin 5 的 `Layer` 窗口规则是否可用**：需在能弹确认框的交互会话里跑 `qdbus org.kde.KWin /Scripting …`，或直接写 `~/.config/kwinrulesrc` 后 `reconfigure` 再观察。
 - **`global-hotkey` 在 KDE 下是否与 KWin 抢键**：需手工按键验证。
@@ -527,6 +559,7 @@ pipefail 把整条管道判成失败，于是「生产构建」明明成立却�
 | `src-tauri/src/kde_plugin.rs` | 「一键启用」后端：状态探测、装包、切 appletsrc、回滚、设置项持久化（3 个 Tauri 命令 + 3 个同名 MCP 工具） |
 | `src/api/kde.ts` + 设置页「KDE 集成」分组 | 前端按钮与状态展示（仅 Linux 渲染），文案在 `src/locales/en-US.ts` |
 | `packaging/plasma-wallpaper/io.github.oneincase.wallpaperem/` | P9 的 Plasma 壁纸插件（`metadata.json` + KConfigXT + `main.qml`/`config.qml` + 引擎契约 README）；**由 `scripts/sync-plasma-plugin.sh` 从独立仓单向同步**，并经 `tauri.conf.json` 的 `bundle.resources` 打进安装包（`$RESOURCE/plasma-wallpaper/`） |
+| `scripts/kde-vm-ui-check.sh` | **设置页 UI 的无障碍断言**（AT-SPI，6 项）：起应用 → 断言 `document web` 出现（页面真加载了）→ 点「设置 → 通用」→ 断言 KDE 分组按钮存在且紧邻缓存组；不依赖截图（§6.10） |
 | `scripts/kde-vm-deb.sh` | 在 VM 上按 tauri-bundler 布局**手工组装并安装 deb**（arm64 没有官方预编译 tauri-cli）：解析 `tauri.linux.conf.json` 的 resources/依赖 → 组装 `usr/bin` + `usr/lib/<productName>` → `dpkg-deb` → `apt-get install --reinstall`（§6.8） |
 | `docs/kde-smoke-setup.md` | 装配说明与覆盖率对照 |
 | `docs/kde-adaptation-plan.md` | 适配方案（§2.5 已回填本轮实测） |

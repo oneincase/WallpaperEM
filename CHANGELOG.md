@@ -69,6 +69,13 @@
   （前端 bundle 里必须含「KDE 桌面集成」与三个 `kde_plugin_*` 命令名，专防「跑的还是旧 renderer」）
   全部通过，`package_dir` 实测落在 `/usr/lib/WallpaperEM/plasma-wallpaper/…`。
   这条自检也已接进 CI 的 `kde-smoke` 作业（先装 artifacts 里的 deb 再跑）。
+- **设置页 UI 的无障碍（AT-SPI）断言 `scripts/kde-vm-ui-check.sh`（6 项）**：本机截图取证走不通
+  （Xvfb/kwin 下 `import` 恒空白，真实会话里 WebKitGTK 的 GL 窗口在 root grab 里是黑块），
+  而 WebKitGTK 会把网页内容暴露给无障碍树 —— 于是一路断言：应用节点存在 → `document web`
+  出现（**这条能直接抓住「开发模式二进制、页面没加载」**）→ 点「设置 → 通用」→ KDE 分组按钮
+  （`Enable`/`一键启用`）存在且紧邻缓存组。对着装出来的 `/usr/bin/WallpaperEM` 实跑 6/6 通过。
+  顺带纠正一个早先的错误结论：此前判「WebKitGTK 网页内容不进无障碍树」，真相是那版是开发模式
+  二进制、页面根本没加载（见报告 §6.9/§6.10）。
 - **`webwallgl` 改走 npm 依赖（3.0.0）**：渲染库此前是 `file:../webwallgl-github/dist/lib`，
   必须把库仓库克隆到本仓平级并先 `pnpm run build:lib`，否则 `pnpm install` 解析不到。
   现在直接装 registry 上的 `webwallgl@^3.0.0`：解包体积 38 MB → 2.8 MB（不再带 sourcemap、
