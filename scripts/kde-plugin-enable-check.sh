@@ -95,6 +95,18 @@ plasmashell_reachable() {
     "$QBUS" org.kde.plasmashell /PlasmaShell >/dev/null 2>&1
   fi
 }
+# 直接给 plasmashell 塞一段脚本（脚本文件路径作参数，免得 JS 里的引号在 argv 里出错）。
+# 与引擎侧 kde_plugin::run_plasma_script 同一套候选命令。
+plasma_eval() {
+  local js; js="$(cat "$1")"
+  if [ "$QBUS" = "gdbus" ]; then
+    gdbus call --session --dest org.kde.plasmashell --object-path /PlasmaShell \
+      --method org.kde.PlasmaShell.evaluateScript "$js" >"$WORK/plasma-eval.log" 2>&1
+  else
+    "$QBUS" org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript \
+      "$js" >"$WORK/plasma-eval.log" 2>&1
+  fi
+}
 info "APP_BIN=$APP_BIN（Plasma 探测通道：$QBUS）"
 
 # ---------------------------------------------------------------- 1) 自建会话
@@ -145,6 +157,34 @@ db.execute("INSERT INTO settings(key,value) VALUES('service.enabled','1') "
            "ON CONFLICT(key) DO UPDATE SET value='1'")
 db.commit()
 PY
+
+# 基线壁纸：**必须自己把桌面切回非本插件**，不能继承机器上残留的状态。
+# 踩过的坑（2026-10-14）：某台 VM 的 appletsrc 里桌面壁纸本来就是本插件（历次自检的残留），
+# 于是 enable 时「当前壁纸 == 本插件」→ 按设计不记录 previous → disable 返回 restored=false、
+# 桌面仍是本插件 → 「关闭后 active=false」这条断言红。那不是产品缺陷，是这个脚本没有前置：
+# 缺了这条基线，restore 断言测的其实是「机器上原本是什么」而不是「一键启用记没记住」。
+step "基线：把桌面壁纸切到非本插件（org.kde.image）"
+cat > "$WORK/baseline.js" <<'JS'
+var ds = desktops();
+for (var i = 0; i < ds.length; i++) {
+  var d = ds[i];
+  d.wallpaperPlugin = 'org.kde.image';
+}
+JS
+plasma_eval "$WORK/baseline.js" || info "基线脚本返回非零（$WORK/plasma-eval.log），继续等 appletsrc"
+BASE_OK=""
+for _ in $(seq 1 40); do
+  if grep -q 'wallpaperplugin=org.kde.image' "$APP_CFG" 2>/dev/null && \
+     ! grep -q "wallpaperplugin=$PLUGIN_ID" "$APP_CFG" 2>/dev/null; then BASE_OK=1; break; fi
+  sleep 0.5
+done
+if [ -n "$BASE_OK" ]; then
+  ok "基线壁纸已是 org.kde.image（自检不再依赖机器上的残留桌面状态）"
+else
+  bad "20s 内桌面壁纸没能切回 org.kde.image（$WORK/plasma-eval.log）—— 这条前置不成立时，下面的「关闭并还原」断言没有意义"
+fi
+ORIG_PLUGIN="$(grep -m1 -o 'wallpaperplugin=[^ ]*' "$APP_CFG" 2>/dev/null | cut -d= -f2)"
+info "还原目标（基线壁纸）：${ORIG_PLUGIN:-<无>}"
 
 # ---------------------------------------------------------------- 3) 起应用 + MCP
 step "起应用并连通 MCP"
@@ -402,6 +442,47 @@ S1="$(cat "$DIR/frame.seq" 2>/dev/null || echo 0)"
 sleep 3
 S2="$(cat "$DIR/frame.seq" 2>/dev/null || echo 0)"
 [ "$S2" = "$S1" ] && ok "关闭后序号不再增长（$S1）" || bad "关闭后序号还在长：$S1 → $S2"
+
+# ---------------------------------------------------------------- 7.5) 边界：桌面本来就是本插件
+# 这条路径以前只是「设计意图」，没有断言；2026-10-14 在发行物上被真实触发过一次（见 §6.8 记录）。
+# 既定行为（有意如此）：绝不覆盖 previous，也不去抢用户自己设的桌面 —— 只如实告诉用户
+#「没记录到切换前的壁纸，得去 Plasma 设置里改回来」，所以 restored=false、active 仍为 true。
+step "边界：桌面壁纸本来就是本插件 → enable/disable 的既定行为"
+cat > "$WORK/already.js" <<'JS'
+var ds = desktops();
+for (var i = 0; i < ds.length; i++) {
+  var d = ds[i];
+  d.wallpaperPlugin = 'io.github.oneincase.wallpaperem';
+}
+JS
+plasma_eval "$WORK/already.js" || info "预置脚本返回非零（$WORK/plasma-eval.log）"
+ALREADY_OK=""
+for _ in $(seq 1 20); do
+  grep -q "wallpaperplugin=$PLUGIN_ID" "$APP_CFG" 2>/dev/null && { ALREADY_OK=1; break; }
+  sleep 0.5
+done
+if [ -n "$ALREADY_OK" ]; then
+  ok "预置成功：桌面壁纸已切到 $PLUGIN_ID（此时 previous 为空）"
+  EN2="$(mcp_text kde_plugin_enable '{}')" || bad "边界 enable 失败：$EN2"
+  PREV="$(python3 - "$DB" <<'PY'
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+r = db.execute("select value from settings where key='kde.plugin.previous'").fetchone()
+print(r[0] if r else "")
+PY
+)"
+  [ -z "$PREV" ] && ok "已是本插件时 enable 不记录 previous（不覆盖用户自己的桌面记录）" \
+                 || bad "已是本插件时 enable 竟然记了 previous：$PREV"
+  D2="$(mcp_text kde_plugin_disable '{}')" || bad "边界 disable 失败：$D2"
+  [ "$(printf '%s' "$D2" | jbool restored)" = "false" ] && ok "无 previous 时 disable 如实返回 restored=false" \
+                                                      || bad "边界 disable 的 restored 不是 false"
+  printf '%s' "$D2" | grep -q "没有记录到切换前的壁纸" && ok "disable 明确告知要去 Plasma 设置里改回" \
+                                                      || bad "disable 的说明没提醒用户"
+  grep -q "wallpaperplugin=$PLUGIN_ID" "$APP_CFG" && ok "不抢桌面：壁纸仍是本插件（等用户去 Plasma 设置改）" \
+                                                   || bad "边界 disable 后壁纸被改掉了（不该）"
+else
+  bad "20s 内没能把桌面预置成本插件，边界用例没跑成"
+fi
 
 # ---------------------------------------------------------------- 8) 收尾
 step "收尾"
