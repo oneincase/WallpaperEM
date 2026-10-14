@@ -312,6 +312,28 @@ pub fn definitions() -> Vec<Value> {
             }), json!([])),
         }),
         json!({
+            "name": "frame_export_start",
+            "description": "**帧导出**：把当前壁纸窗口的画面按帧写成文件（默认 `/dev/shm/wallpaperem/frame.ppm` + `frame.seq`），供 KDE Plasma 壁纸插件（WallpaperEM-Plasma）显示 —— 插件在 plasmashell 进程里读这两个文件，所以这是「插件模式下让桌面动起来」的引擎侧数据通路。写盘是原子的（同目录 tmp + rename），内容与上一帧逐字节相同时不写、也不推序号（省掉插件一次无谓解码）；引擎停帧或崩溃时序号不再增长，插件按 `StallMs` 显示「引擎已停止输出」并停在最后一帧。已在导出时再调一次 = 换参数重起（先停旧的）。",
+            "inputSchema": obj(json!({
+                "dir": { "type": "string", "description": "帧文件目录，默认 /dev/shm/wallpaperem（tmpfs，不落磁盘）" },
+                "fps": { "type": "integer", "description": "导出帧率，默认 20，范围 1..60。抓帧本身要过一次页面编码 + HTTP 回传，1080p 实际能稳定跑到的上限低于 60" },
+                "maxWidth": { "type": "integer", "description": "抓帧最大宽度（等比缩放），默认 1920；传 0 = 不缩放（原尺寸）。帧体积与延迟和它成正比，1080p 全尺寸一帧约 6 MB（PPM 未压缩）" },
+                "label": { "type": "string", "description": "可选：只抓这个 label 的壁纸窗口；不传就抓当前正在显示的壁纸窗口" },
+                "hideWindow": { "type": "boolean", "description": "插件模式：抓帧期间把引擎自己的壁纸窗口整窗透明（Linux/X11，`_NET_WM_WINDOW_OPACITY=0`），让位给 Plasma 插件显示帧；停止时自动恢复。默认 false。**不要用「隐藏窗口」代替**：窗口一旦被取消映射，WebKitGTK 会停掉页面 rAF，抓到的帧冻结在最后一帧（实测 7 秒 140 帧里 139 帧逐字节相同），而保持映射 + 透明则照常出帧（同 7 秒 83 帧全部有变化）。窗口是后应用壁纸才建出来的也没关系，导出循环会每秒补试一次并把结果记进 status.hidden_windows" },
+                "windowCapture": { "type": "boolean", "description": "帧源：直接抓引擎自己那扇**已映射**的 X11 壁纸窗口（`GetImage`），而不是让页面 `toDataURL` 回传。默认 false；设为 true 后若窗口抓帧失败会自动回退页面抓帧，实际走的哪条路见 status.source（`x11-window` / `page`）。为什么需要它：WebKitGTK 上 `canvas.toDataURL()` 得到的是**全黑图**（实测 100% 黑），而 X11 抓同一扇窗是正常画面；窗口必须保持映射（`xdotool unmap` 会让页面 rAF 停摆、帧冻结），整窗透明不影响抓帧" },
+            }), json!([])),
+        }),
+        json!({
+            "name": "frame_export_stop",
+            "description": "停止帧导出（并清掉可能残留的 `*.tmp-*` 临时文件）。停完帧文件留在原地、序号不再增长 —— 插件会停在最后一帧并按 `StallMs` 提示「引擎已停止输出」。返回停止时的最终统计。",
+            "inputSchema": obj(json!({}), json!([])),
+        }),
+        json!({
+            "name": "frame_export_status",
+            "description": "读帧导出的当前状态与累计统计：running/dir/fps/label/hidden_windows/source（帧源：`x11-window` = 直接抓引擎窗口，`page` = 页面自抓回传）与 frames（抓到几帧）、written（真正落盘几帧）、skipped（与上一帧相同而省掉的）、errors、last_seq、width/height/bytes、last_error。排查「插件不动」时先看这里：errors 增长且 last_error 有值 = 抓帧通路有问题；frames 停止增长 = 壁纸窗口没在渲染（遮挡/已停）；**written 一直不涨而 skipped 在涨 = 画面本身静止，或窗口被隐藏（rAF 被停）** —— 插件模式请用 hideWindow 而不是隐藏窗口；hidden_windows=0 而请求了 hideWindow = 还没找到可透明化的引擎窗口；source=page 而画面全黑 = 这台机器上页面读回不可用，请改用 windowCapture。",
+            "inputSchema": obj(json!({}), json!([])),
+        }),
+        json!({
             "name": "list_sessions",
             "description": "当前各屏的壁纸会话（label → 配置）与全局暂停态。",
             "inputSchema": obj(json!({}), json!([])),
@@ -845,6 +867,9 @@ async fn call_inner(app: &AppHandle, name: &str, args: &Value) -> Result<Value, 
         "effect_scaffold" => effect_scaffold(args),
         "wallpaper_screenshot" => screenshot(app, args).await,
         "wallpaper_preview" => preview(app, args).await,
+        "frame_export_start" => frame_export_start(app, args).await,
+        "frame_export_stop" => frame_export_stop().await,
+        "frame_export_status" => frame_export_status(),
         "list_sessions" => list_sessions(app),
         "displays_list" => crate::wallpaper::displays_list(app.clone()),
         "playlist_list" => {
@@ -1545,6 +1570,56 @@ async fn preview(app: &AppHandle, args: &Value) -> Result<Value, String> {
     });
     out["_images"] = json!(images);
     Ok(out)
+}
+
+// ---------- 帧导出（Plasma 壁纸插件的数据通路，实现见 crate::wallpaper::frame_export） ----------
+
+/// 起/换帧导出：参数解析放这里，抓帧循环与原子落盘在 frame_export 里。
+async fn frame_export_start(app: &AppHandle, args: &Value) -> Result<Value, String> {
+    let mut cfg = crate::wallpaper::frame_export::ExportConfig::new();
+    if let Some(dir) = opt_str(args, "dir") {
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            cfg = cfg.with_dir(dir);
+        }
+    }
+    if let Some(fps) = args.get("fps").and_then(|v| v.as_u64()) {
+        cfg = cfg.with_fps(fps as u32);
+    }
+    // maxWidth 缺省 1920（对齐截图链路）：抓帧要走一次页面编码 + HTTP 回传，
+    // 4K 原图那几 MB 没必要。显式传 0 = 不缩放、按原尺寸抓。
+    let max_width = args.get("maxWidth").and_then(|v| v.as_u64());
+    cfg = cfg.with_max_width(match max_width {
+        Some(0) => None,
+        Some(w) => Some(w as u32),
+        None => Some(1920),
+    });
+    cfg = cfg.with_label(
+        opt_str(args, "label")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+    );
+    // 插件模式：引擎窗口整窗透明（不是隐藏 —— 隐藏会让页面 rAF 停摆，见 ExportConfig::hide_window）
+    cfg = cfg.with_hide_window(args.get("hideWindow").and_then(|v| v.as_bool()).unwrap_or(false));
+    // 帧源：优先直接抓引擎自己那扇已映射的 X11 壁纸窗口（Linux 上页面 toDataURL 会得到全黑图）
+    cfg = cfg.with_window_capture(
+        args.get("windowCapture")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    );
+    // 用异步版：换参数重起时若走同步 stop()，会占住 runtime 线程等满 12s
+    // （后台循环没机会响应取消），见 FrameExporter::stop_async 的注释。
+    let st = crate::wallpaper::frame_export::start_global_async(app.clone(), cfg).await?;
+    serde_json::to_value(st).map_err(|e| e.to_string())
+}
+
+async fn frame_export_stop() -> Result<Value, String> {
+    serde_json::to_value(crate::wallpaper::frame_export::stop_global_async().await)
+        .map_err(|e| e.to_string())
+}
+
+fn frame_export_status() -> Result<Value, String> {
+    serde_json::to_value(crate::wallpaper::frame_export::status_global()).map_err(|e| e.to_string())
 }
 
 /// 按关键词查踩坑清单（省 token：不用整份 pitfalls 都读进来）。

@@ -29,8 +29,17 @@ REPO_ONLY=0
 say() { printf '\n=== %s ===\n' "$*"; }
 
 # 只锚定传输根，不递归命中子目录里的 target/
+#
+# **必须显式排除 `src-tauri/target/`**（2026-10-14 实测事故）：`--exclude=/target/` 只匹配
+# 传输根的 target/，于是 `src-tauri/target/`（宿主 macOS 的 16G 构建产物）会被一起同步，
+# 而 `--delete` 会顺手删掉 VM 上 Linux 的增量构建缓存（日志里能看到
+# `cannot delete non-empty directory: src-tauri/target/debug/build/ring-*/out`），
+# 既毁缓存又把两平台产物混在一起。同步前请确保宿主没有正在跑的 cargo（文件被并发
+# 写会让 rsync 报 rc=23 partial transfer）。
 EXCLUDES=(
   --exclude=/target/
+  --exclude=/src-tauri/target/
+  --exclude=/media-bridge/target/
   --exclude=/node_modules/
   --exclude=/.git/
   --exclude=/.DS_Store

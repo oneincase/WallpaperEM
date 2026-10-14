@@ -26,6 +26,28 @@ pub use super::windows::*;
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub use fallback::*;
 
+/// 整窗透明（`_NET_WM_WINDOW_OPACITY`）的跨平台入口。
+///
+/// 只有 Linux/X11 后端有实现（见 `super::linux::set_wallpaper_windows_opacity`，
+/// 里面记了为什么插件模式必须「保持映射 + 透明」而不是「隐藏窗口」）。macOS/Windows
+/// 的壁纸窗口没有等价的 WM 透明度属性，也没有「引擎窗口必须让位给外部壁纸插件」的
+/// 场景，恒返回 `Ok(0)`（= 一扇也没改），调用方据此如实报告而不是假装成功。
+#[cfg(not(target_os = "linux"))]
+pub fn set_wallpaper_windows_opacity(_opacity: f64) -> Result<usize, String> {
+    Ok(0)
+}
+
+/// 直接抓「引擎自己的壁纸窗口」像素的跨平台入口（帧导出用）。
+///
+/// 只有 Linux/X11 后端有真实实现（见 `super::linux::capture_wallpaper_window_rgba`，
+/// 里面记了为什么必须绕开 `canvas.toDataURL()`：WebKitGTK 上页面侧读回是**全黑图**，
+/// 而 X11 抓同一扇窗得到的是正常画面）。macOS/Windows 的帧源仍是渲染器自抓
+/// （`content_server::request_capture`），所以这里返回 `Err`，调用方据此回退页面抓帧。
+#[cfg(not(target_os = "linux"))]
+pub fn capture_wallpaper_window_rgba() -> Result<(Vec<u8>, u16, u16), String> {
+    Err("窗口抓帧只在 Linux/X11 上实现".to_string())
+}
+
 /// 其他平台的编译兜底：桌面层级/屏幕枚举未实现，壁纸以全屏普通窗口呈现
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 mod fallback {

@@ -14,6 +14,7 @@ pub mod platform;
 pub mod pointer;
 pub mod wheel;
 pub mod auto_pause;
+pub mod frame_export;
 
 use crate::audio_capture;
 use crate::db;

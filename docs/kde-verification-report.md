@@ -272,6 +272,56 @@ Ubuntu 24.04.3 / Plasma 5.27.11 / X11 / 1024x768，plasmashell pid 2347 常驻 `
 抢不到 `org.kde.plasmashell` 会立刻退出，必须复用活会话；ImageMagick 掩码必须
 「先把非目标色涂白、再把仍是目标色的涂黑」，顺序反了会把非背景像素数虚报成整块面积。
 
+### 6.6 引擎侧帧导出（`frame_export`）驱动插件（端到端 19 项断言全过）
+
+§6.5 证明「插件能当壁纸」，但帧还是帧泵写的。本轮把引擎这一端补上：`src-tauri/src/wallpaper/frame_export.rs`
+按插件契约往固定路径写 PPM（原子 `tmp` + `rename`）与序号文件，并在插件模式下把自己那扇壁纸窗口
+**整窗透明**。端到端自检 `scripts/kde-frame-export-check.sh`（自建 Xvfb + `kwin_x11` 会话、
+web 类型动画壁纸、19 项断言）**全部通过**。
+
+**为什么帧源不是「页面自抓帧」而是 X11 窗口抓帧。** 页面侧 `__wpCapture`（`drawImage(webglCanvas)`
++ `toDataURL`）在这台 Linux/WebKitGTK（Mesa 25.2.8 / llvmpipe 软栈）上返回**全黑**：miku 场景帧
+99.96% 纯黑、中心像素 `(0,0,0)`；同一时刻屏幕上的桌面**有内容且在变**（`import -window root` 三次
+md5 各不相同、应用日志 `particles live: 79 across 2 systems`）。同一个缺陷也让既有工具
+`wallpaper_screenshot` 产出全黑预览（1088x680 JPEG 仅 4652 字节，目视全黑）——**这是既存问题，
+不是帧导出引入的**。改用 X11 `GetImage` 抓那扇 `_NET_WM_WINDOW_TYPE_DESKTOP` 窗口后：
+`xwd` 4099179 字节（header 107 / depth 32 / 1280x800），采样平均亮度 **192.4**、纯黑占比 **0.000**；
+把该窗 `_NET_WM_WINDOW_OPACITY` 设为 0 之后再抓，仍是 **192.3 / 0.000** ——
+**窗口整窗透明后后备存储内容还在**，插件模式成立。
+
+**插件模式的窗口必须「透明」而不是「隐藏」**（实测对照，同一场景各 7 秒）：
+
+| 窗口状态 | frames | written | skipped |
+| --- | --- | --- | --- |
+| 可见 | 41 | 41 | 0 |
+| 已映射 + `_NET_WM_WINDOW_OPACITY=0` | 83 | 83 | 0 |
+| `xdotool windowunmap`（隐藏） | 140 | **1** | **139** |
+
+隐藏后 WebKitGTK 停掉 rAF，画面冻结；透明不影响出帧。所以 `hideWindow` 走的是「保持映射 + 透明度 0」。
+
+**19 项断言里的关键几项**（原始输出：VM `/tmp/wpem-frame-export.log` 与自检日志）：
+
+| 断言 | 实测 |
+| --- | --- |
+| 帧文件按契约生成 | `frame.ppm` 头 `P6\n1280 800\n255`，字节数 = 头 + w*h*3；`frame.seq` 自增 |
+| 帧内容在变 | 8 秒内 md5 由 `fa2ec9a5…` 变为 `534b9624…`，非黑占比 **1.000** |
+| 帧源是 X11 窗口抓帧 | `status.source = "x11-window"` |
+| 插件模式生效 | `status.hidden_windows = 1`，X 侧 `_NET_WM_WINDOW_OPACITY=0` |
+| 透明期间仍出帧 | 序号 60 → 218（8 秒，rAF 未被停） |
+| 停止可逆 | `hidden_windows=0`，不透明度恢复 `4294967295`，序号冻结（219 → 219） |
+| 停止不留垃圾 | 无 `*.tmp-*` 残留 |
+
+**本轮修掉的一个真缺陷：`stop` 固定慢 12 秒。** 收尾走的是同步 Condvar 等待（`wait_exit`），
+而它跑在 tokio worker 线程上——后台循环恰好需要这条线程才能被调度去读取消标记，于是每次停止
+都**稳定等满 12s 上限再 `abort()`**（日志里 `帧导出心跳：… cancelled=false` 在停止后完全停摆、
+循环来不及 `mark_done`）。现新增 `FrameExporter::stop_async`（`timeout(JoinHandle)` 让出线程）与
+`start_global_async`/`stop_global_async`，MCP 处理器改走异步版；修后同一自检里循环立即退出
+（日志 `帧导出循环退出` 与 `帧导出已停止` 同一毫秒级时间戳，不再出现 `12000ms 内未收尾` 告警），
+19 项断言仍全过。同步 `stop()` 保留给应用退出等同步路径，注释里写明「别在 async 上下文里调用」。
+
+复现：`ssh <vm> 'USE_XVFB=1 bash -s' < scripts/kde-frame-export-check.sh`
+（依赖应用已构建；脚本自起 Xvfb + kwin_x11，造一张 web 类型动画壁纸，跑完停壁纸并删条目）。
+
 ## 7. 对方案的影响（已回填 [kde-adaptation-plan.md](kde-adaptation-plan.md) §2.5）
 
 1. **§4.1 机制①的定义要改**：从「拿桌面层语义并保住图标」改为「拿桌面窗口语义（跳任务栏/全桌面/在普通窗口之下）」，**图标可见性另立一条路**（Plasma 6 Wayland 的 layer-shell `Background`，或 §4.5 壁纸插件）。X11 上无解，别承诺。

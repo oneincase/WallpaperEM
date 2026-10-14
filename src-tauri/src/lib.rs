@@ -418,6 +418,10 @@ pub fn run() {
                 // 应用退出不等于第三方子进程会退出
                 plugin::shutdown_all(_app);
                 crate::media_bridge::stop();
+                // 帧导出同样要收：进程一走，插件的帧文件就再没人更新，留在 tmpfs 里的
+                // 半张临时帧也该清掉；顺手把引擎窗口的整窗透明改回去
+                // （插件模式下的 `_NET_WM_WINDOW_OPACITY=0` 是终端用户可见的状态）。
+                crate::wallpaper::frame_export::stop_global();
             }
             _ => {}
         });

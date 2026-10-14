@@ -33,14 +33,24 @@
   别的应用 = 暂停」（KDE/X11 真机实测：活动窗口是 plasmashell 的 DESKTOP 窗，
   分类为桌面 → 播放）。此前该判据恒 `Unknown`（判定表恒 `Keep`，等于不生效）。
   Wayland 会话仍恒 `Unknown`：协议没有「当前活动窗口」的全局概念。
-- **KDE 下「壁纸 + 桌面图标」有了可行的第二条路（独立仓库，尚未接入引擎）**：
+- **KDE 下「壁纸 + 桌面图标」有了可行的第二条路（独立仓库，引擎侧已接通）**：
   动态壁纸做成 plasmashell 的壁纸插件后，壁纸成为桌面 containment 的背景层，
   **不再盖住桌面图标**——此前窗口方案在本机已被实测证明做不到（KWin 不让任何客户端
   窗口排到桌面视图之下）。插件已在**真实 Plasma 桌面**上验证：帧画到桌面、桌面图标与
   面板图层逐像素不变、按序号换帧（独立仓库 `WallpaperEM-Plasma` 的
-  `scripts/plasma-real-test.sh`，18 项断言）。注意：**引擎侧帧传输还没接**（`frame_export`
-  未实现），现在只能用仓库自带的帧泵喂帧；装插件也仍需手动（`kpackagetool5` / 该仓
-  `scripts/install.sh`），应用内一键启用尚未做。
+  `scripts/plasma-real-test.sh`，18 项断言）。引擎侧也已接通（见下一条）。
+- **引擎侧帧导出（`frame_export`）三个 MCP 工具**：`frame_export_start` /
+  `frame_export_stop` / `frame_export_status`，按插件契约往 tmpfs 写 PPM 帧
+  （`tmp` + 原子 `rename`）与序号文件，逐帧 SHA-256 去重（内容没变就不写盘），
+  `start` 时校验目录可写、`stop` 时清临时文件。两个 Linux 专属要点在真机实测后被写进
+  实现：帧源默认走**页面自抓帧**，但 Linux/WebKitGTK 上 `drawImage(webglCanvas)` +
+  `toDataURL` 读回的是**全黑**（既存缺陷，`wallpaper_screenshot` 同样受影响），
+  因此插件模式用 `windowCapture` 改抓引擎自己的 X11 壁纸窗口；插件模式还必须用
+  `hideWindow` 把该窗口**整窗透明**而不是隐藏——隐藏会让 WebKitGTK 停掉 rAF、画面冻结
+  （实测隐藏后 140 帧仅 1 帧变化，透明则 83/83 全变），且 `stop` 会把不透明度还原。
+  端到端自检 `scripts/kde-frame-export-check.sh`（Xvfb + KWin + web 类型动画壁纸，
+  19 项断言：帧头/字节数、内容 md5 变化、非黑占比、帧源、透明化、停止可逆与无残留）全过。
+  应用内一键启用（图形界面按钮）尚未做，目前经 MCP 调用。
 
 - **`webwallgl` 改走 npm 依赖（3.0.0）**：渲染库此前是 `file:../webwallgl-github/dist/lib`，
   必须把库仓库克隆到本仓平级并先 `pnpm run build:lib`，否则 `pnpm install` 解析不到。

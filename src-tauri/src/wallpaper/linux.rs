@@ -24,6 +24,14 @@
 //!   开关同样不生效（详见该函数说明）。
 //! - **显示器睡眠**：无统一查询接口（logind/DPMS 各管一段），恒返回 false，
 //!   即不做「合盖暂停/释放壁纸」的自动处理。
+//! - **窗口抓帧**（[`capture_wallpaper_window_rgba`]）：Linux/WebKitGTK 上页面侧
+//!   自抓帧（`drawImage(glCanvas).toDataURL`）返回**全黑**，同一窗口用 X11
+//!   `GetImage` 抓到的却是真实像素（实测平均亮度 192），且窗口设
+//!   `_NET_WM_WINDOW_OPACITY=0` 之后 X11 侧仍能抓到完整内容 —— 所以帧导出在
+//!   X11 会话改走「抓窗口像素」而不是读页面画布。**仅 X11**：Wayland 没有
+//!   `GetImage` 等价的全窗口读回，待 KWin `org.kde.KWin.ScreenShot2`
+//!   （`CaptureWindow`）接口补上，在此之前 Wayland 会话调用即报错、由调用方
+//!   回退页面自抓帧。
 
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -113,8 +121,14 @@ pub fn active_screens() -> Vec<ScreenInfo> {
         }
     }
     let out = query_monitors();
-    if let Ok(mut cache) = SCREENS_CACHE.lock() {
-        *cache = Some((Instant::now(), out.clone()));
+    // 空列表**不进缓存**：刚启动那一瞬 GTK/tao 还枚举不出显示器（实测 2026-10-14 验证机上
+    // 启动后约 1s 内 `available_monitors()` 返回空），把它缓存 1.5s 会让这期间的每个命令都
+    // 拿不到屏 —— `wallpaper_apply` 会直接报「未找到目标显示器」。不缓存空结果，下一次调用
+    // 立即重查，屏一出现就能用。
+    if !out.is_empty() {
+        if let Ok(mut cache) = SCREENS_CACHE.lock() {
+            *cache = Some((Instant::now(), out.clone()));
+        }
     }
     out.into_iter().map(|(s, _)| s).collect()
 }
@@ -444,6 +458,303 @@ pub fn occlusion_snapshot() -> Option<super::auto_pause::OcclusionSnapshot> {
     Some(OcclusionSnapshot { coverages })
 }
 
+/// 把本进程的桌面层壁纸窗口整窗设为指定不透明度，返回被改动的窗口数。
+///
+/// 属性是 EWMH 的 `_NET_WM_WINDOW_OPACITY`（32 位 CARDINAL，`0` = 全透明、
+/// `0xFFFFFFFF` = 完全不透明），compositor（KWin/Mutter…）合成时按它调 alpha。
+///
+/// **这是 Plasma 壁纸插件模式的前置条件**（2026-10-14 在真 KWin 上实测）：
+/// 插件负责把引擎导出的帧画到桌面上，引擎自己的窗口就必须看不见 —— 但**不能**
+/// 用「隐藏 / 取消映射」实现：WebKitGTK 会把不可见窗口的 rAF 停掉，抓到的帧就
+/// 冻结在最后一帧（同一场景、同一 1080p 窗口，unmap 后 7 秒 140 帧里 139 帧
+/// 逐字节相同）；保持映射 + 整窗透明则照常出帧（同 7 秒 83 帧全部有变化）。
+///
+/// X11 专用：Wayland 下壁纸窗口是原生 surface，没有这个属性可设，返回 `Ok(0)`
+/// 并记一条 debug 日志（插件模式在 Wayland 下仍需别的机制，见
+/// `docs/kde-adaptation-plan.md` 的开放问题）。
+pub fn set_wallpaper_windows_opacity(opacity: f64) -> Result<usize, String> {
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, PropMode};
+    use x11rb::wrapper::ConnectionExt as _;
+
+    let force_x11 = std::env::var("GDK_BACKEND").is_ok_and(|b| b == "x11");
+    if !force_x11 && std::env::var("WAYLAND_DISPLAY").is_ok() {
+        tracing::debug!("linux: Wayland 会话不支持整窗透明（插件模式另需机制）");
+        return Ok(0);
+    }
+
+    // 窗口筛选（winclist 取法 + pid/type 过滤）收口到 our_desktop_windows，
+    // 与窗口抓帧共用一套条件；这里只要 id。
+    let windows: Vec<u32> = our_desktop_windows()?
+        .into_iter()
+        .map(|(w, _, _)| w)
+        .collect();
+
+    let (conn, _screen_num) = x11rb::connect(None).map_err(|e| format!("连不上 X11：{e}"))?;
+    let intern = |name: &[u8]| -> Option<u32> {
+        Some(conn.intern_atom(false, name).ok()?.reply().ok()?.atom)
+    };
+    let opacity_atom = intern(b"_NET_WM_WINDOW_OPACITY").ok_or("没有 _NET_WM_WINDOW_OPACITY")?;
+
+    let value = opacity_to_cardinal(opacity);
+    let mut changed = 0usize;
+    for w in &windows {
+        if let Err(e) = conn.change_property32(
+            PropMode::REPLACE,
+            *w,
+            opacity_atom,
+            AtomEnum::CARDINAL,
+            &[value],
+        ) {
+            return Err(format!("写 _NET_WM_WINDOW_OPACITY 失败：{e}"));
+        }
+        changed += 1;
+    }
+    let _ = conn.flush();
+
+    // 读回校验：`change_property32` 返回的是 VoidCookie，X 的错误是**异步**的 ——
+    // 窗口已经没了、请求被拒，调用方都只会看到“成功”。插件模式完全押在这个属性上，
+    // 静默失败的两头都是坏结果（该透明时没透明 = 引擎窗口盖住插件；该恢复时没恢复 =
+    // 用户看到「壁纸不见了」），所以这里逐窗读回，对不上就记 warn。
+    let mut mismatched = 0usize;
+    for w in &windows {
+        let got = conn
+            .get_property(false, *w, opacity_atom, AtomEnum::CARDINAL, 0, 1)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| r.value32().and_then(|mut it| it.next()));
+        if got != Some(value) {
+            mismatched += 1;
+            tracing::warn!(
+                "linux: 窗口 {w:#x} 不透明度写回不一致：期望 {value}，实际 {got:?}"
+            );
+        }
+    }
+    if changed > 0 {
+        tracing::debug!("linux: 已把 {changed} 扇窗口的不透明度写成 {value}（不一致 {mismatched}）");
+    }
+    Ok(changed)
+}
+
+/// 本进程的桌面层窗口清单（X11），逐项给出 `(window_id, width, height)`。
+///
+/// 全文件唯一的「枚举本进程 DESKTOP 窗口」实现，[`set_wallpaper_windows_opacity`] 与
+/// [`find_wallpaper_window`] 共用，避免两处各写一套过滤条件而后悄悄分叉：
+/// - 顶层窗口清单取 `_NET_CLIENT_LIST_STACKING`（WM 维护的堆叠序），缺失或为空时
+///   退回 `_NET_CLIENT_LIST`（无序，但内容一致）；
+/// - 只留 `_NET_WM_PID == std::process::id()` 且 `_NET_WM_WINDOW_TYPE` 含
+///   `_NET_WM_WINDOW_TYPE_DESKTOP` 的窗口（本进程的普通窗口/设置窗被排除）。
+///
+/// 刻意**不过滤映射状态与尺寸**：调用方语义不同 —— 整窗透明对未映射窗口也要设属性
+/// （窗口可能还没映射，属性得先写好），而抓帧要求窗口可见且够大。任一属性读不到就
+/// 跳过该窗口（当作「不是我们的桌面窗」），不因此整体失败。
+fn our_desktop_windows() -> Result<Vec<(u32, u16, u16)>, String> {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, Window};
+
+    let (conn, screen_num) = x11rb::connect(None).map_err(|e| format!("连不上 X11：{e}"))?;
+    let root = conn.setup().roots[screen_num].root;
+    let intern = |name: &[u8]| -> Option<u32> {
+        Some(conn.intern_atom(false, name).ok()?.reply().ok()?.atom)
+    };
+
+    // 顶层窗口清单（没有 EWMH 的 WM 罕见；两代属性都没有才算失败）
+    let prop = |atom| -> Option<Vec<u32>> {
+        Some(
+            conn.get_property(false, root, atom, AtomEnum::WINDOW, 0, 4096)
+                .ok()?
+                .reply()
+                .ok()?
+                .value32()?
+                .collect(),
+        )
+    };
+    let windows: Vec<Window> = match intern(b"_NET_CLIENT_LIST_STACKING")
+        .and_then(&prop)
+        .filter(|v| !v.is_empty())
+    {
+        Some(v) => v,
+        None => {
+            let list = intern(b"_NET_CLIENT_LIST").ok_or("没有 _NET_CLIENT_LIST")?;
+            prop(list).ok_or("读不到窗口清单")?
+        }
+    };
+
+    let pid_atom = intern(b"_NET_WM_PID").ok_or("没有 _NET_WM_PID")?;
+    let type_atom = intern(b"_NET_WM_WINDOW_TYPE").ok_or("没有 _NET_WM_WINDOW_TYPE")?;
+    let type_desktop =
+        intern(b"_NET_WM_WINDOW_TYPE_DESKTOP").ok_or("没有 _NET_WM_WINDOW_TYPE_DESKTOP")?;
+
+    let mut out = Vec::new();
+    for w in windows {
+        let pid = conn
+            .get_property(false, w, pid_atom, AtomEnum::CARDINAL, 0, 1)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| r.value32().and_then(|mut it| it.next()));
+        if pid != Some(std::process::id()) {
+            continue;
+        }
+        let wtype: Vec<u32> = conn
+            .get_property(false, w, type_atom, AtomEnum::ATOM, 0, 8)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| r.value32().map(|it| it.collect()))
+            .unwrap_or_default();
+        if !wtype.contains(&type_desktop) {
+            continue;
+        }
+        // 几何拿不到就按 0x0 记（抓帧会因「太小」拒绝；整窗透明不需要尺寸）
+        let (w_, h_) = conn
+            .get_geometry(w)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .map(|g| (g.width, g.height))
+            .unwrap_or((0, 0));
+        out.push((w, w_, h_));
+    }
+    Ok(out)
+}
+
+/// 抓帧的最小窗口边长（像素）：比这更小的不可能是壁纸窗口，直接判失败而不是
+/// 抓出一张 1x1 的垃圾帧去覆盖整屏（调用方会回退页面自抓帧）。
+const MIN_CAPTURE_SIDE: u16 = 16;
+
+/// 找到本进程的壁纸窗口，返回 `(window_id, width, height)`。
+///
+/// 桌面窗口理论上每个显示器一扇（`wallpaper-<displayId>`），但可能有还没销毁的旧
+/// 窗口或辅助窗口，所以按**面积最大**挑：壁纸窗口必然铺满一块屏，是最大的一扇。
+///
+/// `Ok(None)` = 一扇本进程的桌面窗口都没有（窗口还没建出来、或系统壁纸窗口不归
+/// 本进程）——这是「暂不可用」而非错误，调用方回退即可。连接失败/没有 EWMH 属性
+/// 才返回 `Err`。尺寸小于 [`MIN_CAPTURE_SIDE`] 的窗口不参与选择；若全部都不够大，
+/// 也返回 `Ok(None)`（同样交给调用方回退）。
+pub fn find_wallpaper_window() -> Result<Option<(u32, u16, u16)>, String> {
+    Ok(our_desktop_windows()?
+        .into_iter()
+        .filter(|(_, w, h)| *w >= MIN_CAPTURE_SIDE && *h >= MIN_CAPTURE_SIDE)
+        .max_by_key(|(_, w, h)| (*w as u64) * (*h as u64)))
+}
+
+/// 用 X11 `GetImage` 抓本进程壁纸窗口的像素，返回 `(RGBA8, width, height)`。
+///
+/// 为什么走窗口而不是读页面画布：见文件头「窗口抓帧」一段（WebKitGTK 的
+/// `toDataURL` 全黑，X11 后备存储里是真内容，且整窗透明后内容仍在）。
+///
+/// 说清楚的三个边界：
+/// - **仅 X11**：`WAYLAND_DISPLAY` 且未强制 `GDK_BACKEND=x11` 时直接报错（Wayland
+///   没有 `GetImage` 等价物，待 KWin `ScreenShot2`），调用方回退页面自抓帧；
+/// - **depth 只支持 24/32**：都按 32bpp 解（X server 的 ZPixmap 把 24 位像素也放在
+///   4 字节里，最高字节是填充/alpha），其他 depth（如 16 位 565）返回 Err 而不是
+///   猜字节序把颜色抓错；
+/// - **像素序**：`GetImage` 给的是服务器字节序的 BGRX，转换见 [`bgrx_to_rgba`]。
+///
+/// 抓不到像素的原因（窗口未映射、被合成器接管、BadMatch…）由 GetImage 的
+/// `ReplyError` 变成带上下文的中文 Err，而不是 panic。
+pub fn capture_wallpaper_window_rgba() -> Result<(Vec<u8>, u16, u16), String> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        // 该模块只在 Linux 编译（见 mod.rs 的 `#[cfg(target_os = "linux")]`），这里
+        // 是为「有人误把模块放开到全平台」时仍能优雅失败而留的分包（同任务要求）。
+        Err("仅 X11/Linux 支持窗口抓帧".into())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // `get_image`/`get_property` 等都在 `xproto::ConnectionExt` 上；
+        // 这里没有 `flush`，所以不需要 `x11rb::connection::Connection`。
+        use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat};
+
+        let force_x11 = std::env::var("GDK_BACKEND").is_ok_and(|b| b == "x11");
+        if !force_x11 && std::env::var("WAYLAND_DISPLAY").is_ok() {
+            return Err("Wayland 会话不支持窗口抓帧（待 KWin ScreenShot2）".into());
+        }
+
+        let (wid, w, h) =
+            find_wallpaper_window()?.ok_or("未找到本进程的壁纸窗口（桌面窗口还没建出来？）")?;
+        if w < MIN_CAPTURE_SIDE || h < MIN_CAPTURE_SIDE {
+            return Err(format!("壁纸窗口太小，拒绝抓帧：{w}x{h}"));
+        }
+
+        let (conn, _screen_num) = x11rb::connect(None).map_err(|e| format!("连不上 X11：{e}"))?;
+
+        // X11 0.13 的实参顺序是 (format, drawable, x, y, w, h, plane_mask)；
+        // drawable 是 `type Drawable = u32` 的别名，窗口 id 直接传（没有 Drawable::Window）。
+        // plane_mask 用 u32::MAX = 全部平面；depth 从 reply 读，用来决定行跨度/合法性。
+        let reply = conn
+            .get_image(ImageFormat::Z_PIXMAP, wid, 0, 0, w, h, u32::MAX)
+            .map_err(|e| format!("GetImage 请求失败：{e}"))?
+            .reply()
+            .map_err(|e| format!("GetImage 无回复：{e}"))?;
+
+        if reply.depth != 24 && reply.depth != 32 {
+            return Err(format!(
+                "壁纸窗口色深 {} 不支持（仅 24/32 bpp）",
+                reply.depth
+            ));
+        }
+
+        // depth 24/32 的 ZPixmap 每像素 4 字节；X 的行跨度是 4 字节对齐，这里 (w*4+3)/4*4
+        // 恒等于 w*4（w: u16 ⇒ w*4 已是 4 的倍数），但保留通用写法，单测覆盖了非整除步长。
+        let bytes_per_line = (w as usize * 4 + 3) / 4 * 4;
+        let need = bytes_per_line
+            .checked_mul(h as usize)
+            .ok_or("窗口尺寸溢出（宽×高过大）")?;
+        if reply.data.len() < need {
+            return Err(format!(
+                "GetImage 数据不完整：{} 字节 < 期望 {} 字节（{w}x{h} depth {}）",
+                reply.data.len(),
+                need,
+                reply.depth
+            ));
+        }
+
+        Ok((bgrx_to_rgba(&reply.data, w, h, bytes_per_line), w, h))
+    }
+}
+
+/// BGRX(ZPixmap) → RGBA8。**平台无关纯函数**（不带 cfg，宿主机也能跑单测）。
+///
+/// X server 的 ZPixmap 每像素 4 字节、按服务器字节序排成 `B,G,R,X`（X 是填充；
+/// depth 32 时是 alpha，但本用法下窗口内容恒不透明，输出 alpha 一律 255）。
+/// `bytes_per_line` 由调用方按 X 的行跨度给（≥ `w*4`），因此这里必须**按 stride
+/// 跳行**而不是假定紧凑排列 —— 少了这一步，任何一行跨度的差异都会把图像斜切。
+///
+/// 越界一律**跳过**而不是 panic：缓冲区来自 X server，长度不由我们保证，宁可输出
+/// 一张尾部有洞的图（上层会发现异常）也不要让帧导出线程崩掉。
+fn bgrx_to_rgba(data: &[u8], w: u16, h: u16, bytes_per_line: usize) -> Vec<u8> {
+    let (w, h) = (w as usize, h as usize);
+    let mut rgba = vec![0u8; w * h * 4];
+    for row in 0..h {
+        let row_start = row * bytes_per_line;
+        for col in 0..w {
+            let s = row_start + col * 4;
+            // 需要 s..s+4 四个字节；不足则本行剩余像素全部跳过
+            let Some(px) = data.get(s..s + 4) else {
+                break;
+            };
+            let d = (row * w + col) * 4;
+            rgba[d] = px[2]; // R：BGRX 的第三字节
+            rgba[d + 1] = px[1]; // G
+            rgba[d + 2] = px[0]; // B
+            rgba[d + 3] = 255; // X/alpha → 不透明
+        }
+    }
+    rgba
+}
+
+/// 不透明度 → `_NET_WM_WINDOW_OPACITY` 的 32 位值（EWMH：`0xFFFFFFFF` = 完全不透明）。
+/// 越界输入截到 `0..=1`，NaN 按 0 处理 —— 宁可透过去，也不要因为一个坏值把壁纸
+/// 钉成不透明、把插件模式悄悄变成「引擎窗口盖住插件」。
+fn opacity_to_cardinal(opacity: f64) -> u32 {
+    if opacity.is_nan() || opacity <= 0.0 {
+        return 0;
+    }
+    if opacity >= 1.0 {
+        return u32::MAX;
+    }
+    (opacity * u32::MAX as f64).round() as u32
+}
+
 /// 前台窗口分类的纯逻辑：把「已解析出来的 X11 属性」映射成 [`FrontKind`]。
 ///
 /// 判定顺序刻意与 macOS 后端一致（Finder → 桌面；自己 → SelfApp）：
@@ -592,6 +903,120 @@ mod frontmost_tests {
             classify_frontmost(true, None, OURS, false, false),
             FrontKind::Other
         );
+    }
+}
+
+#[cfg(test)]
+mod opacity_tests {
+    use super::opacity_to_cardinal;
+
+    #[test]
+    fn zero_is_fully_transparent() {
+        assert_eq!(opacity_to_cardinal(0.0), 0);
+    }
+
+    #[test]
+    fn one_and_above_are_fully_opaque() {
+        // EWMH：0xFFFFFFFF 才是「不透明」，少一位都会让壁纸半透明
+        assert_eq!(opacity_to_cardinal(1.0), u32::MAX);
+        assert_eq!(opacity_to_cardinal(1.5), u32::MAX);
+    }
+
+    #[test]
+    fn negative_or_nan_falls_back_to_transparent() {
+        // 坏值必须偏「透」：偏不透明 = 引擎窗口把插件盖住，故障看不出来
+        assert_eq!(opacity_to_cardinal(-0.5), 0);
+        assert_eq!(opacity_to_cardinal(f64::NAN), 0);
+    }
+
+    #[test]
+    fn middle_values_scale_monotonically() {
+        let quarter = opacity_to_cardinal(0.25);
+        let half = opacity_to_cardinal(0.5);
+        let three_quarter = opacity_to_cardinal(0.75);
+        assert!(quarter < half && half < three_quarter);
+        assert!(three_quarter < u32::MAX);
+        assert_eq!(half, 0x8000_0000);
+    }
+}
+
+/// X11 抓帧的像素转换单测：`bgrx_to_rgba` 刻意不带 cfg 门槛，就是为了能在任何
+/// 开发机（含 macOS/Windows）上跑。**注意**：本模块 `linux` 整体挂在
+/// `#[cfg(target_os = "linux")]` 下（见 mod.rs），所以在非 Linux 宿主上这些测试会被
+/// 编译掉、`cargo test --lib` 显示 0 tests（不是失败）；要在这台 macOS 上真跑，得把
+/// `bgrx_to_rgba` + 本模块挪进一个不带平台门槛的私有子模块（需改 mod.rs）。
+#[cfg(test)]
+mod window_capture_tests {
+    use super::bgrx_to_rgba;
+
+    /// 每像素 B,G,R,X 的紧缩缓冲（stride = w*4）
+    fn px(b: u8, g: u8, r: u8) -> [u8; 4] {
+        [b, g, r, 0xFF]
+    }
+
+    #[test]
+    fn converts_bgrx_rows_to_rgba() {
+        // 2x2、无行填充：第 1 行红绿，第 2 行蓝白（X 通道应被丢弃、alpha 恒 255）
+        let mut data = Vec::new();
+        data.extend_from_slice(&px(0x00, 0x00, 0xFF)); // 红
+        data.extend_from_slice(&px(0x00, 0xFF, 0x00)); // 绿
+        data.extend_from_slice(&px(0xFF, 0x00, 0x00)); // 蓝
+        data.extend_from_slice(&px(0xFF, 0xFF, 0xFF)); // 白
+
+        let rgba = bgrx_to_rgba(&data, 2, 2, 8);
+        assert_eq!(
+            rgba,
+            vec![
+                255, 0, 0, 255, // 红
+                0, 255, 0, 255, // 绿
+                0, 0, 255, 255, // 蓝
+                255, 255, 255, 255, // 白
+            ]
+        );
+    }
+
+    #[test]
+    fn large_bytes_per_line_skips_row_padding() {
+        // 2x1 窗口但 stride = 20（> 8）：第 2 行起点在 20，中间 12 字节填充必须整段跳过
+        let mut data = vec![0u8; 40];
+        data[0..4].copy_from_slice(&px(0xAA, 0xBB, 0xCC)); // 行 0 像素 0
+        data[4..8].copy_from_slice(&px(0x11, 0x22, 0x33)); // 行 0 像素 1
+        data[8..20].fill(0xEE); // 行 0 尾部填充（不该出现在输出里）
+        data[20..24].copy_from_slice(&px(0x01, 0x02, 0x03)); // 行 1 像素 0
+        data[24..28].copy_from_slice(&px(0x04, 0x05, 0x06)); // 行 1 像素 1
+        data[28..40].fill(0xEE); // 行 1 尾部填充
+
+        let rgba = bgrx_to_rgba(&data, 2, 2, 20);
+        assert_eq!(
+            rgba,
+            vec![
+                0xCC, 0xBB, 0xAA, 255, 0x33, 0x22, 0x11, 255, // 行 0
+                0x03, 0x02, 0x01, 255, 0x06, 0x05, 0x04,
+                255, // 行 1（填充 0xEE 未混入）
+            ]
+        );
+    }
+
+    #[test]
+    fn truncated_data_does_not_panic_and_zero_fills_tail() {
+        // 声明 2x2 却只给 1.5 行：不得 panic，缺的像素保持 0
+        let mut data = Vec::new();
+        data.extend_from_slice(&px(0x00, 0x00, 0xFF)); // 行 0 像素 0 → 红
+        data.extend_from_slice(&px(0x00, 0xFF, 0x00)); // 行 0 像素 1 → 绿
+        data.extend_from_slice(&[0x10, 0x20, 0x30, 0xFF]); // 行 1 像素 0（截断处）
+
+        let rgba = bgrx_to_rgba(&data, 2, 2, 8);
+        assert_eq!(rgba.len(), 16);
+        assert_eq!(&rgba[0..8], &[255, 0, 0, 255, 0, 255, 0, 255]);
+        assert_eq!(&rgba[8..12], &[0x30, 0x20, 0x10, 255]);
+        assert_eq!(&rgba[12..16], &[0, 0, 0, 0]); // 越界像素跳过 → 全 0
+    }
+
+    #[test]
+    fn empty_buffer_yields_all_transparent_black() {
+        // 最极端：X server 一个字节都没给，也必须返回正确长度的全 0 图而不是 panic
+        let rgba = bgrx_to_rgba(&[], 3, 2, 12);
+        assert_eq!(rgba, vec![0u8; 24]);
     }
 }
 
