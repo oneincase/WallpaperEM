@@ -75,10 +75,27 @@ trap cleanup EXIT
 step "前置检查"
 [ -x "$APP_BIN" ] || { echo "✗ 找不到可执行文件 $APP_BIN"; exit 1; }
 [ -f "$DB" ] || { echo "✗ 找不到应用数据库 $DB（先运行一次应用）"; exit 1; }
-for c in Xvfb kwin_x11 plasmashell dbus-launch qdbus xdotool xprop xwininfo python3 curl; do
+for c in Xvfb kwin_x11 plasmashell dbus-launch xdotool xprop xwininfo python3 curl; do
   command -v "$c" >/dev/null 2>&1 || { echo "✗ 缺命令 $c"; exit 1; }
 done
-info "APP_BIN=$APP_BIN"
+# Plasma 脚本通道：qdbus 的各代命令不一定都装（CI 的 ubuntu 镜像里就常常只有 gdbus）。
+# 这里只用来「探一下 /PlasmaShell 在不在」，跟引擎侧 kde_plugin::run_plasma_script
+# 一样按候选顺序找，gdbus 兜底 —— 否则换个镜像就红在依赖检查上。
+QBUS=""
+for c in qdbus qdbus-qt5 qdbus6; do
+  command -v "$c" >/dev/null 2>&1 && { QBUS="$c"; break; }
+done
+if [ -z "$QBUS" ] && command -v gdbus >/dev/null 2>&1; then QBUS="gdbus"; fi
+[ -n "$QBUS" ] || { echo "✗ 缺命令 qdbus/qdbus-qt5/qdbus6/gdbus（探测 plasmashell 用）"; exit 1; }
+plasmashell_reachable() {
+  if [ "$QBUS" = "gdbus" ]; then
+    gdbus call --session --dest org.kde.plasmashell --object-path /PlasmaShell \
+      --method org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1
+  else
+    "$QBUS" org.kde.plasmashell /PlasmaShell >/dev/null 2>&1
+  fi
+}
+info "APP_BIN=$APP_BIN（Plasma 探测通道：$QBUS）"
 
 # ---------------------------------------------------------------- 1) 自建会话
 step "自建会话：Xvfb $DISPLAY + kwin_x11 + plasmashell"
@@ -96,11 +113,11 @@ for _ in $(seq 1 40); do xprop -root _NET_SUPPORTING_WM_CHECK >/dev/null 2>&1 &&
 plasmashell --no-respawn >"$WORK/plasmashell.log" 2>&1 & PLASMA_PID=$!
 # plasmashell 的脚本接口要等它把 /PlasmaShell 注册到会话总线（这才是「一键启用」真正依赖的东西）
 DEADLINE=$(( $(date +%s) + 60 ))
-until qdbus org.kde.plasmashell /PlasmaShell >/dev/null 2>&1; do
+until plasmashell_reachable; do
   [ "$(date +%s)" -lt "$DEADLINE" ] || { bad "60s 内 plasmashell 的 /PlasmaShell 没起来（$WORK/plasmashell.log）"; exit 1; }
   sleep 1
 done
-ok "plasmashell 已就绪（/PlasmaShell 可 qdbus 访问，pid=$PLASMA_PID）"
+ok "plasmashell 已就绪（/PlasmaShell 可 $QBUS 访问，pid=$PLASMA_PID）"
 
 # ---------------------------------------------------------------- 2) 备份真状态
 cp -f "$APP_CFG" "$WORK/appletsrc.bak" 2>/dev/null || : > "$WORK/appletsrc.bak"
@@ -132,7 +149,16 @@ PY
 # ---------------------------------------------------------------- 3) 起应用 + MCP
 step "起应用并连通 MCP"
 APP_BIN_ABS="$(cd "$(dirname "$APP_BIN")" && pwd)/$(basename "$APP_BIN")"
-pkill -f "$APP_BIN_ABS" 2>/dev/null && { info "关掉上一次自检起的应用"; sleep 1; }
+# 只杀「上一次自检起的应用」。**不能用 `pkill -f "$APP_BIN_ABS"`**：脚本最常见的调法
+# 是 `ssh <vm> 'APP_BIN=/usr/bin/WallpaperEM bash -s' < 脚本`，调用者那条 shell 的
+# cmdline 里就带着这个路径，pkill -f 会把自己的调用者（连同整条 ssh 会话）一起杀掉，
+# 现象是 ssh 返回 255、输出半截 —— 实测踩过。按 /proc/<pid>/exe 精确匹配真正的二进
+# 制，既不会误杀，也不依赖 cmdline 文本。
+for pid in $(pgrep -f "$APP_BIN_ABS" 2>/dev/null || true); do
+  [ "$(readlink -f "/proc/$pid/exe" 2>/dev/null)" = "$APP_BIN_ABS" ] || continue
+  kill "$pid" 2>/dev/null && { info "关掉上一次自检起的应用（pid=$pid）"; }
+done
+sleep 1
 setsid "$APP_BIN" >"$LOG" 2>&1 &
 APP_PID=$!
 read -r PORT TOKEN < <(python3 - "$DB" <<'PY'
@@ -191,6 +217,35 @@ while :; do
   sleep 1
 done
 ok "枚举到显示器"
+
+# 安装产物自检：确认「跑起来的这份二进制」对应的前端 bundle 里真的有 KDE 组与
+# 三个命令名。装完 deb 却跑的是旧 renderer（或者 renderer 没进包）时，界面上的
+# 按钮根本不存在 —— 这条断言让那种情况直接红，而不是靠人眼。
+# 资源目录语义（tauri 2.11.5 Linux 非 AppImage）= <exe 所在目录>/../lib/<exe 名>。
+RES_ROOT="$(cd "$(dirname "$APP_BIN")/../lib/$(basename "$APP_BIN")" 2>/dev/null && pwd || true)"
+# 注意资源布局：renderer 是 HTML 外壳，真正的 JS 打包产物在同级 assets/ 里 ——
+# 只 grep renderer 会假红（实测踩过：一开始就漏了 assets）。中文串按原文找，
+# 另外顺手认一下 \u 转义形式：打包器 charset 一改就会把中文写成转义
+# （本项目 Vite 现在输出 UTF-8 原文）。
+if [ -d "$RES_ROOT/renderer" ] || [ -d "$RES_ROOT/assets" ]; then
+  step "安装产物自检：前端 bundle 里含 KDE 组与 kde_plugin_* 命令"
+  FRONT_DIRS=""
+  [ -d "$RES_ROOT/renderer" ] && FRONT_DIRS="$RES_ROOT/renderer"
+  [ -d "$RES_ROOT/assets" ] && FRONT_DIRS="$FRONT_DIRS $RES_ROOT/assets"
+  # shellcheck disable=SC2086
+  HIT_LABEL="$(grep -rl -e 'KDE 桌面集成' -e 'u684C' $FRONT_DIRS 2>/dev/null | head -1)"
+  HIT_CMD="$(grep -rl 'kde_plugin_status' $FRONT_DIRS 2>/dev/null | head -1)"
+  [ -n "$HIT_LABEL" ] && ok "bundle 含「KDE 桌面集成」文案（$(basename "$HIT_LABEL")）" \
+    || bad "bundle 里没有 KDE 组文案（找过：${RES_ROOT}/renderer、assets）"
+  [ -n "$HIT_CMD" ] && ok "bundle 含命令名 kde_plugin_status（$(basename "$HIT_CMD")）" \
+    || bad "bundle 里没有 kde_plugin_status"
+  for cmd in kde_plugin_enable kde_plugin_disable; do
+    grep -rq "$cmd" $FRONT_DIRS 2>/dev/null && ok "bundle 里有 invoke(\"$cmd\")" \
+      || bad "bundle 里没有 $cmd"
+  done
+else
+  info "跳过安装产物自检：$RES_ROOT/renderer 与 assets 都不存在（开发态二进制）"
+fi
 
 # ---------------------------------------------------------------- 4) 挂一张会动的壁纸
 step "建 web 工程 → 写会动的页面 → 安装 → 应用到桌面（enable 要求有在播的壁纸）"

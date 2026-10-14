@@ -39,6 +39,10 @@ say() { printf '\n=== %s ===\n' "$*"; }
 EXCLUDES=(
   --exclude=/target/
   --exclude=/src-tauri/target/
+  # build.rs 生成的产物（src-tauri/bundled/libsteam_api.so）：宿主没有，不该被 --delete
+  # 删掉、也不该同步过去；删掉之后 --no-build 的装包会以「资源缺失」失败，
+  # 见 scripts/kde-vm-deb.sh 里的缺失探测。
+  --exclude=/src-tauri/bundled/
   --exclude=/media-bridge/target/
   --exclude=/node_modules/
   --exclude=/.git/
@@ -49,8 +53,11 @@ EXCLUDES=(
   --exclude=*.rmeta
 )
 
-BW_FLAG=()
-[ "$BW" != "0" ] && BW_FLAG=(--bwlimit="$BW")
+# 限速参数用普通字符串而不是数组：空数组在 `set -u` 下的展开会让 bash 3.2（macOS 自带）
+# 报 `BW_FLAG[@]: unbound variable`，而 `BW=0`（不限速）正是文档里写明的用法。
+# 下面两处 rsync 以**不加引号**的方式展开它：值为空时展开成零个参数，这是本意。
+BW_FLAG=""
+[ "$BW" != "0" ] && BW_FLAG="--bwlimit=$BW"
 
 say "连通性"
 if ! ssh -o BatchMode=yes -o ConnectTimeout=8 "$VM_HOST" 'echo reachable' >/dev/null 2>&1; then
@@ -60,7 +67,7 @@ fi
 echo "  SSH OK: $VM_HOST"
 
 say "同步仓库 → $VM_REPO"
-rsync -az --delete --partial "${BW_FLAG[@]}" "${EXCLUDES[@]}" \
+rsync -az --delete --partial $BW_FLAG "${EXCLUDES[@]}" \
   "$REPO/" "$VM_HOST:$VM_REPO/"
 RC_REPO=$?
 echo "  rsync rc=$RC_REPO"
@@ -73,7 +80,7 @@ if [ "$REPO_ONLY" = "0" ]; then
     exit 1
   fi
   # --delete-excluded：顺手清掉目标端可能残留的 target/
-  rsync -az --delete --delete-excluded --partial "${BW_FLAG[@]}" "${EXCLUDES[@]}" \
+  rsync -az --delete --delete-excluded --partial $BW_FLAG "${EXCLUDES[@]}" \
     "$MEDIA_BRIDGE/" "$VM_HOST:$VM_MEDIA_BRIDGE/"
   RC_MB=$?
   echo "  rsync rc=$RC_MB"

@@ -369,6 +369,76 @@ ssh <vm> 'APP_BIN=/home/parallels/WallpaperEM/src-tauri/target/release/Wallpaper
 > 重定向了），所以设置页截图在**自建 Xvfb 会话里拿不到**；功能正确性靠上面的断言 + 前端
 > `pnpm typecheck` + i18n 审计，真机 UI 目视确认留给有物理/远程桌面的会话。
 
+### 6.8 装成 deb 之后的复验（33 → 37 项，并抓到一个发布级缺陷）
+
+上一节的 33 项跑的是**开发态二进制**（`src-tauri/target/release/WallpaperEM`）——路径、权限、
+资源布局都和用户机上的真实安装不同。补了 `scripts/kde-vm-deb.sh` 把最新版真装进 VM 再复验。
+
+**为什么手工组装 deb**：tauri-cli 官方预编译产物没有 aarch64-linux（GitHub release 资产只有
+x86_64/`cargo-tauri` 之类），所以按 tauri-bundler 的布局手工组装：
+
+```
+usr/bin/<productName>                              ← install -m 0755
+usr/lib/<productName>/{renderer,assets,plasma-wallpaper,libsteam_api.so}
+usr/share/{applications/<productName>.desktop,icons/hicolor/*/apps/*}
+```
+
+这正是 tauri 2.11.5 在 Linux 非 AppImage 下 `resource_dir()` 的语义（`tauri-2.11.5
+src/path/desktop.rs`：`/usr/lib/<exe_name>`）。deb 包名/文件名与官方一致
+（`wallpaper-em_2.2.0_arm64.deb`，`Package: wallpaper-em`），Depends/Recommends 从
+`tauri.linux.conf.json` 解析后写进 control；产物 9.8M，`apt-get install` 走依赖解析装成。
+
+**抓到的真缺陷（发布级，开发态永远看不到）**：`packaging/plasma-wallpaper/` 里的插件包文件是
+`0600`（umask 077 的检出留下来的），`cp -a` 原样带进 deb → 装成 `root:root 0600`。普通用户点
+「启用」时 `fs::copy` 立刻 `Permission denied`（自检报 `拷贝 … /README.md 失败: Permission
+denied (os error 13)`），4 项红。为什么开发态测试看不见：那会儿源和目标是同一个用户，且
+**git 只记 100644/100755，checkout 不会纠正工作区权限**。修法三处：
+
+1. `scripts/sync-plasma-plugin.sh`：同步后 `find -type d chmod 755 / -type f chmod 644`（并写明原因）；
+2. `scripts/kde-vm-deb.sh`：staging 之后再归一一次权限；
+3. CI 的 deb 校验新增断言：`plasma-wallpaper/**/metadata.json`、`contents/ui/main.qml`、
+   `renderer/index.html`、`libsteam_api.so` 必须存在于 deb 且权限是 `-rw-r--r--`。
+
+**另外两个坑（都是「只有装机才出现」）**：
+
+- `rsync --delete` 把 VM 上由 `build.rs` 生成的 `src-tauri/bundled/libsteam_api.so` 删了
+  （宿主没有这个被 gitignore 的目录），于是 `--no-build` 装包报「资源缺失」。修法：sync 里
+  `--exclude=/src-tauri/bundled/`；deb 脚本探测到资源缺失就强制构建并 `touch build.rs`
+  ——否则 cargo 认为 build script 仍是新鲜的、不会重写 `bundled/`。
+- `apt-get install` 对**同版本号**会「已是最新」直接跳过：修好权限后重装被跳过一次，装着的还是
+  旧文件。改成 `apt-get install --reinstall`。
+
+- `pkill -f "$APP_BIN_ABS"` 会**把调用者自己杀掉**：脚本最常见的调法是
+  `ssh <vm> 'APP_BIN=/usr/bin/WallpaperEM bash -s' < 脚本`，而 `pkill -f` 匹配的是整条
+  cmdline —— 调用者那条 shell 的 cmdline 里正好带着这个路径，于是自检把自己连着的 ssh
+  会话干掉（现象：ssh 返回 255、输出半截）。改成按 `/proc/<pid>/exe` 精确匹配真正的二进制。
+  残留进程还会污染下一次自检（`appletsrc` 断言假红），所以自检前必须清干净。
+
+**结果**：`APP_BIN=/usr/bin/WallpaperEM bash scripts/kde-plugin-enable-check.sh` → **37/37 PASS**
+（33 项行为断言 + 4 项安装产物自检），且 `kde_plugin_status.package_dir` 实测为
+`/usr/lib/WallpaperEM/plasma-wallpaper/…`，即 `resolve_package_dir` 在真实安装下按资源目录找到了包；
+安装后的 `metadata.json`/`main.qml` 对 `nobody` 用户可读；bundle 里确认含「KDE 桌面集成」
+（`assets/index-1dTsR9_F.js`）与三个 `kde_plugin_*` 命令名（`assets/ui-qH7NIsJZ.js`）。
+
+**新增 4 项「安装产物自检」**（合计 37 项）：前端 bundle 必须含「KDE 桌面集成」与
+`kde_plugin_status`/`kde_plugin_enable`/`kde_plugin_disable` 三个命令名。前两个包在 HTML 外壳的
+同级 `assets/` 目录里（**不是** `renderer/`），第一版断言只扫 `renderer` 导致假红 4 项 —— 这也是
+「断言自己也会错」的例子。它专防「装完 deb 跑的
+还是旧 renderer」这类假绿，**不依赖像素**，截图拿不到也能红。同一条自检现在也接进了 CI 的
+`kde-smoke` 作业（先 `apt-get install ./artifacts/*.deb`，再用 `/usr/bin/WallpaperEM` 跑）。
+
+**UI 目视确认的两次额外尝试（都失败，记录以免重复踩）**：
+
+- AT-SPI：VM 装 `at-spi2-core` + `python3-pyatspi` 后能枚举到应用框架（`APP WallpaperEM` →
+  `frame | WallpaperEM`），但 WebKitGTK 的网页内容**没有**进无障碍树（伴随
+  `A connection to the bus can't be made`），所以无法用无障碍 API 断言/点击按钮。
+- 截图：`import -window root` 在真实 `:0`（Xorg 1366x768 + plasmashell）能拍到 plasmashell，
+  但我们的窗口区域是黑块；`xwd -root` 能出 4MB 数据、自写 XWD→PNG 解码后平均亮度 0.0
+  （kwin 合成器重定向）。Xvfb+kwin 下 `import` 更是恒为 263 字节空白 PNG。
+
+结论：Linux 上的 UI 目视确认需要物理/远程桌面会话；本轮以前端 `pnpm typecheck` + i18n 审计 +
+「安装产物里确实有这段界面代码」的断言代替，功能正确性由 37 项端到端断言覆盖。
+
 ## 7. 对方案的影响（已回填 [kde-adaptation-plan.md](kde-adaptation-plan.md) §2.5）
 
 1. **§4.1 机制①的定义要改**：从「拿桌面层语义并保住图标」改为「拿桌面窗口语义（跳任务栏/全桌面/在普通窗口之下）」，**图标可见性另立一条路**（Plasma 6 Wayland 的 layer-shell `Background`，或 §4.5 壁纸插件）。X11 上无解，别承诺。
@@ -381,6 +451,7 @@ ssh <vm> 'APP_BIN=/home/parallels/WallpaperEM/src-tauri/target/release/Wallpaper
 ## 8. 仍未验证 / 无法验证
 
 - **Plasma 6 全部专属项**：layer-shell `Background` 层（本机 5.27 实测有 `zwlr_layer_shell_v1` **v3**，但 v5 与「Background 层里排到 plasmashell 桌面视图之下」仍未证）、`ext_background_effect_manager_v1`（5.27 实测未广告，符合预期）、portal `Wallpaper`(6.5)、Plasma 6 托盘 SNI、每虚拟桌面独立壁纸。需 Ubuntu 25.04 / Fedora KDE / openSUSE 的 arm64 或 amd64 机器。
+- **装成 deb 之后的复验**：✅ 已由 §6.8 补上（真装 `wallpaper-em_2.2.0_arm64.deb`，`/usr/bin/WallpaperEM` 跑 37 项断言全过，并因此修掉一个发布级权限缺陷）。仍未用**真实安装包**验证的只剩：设置页按钮的目视确认（见下条）、以及 AppImage/官方打包器（本机 arm64 无 aarch64 预编译 tauri-cli）。
 - **P9 插件在真 plasmashell 里选为壁纸**：✅ 已由 §6.5 补上（真实会话 `:0`，18 项断言全过，图标层逐像素不变）。仍未量化的只有**长期帧率/合成开销**与**插件异常对 plasmashell 的影响面**（需真实使用观察），以及多屏按实例分帧、Plasma 6 实测。**应用内一键启用**已由 §6.7 补上（33 项断言，走的就是按钮那条产品路径）；剩下没做到的只是**设置页按钮的目视确认**——本机 Xvfb/KWin 下抓屏恒为全黑（合成器把窗口内容重定向了），`import`/`xwd` 都拿不到画面。
 - **引擎侧帧传输**：DMA-BUF/socket 那条路一行代码都还没有；`zwp_linux_dmabuf_v1` v4 只是证明协议可用。
 - **KWin 5 的 `Layer` 窗口规则是否可用**：需在能弹确认框的交互会话里跑 `qdbus org.kde.KWin /Scripting …`，或直接写 `~/.config/kwinrulesrc` 后 `reconfigure` 再观察。
@@ -402,11 +473,12 @@ ssh <vm> 'APP_BIN=/home/parallels/WallpaperEM/src-tauri/target/release/Wallpaper
 | `scripts/linux-kde-smoke.sh` | 有断言的 KDE/X11 冒烟：真机走真实用户总线、CI 无用户会话时自动退回 `dbus-run-session`；已在 VM 上 5/5 通过（见 §6.1） |
 | `scripts/kde-wayland-globals.sh` | KWin 的 Wayland 全局清单探测（自起嵌套 `kwin_wayland --virtual` 或 attach 现有会话）；§6.2 的全部数据来自它 |
 | `scripts/kde-plugin-check.sh` | P9 插件包验证：结构 → `kpackagetool5` 安装注册 → `qmlscene` 渲染取样 → 卸载（12 项，见 §6.3） |
-| `scripts/kde-plugin-enable-check.sh` | **应用内「一键启用」端到端自检**：自起 Xvfb+KWin+plasmashell（MCP 驱动，走按钮同一条产品路径），33 项断言覆盖装包 / 切换 appletsrc / 真出帧 / 状态 / 恢复 / 清理（§6.7） |
+| `scripts/kde-plugin-enable-check.sh` | **应用内「一键启用」端到端自检**：自起 Xvfb+KWin+plasmashell（MCP 驱动，走按钮同一条产品路径），断言覆盖装包 / 切换 appletsrc / 真出帧 / 状态 / 恢复 / 清理（33 项）+ 安装产物自检（4 项，§6.8） |
 | `scripts/sync-plasma-plugin.sh` | 把独立仓 `../WallpaperEM-Plasma` 的插件包**单向**同步进 `packaging/plasma-wallpaper/`（真源在插件仓，本仓那份是打包副本，别在本仓直接改） |
 | `src-tauri/src/kde_plugin.rs` | 「一键启用」后端：状态探测、装包、切 appletsrc、回滚、设置项持久化（3 个 Tauri 命令 + 3 个同名 MCP 工具） |
 | `src/api/kde.ts` + 设置页「KDE 集成」分组 | 前端按钮与状态展示（仅 Linux 渲染），文案在 `src/locales/en-US.ts` |
 | `packaging/plasma-wallpaper/io.github.oneincase.wallpaperem/` | P9 的 Plasma 壁纸插件（`metadata.json` + KConfigXT + `main.qml`/`config.qml` + 引擎契约 README）；**由 `scripts/sync-plasma-plugin.sh` 从独立仓单向同步**，并经 `tauri.conf.json` 的 `bundle.resources` 打进安装包（`$RESOURCE/plasma-wallpaper/`） |
+| `scripts/kde-vm-deb.sh` | 在 VM 上按 tauri-bundler 布局**手工组装并安装 deb**（arm64 没有官方预编译 tauri-cli）：解析 `tauri.linux.conf.json` 的 resources/依赖 → 组装 `usr/bin` + `usr/lib/<productName>` → `dpkg-deb` → `apt-get install --reinstall`（§6.8） |
 | `docs/kde-smoke-setup.md` | 装配说明与覆盖率对照 |
 | `docs/kde-adaptation-plan.md` | 适配方案（§2.5 已回填本轮实测） |
 | `docs/kde-plasma-constraints.md` | 上游约束调研（12 条硬约束 + 71 链接） |

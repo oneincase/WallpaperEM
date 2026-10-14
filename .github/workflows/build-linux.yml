@@ -216,6 +216,22 @@ jobs:
           dpkg-deb -f "$deb" Recommends
           dpkg-deb -f "$deb" Depends | tr -d '\n' | grep -q 'libayatana-appindicator3-1' \
             || { echo "[FAIL] Depends 缺 libayatana-appindicator3-1（tray 运行时库）"; exit 1; }
+          # 断言「打包资源真的进了 deb、且对 other 可读」：应用内一键启用要在运行时按
+          # resource_dir()（Linux 非 AppImage = /usr/lib/<exe>）找到插件包，再以**普通用户**
+          # 身份把它拷进 ~/.local/share/plasma/wallpapers/。资源映射写了没进包、或者
+          # 带着 0600 进去（umask 077 的检出会这样），装机后按钮点了都是失败。
+          echo "-- 打包资源 --"
+          dpkg-deb -c "$deb" | awk '{print $NF}' | grep -E '^\./usr/lib/WallpaperEM/' | head -8
+          for need in \
+            "usr/lib/WallpaperEM/plasma-wallpaper/io.github.oneincase.wallpaperem/metadata.json" \
+            "usr/lib/WallpaperEM/plasma-wallpaper/io.github.oneincase.wallpaperem/contents/ui/main.qml" \
+            "usr/lib/WallpaperEM/renderer/index.html" \
+            "usr/lib/WallpaperEM/libsteam_api.so" ; do
+            line=$(dpkg-deb -c "$deb" | grep "\./$need\$" || true)
+            [ -n "$line" ] || { echo "[FAIL] deb 里缺 ./$need"; exit 1; }
+            echo "$line" | grep -q '^-rw-r--r--' \
+              || { echo "[FAIL] ./$need 权限不是 0644（普通用户读不了）：$line"; exit 1; }
+          done
 
       - name: 选定被测二进制（AppImage 无 FUSE 直跑）
         run: |
@@ -226,6 +242,16 @@ jobs:
           echo "APP=$app" >> "$GITHUB_ENV"
           echo "APPIMAGE_EXTRACT_AND_RUN=1" >> "$GITHUB_ENV"
           echo "被测二进制：$app"
+
+      - name: 装 deb 并跑「应用内一键启用」端到端自检
+        # 真的装包、真的把 plasmashell 桌面壁纸切过去、真的抓帧，跑完自动还原。
+        # 这一步盯的是「只有装出来的包才会踩」的问题：打包资源没进包、资源权限不是
+        # other 可读（0600 的坑）、resource_dir() 路径语义、renderer bundle 里没有
+        # KDE 界面代码。AppImage 那条路资源在挂载点里，所以这里用 deb 装出来的二进制。
+        run: |
+          set -uo pipefail
+          sudo apt-get install -y "$GITHUB_WORKSPACE"/artifacts/*.deb || sudo apt-get -f install -y
+          APP_BIN=/usr/bin/WallpaperEM bash scripts/kde-plugin-enable-check.sh 2>&1 | tail -100
 
       - name: 跑 KDE/X11 冒烟
         env:

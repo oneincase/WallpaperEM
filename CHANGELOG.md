@@ -57,10 +57,18 @@
   + 设置页分组，另配三个同名 MCP 工具（`kde_plugin_status`/`enable`/`disable`）。
   插件包由 `scripts/sync-plasma-plugin.sh` 从独立仓库**单向**同步进
   `packaging/plasma-wallpaper/`，并经 `tauri.conf.json` 的 resources 打进安装包。
-  真机自检 `scripts/kde-plugin-enable-check.sh`（自起 Xvfb+KWin+plasmashell，**33 项断言
-  全过**）覆盖：从随包资源装包、切换 appletsrc、真出帧、状态可读、卸载恢复原壁纸、
-  备份与设置项无残留。
+  真机自检 `scripts/kde-plugin-enable-check.sh`（自起 Xvfb+KWin+plasmashell，**37 项断言
+  全过**：33 项行为 + 4 项安装产物）覆盖：从随包资源装包、切换 appletsrc、真出帧、状态可读、
+  卸载恢复原壁纸、备份与设置项无残留，以及「装成 deb 之后」的复验（见上）。
 
+- **真装成 deb 之后的复验（37 项断言）**：新增 `scripts/kde-vm-deb.sh` —— arm64 上没有官方
+  预编译的 aarch64 tauri-cli，所以按 tauri-bundler 的布局手工组装并安装 deb
+  （`usr/bin/<productName>` + `usr/lib/<productName>/{renderer,assets,plasma-wallpaper,libsteam_api.so}`，
+  这正是 tauri 2.11.5 在 Linux 非 AppImage 下 `resource_dir()` 的语义），包名/版本与官方一致。
+  装完用 `/usr/bin/WallpaperEM` 跑同一套端到端自检：33 项行为断言 + 4 项新增的**安装产物自检**
+  （前端 bundle 里必须含「KDE 桌面集成」与三个 `kde_plugin_*` 命令名，专防「跑的还是旧 renderer」）
+  全部通过，`package_dir` 实测落在 `/usr/lib/WallpaperEM/plasma-wallpaper/…`。
+  这条自检也已接进 CI 的 `kde-smoke` 作业（先装 artifacts 里的 deb 再跑）。
 - **`webwallgl` 改走 npm 依赖（3.0.0）**：渲染库此前是 `file:../webwallgl-github/dist/lib`，
   必须把库仓库克隆到本仓平级并先 `pnpm run build:lib`，否则 `pnpm install` 解析不到。
   现在直接装 registry 上的 `webwallgl@^3.0.0`：解包体积 38 MB → 2.8 MB（不再带 sourcemap、
@@ -79,9 +87,28 @@
 - **KDE 静态壁纸失败后不再无法回退**：原实现里 `plasma-apply-wallpaperimage` 与
   `qdbus … evaluateScript` 两条路径各自 `return`，第一条失败就到此为止（`swww`/`feh`
   等后续手段在 KDE 分支上永远不会被执行）；现改为三级链式回退，任一成功即止。
+- **`rsync --delete` 会把 VM 上由 `build.rs` 生成的 `src-tauri/bundled/libsteam_api.so` 删掉**：
+  宿主没有这个被 gitignore 的目录，删掉后 `--no-build` 装包会以「资源缺失」失败。
+  修：同步脚本加 `--exclude=/src-tauri/bundled/`；`scripts/kde-vm-deb.sh` 探测到资源缺失就
+  强制构建并 `touch build.rs`（否则 cargo 认为 build script 新鲜、不会重写 `bundled/`）。
+  另外该脚本的安装步骤改为 `apt-get install --reinstall`：同版本号时 apt 会「已是最新」
+  直接跳过，修好的包根本换不上去（实测踩过）。
 - **自启条目补齐启用键**：`auto-launch` 写出的 `~/.config/autostart/*.desktop` 缺少
   `X-GNOME-Autostart-enabled=true` 与 `StartupNotify=false`，启动后幂等补齐（文件不存在
   则不动，失败只 warn）。
+- **插件包曾以 `0600` 权限打进 deb，装机后「一键启用」必失败**：`packaging/plasma-wallpaper/`
+  的文件带着 `0600`（umask 077 的检出留下的），`cp -a` 原样进包 → 装成 `root:root 0600`，
+  普通用户点「启用」时 `fs::copy` 直接 `Permission denied`（报 `拷贝 …/README.md 失败`）。
+  开发态测不出来（源和目标同用户），**git 也只记 100644/100755、checkout 不会纠正工作区权限**。
+  修：`scripts/sync-plasma-plugin.sh` 同步后权限归一为 755/644（并写明原因）、
+  `scripts/kde-vm-deb.sh` staging 后再归一一次、CI 增加「资源在 deb 里且为 `-rw-r--r--`」断言。
+- **`scripts/kde-plugin-enable-check.sh` 会把自己的调用者杀掉**：`pkill -f "$APP_BIN_ABS"`
+  匹配整条 cmdline，而脚本常见调法 `ssh <vm> 'APP_BIN=/usr/bin/WallpaperEM bash -s'` 的调用者
+  cmdline 里正带着这个路径 → 自检把 ssh 会话干掉（返回 255、输出半截）。改成按
+  `/proc/<pid>/exe` 精确匹配真正的二进制；残留进程还会让下一次自检的 `appletsrc` 断言假红。
+- **`scripts/kde-vm-sync.sh` 在 `BW=0`（不限速）下直接崩**：限速参数原本是空数组，
+  `set -u` 下展开 bash 3.2（macOS 自带）会报 `BW_FLAG[@]: unbound variable`——而这个
+  写法正是脚本用法注释里推荐的那条。改成普通字符串变量（空则展开为零个参数）。
 
 ## [v2.2.0] - 2026-10-04
 

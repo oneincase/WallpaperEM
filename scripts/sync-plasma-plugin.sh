@@ -41,5 +41,13 @@ for f in contents/config/main.xml contents/ui/main.qml contents/ui/config.qml; d
   }
 done
 
+# 权限归一：这些文件是**随安装包分发**的资源，运行时会被普通用户读走、并拷进
+# ~/.local/share/plasma/wallpapers/。umask 077 的检出会留下 0600，
+# 装成 deb（root:root 0600）后普通用户 fs::copy 直接 Permission denied ——
+# 实测踩过（安装包自检里「一键启用」失败）。git 只记 100644/100755，
+# 工作区权限不会被 checkout 纠正，所以每次同步都归一。
+find "$DST" -type d -exec chmod 755 {} +
+find "$DST" -type f -exec chmod 644 {} +
+
 echo "已同步：$SRC → $DST"
 find "$DST" -type f -not -name '.DS_Store' | sed "s|$DST/|  |" | sort
