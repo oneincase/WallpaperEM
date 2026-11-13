@@ -1086,11 +1086,13 @@ impl DownloadService {
         }
         // 标签快照：本地库自己存一份，别只依赖 JOIN workshop_items ——
         // 工坊缓存可能被清理，而本地筛选要一直能用
-        let tags_json = meta
-            .as_ref()
-            .and_then(|m| serde_json::to_string(&m.tags).ok())
-            .unwrap_or_else(|| "[]".into());
-        {
+        // 纯依赖下载（有合并目标）只把内容留在 wallpapers/<id> 备将来合并，
+        // 不登记 library_items —— 资产包不是壁纸，不该出现在本地库列表里
+        if dependency_targets.is_empty() {
+            let tags_json = meta
+                .as_ref()
+                .and_then(|m| serde_json::to_string(&m.tags).ok())
+                .unwrap_or_else(|| "[]".into());
             let conn = self.db.lock().map_err(|e| e.to_string())?;
             let _ = conn.execute(
                 "INSERT INTO library_items(item_id, title, type, size_bytes, file_count, tags)
