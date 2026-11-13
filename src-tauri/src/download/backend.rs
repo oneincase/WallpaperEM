@@ -256,6 +256,13 @@ impl SteamCmd {
         }
         None
     }
+
+    /// 该行是否是「登录过于频繁」（Steam 限流）。
+    /// 这类失败**不能自动重试**：队列几条任务同时重登只会把限流窗口越拖越长。
+    pub fn is_rate_limit(&self, s: &str) -> bool {
+        let l = s.to_ascii_lowercase();
+        l.contains("rate limit") || l.contains("too many login attempts")
+    }
 }
 
 /// 无需构造实例的提示判定，供字节级读取器的 'static 闭包使用。
@@ -538,6 +545,14 @@ impl Backend {
         }
     }
 
+    /// 该行是否是 Steam 的登录限流（不能自动重试，见各后端实现注释）
+    pub fn is_rate_limit(&self, s: &str) -> bool {
+        match self {
+            Self::SteamCmd(b) => b.is_rate_limit(s),
+            Self::DepotDownloader(b) => b.is_rate_limit(s),
+        }
+    }
+
     /// 进度是否来自输出行（DD 逐文件打百分比）而不是轮询目录体积（steamcmd）
     pub fn progress_from_output(&self) -> bool {
         matches!(self, Self::DepotDownloader(_))
@@ -735,6 +750,21 @@ mod tests {
         );
         assert_eq!(b.match_guard_prompt("password:"), Some(GuardKind::Password));
         assert_eq!(b.match_guard_prompt("Loading Steam API...OK"), None);
+    }
+
+    #[test]
+    fn rate_limit_is_recognized_and_not_retryable() {
+        let b = sc();
+        // steamcmd / SteamKit 的两种写法都要能认出来：限流不能自动重试
+        assert!(b.is_rate_limit("ERROR! Rate Limit Exceeded"));
+        assert!(b.is_rate_limit("Too many login attempts. Please try again later."));
+        assert!(!b.is_rate_limit("Logging in using cached credentials."));
+        assert!(!b.is_rate_limit("Success. Downloaded item 123"));
+        // 顺带锁住文案：这不是「网络抖动」，重试只会把限流窗口拖长
+        assert_eq!(
+            b.parse_failure("Rate Limit Exceeded").as_deref(),
+            Some("登录过于频繁，请稍后再试")
+        );
     }
 
     #[test]

@@ -190,6 +190,13 @@ impl DepotDl {
         None
     }
 
+    /// 该行是否是「登录过于频繁」（Steam 限流）。
+    /// 这类失败**不能自动重试**：队列几条任务同时重登只会把限流窗口越拖越长。
+    pub fn is_rate_limit(&self, s: &str) -> bool {
+        let l = s.to_ascii_lowercase();
+        l.contains("ratelimitexceeded") || l.contains("rate limit")
+    }
+
     /// 该行输出是否表示失败，返回面向用户的中文原因。
     ///
     /// 只认上游源码里明确的失败文案：DD 失败会 return 1，退出码本身已可信，
@@ -289,10 +296,16 @@ impl DepotDl {
 }
 
 /// `home` 下是否存在 DD 写的 `account.config`（IsolatedStorage 的叶子文件）。
-/// 深度封顶：`…/IsolatedStorage/<混淆>/<混淆>/Url.<hash>/AssemFiles/account.config`。
+///
+/// 真实层级（实测 macOS）：
+///   `home/Library/Application Support/IsolatedStorage/<混淆>/<混淆>/Url.<hash>/AssemFiles/account.config`
+/// 从 home 数到 `AssemFiles` 已经 7 层，旧上限 6 让每层都差一级、永远查不到令牌 ——
+/// 于是每个任务都拿账号密码重新登录，队列一连跑就撞 Steam 的「登录过于频繁」
+/// （2026-11-13 实测：令牌文件其实一直在，同一份隔离目录手动免密登录完全正常）。
+/// 上限给到 12：覆盖各平台布局差异，又保留递归兜底（混淆目录层数不保证不变）。
 pub fn token_store_present(home: &Path) -> bool {
     fn walk(dir: &Path, depth: usize) -> bool {
-        if depth > 6 {
+        if depth > 12 {
             return false;
         }
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -549,6 +562,19 @@ mod tests {
     }
 
     #[test]
+    fn rate_limit_is_recognized_and_not_retryable() {
+        let p = dd();
+        // SteamKit 的异常文案（DD 原样打 "Failed to authenticate with Steam: …"）
+        assert!(p.is_rate_limit("Failed to authenticate with Steam: RateLimitExceeded"));
+        assert!(p.is_rate_limit("Rate limit exceeded"));
+        assert!(!p.is_rate_limit("Got 130 licenses for account!"));
+        assert_eq!(
+            p.parse_failure("Failed to authenticate with Steam: RateLimitExceeded").as_deref(),
+            Some("登录过于频繁，请稍后再试")
+        );
+    }
+
+    #[test]
     fn guard_prompts_from_real_output() {
         let p = dd();
         // ConsoleAuthenticator（stderr，无换行）
@@ -653,6 +679,31 @@ mod tests {
         assert!(!token_store_present(&d), "没有令牌文件时应为 false");
         std::fs::write(leaf.join("account.config"), b"x").unwrap();
         assert!(token_store_present(&d));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn token_store_probe_finds_macos_isolated_storage_layout() {
+        // macOS 的真实层级比旧上限深两级：
+        // Library/Application Support/IsolatedStorage/<混淆>/<混淆>/Url.<hash>/AssemFiles/account.config
+        // 旧上限 6 在这里永远差一级 ⇒ 每个任务都用账号密码重登 ⇒ Steam 报登录过于频繁。
+        let d = std::env::temp_dir().join("wpem-depotdl-token-probe-macos");
+        let _ = std::fs::remove_dir_all(&d);
+        let leaf = d
+            .join("Library")
+            .join("Application Support")
+            .join("IsolatedStorage")
+            .join("cdrer5qu.lbc")
+            .join("t4tuaurk.ibp")
+            .join("Url.02eo5hacpemcgklat33fbjrszovmtsh3")
+            .join("AssemFiles");
+        std::fs::create_dir_all(&leaf).unwrap();
+        assert!(!token_store_present(&d), "没有令牌文件时应为 false");
+        std::fs::write(leaf.join("account.config"), b"x").unwrap();
+        assert!(
+            token_store_present(&d),
+            "macOS 布局（7 层到 AssemFiles）必须能命中 account.config"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 

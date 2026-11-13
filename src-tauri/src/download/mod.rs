@@ -44,7 +44,7 @@ const SIZE_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 /// steamcmd 下载完成后用它提交结果失败（`Updating workshop item details failed`），
 /// 进程僵死不退出、成品留在 `downloads/` 永远进不了 `content/`。
 /// 宽限过后由应用接手收尾：搬运产物 → 杀进程 → 按成功走安装。
-const STALL_COMMIT_GRACE: Duration = Duration::from_secs(120);
+const STALL_COMMIT_GRACE: Duration = Duration::from_secs(10);
 /// 输出行进度（DepotDownloader 逐文件百分比）的节流间隔：
 /// 大件会连续刷几十行，按行发事件会把前端淹没
 const PROGRESS_THROTTLE: Duration = Duration::from_millis(1000);
@@ -95,6 +95,9 @@ pub struct DownloadService {
     running: Arc<Mutex<HashSet<i64>>>,
     /// task_id → 该任务的子进程槽（并行池）
     children: Arc<tokio::sync::Mutex<HashMap<i64, ChildSlot>>>,
+    /// 登录限流冷却：某任务撞到 Steam「登录过于频繁」后，调度器在这之前不再领新任务。
+    /// 否则队列里几十条任务会挨个启动、挨个用密码登录 —— 限流窗口被越拉越长。
+    rate_limit_until: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
 impl DownloadService {
@@ -105,6 +108,7 @@ impl DownloadService {
             guard_waiters: Arc::new(Mutex::new(HashMap::new())),
             running: Arc::new(Mutex::new(HashSet::new())),
             children: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            rate_limit_until: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -386,6 +390,7 @@ impl DownloadService {
         let mut st = TaskState {
             success: false,
             error_msg: None,
+            fail_code: None,
             recent: Vec::new(),
             guard_rx: None,
             exit_code: None,
@@ -397,6 +402,10 @@ impl DownloadService {
         let watchdog = backend::WATCHDOG;
         let task_deadline = tokio::time::sleep(watchdog);
         tokio::pin!(task_deadline);
+        // 停滞收尾的轮询哨：poller 只置标记，真正的杀进程在主循环里做
+        //（子进程槽的锁由「等退出」分支持有，跨任务抢锁会死锁）
+        let mut stall_check = tokio::time::interval(std::time::Duration::from_millis(500));
+        stall_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -437,6 +446,17 @@ impl DownloadService {
                 }, if st.exit_code.is_none() => {
                     st.exit_code = code.map(|s| s.code().unwrap_or(-1));
                     tracing::info!("download tool exited: {:?}", st.exit_code);
+                }
+                _ = stall_check.tick() => {
+                    // 停滞收尾（poller 置位 + 已把成品搬进 content/）：
+                    // 在这里杀进程才安全 —— select 会先取消上面那个「等退出」分支、
+                    // 放掉子进程槽的锁，kill_task 才不会和它抢锁卡死。
+                    if stalled_commit.load(Ordering::SeqCst) {
+                        tracing::warn!("task {task_id}: 停滞收尾标记已置位，终止下载工具");
+                        self.kill_task(task_id).await;
+                        st.exit_code = Some(0);
+                        break;
+                    }
                 }
                 _ = &mut task_deadline => {
                     tracing::warn!("download task {task_id} timed out after {:?}", watchdog);
@@ -510,7 +530,7 @@ impl DownloadService {
         }
 
         if let Some(err) = st.error_msg {
-            self.fail(task_id, "DOWNLOAD_FAILED", &err);
+            self.fail(task_id, st.fail_code.unwrap_or("DOWNLOAD_FAILED"), &err);
             return;
         }
         if !real_success {
@@ -646,7 +666,9 @@ impl DownloadService {
                             }
                         }
                     }
-                    svc.kill_task(task_id).await;
+                    // 注意：这里**不能**调 kill_task —— 主循环的 select 分支正握着
+                    // 子进程槽的锁等退出，poller 再抢同一把锁会永久阻塞（实测任务
+                    // 停在 99% 不动）。杀进程交给主循环的停滞检查分支（见 run_task）。
                 }
                 let pct = match total {
                     Some(t) if t > 0 => {
@@ -773,6 +795,10 @@ impl DownloadService {
         self.request_guard(task_id, dl, line, st);
         if st.error_msg.is_none() {
             if let Some(msg) = dl.parse_failure(line) {
+                // 登录限流：自动重试会让限流窗口越拖越长，标成不可重试
+                if dl.is_rate_limit(line) {
+                    st.fail_code = Some("RATE_LIMITED");
+                }
                 st.error_msg = Some(msg);
             }
         }
@@ -908,6 +934,10 @@ impl DownloadService {
         Ok(pw)
     }
 
+    /// 命中 Steam 登录限流后的队列冷却时间（秒）。限流窗口通常是几分钟，
+    /// 10 分钟足够让窗口过去，也避免用户以为「下载没反应」。
+    const RATE_LIMIT_COOLDOWN_SECS: u64 = 10 * 60;
+
     /// 单任务自动重试上限：网络抖动 / steamcmd 瞬断自行恢复。国内免代理环境下
     /// CDN/登录节点偶发失败是常态，靠手动点重试体验太差
     const AUTO_RETRY_MAX: i64 = 2;
@@ -916,6 +946,19 @@ impl DownloadService {
     /// 不重试：验证码（GUARD）/ 登录凭据（NEED_CREDENTIALS）/ 取消（CANCELLED）/
     /// 安装失败（INSTALL_FAILED，内容问题重下也没用）。
     fn fail(&self, id: i64, code: &str, msg: &str) {
+        // 限流冷却：不只是本任务不重试，整个队列暂停领取新任务一段时间。
+        // 否则 40+ 条排队任务会挨个启动、挨个重登，把 Steam 的限流窗口越拖越长。
+        if code == "RATE_LIMITED" {
+            if let Ok(mut g) = self.rate_limit_until.lock() {
+                *g = Some(
+                    std::time::Instant::now() + Duration::from_secs(Self::RATE_LIMIT_COOLDOWN_SECS),
+                );
+            }
+            tracing::warn!(
+                "命中 Steam 登录限流：队列暂停 {} 秒，之后自动继续",
+                Self::RATE_LIMIT_COOLDOWN_SECS
+            );
+        }
         let transient = matches!(code, "DOWNLOAD_FAILED" | "SPAWN_FAILED" | "IO_ERROR");
         if transient {
             let attempts: i64 = self
@@ -1313,6 +1356,9 @@ impl DownloadService {
 struct TaskState {
     success: bool,
     error_msg: Option<String>,
+    /// 失败错误码（缺省 DOWNLOAD_FAILED）。限流等「重试只会更糟」的失败在这里
+    /// 换成不可自动重试的码，由 fail() 决定是否重回队列。
+    fail_code: Option<&'static str>,
     /// 最近的非进度输出，失败时拼进错误信息辅助排查
     recent: Vec<String>,
     guard_rx: Option<oneshot::Receiver<String>>,
@@ -1502,6 +1548,17 @@ pub fn init(app: &AppHandle) -> Result<(), String> {
         loop {
             let limit = svc.parallel_limit();
             let running = svc.running.lock().map(|g| g.len()).unwrap_or(0);
+            // 登录限流冷却期内不领新任务：连续起进程只会不断重登、把窗口越拖越长
+            let cooling = svc
+                .rate_limit_until
+                .lock()
+                .ok()
+                .and_then(|g| *g)
+                .map(|until| until > std::time::Instant::now())
+                .unwrap_or(false);
+            if cooling {
+                continue;
+            }
             if running < limit {
                 match svc.next_queued() {
                     Ok(Some((id, item))) => {
