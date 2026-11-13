@@ -39,6 +39,12 @@ pub const APP_ID: &str = "431960";
 const GUARD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// steamcmd 无进度输出，用产物目录大小估算进度的轮询间隔
 const SIZE_POLL_INTERVAL: Duration = Duration::from_millis(1000);
+/// steamcmd 收尾兜底的宽限时间：已下字节达到总量但持续无增长，视为卡在「提交」阶段。
+/// 场景：代理/网关会回收空闲连接，下载内容的几分钟里登录用的 CM 控制连接被掐，
+/// steamcmd 下载完成后用它提交结果失败（`Updating workshop item details failed`），
+/// 进程僵死不退出、成品留在 `downloads/` 永远进不了 `content/`。
+/// 宽限过后由应用接手收尾：搬运产物 → 杀进程 → 按成功走安装。
+const STALL_COMMIT_GRACE: Duration = Duration::from_secs(120);
 /// 输出行进度（DepotDownloader 逐文件百分比）的节流间隔：
 /// 大件会连续刷几十行，按行发事件会把前端淹没
 const PROGRESS_THROTTLE: Duration = Duration::from_millis(1000);
@@ -361,6 +367,8 @@ impl DownloadService {
         // 登录验证任务没有产物也不看进度，用 -1 的不确定态进度即可。
         // 注意状态必须保持 authenticating：误报 downloading 会让前端把验证任务
         // 显示成「下载中」，还会触发「登录已推进」逻辑提前收起手机确认弹窗。
+        // 收尾兜底标记：轮询器发现「字节下齐但卡在提交」时置位并杀进程
+        let stalled_commit = Arc::new(AtomicBool::new(false));
         let progress_poll = if is_verify {
             self.emit_progress(task_id, "authenticating", -1.0);
             tauri::async_runtime::spawn(std::future::pending::<()>())
@@ -369,8 +377,9 @@ impl DownloadService {
         } else {
             self.spawn_size_poller(
                 task_id,
-                dl.artifact_dir(&workdir, &item_id),
+                dl.progress_dirs(&workdir, &item_id),
                 item_id.clone(),
+                stalled_commit.clone(),
             )
         };
 
@@ -470,7 +479,12 @@ impl DownloadService {
             st.success && st.error_msg.is_none()
         } else {
             let files_ok = dl.artifact_ready(&workdir, &item_id);
-            let finished = st.success || (dl.trust_exit_code() && st.exit_code == Some(0));
+            // 停滞收尾兜底：轮询器已把成品搬进 content/ 并杀掉僵死进程
+            //（CM 空闲连接被掐导致 steamcmd 提交失败的场景），产物在即成功
+            let stalled_ok = stalled_commit.load(Ordering::SeqCst);
+            let finished = st.success
+                || stalled_ok
+                || (dl.trust_exit_code() && st.exit_code == Some(0));
             finished && files_ok && st.error_msg.is_none()
         };
 
@@ -585,15 +599,55 @@ impl DownloadService {
     fn spawn_size_poller(
         &self,
         task_id: i64,
-        artifact: PathBuf,
+        progress_dirs: Vec<PathBuf>,
         item_id: String,
+        stalled: Arc<AtomicBool>,
     ) -> tauri::async_runtime::JoinHandle<()> {
         let svc = self.clone();
         tauri::async_runtime::spawn(async move {
             let total = svc.lookup_file_size(&item_id).await;
+            let mut last_size = 0u64;
+            let mut last_growth = std::time::Instant::now();
             loop {
                 tokio::time::sleep(SIZE_POLL_INTERVAL).await;
-                let downloaded = backend::dir_size(&artifact);
+                let downloaded = progress_dirs
+                    .iter()
+                    .map(|d| backend::dir_size(d))
+                    .sum::<u64>();
+                // 收尾兜底：字节已达总量但持续无增长 → steamcmd 大概率卡在提交阶段
+                //（CM 空闲连接被代理掐掉，见 STALL_COMMIT_GRACE 注释）。
+                // 接手收尾：搬运成品 → 杀进程，主循环按 stalled 标记走成功路径。
+                if downloaded > last_size {
+                    last_size = downloaded;
+                    last_growth = std::time::Instant::now();
+                } else if !stalled.load(Ordering::SeqCst)
+                    && total.is_some_and(|t| t > 0 && downloaded >= t as u64)
+                    && last_growth.elapsed() >= STALL_COMMIT_GRACE
+                {
+                    stalled.store(true, Ordering::SeqCst);
+                    tracing::warn!(
+                        "task {task_id}: 已下齐 {downloaded}B 但 {} 秒无增长，判定卡在提交阶段，应用接手收尾",
+                        STALL_COMMIT_GRACE.as_secs()
+                    );
+                    if let (Some(src), Some(dst)) =
+                        (progress_dirs.first(), progress_dirs.get(1))
+                    {
+                        match backend::commit_stalled_artifact(src, dst) {
+                            Ok(n) if n > 0 => {
+                                tracing::warn!("task {task_id}: 停滞收尾已搬运 {n} 个条目到 content/");
+                            }
+                            other => {
+                                // 搬运失败/无产物：清标记回落到看门狗路径，别误判成功
+                                tracing::warn!(
+                                    "task {task_id}: 停滞收尾搬运无果（{other:?}），交由看门狗处理"
+                                );
+                                stalled.store(false, Ordering::SeqCst);
+                                continue;
+                            }
+                        }
+                    }
+                    svc.kill_task(task_id).await;
+                }
                 let pct = match total {
                     Some(t) if t > 0 => {
                         let raw = downloaded as f64 / t as f64 * 100.0;

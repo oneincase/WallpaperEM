@@ -154,6 +154,17 @@ impl SteamCmd {
             .join(item_id)
     }
 
+    /// 进度统计目录：steamcmd 下载期间先写 `workshop/downloads/`，全部完成才
+    /// 搬到 `workshop/content/` —— 只看 content 会在整个下载期恒为 0，
+    /// 两处合计才是真实的已下字节数。
+    pub fn progress_dirs(&self, workdir: &Path, item_id: &str) -> Vec<PathBuf> {
+        let base = workdir.join("steamapps").join("workshop");
+        vec![
+            base.join("downloads").join(APP_ID).join(item_id),
+            base.join("content").join(APP_ID).join(item_id),
+        ]
+    }
+
     /// 该行输出是否在索要交互输入。
     pub fn match_guard_prompt(&self, s: &str) -> Option<GuardKind> {
         if re(CODE_RE).is_match(s) {
@@ -290,6 +301,24 @@ fn re(pattern: &'static str) -> &'static regex::Regex {
 /// 递归统计目录内的字节数（steamcmd 无进度输出时用它估算下载进度）。
 pub fn dir_size(path: &Path) -> u64 {
     dir_size_excluding(path, &[])
+}
+
+/// 收尾兜底：把 steamcmd 僵在 `downloads/` 里的成品搬进 `content/`。
+/// 触发场景见 `mod.rs` 的 `STALL_COMMIT_GRACE` —— 字节已下齐但提交失败，
+/// 成品永远不会自己挪过去。同一 workdir 内 rename，不跨卷。
+/// 返回搬移的条目数；`downloads` 不存在时返回 0（视为无产物）。
+pub fn commit_stalled_artifact(downloads: &Path, content: &Path) -> std::io::Result<u64> {
+    if !downloads.is_dir() {
+        return Ok(0);
+    }
+    std::fs::create_dir_all(content)?;
+    let mut moved = 0u64;
+    for entry in std::fs::read_dir(downloads)?.flatten() {
+        let to = content.join(entry.file_name());
+        std::fs::rename(entry.path(), &to)?;
+        moved += 1;
+    }
+    Ok(moved)
 }
 
 /// 同 [`dir_size`]，但跳过 `skip` 里的顶层目录名（后端自己的元数据目录）。
@@ -537,6 +566,15 @@ impl Backend {
         }
     }
 
+    /// 进度轮询要统计大小的目录（steamcmd 为 downloads+content 两处合计；
+    /// DD 进度来自输出行，不走这里）
+    pub fn progress_dirs(&self, workdir: &Path, item_id: &str) -> Vec<PathBuf> {
+        match self {
+            Self::SteamCmd(b) => b.progress_dirs(workdir, item_id),
+            Self::DepotDownloader(b) => vec![b.artifact_dir(workdir, item_id)],
+        }
+    }
+
     /// 产物是否真实落地（成功判定用；两个后端的判据不同）
     pub fn artifact_ready(&self, workdir: &Path, item_id: &str) -> bool {
         match self {
@@ -643,6 +681,39 @@ mod tests {
             sc().artifact_dir(Path::new("/work"), "999"),
             PathBuf::from("/work/steamapps/workshop/content/431960/999")
         );
+    }
+
+    #[test]
+    fn progress_dirs_cover_downloads_and_content() {
+        // steamcmd 下载期间先写 downloads/，进度统计必须两处合计
+        assert_eq!(
+            sc().progress_dirs(Path::new("/work"), "999"),
+            vec![
+                PathBuf::from("/work/steamapps/workshop/downloads/431960/999"),
+                PathBuf::from("/work/steamapps/workshop/content/431960/999"),
+            ]
+        );
+    }
+
+    #[test]
+    fn commit_stalled_artifact_moves_files() {
+        let tmp = std::env::temp_dir().join(format!("wem-stall-{}", std::process::id()));
+        let downloads = tmp.join("downloads");
+        let content = tmp.join("content");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&downloads).unwrap();
+        std::fs::write(downloads.join("scene.pkg"), b"pkg-bytes").unwrap();
+        std::fs::write(downloads.join("project.json"), b"{}").unwrap();
+
+        assert_eq!(commit_stalled_artifact(&downloads, &content).unwrap(), 2);
+        assert!(content.join("scene.pkg").is_file());
+        assert!(content.join("project.json").is_file());
+        assert!(std::fs::read_dir(&downloads).unwrap().next().is_none());
+
+        // downloads 不存在：返回 0 不报错；再次调用幂等（目录已空）
+        assert_eq!(commit_stalled_artifact(&tmp.join("nope"), &content).unwrap(), 0);
+        assert_eq!(commit_stalled_artifact(&downloads, &content).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
