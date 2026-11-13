@@ -310,6 +310,112 @@ pub fn dir_size(path: &Path) -> u64 {
     dir_size_excluding(path, &[])
 }
 
+/// 产物目录里最新的文件修改时间（递归，跳过顶层 `skip` 目录名）。
+///
+/// steamcmd 会**预分配整个文件**（实测 20MB 的 scene.pkg 在下载开始 7 秒后
+/// 就已经是最终大小 20,067,115B，之后几分钟里边写边大小不变），所以「停滞」
+/// 只能靠写入活动（mtime）判定，不能靠体积增长 —— 按体积判会把还在写的大文件
+/// 当成已下齐，收编出「长度对、中间全零」的坏文件。
+pub fn latest_mtime(path: &Path, skip: &[&str]) -> Option<std::time::SystemTime> {
+    fn walk(dir: &Path, skip: &[&str], acc: &mut Option<std::time::SystemTime>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let name = e.file_name();
+            if skip.iter().any(|s| name == std::ffi::OsStr::new(s)) {
+                continue;
+            }
+            match e.metadata() {
+                Ok(m) if m.is_dir() => walk(&e.path(), skip, acc),
+                Ok(m) => {
+                    if let Ok(t) = m.modified() {
+                        if acc.map(|cur| t > cur).unwrap_or(true) {
+                            *acc = Some(t);
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    let mut acc = None;
+    if path.is_dir() {
+        walk(path, skip, &mut acc);
+    }
+    acc
+}
+
+/// 目录内是否存在 ≥ `threshold` 字节的连续零段。
+///
+/// 用途：收编停滞产物前的完整性兜底。steamcmd 预分配后，没写完的区域就是
+/// 整片 0 —— 被提前收尾的坏 pkg 实测有 1MB/2MB/3MB 的页对齐零段；而本机
+/// 70+ 个正常 pkg 的最大零段 ≤ 762KB（压缩容器里极少出现长零段）。
+/// 命中即视为「预分配未写完」，不能当成功收编。
+pub fn has_zero_hole(path: &Path, threshold: u64) -> bool {
+    const CHUNK: usize = 1 << 20;
+    let mut buf = vec![0u8; CHUNK];
+    let mut run: u64 = 0;
+
+    fn scan_file(f: &Path, buf: &mut [u8], run: &mut u64, threshold: u64) -> bool {
+        let Ok(mut file) = std::fs::File::open(f) else {
+            return false;
+        };
+        use std::io::Read;
+        loop {
+            let Ok(n) = file.read(buf) else {
+                return false;
+            };
+            if n == 0 {
+                return false;
+            }
+            for &b in &buf[..n] {
+                if b == 0 {
+                    *run += 1;
+                    if *run >= threshold {
+                        return true;
+                    }
+                } else {
+                    *run = 0;
+                }
+            }
+        }
+    }
+
+    fn walk(dir: &Path, buf: &mut [u8], run: &mut u64, threshold: u64) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            match e.metadata() {
+                Ok(m) if m.is_dir() => {
+                    if walk(&p, buf, run, threshold) {
+                        return true;
+                    }
+                }
+                Ok(m) if m.is_file() => {
+                    if m.len() < threshold {
+                        continue;
+                    }
+                    // 分段之间要连续计数：不清 run（跨文件不连续，但每文件开头清零）
+                    *run = 0;
+                    if scan_file(&p, buf, run, threshold) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    if !path.is_dir() {
+        return false;
+    }
+    walk(path, &mut buf, &mut run, threshold)
+}
+
 /// 收尾兜底：把 steamcmd 僵在 `downloads/` 里的成品搬进 `content/`。
 /// 触发场景见 `mod.rs` 的 `STALL_COMMIT_GRACE` —— 字节已下齐但提交失败，
 /// 成品永远不会自己挪过去。同一 workdir 内 rename，不跨卷。
@@ -728,6 +834,50 @@ mod tests {
         // downloads 不存在：返回 0 不报错；再次调用幂等（目录已空）
         assert_eq!(commit_stalled_artifact(&tmp.join("nope"), &content).unwrap(), 0);
         assert_eq!(commit_stalled_artifact(&downloads, &content).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn zero_hole_detects_preallocated_unwritten_regions() {
+        let tmp = std::env::temp_dir().join(format!("wem-hole-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // 8MB 文件：中间 2MB 空洞（模拟 steamcmd 预分配未写完）
+        let mut data = vec![0xABu8; 8 * 1024 * 1024];
+        for b in data.iter_mut().skip(3 * 1024 * 1024).take(2 * 1024 * 1024) {
+            *b = 0;
+        }
+        std::fs::write(tmp.join("scene.pkg"), &data).unwrap();
+        assert!(has_zero_hole(&tmp, 1024 * 1024), "2MB 空洞必须被识别");
+
+        // 低于阈值的长零段（700KB）不误报：正常 pkg 语料最大零段 ≤ 762KB
+        let mut ok = vec![0xABu8; 8 * 1024 * 1024];
+        for b in ok.iter_mut().skip(1024 * 1024).take(700 * 1024) {
+            *b = 0;
+        }
+        std::fs::write(tmp.join("scene.pkg"), &ok).unwrap();
+        assert!(!has_zero_hole(&tmp, 1024 * 1024), "700KB 零段不该误报");
+
+        // 目录不存在：不得 panic
+        assert!(!has_zero_hole(&tmp.join("nope"), 1024 * 1024));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn latest_mtime_tracks_writes() {
+        let tmp = std::env::temp_dir().join(format!("wem-mtime-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("sub")).unwrap();
+        assert!(latest_mtime(&tmp, &[]).is_none(), "空目录没有 mtime");
+        std::fs::write(tmp.join("sub").join("a.bin"), b"x").unwrap();
+        let t1 = latest_mtime(&tmp, &[]).expect("写入后应有 mtime");
+        // 再写一次：mtime 必须前进（steamcmd 预分配后靠它判「还在写」）
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(tmp.join("sub").join("b.bin"), b"y").unwrap();
+        let t2 = latest_mtime(&tmp, &[]).unwrap();
+        assert!(t2 >= t1);
+        // skip 顶层目录：跳过 sub 后应看不到文件
+        assert!(latest_mtime(&tmp, &["sub"]).is_none());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

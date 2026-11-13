@@ -39,12 +39,19 @@ pub const APP_ID: &str = "431960";
 const GUARD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// steamcmd 无进度输出，用产物目录大小估算进度的轮询间隔
 const SIZE_POLL_INTERVAL: Duration = Duration::from_millis(1000);
-/// steamcmd 收尾兜底的宽限时间：已下字节达到总量但持续无增长，视为卡在「提交」阶段。
+/// steamcmd 收尾兜底的静默宽限：已下字节达到总量，且目录里**已经这么多秒没有任何
+/// 文件被写过**，才视为卡在「提交」阶段。
 /// 场景：代理/网关会回收空闲连接，下载内容的几分钟里登录用的 CM 控制连接被掐，
 /// steamcmd 下载完成后用它提交结果失败（`Updating workshop item details failed`），
 /// 进程僵死不退出、成品留在 `downloads/` 永远进不了 `content/`。
-/// 宽限过后由应用接手收尾：搬运产物 → 杀进程 → 按成功走安装。
+/// 注意判据是 **mtime 活动**而不是体积：steamcmd 预分配整文件，体积一开始就是
+/// 最终大小，按体积判会在还在写的时候误收编（见 [`ZERO_HOLE_THRESHOLD`] 的由来）。
+/// 宽限过后由应用接手收尾：校验无零段空洞 → 搬运产物 → 杀进程 → 按成功走安装。
 const STALL_COMMIT_GRACE: Duration = Duration::from_secs(10);
+/// 收编停滞产物前的零段阈值：产物目录里出现 ≥1MB 连续 0 视为「预分配未写完」。
+/// 实测依据：本机 70+ 个正常 pkg 的最大零段 ≤ 762KB（压缩容器里长零段极罕见），
+/// 而被提前收尾的坏 pkg 恰好是 1MB / 2MB / 3MB 的页对齐空洞。
+const ZERO_HOLE_THRESHOLD: u64 = 1024 * 1024;
 /// 输出行进度（DepotDownloader 逐文件百分比）的节流间隔：
 /// 大件会连续刷几十行，按行发事件会把前端淹没
 const PROGRESS_THROTTLE: Duration = Duration::from_millis(1000);
@@ -371,8 +378,11 @@ impl DownloadService {
         // 登录验证任务没有产物也不看进度，用 -1 的不确定态进度即可。
         // 注意状态必须保持 authenticating：误报 downloading 会让前端把验证任务
         // 显示成「下载中」，还会触发「登录已推进」逻辑提前收起手机确认弹窗。
-        // 收尾兜底标记：轮询器发现「字节下齐但卡在提交」时置位并杀进程
+        // 收尾兜底标记：轮询器发现「字节下齐但卡在提交」时置位并杀进程；
+        // stalled_incomplete 表示「字节到了但内容有零段空洞（预分配未写完）」，
+        // 这种不能收编，主循环杀掉后按失败走自动重试（steamcmd 会续传补洞）。
         let stalled_commit = Arc::new(AtomicBool::new(false));
+        let stalled_incomplete = Arc::new(AtomicBool::new(false));
         let progress_poll = if is_verify {
             self.emit_progress(task_id, "authenticating", -1.0);
             tauri::async_runtime::spawn(std::future::pending::<()>())
@@ -384,6 +394,7 @@ impl DownloadService {
                 dl.progress_dirs(&workdir, &item_id),
                 item_id.clone(),
                 stalled_commit.clone(),
+                stalled_incomplete.clone(),
             )
         };
 
@@ -451,6 +462,17 @@ impl DownloadService {
                     // 停滞收尾（poller 置位 + 已把成品搬进 content/）：
                     // 在这里杀进程才安全 —— select 会先取消上面那个「等退出」分支、
                     // 放掉子进程槽的锁，kill_task 才不会和它抢锁卡死。
+                    if stalled_incomplete.load(Ordering::SeqCst) {
+                        tracing::warn!(
+                            "task {task_id}: 停滞产物含零段空洞（预分配未写完），中断并按失败重试"
+                        );
+                        st.error_msg = Some(
+                            "下载内容不完整（预分配未写完），已中断并自动重试".into(),
+                        );
+                        self.kill_task(task_id).await;
+                        st.exit_code = Some(-3);
+                        break;
+                    }
                     if stalled_commit.load(Ordering::SeqCst) {
                         tracing::warn!("task {task_id}: 停滞收尾标记已置位，终止下载工具");
                         self.kill_task(task_id).await;
@@ -622,47 +644,76 @@ impl DownloadService {
         progress_dirs: Vec<PathBuf>,
         item_id: String,
         stalled: Arc<AtomicBool>,
+        stalled_incomplete: Arc<AtomicBool>,
     ) -> tauri::async_runtime::JoinHandle<()> {
         let svc = self.clone();
         tauri::async_runtime::spawn(async move {
             let total = svc.lookup_file_size(&item_id).await;
-            let mut last_size = 0u64;
-            let mut last_growth = std::time::Instant::now();
+            // 写入活动（mtime）而非体积：steamcmd 预分配整文件，体积从一开始
+            // 就是最终大小（实测 20MB 的 pkg 第 7 秒即到 20,067,115B），
+            // 按体积判「没增长」会在还在写的时候误收编出坏文件。
+            let mut last_activity = backend::latest_mtime(
+                progress_dirs.first().map(|p| p.as_path()).unwrap_or(Path::new("")),
+                &[],
+            );
+            let mut quiet_since = std::time::Instant::now();
             loop {
                 tokio::time::sleep(SIZE_POLL_INTERVAL).await;
                 let downloaded = progress_dirs
                     .iter()
                     .map(|d| backend::dir_size(d))
                     .sum::<u64>();
-                // 收尾兜底：字节已达总量但持续无增长 → steamcmd 大概率卡在提交阶段
-                //（CM 空闲连接被代理掐掉，见 STALL_COMMIT_GRACE 注释）。
-                // 接手收尾：搬运成品 → 杀进程，主循环按 stalled 标记走成功路径。
-                if downloaded > last_size {
-                    last_size = downloaded;
-                    last_growth = std::time::Instant::now();
+                let activity = backend::latest_mtime(
+                    progress_dirs.first().map(|p| p.as_path()).unwrap_or(Path::new("")),
+                    &[],
+                );
+                if activity != last_activity {
+                    last_activity = activity;
+                    quiet_since = std::time::Instant::now();
+                }
+                // 收尾兜底：字节已达总量、且 {} 秒内没有任何文件被写过 →
+                // steamcmd 大概率卡在提交阶段（CM 空闲连接被代理掐掉）。
+                // 收编前先验一遍零值空洞：预分配了但没写完的文件不能当成功。
+                let quiet = quiet_since.elapsed() >= STALL_COMMIT_GRACE;
+                if !quiet {
+                    // 还在写：只更新进度，不碰收编
                 } else if !stalled.load(Ordering::SeqCst)
+                    && !stalled_incomplete.load(Ordering::SeqCst)
                     && total.is_some_and(|t| t > 0 && downloaded >= t as u64)
-                    && last_growth.elapsed() >= STALL_COMMIT_GRACE
                 {
-                    stalled.store(true, Ordering::SeqCst);
-                    tracing::warn!(
-                        "task {task_id}: 已下齐 {downloaded}B 但 {} 秒无增长，判定卡在提交阶段，应用接手收尾",
-                        STALL_COMMIT_GRACE.as_secs()
-                    );
-                    if let (Some(src), Some(dst)) =
-                        (progress_dirs.first(), progress_dirs.get(1))
-                    {
-                        match backend::commit_stalled_artifact(src, dst) {
+                    let src = progress_dirs.first().cloned();
+                    let has_hole = match &src {
+                        Some(p) => {
+                            let p2 = p.clone();
+                            tokio::task::spawn_blocking(move || {
+                                backend::has_zero_hole(&p2, ZERO_HOLE_THRESHOLD)
+                            })
+                            .await
+                            .unwrap_or(false)
+                        }
+                        None => false,
+                    };
+                    if has_hole {
+                        // 预分配未写完：不能收编。置标记让主循环杀掉并按失败重试
+                        //（steamcmd 会从已有的 state patch 续传，把空洞补上）。
+                        stalled_incomplete.store(true, Ordering::SeqCst);
+                        tracing::warn!(
+                            "task {task_id}: 已下字节达总量但内容含 ≥{}KB 零段，判定未写完，将中断重试",
+                            ZERO_HOLE_THRESHOLD / 1024
+                        );
+                    } else if let (Some(src), Some(dst)) = (src, progress_dirs.get(1)) {
+                        match backend::commit_stalled_artifact(&src, dst) {
                             Ok(n) if n > 0 => {
-                                tracing::warn!("task {task_id}: 停滞收尾已搬运 {n} 个条目到 content/");
+                                stalled.store(true, Ordering::SeqCst);
+                                tracing::warn!(
+                                    "task {task_id}: 已下齐 {downloaded}B 且 {} 秒无写入，判定卡在提交阶段，应用接手收尾（搬运 {n} 个条目）",
+                                    STALL_COMMIT_GRACE.as_secs()
+                                );
                             }
                             other => {
-                                // 搬运失败/无产物：清标记回落到看门狗路径，别误判成功
                                 tracing::warn!(
                                     "task {task_id}: 停滞收尾搬运无果（{other:?}），交由看门狗处理"
                                 );
-                                stalled.store(false, Ordering::SeqCst);
-                                continue;
                             }
                         }
                     }
