@@ -1108,11 +1108,17 @@ impl DownloadService {
             );
         }
 
-        // 声明了依赖的壁纸：本地已有的依赖直接补齐目录内容，缺的自动加入下载队列
-        let dep_ids = project
+        // 声明了依赖的壁纸：本地已有的依赖直接补齐目录内容，缺的自动加入下载队列。
+        // project.json 只覆盖显式声明的情况；pkg 内引用的资产包（无声明也要用）补扫一遍
+        let mut dep_ids = project
             .as_ref()
             .map(|v| parse_dependency_ids(v, &item_id))
             .unwrap_or_default();
+        for id in scan_pkg_workshop_refs(&dest, &item_id) {
+            if !dep_ids.contains(&id) {
+                dep_ids.push(id);
+            }
+        }
         if !dep_ids.is_empty() {
             let missing = self.settle_dependencies(&dest, &dep_ids);
             if !missing.is_empty() {
@@ -1374,6 +1380,34 @@ pub(crate) fn parse_dependency_ids(project: &serde_json::Value, self_id: &str) -
     }
     if let Some(s) = project.get("dependency").and_then(|d| d.as_str()) {
         push(s);
+    }
+    ids
+}
+
+/// 扫描产物目录里的 `*.pkg` 二进制，提取 `workshop/<id>/` 资产包引用。
+/// 有些作品不在 project.json 声明 dependencies，却在 pkg 内引用资产包路径
+/// （如 `materials/workshop/2423877731/effects/...`）——不补下这些包，
+/// 壁纸加载时按路径找不到资源。路径要求前后都有 `/`，避免二进制噪声误报。
+/// pkg 可达上百 MB，这里做一次性全量字节匹配（安装收编本来就拷贝同量数据）。
+pub(crate) fn scan_pkg_workshop_refs(dir: &Path, self_id: &str) -> Vec<String> {
+    let re = regex::bytes::Regex::new(r"workshop/([0-9]{6,})/").expect("pkg ref regex");
+    let mut ids: Vec<String> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return ids;
+    };
+    for e in entries.flatten() {
+        if e.path().extension().and_then(|s| s.to_str()) != Some("pkg") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(e.path()) else {
+            continue;
+        };
+        for cap in re.captures_iter(&bytes) {
+            let m = String::from_utf8_lossy(&cap[1]).into_owned();
+            if m != self_id && !ids.contains(&m) {
+                ids.push(m);
+            }
+        }
     }
     ids
 }
@@ -1878,6 +1912,22 @@ mod tests {
 
         let v2: serde_json::Value = serde_json::from_str(r#"{ "title": "t" }"#).unwrap();
         assert!(parse_dependency_ids(&v2, "999").is_empty());
+    }
+
+    #[test]
+    fn pkg_workshop_refs_extracted_and_deduped() {
+        let d = fixture("pkg-refs");
+        // 模拟 scene.pkg：资产包路径（合法引用）+ 自身 + 噪声（无前后斜杠、位数不足）
+        std::fs::write(
+            d.join("scene.pkg"),
+            b"materials/workshop/2423877731/effects/a.json\x00shaders/workshop/2973943998/x.frag\x00workshop/999/ok\x00noise: workshop/12345/ and xworkshop/2423877731/again",
+        )
+        .unwrap();
+        // 非 pkg 文件不扫
+        std::fs::write(d.join("project.json"), r#"{"file":"scene.pkg"}"#).unwrap();
+
+        let ids = scan_pkg_workshop_refs(&d, "999");
+        assert_eq!(ids, vec!["2423877731", "2973943998"]);
     }
 
     #[test]
