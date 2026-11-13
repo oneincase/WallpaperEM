@@ -21,8 +21,8 @@ importers:
         specifier: ^19.0.0
         version: 19.3.0(react@19.3.0)
       webwallgl:
-        specifier: ^3.0.0
-        version: 3.0.0
+        specifier: ^3.0.2
+        version: 3.0.2
     devDependencies:
       '@tailwindcss/vite':
         specifier: ^4.0.0
@@ -948,8 +948,8 @@ packages:
       yaml:
         optional: true
 
-  webwallgl@3.0.0:
-    resolution: {integrity: sha512-If5DUW3hHeWOyyhvswHkycWm0U5mWJUpKb4ws/J+jrwK3gUbmpoyyACfezKClrcpMB8u2UNyl/ni3M0Z2gjjww==}
+  webwallgl@3.0.2:
+    resolution: {integrity: sha512-mYb/zwq9vDVF8KLOBswZEf+DZ3bvVLnrcTjqzEf2oKV4hfrobCBnDTXJ9goEiK/eNGdL4xyEJX+bxJmvh1jfHA==}
 
   yallist@3.1.1:
     resolution: {integrity: sha512-a4UGQaWPH59mOXUYnAG2ewncQS4i4F43Tv3JoAM+s2VDAmS9NsK8GpDMLrCHPksFT7h3K6TOoUNn2pb7RoXx4g==}
@@ -1649,7 +1649,7 @@ snapshots:
       jiti: 2.7.0
       lightningcss: 1.32.0
 
-  webwallgl@3.0.0:
+  webwallgl@3.0.2:
     dependencies:
       mediabunny: 1.61.3
 
